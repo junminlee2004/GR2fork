@@ -2,7 +2,66 @@
 SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
+ShadPS4 fork focused on improving emulation of Gravity Rush 2 on PC.
 
+Buy me a kofi here -> https://ko-fi.com/junminlee2004
+
+join the GR2fork discord server (new) here for extended support. Anyone who wants to lurk for general game discussion surrounding gravity rush 1 and 2 are also welcome -> https://discord.gg/hnHRpzxGzG
+
+**Minimum Requirements:**
+
+@ 1080p 30fps (LOCKED)
+
+CPU: Ryzen 5 5600X
+
+GPU: GTX 1650 4gb / RX 6400 4gb
+
+RAM: 12gb
+
+SSD
+
+**Recommended Requirements:**
+
+CPU: i7 12700 / ryzen 5 7600
+
+GPU: Any modern gpu stronger than the minimum requirements with >4gb vram
+
+RAM: 16gb
+
+SSD
+
+ROG ALLY Z1 EXTREME
+
+XBOX ALLY X Z2 EXTREME
+
+LEGION GO Z1 EXTREME
+
+any 7840u cpu
+**Installation Instructions:**
+
+Download GR2fork_windows.zip
+extract it to whatever directory you want
+prepare your game dump and make sure it is downloaded to some folder on your pc. If you want to use the 1.11 patch, make sure the patch is copied into the base game's folder as it should be instead of having it in a separate folder. MAKE SURE YOUR GAME IS INSTALLED ON AN SSD
+add in your dumped sysmodules into GR2fork\user\sys_modules.
+open shadPS4QtLauncher.exe in GR2fork and add your Gravity Rush 2 game directory.
+add in the shadPS4gr2fork.exe to versions in the launcher emulator versions in the top right corner.
+set up configs. The input_config template file is in the root directory. DO NOT PRESS THE DELETE KEY IF USING KBM. DO NOT ENABLE READBACKS OR TOUCH THE DEBUG SECTION OF THE EMULATOR. Also please remember to enable shader cache by setting enable pipeline cache = true in the config.toml.
+Final note, do not be discouraged by crashing when going into a new area. Once you build up a good shader cache collection, crashes will dwindle
+**FAQ:**
+
+Q: Is there currently any keyboard/mouse mapping for touchpad swipe (especially swipe down)? Or is this feature not implemented yet in this fork?
+
+A: Yes, in fact this was one of the first things I coded into the emulator. The reason you dont see these options in the qtlauncher gui menu is that the mainline build has zero code to emulate touchpad swipes so there exists no gui buttons to support my new input code. As such, you will have to manually edit the default.ini config file in the input_config folder. On my PC, I have these 4 lines (you will have to add them too):
+
+touchpad_left = j
+
+touchpad_center = k
+
+touchpad_right = l
+
+touchpad_down = m
+
+so if I press J and then k that is swipe right. If I press k and then m it swipes down etc. Also for devices with a touchscreen, I made it so that the touchscreen can act as the touchpad.
 <h1 align="center">
   <br>
   <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
