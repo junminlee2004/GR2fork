@@ -77,14 +77,14 @@ public:
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
         const auto write_limit = 100_MB;
         const bool write_limit_exceeded = bytes_written > write_limit;
-        if (entry.log_level >= Level::Error || write_limit_exceeded) {
-            if (write_limit_exceeded) {
-                // Stop writing after the write limit is exceeded.
-                // Don't close the file so we can print a stacktrace if necessary
-                enabled = false;
-            }
-            file.Flush();
+        if (write_limit_exceeded) {
+            // Stop writing after the write limit is exceeded.
+            // Don't close the file so we can print a stacktrace if necessary
+            enabled = false;
         }
+        // Always flush so hard crashes never lose log lines.
+        // fflush cost is ~1μs per call — negligible vs the formatting work above.
+        file.Flush();
     }
 
     void Flush() {
@@ -118,6 +118,11 @@ public:
 };
 
 bool initialization_in_progress_suppress_logging = true;
+
+// Set by StopAsyncAndForceSync(). Once true, PushEntry skips the async
+// queue and writes inline with fflush. The crash handler flips this so
+// post-crash LOG_CRITICAL output actually reaches shad_log.txt.
+std::atomic<bool> g_force_sync{false};
 
 /**
  * Static state as a singleton.
@@ -160,6 +165,23 @@ public:
     }
 
     static void Stop() {
+        instance->StopBackendThread();
+    }
+
+    // Crash-handler entry point. Same as Stop() but safe to call from the
+    // backend thread itself: detects self-invocation and skips the join so
+    // we don't deadlock. The flag in g_force_sync still gets set (by the
+    // caller) so subsequent producer threads take the inline path.
+    static void StopFromAnyThread() {
+        if (!instance) {
+            return;
+        }
+        if (instance->backend_thread.get_id() == std::this_thread::get_id()) {
+            // Self-call from the backend thread (i.e. crash inside Write/Flush).
+            // Joining ourselves would deadlock. The backend thread will exit
+            // naturally when control returns up the stack.
+            return;
+        }
         instance->StopBackendThread();
     }
 
@@ -220,9 +242,15 @@ public:
             .function = function,
             .message = std::move(message),
         };
-        if (Config::getLogType() == "async") {
+        if (Config::getLogType() == "async" &&
+            !g_force_sync.load(std::memory_order_relaxed)) {
             message_queue.EmplaceWait(entry);
         } else {
+            // Sync path: either configured that way, or the crash handler
+            // flipped g_force_sync. Write inline so the bytes hit the file
+            // (and fflush to OS via FileBackend::Write) before this call
+            // returns. This is what makes post-crash LOG_CRITICAL output
+            // actually appear in shad_log.txt.
             ForEachBackend([&entry](auto& backend) { backend.Write(entry); });
             std::fflush(stdout);
         }
@@ -329,5 +357,23 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename,
         Impl::Instance().PushEntry(log_class, log_level, filename, line_num, function, format,
                                    args);
     }
+}
+
+void StopAsyncAndForceSync() {
+    // Already switched? No-op (idempotent).
+    if (g_force_sync.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // Logging never initialized (or already torn down) — flag is set, that's
+    // all we can do. Future PushEntry calls go nowhere, which is fine.
+    if (!Impl::IsActive()) {
+        return;
+    }
+    // Drain the queue and stop the backend thread. After this returns,
+    // PushEntry's inline branch (gated on g_force_sync above) writes
+    // straight to the file backend with fflush before returning, so
+    // LOG_CRITICAL from the crash handler reaches shad_log.txt before
+    // the process dies.
+    Impl::StopFromAnyThread();
 }
 } // namespace Common::Log

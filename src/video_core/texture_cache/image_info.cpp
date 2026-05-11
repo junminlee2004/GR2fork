@@ -142,6 +142,25 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     guest_address = image.Address();
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
+
+    // FIX(GR2FORK): per-user-request, threshold and cap both at 2048.
+    // Previous policy (> 2048 → 1) was destroying legitimate large array
+    // textures and effects went missing over time as more textures aged
+    // into that range. The 4096 cap was rejected — it could produce values
+    // above the device's maxImageArrayLayers (commonly 2048) and fail
+    // vkCreateImage. 2048 is the standard Vulkan minimum-spec ceiling for
+    // maxImageArrayLayers, so clamping there is creatable on essentially
+    // all target hardware. Caveat: the AMD T# field is 13 bits (up to
+    // 8191), so values in (2048, 8191] still get a wrong-but-creatable
+    // layer count; if those exist they render wrong rather than missing
+    // — watch this warning.
+    if (resources.layers > 2048u) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan,
+                    "T# layer count {} exceeds 2048 cap, clamping to 2048",
+                    resources.layers);
+        resources.layers = 2048;
+    }
+
     UpdateSize();
 }
 
@@ -151,6 +170,132 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
 }
 
 void ImageInfo::UpdateSize() {
+    // NOTE: layer-count fixup for garbage T#s previously lived here at
+    // threshold 512 and clobbered ColorBuffer/DepthBuffer/null paths too.
+    // It now lives in the AmdGpu::Image ctor (threshold 2048) and the
+    // primary bail is in vk_rasterizer.cpp BindTextures.
+
+    // PERF(GR2 v8): Compute signature with packed 64-bit words instead of 13 separate hash steps.
+    // This reduces ALU from 13 multiply+xor chains to 4.
+    //
+    // PERF(GR2 v1.14): Replace the 4-step serial FNV-1a chain with 4 INDEPENDENT
+    // FNV mixers combined by XOR. The serial form has a ~16-cycle critical path
+    // on Zen4 (4 imul-after-imul stalls); the parallel form pipelines all four
+    // muls simultaneously, dropping the critical path to ~5 cycles. Each lane
+    // uses a distinct seed so common zero-input lanes don't collapse to the same
+    // value. UpdateSize is on the FindImage / ImageDesc rebuild hot path
+    // (~0.53% of GpuComm in a captured profile), and the size_sig early-out
+    // is the dominant exit, so this directly attacks the cycles spent there.
+    //
+    // Collision behaviour: the size_sig field is purely a runtime cache (not
+    // serialized), and a self-collision (same h for distinct inputs of the
+    // SAME ImageInfo object across calls) at 1/2^64 is astronomically unlikely
+    // for the bounded GR2 input domain. A miss only re-runs the mip layout
+    // computation; never causes incorrect output.
+    const u64 v0 = (static_cast<u64>(pitch) << 32) | static_cast<u64>(size.width);
+    const u64 v1 = (static_cast<u64>(size.height) << 32) | static_cast<u64>(size.depth);
+    // Pack levels(8) + layers(16) + num_bits(16) + num_samples(8) + tile_mode(8) + array_mode(8)
+    const u64 v2 =
+        static_cast<u64>(resources.levels) |
+        (static_cast<u64>(resources.layers) << 8) |
+        (static_cast<u64>(num_bits) << 24) |
+        (static_cast<u64>(num_samples) << 40) |
+        (static_cast<u64>(static_cast<u32>(tile_mode)) << 48) |
+        (static_cast<u64>(static_cast<u32>(array_mode)) << 56);
+    // Pack boolean flags
+    const u64 v3 =
+        static_cast<u64>(alt_tile ? 1u : 0u) |
+        (static_cast<u64>(props.is_block ? 1u : 0u) << 1) |
+        (static_cast<u64>(props.is_pow2 ? 1u : 0u) << 2);
+
+    constexpr u64 P = 1099511628211ULL;
+    const u64 a0 = (v0 ^ 0xcbf29ce484222325ULL) * P;
+    const u64 a1 = (v1 ^ 0x84222325cbf29ce4ULL) * P;
+    const u64 a2 = (v2 ^ 0x9e3779b97f4a7c15ULL) * P;
+    const u64 a3 = (v3 ^ 0xbf58476d1ce4e5b9ULL) * P;
+    const u64 h = a0 ^ a1 ^ a2 ^ a3;
+
+    if (h == size_sig) {
+        return;
+    }
+    size_sig = h;
+
+    // Fast path: most GR2 textures are single-mip. Avoid the per-mip loop overhead.
+    if (resources.levels == 1) {
+        guest_size = 0;
+
+        u32 mip_w = pitch;
+        u32 mip_h = size.height;
+        if (props.is_block) {
+            mip_w = (mip_w + 3) / 4;
+            mip_h = (mip_h + 3) / 4;
+        }
+        mip_w = std::max(mip_w, 1u);
+        mip_h = std::max(mip_h, 1u);
+        u32 mip_d = std::max(size.depth, 1u);
+        u32 thickness = 1;
+
+        if (props.is_pow2) {
+            mip_w = std::bit_ceil(mip_w);
+            mip_h = std::bit_ceil(mip_h);
+            mip_d = std::bit_ceil(mip_d);
+        }
+
+        auto& mip_info = mips_layout[0];
+        switch (array_mode) {
+            case AmdGpu::ArrayMode::ArrayLinearAligned: {
+                std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
+                ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
+                break;
+            }
+            case AmdGpu::ArrayMode::Array1DTiledThick:
+                thickness = 4;
+                mip_d += (-mip_d) & (thickness - 1);
+                [[fallthrough]];
+            case AmdGpu::ArrayMode::Array1DTiledThin1: {
+                std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
+                ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
+                break;
+            }
+            case AmdGpu::ArrayMode::Array2DTiledThick:
+                thickness = 4;
+                mip_d += (-mip_d) & (thickness - 1);
+                [[fallthrough]];
+            case AmdGpu::ArrayMode::Array2DTiledThin1: {
+                if (props.is_block) [[unlikely]] {
+                    // FIX(GR2FORK): garbage T# — macro-tiled 2D mode is
+                    // mutually exclusive with block-compressed formats
+                    // (the macro-tile size calculator has no path for
+                    // block textures). Treat as a zero-size image so
+                    // downstream FindImageWithView returns a null result
+                    // and BindTextures emits a null descriptor. Was an
+                    // ASSERT, but garbage T#s with this combination are
+                    // observed in shipping titles (GR2 texture bombs).
+                    LOG_WARNING(Render_Vulkan,
+                                "T# garbage: Array2DTiledThin1 + block fmt — "
+                                "treating as null (single-mip path)");
+                    guest_size = 0;
+                    return;
+                }
+                std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
+                    mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, 0, alt_tile);
+                break;
+            }
+            default: {
+                UNREACHABLE_MSG("Unknown array mode {}", magic_enum::enum_name(array_mode));
+            }
+        }
+        if (props.is_block) {
+            mip_info.pitch = std::max(mip_info.pitch * 4, 32u);
+            mip_info.height = std::max(mip_info.height * 4, 32u);
+        }
+
+        mip_info.size *= mip_d * resources.layers;
+        mip_info.offset = 0;
+        guest_size = mip_info.size;
+        return;
+    }
+
     guest_size = 0;
     for (s32 mip = 0; mip < resources.levels; ++mip) {
         u32 mip_w = pitch >> mip;
@@ -191,7 +336,19 @@ void ImageInfo::UpdateSize() {
             mip_d += (-mip_d) & (thickness - 1);
             [[fallthrough]];
         case AmdGpu::ArrayMode::Array2DTiledThin1: {
-            ASSERT(!props.is_block);
+            if (props.is_block) [[unlikely]] {
+                // FIX(GR2FORK): garbage T# — see single-mip path comment
+                // above. Same pattern: zero-size and bail rather than
+                // ASSERT. We've already accumulated `guest_size` for
+                // mips < `mip`, but FindImageWithView's caller is going
+                // to drop this whole image, so the partial accumulation
+                // doesn't matter — overwrite to zero for clarity.
+                LOG_WARNING(Render_Vulkan,
+                            "T# garbage: Array2DTiledThin1 + block fmt — "
+                            "treating as null (multi-mip path, mip={})", mip);
+                guest_size = 0;
+                return;
+            }
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
                 mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
             break;

@@ -8,6 +8,8 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#include <vk_mem_alloc.h>
+
 #define A_CPU
 #include "core/debug_state.h"
 #include "video_core/host_shaders/fsr/ffx_a.h"
@@ -395,12 +397,62 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 }
 
 void FsrPass::ResizeAndInvalidate(u32 width, u32 height) {
+    // FIX(GR2FORK): output dimensions changed (the user toggled an aspect-
+    // ratio override, resized the SDL window, switched to fullscreen, or
+    // ImGui's dock layout shifted the Display window's contentArea by a few
+    // pixels as the loading-layer remove queue settles). Each
+    // available_imgs[i] holds vk::Images sized for the OLD output_size; we
+    // must release them before re-creating at the new size, because:
+    //
+    //   1. UniqueImage::Create() has an ASSERT(!image), so calling Create()
+    //      on an Img whose image handle is already non-null aborts the
+    //      process. This is the GR2 ultrawide + FSR crash: the 21:9/32:9
+    //      eboot patch makes frame->width exceed image_size.width (1920),
+    //      which makes FSR actually fire (input < output) and run
+    //      CreateImages on each Img over the next num_images frames; the
+    //      first sub-pixel contentArea shift after that re-enters here
+    //      with stale image handles, dirty=true flips, the next
+    //      CreateImages call hits the assert, abort.
+    //
+    //   2. UniqueImage's move-assign overwrites image/allocation handles
+    //      *without* invoking ~UniqueImage on the old contents, so the
+    //      naive `img.x = UniqueImage(...)` reset would silently leak a
+    //      vk::Image + VmaAllocation per resize. Free via vmaDestroyImage
+    //      directly to sidestep both bugs.
+    //
+    // We waitIdle here because FSR's per-Img cycle (cur_image) is
+    // independent of the per-Vulkan::Frame present_done fence the presenter
+    // waits on — an in-flight frame on the GPU may still be sampling an
+    // Img we are about to free. ResizeAndInvalidate fires only on real
+    // output_size changes (rare), so a full device sync is acceptable.
+    Check<"FSR resize wait idle">(device.waitIdle());
+
     this->cur_size = vk::Extent2D{
         .width = width,
         .height = height,
     };
     for (int i = 0; i < num_images; ++i) {
-        available_imgs[i].dirty = true;
+        auto& img = available_imgs[i];
+        // Drop views first — they reference the images we're about to
+        // destroy. UniqueHandle's reset() invokes the destroyer, which is
+        // safe after waitIdle.
+        img.intermediary_image_view.reset();
+        img.output_image_view.reset();
+        if (img.intermediary_image.image) {
+            vmaDestroyImage(img.intermediary_image.allocator,
+                            img.intermediary_image.image,
+                            img.intermediary_image.allocation);
+            img.intermediary_image.image = VK_NULL_HANDLE;
+            img.intermediary_image.allocation = VK_NULL_HANDLE;
+        }
+        if (img.output_image.image) {
+            vmaDestroyImage(img.output_image.allocator,
+                            img.output_image.image,
+                            img.output_image.allocation);
+            img.output_image.image = VK_NULL_HANDLE;
+            img.output_image.allocation = VK_NULL_HANDLE;
+        }
+        img.dirty = true;
     }
 }
 

@@ -31,7 +31,10 @@ constexpr auto PORTABLE_DIR = "user";
 
 // Sub-directories contained within a user data directory
 constexpr auto LOG_DIR = "log";
-constexpr auto SCREENSHOTS_DIR = "screenshots";
+// RENAME(GR2FORK v1.0): "screenshots" -> "Capture Gallery" for a cleaner,
+// more descriptive user-facing directory name. Space in the name is fine —
+// std::filesystem::path handles it transparently on all host OSes.
+constexpr auto SCREENSHOTS_DIR = "Capture Gallery";
 constexpr auto SHADER_DIR = "shader";
 constexpr auto GAMEDATA_DIR = "data";
 constexpr auto TEMPDATA_DIR = "temp";

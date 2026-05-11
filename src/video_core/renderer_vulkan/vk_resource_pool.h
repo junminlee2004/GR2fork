@@ -51,7 +51,13 @@ protected:
 
 class CommandPool final : public ResourcePool {
 public:
-    explicit CommandPool(const Instance& instance, MasterSemaphore* master_semaphore);
+    /// queue_family_index defaults to UINT32_MAX, which means "use the graphics
+    /// queue family" — preserved as the implicit default for the existing
+    /// graphics-side caller. Pass `instance.GetComputeQueueFamilyIndex()` (or
+    /// any other valid family) to allocate a pool bound to that family, used
+    /// by ComputeScheduler in the multi-queue path (Phase MQ-3+).
+    explicit CommandPool(const Instance& instance, MasterSemaphore* master_semaphore,
+                         u32 queue_family_index = UINT32_MAX);
     ~CommandPool() override;
 
     void Allocate(std::size_t begin, std::size_t end) override;

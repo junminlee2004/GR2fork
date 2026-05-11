@@ -17,8 +17,24 @@ s32 PS4_SYSV_ABI sceKernelIsInSandbox() {
 }
 
 s32 PS4_SYSV_ABI sceKernelIsNeoMode() {
-    return Config::isNeoModeConsole() &&
-           Common::ElfInfo::Instance().GetPSFAttributes().support_neo_mode;
+    // PERF(GR2FORK release_v2_3): both inputs are fixed for process lifetime.
+    // Config::isNeoModeConsole() reflects the user's emulator config (set
+    // at launch, not mutated during gameplay), and ElfInfo's
+    // support_neo_mode is read from the game's PSF metadata during ELF
+    // load (before any game code runs and so before any of this function's
+    // call sites can fire). The cycle cost matters because this is called
+    // from many hot paths: image_info.cpp (alt_tile detection on every
+    // ImageInfo construction), liverpool.cpp (gpu init), and seven
+    // distinct gnmdriver.cpp draw paths. Pre-v2_3 it showed at 0.05% on
+    // DrawThread alone.
+    //
+    // Magic-static guarantees thread-safe one-time initialization in
+    // C++11+. After the first successful initialization, every subsequent
+    // call is a guard-byte check + load — typically 3 instructions on x86.
+    static const s32 cached =
+        Config::isNeoModeConsole() &&
+        Common::ElfInfo::Instance().GetPSFAttributes().support_neo_mode;
+    return cached;
 }
 
 s32 PS4_SYSV_ABI sceKernelHasNeoMode() {

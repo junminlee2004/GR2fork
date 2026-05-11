@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string_view>
+
 #include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
@@ -9,7 +11,48 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
-#include "video_core/host_shaders/fault_buffer_process_comp.h"
+// Inline-embedded shader source. Equivalent to what host_shaders/CMakeLists.txt
+// would generate as fault_buffer_process_comp.h. Used directly here because the
+// generated header isn't reliably present in this build configuration.
+namespace HostShaders {
+constexpr std::string_view FAULT_BUFFER_PROCESS_COMP = R"shader_src(
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_ARB_gpu_shader_int64 : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer input_buf {
+    uint fault_buffer[];
+};
+
+layout(std430, binding = 1) buffer output_buf {
+    uint64_t download_buffer[];
+};
+layout(std430, binding = 1) buffer output_buf32 {
+    uint download_buffer32[];
+};
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    uint word = fault_buffer[id];
+    fault_buffer[id] = 0u;
+    const uint base_bit = id * 32u;
+    while (word != 0u) {
+        const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+        if (store_index >= MAX_PAGE_FAULTS) {
+            return;
+        }
+        const uint bit = findLSB(word);
+        word &= word - 1;
+        const uint page = base_bit + bit;
+        download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
+    }
+}
+)shader_src";
+} // namespace HostShaders
 
 namespace VideoCore {
 
@@ -134,7 +177,7 @@ void FaultManager::ProcessFaultBuffer() {
         },
     }};
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
@@ -143,6 +186,11 @@ void FaultManager::ProcessFaultBuffer() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
+    // Cross-pipeline cache invalidation: this direct compute push touches
+    // set 0's compute shadow without going through Pipeline::BindResources,
+    // so bump the gen so any compute Pipeline that previously cached set 0
+    // for this cmdbuf will repush on its next call.
+    scheduler.BumpPushDescGen(vk::PipelineBindPoint::eCompute);
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = caching_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);

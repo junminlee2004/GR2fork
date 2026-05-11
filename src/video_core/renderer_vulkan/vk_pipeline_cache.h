@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -20,7 +24,8 @@ struct std::hash<vk::ShaderModule> {
 };
 
 namespace AmdGpu {
-class Liverpool;
+struct Liverpool;
+struct LiverpoolRegsSnapshot;
 }
 
 namespace Serialization {
@@ -42,25 +47,87 @@ struct Program {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
     };
-    static constexpr size_t MaxPermutations = 8;
+    static constexpr size_t MaxPermutations = 16;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     Shader::Info info;
     ModuleList modules{};
 
+    // Fast lookup for shader permutations by specialization signature.
+    // Avoids repeated deep StageSpecialization comparisons on hot paths.
+    tsl::robin_map<u64, size_t> perm_index_by_sig{};
+
+    // PERF(GR2 v16): Cache the last GetProgram result per program.
+    // When the pipeline stamp changes (e.g. viewport/scissor update) but the shader's
+    // user_data, runtime_info, and binding offsets are unchanged, we can skip the expensive
+    // StageSpecialization construction (~2.26% of GpuComm) entirely.
+    struct LastResultCache {
+        u64 ud_hash{};           // stage-aware hash of user_data + runtime_info + binding
+        u64 ri_bind_hash{};      // hash of runtime_info + binding only (for stable program shortcut)
+        size_t perm_idx{};
+        u64 perm_hash{};
+        vk::ShaderModule module{};
+        bool valid{false};
+    } last_result{};
+
+    // PERF(GR2 v17): Stability tracking for single-permutation programs.
+    // When a program has had only 1 permutation for many consecutive calls, mark it as "stable".
+    // For stable single-permutation programs, skip StageSpecialization construction when only
+    // user_data addresses change (stride/format/etc. are extremely unlikely to change).
+    u32 stability_counter{};
+    static constexpr u32 kStabilityThreshold = 64;
+    static constexpr u32 kStabilityRevalidateInterval = 512;
+
+    // PERF(GR2FORK): ud_hash → perm_idx cache. Sits between LastResultCache
+    // (single-entry, "exact same call as last time") and the
+    // StageSpecialization constructor + sig lookup. Catches the common case
+    // where a program is called with one of a small set of distinct ud_hashes
+    // in rotation (e.g. UI vs in-world fragment shaders sharing a program).
+    //
+    // Distinct from the BANNED v17 stable-single-permutation shortcut:
+    // - v17 keyed on ri_bind_hash (no SGPR content). Different sharps with
+    //   the same slot layout collided → stale module served → green
+    //   garbled effects, vertex explosions in GR2.
+    // - This keys on ud_hash, which is XXH3 of the full user_data BYTES.
+    //   Different SGPRs → different ud_hash → different cache slot or
+    //   miss → no cross-contamination. Same correctness invariant the
+    //   surviving line-978 last_result fast-path relies on.
+    //
+    // 32 direct-mapped slots; ~512 bytes per Program. Bumped on every
+    // success path that resolves perm_idx after a StageSpecialization
+    // construction. Never invalidated proactively — perm_idx is only
+    // appended-to in modules, so old indices stay valid. Bounds-checked
+    // against modules.size() on lookup as a defensive guard.
+    struct UdHashCacheEntry {
+        u64 ud_hash{};
+        u32 perm_idx{};
+        bool valid{false};
+    };
+    static constexpr size_t kUdHashCacheSize = 32;
+    std::array<UdHashCacheEntry, kUdHashCacheSize> ud_hash_lru{};
+
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
-        : info{stage, l_stage, params} {}
-
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
-        modules.emplace_back(module, std::move(spec));
+    : info{stage, l_stage, params} {
+        modules.reserve(MaxPermutations);
+        perm_index_by_sig.reserve(MaxPermutations * 2);
     }
 
-    void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx) {
-        modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec)};
-    }
+        void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+            const u64 sig = spec.sig;
+            modules.emplace_back(module, std::move(spec));
+            // Only keep the first index for a given sig; multiple serialized permutation indices
+            // may map to the same specialization (safe to reuse the same module).
+            perm_index_by_sig.try_emplace(sig, modules.size() - 1);
+        }
+
+        void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
+                          size_t perm_idx) {
+            modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
+            const u64 sig = spec.sig;
+            modules[perm_idx] = {module, std::move(spec)};
+            perm_index_by_sig.try_emplace(sig, perm_idx);
+                          }
 };
 
 class PipelineCache {
@@ -69,21 +136,57 @@ public:
                            AmdGpu::Liverpool* liverpool);
     ~PipelineCache();
 
-    void WarmUp();
+    // Deserializes the on-disk shader cache into program_cache /
+    // graphics_pipelines / compute_pipelines. Used to be called from this
+    // ctor; was moved out so the Presenter (which is *this object's
+    // grand-owner) is fully constructed when WarmUp runs and can drive a
+    // "LOADING SHADERS" overlay on the swapchain instead of presenting a
+    // black window for the 30+ seconds it can take with a large cache.
+    //
+    // `tick` is invoked from this thread once per blob processed; `loaded`
+    // is the running tally and `total` is the precomputed CountBlobs result
+    // (constant for the duration of the call). The callback is optional —
+    // passing {} preserves the historical behavior.
+    void WarmUp(const std::function<void(u32 loaded, u32 total)>& tick = {});
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    // Phase 1D-0b (Turn 2B-1): the public lookup methods now take a
+    // const reference to the captured reg snapshot rather than reading
+    // `liverpool->regs` internally. The snapshot mirrors `Regs`'s field
+    // interface, so the lookup bodies (RefreshGraphicsKey, RefreshGraphicsStages,
+    // RefreshComputeKey, BuildRuntimeInfo) read regs.X identically to the
+    // pre-2B-1 path — only the source switches.
+    const GraphicsPipeline* GetGraphicsPipeline(const AmdGpu::LiverpoolRegsSnapshot& regs);
 
-    const ComputePipeline* GetComputePipeline();
+    const ComputePipeline* GetComputePipeline(const AmdGpu::LiverpoolRegsSnapshot& regs);
 
+    // PERF(GR2FORK v1.60): the third tuple element used to be a
+    // std::optional<Shader::Gcn::FetchShaderData> RETURNED BY VALUE. That
+    // value contains a std::vector<VertexAttribute> internally, so every
+    // GetProgram call performed a heap-alloc + memcpy of the attribute
+    // vector to construct the tuple, then std::tie at the call site
+    // assigned it into a local optional, then RefreshGraphicsStages did
+    // ANOTHER copy from local into PipelineCache::fetch_shader. Two
+    // unnecessary deep copies per stage per draw, ~5 stages × ~5000 draws/s
+    // = ~25K extra heap ops/s on the GpuComm thread. perf attributed
+    // _Optional_payload_base<FetchShaderData>::_M_copy_assign at 0.37% of
+    // GpuComm under nominally-unrelated frames (skid).
+    //
+    // The pointer points into program->modules[N].spec.fetch_shader_data,
+    // which is owned by the program (whose unique_ptr lives in
+    // program_cache and has stable address). Lifetime is bounded by the
+    // single GetProgram call's return path — the caller dereferences and
+    // copies into its own storage exactly once. nullptr means "no fetch
+    // shader" (e.g. compute stage, or vertex stage without VS_FETCH).
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
+                              const std::optional<Shader::Gcn::FetchShaderData>*, u64>;
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
-                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
+                      const AmdGpu::LiverpoolRegsSnapshot& regs);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
@@ -96,9 +199,9 @@ public:
     }
 
 private:
-    bool RefreshGraphicsKey();
-    bool RefreshGraphicsStages();
-    bool RefreshComputeKey();
+    bool RefreshGraphicsKey(const AmdGpu::LiverpoolRegsSnapshot& regs);
+    bool RefreshGraphicsStages(const AmdGpu::LiverpoolRegsSnapshot& regs);
+    bool RefreshComputeKey(const AmdGpu::LiverpoolRegsSnapshot& regs);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
@@ -107,11 +210,86 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                                const AmdGpu::LiverpoolRegsSnapshot& regs);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
+
+    // =========================================================================
+    // OPT(GR2 v78): Async graphics pipeline compile + driver-hang watchdog.
+    // =========================================================================
+    // shadPS4 has been hanging silently inside `vkCreateGraphicsPipelines` on
+    // certain (pipeline, RADV Mesa version) combinations — the synchronous
+    // Vulkan call never returns. Since GetGraphicsPipeline runs on the GPU
+    // submit thread, a driver hang there freezes the entire emulator.
+    //
+    // Fix: launch the GraphicsPipeline ctor on a worker via std::async. Wait
+    // briefly on the future (most compiles take <50ms — zero behavior change
+    // for the common case). If the budget elapses, return nullptr from
+    // GetGraphicsPipeline and stash the future in `pending_graphics_pipelines`.
+    // Rasterizer::Draw already handles nullptr as "skip this draw" (frame-skip).
+    // On every subsequent call for the same key, non-blocking-poll the future.
+    // Log loudly once past kHangLogThreshold; mark permafailed + move future
+    // to the file-local graveyard past kPermaFailThreshold so we neither block
+    // destruction nor join a hung thread.
+    struct PendingGraphicsPipeline {
+        std::future<std::unique_ptr<GraphicsPipeline>> future;
+        std::chrono::steady_clock::time_point started_at;
+        u64 pipeline_hash{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        // Stage-data deep copies. GraphicsPipeline's ctor takes spans into
+        // PipelineCache::infos/runtime_infos/modules — those cache members are
+        // overwritten on the next RefreshGraphicsStages, so the async task
+        // cannot rely on them. Copy once at launch.
+        std::array<const Shader::Info*, MaxShaderStages> infos_copy{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos_copy{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules_copy{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_copy{};
+        bool hang_warned{false};
+        bool permafailed{false};
+    };
+
+    // Thresholds. Tune via constants here; no config plumbing to avoid scope creep.
+    //
+    // PERF(post-B1, spike-score targeted): kInitialSyncBudget was 200ms, which
+    // blocked the GpuComm thread on first encounter of a new pipeline for up to
+    // that duration. With multiple new pipelines per frame (typical at warmup
+    // and scene transitions) this stacked into 400-1100ms frame spikes that
+    // dominate the spike-frametime score (~75% of every captured baseline run):
+    //
+    //   warmup spike at frame ~68: ~1086ms ≈ 5 × 200ms (5 pipelines serialized)
+    //   scene cluster at frame ~492: ~433ms ≈ 2 × 200ms (2 pipelines serialized)
+    //   200ms ceiling spikes at frame ~493: exactly the budget
+    //
+    // Set to 0: pipeline compile is fully async on first encounter. wait_for(0)
+    // still returns ready for compiles that finished synchronously (rare, e.g.
+    // serialized cache hits), so those proceed normally. Anything not yet ready
+    // gets stashed in pending_graphics_pipelines and the draw is skipped this
+    // frame; subsequent frames poll non-blockingly via TryFinalizePending and
+    // install the pipeline once compile completes (typically 1-3 frames later).
+    //
+    // Visual cost: brief gap (1-3 frames @ 30fps cap = 33-100ms) on the very
+    // first appearance of each new pipeline. The same skip-this-draw fallback
+    // path already exists today for compiles that exceed 200ms.
+    //
+    // If visual artifacts during scene transitions are too noticeable, raise
+    // this to a small value (e.g. 1ms-5ms) to catch fast compiles without the
+    // 200ms-tier blocking. Do not raise back to 100ms+ without re-running the
+    // spike-score A/B — the warmup and scene-transition spikes will return.
+    static constexpr std::chrono::milliseconds kInitialSyncBudget{1};
+    static constexpr std::chrono::seconds      kHangLogThreshold{5};
+    static constexpr std::chrono::seconds      kPermaFailThreshold{30};
+
+    // True if the pending entry's future is ready and the result was moved into
+    // graphics_pipelines[key] (caller must then erase from pending map). False
+    // if still compiling or permafailed.
+    bool TryFinalizePending(PendingGraphicsPipeline& pending,
+                            const GraphicsPipelineKey& key);
+
+    std::unique_ptr<PendingGraphicsPipeline> LaunchAsyncPipelineCompile(
+        const GraphicsPipelineKey& key, u64 pipeline_hash);
 
 private:
     const Instance& instance;
@@ -125,11 +303,18 @@ private:
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    // OPT(GR2 v78): In-flight async compiles keyed on graphics_key.
+    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
+        pending_graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    // Fast path: if only shader user data changes, the graphics pipeline key does not.
+    u64 last_gfx_stamp{};
+    const GraphicsPipeline* last_gfx_pipeline{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    GraphicsPipelineKey prev_graphics_key_{};  // Key-level dedup: skip map lookup when unchanged
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 

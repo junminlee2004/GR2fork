@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 #include "common/assert.h"
+#include "common/sync_trace.h"
 #include "common/types.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -10,8 +12,10 @@
 #include "core/libraries/libs.h"
 
 namespace Libraries::Kernel {
-
-static constexpr u32 MUTEX_ADAPTIVE_SPINS = 2000;
+// FIX(GR2FORK): match condvar/EF/sema slow-wait threshold (500ms).
+static constexpr auto kTraceMutexLockThresholdMs = std::chrono::milliseconds(500);
+static constexpr u32 MUTEX_DEFAULT_SPINS  = 500;
+static constexpr u32 MUTEX_ADAPTIVE_SPINS = 8000;
 static std::mutex MutxStaticLock;
 
 #define THR_MUTEX_INITIALIZER ((PthreadMutex*)NULL)
@@ -67,9 +71,12 @@ static int MutexInit(PthreadMutexT* mutex, const PthreadMutexAttr* mutex_attr, c
     pmutex->m_flags = PthreadMutexFlags(attr->m_type);
     pmutex->m_owner = nullptr;
     pmutex->m_count = 0;
-    pmutex->m_spinloops = 0;
-    pmutex->m_yieldloops = 0;
+    // Small default spin window helps avoid futex wake/sleep on short holds (common in job systems).
+    pmutex->m_spinloops = MUTEX_DEFAULT_SPINS;
+    pmutex->m_yieldloops = 8;
     pmutex->m_protocol = attr->m_protocol;
+
+    // Adaptive mutexes get a larger spin budget.
     if (attr->m_type == PthreadMutexType::AdaptiveNp) {
         pmutex->m_spinloops = MUTEX_ADAPTIVE_SPINS;
         // pmutex->m_yieldloops = _thr_yieldloops;
@@ -206,16 +213,25 @@ int PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec) {
             }
             CPU_SPINWAIT;
         }
-
-        count = m_yieldloops;
-        while (count--) {
-            std::this_thread::yield();
-            if (m_lock.try_lock()) {
-                m_owner = curthread;
-                return 0;
-            }
-        }
+        // Note: yield loop removed. With PTHREAD_ADAPTIVE_MUTEX backing m_lock,
+        // the kernel already does adaptive spinning in m_lock.lock() below.
+        // The old yield loop caused redundant sched_yield() syscalls.
     }
+
+    // FIX(GR2FORK): instrument kernel-fallback mutex contention. The spin
+    // loop above is the fast path and isn't recorded — only entries that
+    // fall through to m_lock.lock()/try_lock_*() are slow enough to matter.
+    // Without this, a thread blocked on a contested mutex (e.g. the Main
+    // SM trying to grab a mutex held by a stuck loader) is invisible in
+    // hang dumps. arg1 = current owner pointer at wait-start, useful for
+    // identifying which holder needs investigating.
+    const auto trace_start = std::chrono::steady_clock::now();
+    Common::SyncTrace::NoteWaitBegin(
+        Common::SyncTrace::Op::WAIT_MUTEX_SLOW, this, name,
+        reinterpret_cast<u64>(m_owner));
+    struct WaitEndGuard {
+        ~WaitEndGuard() { Common::SyncTrace::NoteWaitEnd(); }
+    } _end_guard;
 
     int ret = 0;
     if (abstime == nullptr) {
@@ -232,6 +248,17 @@ int PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec) {
     }
     if (ret == 0) {
         m_owner = curthread;
+    }
+
+    // FIX(GR2FORK): record slow exits — successful lock after long contention,
+    // timeout, or EINVAL all interesting.
+    const auto d = std::chrono::steady_clock::now() - trace_start;
+    if (d >= kTraceMutexLockThresholdMs) {
+        Common::SyncTrace::Record(
+            Common::SyncTrace::Op::WAIT_MUTEX_SLOW, this, name,
+            reinterpret_cast<u64>(m_owner),
+            std::chrono::duration_cast<std::chrono::milliseconds>(d).count(),
+            0, ret);
     }
     return ret;
 }

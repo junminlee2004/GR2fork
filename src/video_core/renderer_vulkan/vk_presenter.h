@@ -4,11 +4,13 @@
 #pragma once
 
 #include <condition_variable>
+#include <vector>
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
+#include "video_core/renderer_vulkan/vk_compute_scheduler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -92,13 +94,37 @@ public:
 
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
 
+    /// FIX(GR2FORK): drain the GPU to completion. Used by AvPlayerSource::Stop()
+    /// to prevent the Vulkan command stream from referencing guest-memory
+    /// frame buffers that are about to be freed. CUSA03694 (GR2 US) triggers
+    /// a device-lost at vk_presenter.cpp:770 during newspaper comic cutscenes
+    /// because Stop() lands while the GPU still has in-flight draws sampling
+    /// the decoded NV12 frame.
+    void WaitIdle() {
+        (void)instance.GetDevice().waitIdle();
+    }
+
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                         VAddr cpu_address);
 
     Frame* PrepareBlankFrame(bool present_thread);
 
+    /// Drives the on-disk shader cache deserialization (PipelineCache::WarmUp)
+    /// while painting a "LOADING SHADERS" overlay onto the swapchain at a
+    /// throttled cadence. Called from gnmdriver::RegisterLib *after* this
+    /// Presenter is fully constructed and *before* videoout::RegisterLib
+    /// starts the PresentThread, so this method is the only thing driving
+    /// the swapchain during warmup. Safe to call when the cache is empty
+    /// or disabled — degenerates into an immediate WarmUp() with no frames
+    /// pumped.
+    void WarmUpPipelineCache();
+
     void Present(Frame* frame, bool is_reusing_frame = false);
     Frame* PrepareLastFrame();
+
+    /// Captures the last presented frame to CPU memory as RGBA pixels.
+    /// Returns true if successful. Output vector will contain width*height*4 bytes.
+    bool CaptureScreenshot(std::vector<u8>& out_pixels, u32& out_width, u32& out_height);
 
 private:
     Frame* GetRenderFrame();
@@ -106,6 +132,28 @@ private:
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
     void SetExpectedGameSize(s32 width, s32 height);
+
+    /// One-shot helper used by WarmUpPipelineCache. Acquires a blank frame
+    /// and runs it through Present() so the LoadingScreenLayer overlay is
+    /// painted onto the swapchain. Safe to call only on the thread that
+    /// constructed the Presenter (gnmdriver registration thread); the
+    /// PresentThread does not yet exist when this runs.
+    void PumpLoadingFrame();
+
+    /// Phase 1D-pre-E: scheduler-touching chunk of PrepareFrame, extracted
+    /// so the producer-side wrapper can route it through
+    /// `Rasterizer::PushPresenterRecord`. Runs on the assembler thread
+    /// under future async; on the producer thread under sync.
+    void DoPrepareFrameRecord(Frame* frame,
+                              const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                              VideoCore::ImageId image_id,
+                              vk::Extent2D image_size);
+
+    /// Phase 1D-pre-E: scheduler-touching chunk of PrepareBlankFrame.
+    /// `use_present_scheduler` selects between present_scheduler (called
+    /// inline from the present-thread path) and draw_scheduler (called via
+    /// PushPresenterRecord from the warmup path).
+    void DoPrepareBlankFrameRecord(Frame* frame, bool use_present_scheduler);
 
 private:
     float expected_ratio{1920.0 / 1080.0f};
@@ -122,6 +170,10 @@ private:
     Scheduler draw_scheduler;
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
+    // Phase MQ-3: async-compute submission lane. Shares draw_scheduler's
+    // MasterSemaphore (single timeline). Constructed but unused in MQ-3 —
+    // first wire-up lands in MQ-4 with the first compute dispatch routing.
+    ComputeScheduler compute_scheduler;
     Swapchain swapchain;
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;

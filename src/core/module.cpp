@@ -5,11 +5,14 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/config.h"
 #include "common/memory_patcher.h"
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/cpu_patches.h"
+#include "core/libraries/aspect_patches/aspect_patches.h"
+#include "core/libraries/resolution_patches/resolution_patches.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
 #include "core/module.h"
@@ -231,6 +234,39 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_address = base_virtual_addr;
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::OnGameLoaded();
+
+            // GR2 aspect-ratio override — runtime equivalent of HxD
+            // replace-all on the 45 1.7777778f sites. Applied here so it
+            // fires before any game code executes. Driven by the
+            // [GPU] aspectRatioOverride = "16:9" | "16:10" | "21:9" | "32:9"
+            // config option (default "16:9" = no patching).
+            const auto _gr2_aspect_target =
+                Libraries::AspectPatches::ParseAspectFromConfig(
+                    Config::getAspectRatioOverride());
+            Libraries::AspectPatches::ApplyGr2AspectPatches(
+                base_virtual_addr, _gr2_aspect_target);
+
+            // GR2 resolution override — runtime patches for the 37
+            // hard-coded 1920x1080 W/H/halfW/halfH/invW/invH constants
+            // (plus the broader 14-group "recommended" set; see
+            // resolution_patches.cpp for per-group classifications).
+            // Composes with aspectRatioOverride (the chosen pixel
+            // density × the chosen aspect → final framebuffer dims).
+            //
+            // [GPU] resolutionOverride
+            //     "Off" | "540p" | "720p" | "1080p" | "1440p" | "2160p"/"4K" | "4320p"/"8K"
+            //
+            // [GPU] disableMotionBlur (bool, default false)
+            //     When true, the MotionBlur post-process pass is skipped
+            //     by NOPing two pass-registration calls in the render-
+            //     graph builder. Independent of resolutionOverride — can
+            //     be toggled at native resolution too.
+            Libraries::ResolutionPatches::ApplyGr2ResolutionPatches(
+                base_virtual_addr,
+                Libraries::ResolutionPatches::ParseResolutionFromConfig(
+                    Config::getResolutionOverride()),
+                Libraries::AspectPatches::TargetAspectToRatio(_gr2_aspect_target),
+                Config::getDisableMotionBlur());
         }
     }
 }
@@ -481,6 +517,17 @@ OrbisKernelModuleInfoEx Module::GetModuleInfoEx() const {
 }
 
 const ModuleInfo* Module::FindModule(std::string_view id) {
+    // Debug: dump all module mappings when looking for unknown module Z
+    static bool dumped = false;
+    if (!dumped && id == "Z") {
+        dumped = true;
+        LOG_ERROR(Core_Linker, "[GR2PhotoHLE] Looking up module 'Z'. Dumping all import modules:");
+        for (const auto& mod : dynamic_info.import_modules) {
+            LOG_ERROR(Core_Linker, "[GR2PhotoHLE]   enc_id='{}' name='{}' id={}",
+                      mod.enc_id, mod.name, mod.id);
+        }
+    }
+
     const auto& import_modules = dynamic_info.import_modules;
     for (u32 i = 0; const auto& mod : import_modules) {
         if (mod.enc_id == id) {
@@ -499,6 +546,17 @@ const ModuleInfo* Module::FindModule(std::string_view id) {
 }
 
 const LibraryInfo* Module::FindLibrary(std::string_view id) {
+    // Debug: dump all library mappings for mystery NID diagnosis
+    static bool lib_dumped = false;
+    if (!lib_dumped && id == "0") {
+        lib_dumped = true;
+        LOG_ERROR(Core_Linker, "[GR2PhotoHLE] Looking up library '0'. Dumping all import libs:");
+        for (const auto& lib : dynamic_info.import_libs) {
+            LOG_ERROR(Core_Linker, "[GR2PhotoHLE]   enc_id='{}' name='{}' id={} ver={}",
+                      lib.enc_id, lib.name, lib.id, lib.version);
+        }
+    }
+
     const auto& import_libs = dynamic_info.import_libs;
     for (u32 i = 0; const auto& lib : import_libs) {
         if (lib.enc_id == id) {

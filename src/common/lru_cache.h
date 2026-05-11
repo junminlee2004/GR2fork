@@ -55,8 +55,15 @@ public:
 
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
+        // FIX(GR2FORK): was `std::invoke_result<Func, ObjectType>` (the trait
+        // CLASS, not its ::type). is_same_v<trait_class, bool> is permanently
+        // false, so the early-exit branch (`if (func(obj)) return;`) was
+        // never compiled and `func`'s return value was always discarded —
+        // turning every `return true` from the GC's clean_up lambda into a
+        // no-op and over-running the iteration by hundreds of items past
+        // num_deletions=0. Use the _t alias (which IS the produced type).
         static constexpr bool RETURNS_BOOL =
-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
+            std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
         Item* iterator = first_item;
         while (iterator) {
             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {

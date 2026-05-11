@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <span>
 #include <unordered_map>
 
@@ -75,6 +76,46 @@ public:
         return present_queue;
     }
 
+    /// Compute queue (Phase MQ-1).
+    /// If the device exposes a dedicated compute-only queue family, returns
+    /// that queue. Otherwise returns the graphics queue (fallback) — call
+    /// IsAsyncComputeAvailable() to distinguish.
+    vk::Queue GetComputeQueue() const {
+        return compute_queue;
+    }
+
+    u32 GetComputeQueueFamilyIndex() const {
+        return compute_queue_family_index;
+    }
+
+    /// Returns true if a queue family separate from graphics was found and
+    /// allocated for async compute. When false, GetComputeQueue() returns
+    /// the same handle as GetGraphicsQueue() and they share the same family.
+    bool IsAsyncComputeAvailable() const {
+        return async_compute_available;
+    }
+
+    /// Sharing mode for resources that may be accessed by both graphics and
+    /// compute queues across a frame (Phase MQ-2). Returns eConcurrent only
+    /// when a separate compute family exists; otherwise eExclusive (the
+    /// queues alias and concurrent mode would be invalid/pointless).
+    vk::SharingMode CrossQueueSharingMode() const {
+        return async_compute_available ? vk::SharingMode::eConcurrent
+                                       : vk::SharingMode::eExclusive;
+    }
+
+    /// Queue family index list for use with eConcurrent resources. When
+    /// async compute is unavailable, returns a zero-length span (the
+    /// caller should set queueFamilyIndexCount=0 / pQueueFamilyIndices=nullptr,
+    /// matching eExclusive semantics).
+    std::span<const u32> CrossQueueFamilyIndices() const {
+        if (!async_compute_available) {
+            return {};
+        }
+        return {cross_queue_family_indices_.data(),
+                cross_queue_family_indices_.size()};
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -122,6 +163,12 @@ public:
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
+    }
+
+    /// Returns true if VK_EXT_device_fault is supported and enabled.
+    /// Allows querying detailed GPU-side fault info on VK_ERROR_DEVICE_LOST.
+    bool IsDeviceFaultSupported() const {
+        return device_fault;
     }
 
     /// Returns true when VK_EXT_custom_border_color is supported
@@ -360,6 +407,12 @@ public:
         return properties.limits.maxSamplerAnisotropy;
     }
 
+    /// Returns the maximum number of image array layers supported by the device.
+    /// Used to detect garbage T# layer counts (real textures cannot exceed this).
+    u32 MaxImageArrayLayers() const {
+        return properties.limits.maxImageArrayLayers;
+    }
+
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return push_descriptor_props.maxPushDescriptors;
@@ -470,11 +523,19 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue compute_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 compute_queue_family_index{0};
+    bool async_compute_available{false};
+    // Populated in CreateDevice. When async compute is available, contains
+    // {graphics_family, compute_family}; otherwise unused (CrossQueueFamilyIndices
+    // returns an empty span). Stored as a fixed array for stable pointer-to-data
+    // suitable for VkBufferCreateInfo::pQueueFamilyIndices.
+    std::array<u32, 2> cross_queue_family_indices_{0, 0};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
@@ -499,6 +560,7 @@ private:
     bool portability_subset{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
+    bool device_fault{};
     bool supports_memory_budget{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

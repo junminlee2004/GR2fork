@@ -174,10 +174,18 @@ struct Info : InfoPersistent {
 
     void PushUd(Backend::Bindings& bnd, PushData& push) const {
         u32 mask = ud_mask.mask;
+        // PERF(GR2FORK v1.20): use the canonical "clear lowest set bit"
+        // form `mask &= mask - 1`, which Zen4/BMI1 emits as the single-
+        // cycle BLSR instruction. The previous `mask &= ~(1U << index)`
+        // form is semantically equivalent but compilers don't always
+        // recognise it as BLSR — they may emit SHL + NOT + AND (~3 cycles).
+        // Saves ~2 cycles per set bit. For a typical shader with 4-8
+        // user_data registers, that's 8-16 cycles per PushUd call, and
+        // this function fires per-stage per-draw.
         while (mask) {
             const u32 index = std::countr_zero(mask);
             ASSERT(bnd.user_data < NUM_USER_DATA_REGS && index < NUM_USER_DATA_REGS);
-            mask &= ~(1U << index);
+            mask &= mask - 1;
             push.ud_regs[bnd.user_data++] = user_data[index];
         }
     }

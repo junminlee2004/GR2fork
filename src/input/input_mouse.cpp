@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#define _USE_MATH_DEFINES
+#include <atomic>
 #include <cmath>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
@@ -25,6 +28,130 @@ bool mouse_gyro_roll_mode = false;
 Uint32 mouse_polling_id = 0;
 MouseMode mouse_mode = MouseMode::Off;
 
+// Touchpad swipe emulation state — completely independent of mouse_mode
+float touchpad_swipe_speed = 0.005f;
+float touchpad_swipe_threshold = 15.0f;
+float swipe_start_x = 0.0f, swipe_start_y = 0.0f;
+bool swipe_active = false;
+bool touchpad_swipe_enabled = false;
+
+// Staged swipe playback — needs multiple frames for game to register
+enum class SwipePlayback { Idle, TouchDown, SwipeMove, Done };
+SwipePlayback swipe_playback = SwipePlayback::Idle;
+float swipe_end_x = 0.5f, swipe_end_y = 0.5f;
+int swipe_frame_counter = 0;
+
+// ---------------------------------------------------------------------------
+// Button-triggered touchpad swipe
+// ---------------------------------------------------------------------------
+// Independent of the mouse-driven swipe above. Driven by SDL_AddTimer so its
+// timing does not depend on MousePolling being active.
+//
+// Sequence on TriggerButtonSwipe():
+//     phase 0 (immediate)       : touch DOWN at center,  TouchPad button DOWN
+//     phase 1 (after delay)     : touch DOWN at endpoint (still DOWN)
+//     phase 2 (after delay+hold): release everything
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kButtonSwipeDefaultDelayMs = 200;
+constexpr int kButtonSwipeHoldMs = 100;
+
+// Endpoints in (x, y) normalized 0..1, matching the existing touchpad_*
+// region buttons:
+//   touchpad_up    -> (0.5, 0.25)
+//   touchpad_down  -> (0.5, 0.75)
+//   touchpad_left  -> (0.25, 0.5)
+//   touchpad_right -> (0.75, 0.5)
+constexpr float kButtonSwipeEndpoints[4][2] = {
+    {0.5f, 0.25f}, // BUTTON_SWIPE_UP
+    {0.5f, 0.75f}, // BUTTON_SWIPE_DOWN
+    {0.25f, 0.5f}, // BUTTON_SWIPE_LEFT
+    {0.75f, 0.5f}, // BUTTON_SWIPE_RIGHT
+};
+
+std::atomic<int> g_button_swipe_delay_ms{kButtonSwipeDefaultDelayMs};
+
+struct ButtonSwipeState {
+    GameController* controller = nullptr;
+    int direction = 0;
+    std::atomic<bool> active{false};
+};
+ButtonSwipeState g_button_swipe;
+
+Uint32 ButtonSwipeReleaseCallback(void* param, SDL_TimerID /*id*/, Uint32 /*interval*/) {
+    auto* controller = static_cast<GameController*>(param);
+    int dir = g_button_swipe.direction;
+    if (controller) {
+        controller->SetTouchpadState(0, false, kButtonSwipeEndpoints[dir][0],
+                                     kButtonSwipeEndpoints[dir][1]);
+        controller->CheckButton(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, false);
+    }
+    g_button_swipe.active.store(false, std::memory_order_release);
+    LOG_INFO(Input, "Button swipe complete dir={}", dir);
+    return 0; // one-shot
+}
+
+Uint32 ButtonSwipeMoveCallback(void* param, SDL_TimerID /*id*/, Uint32 /*interval*/) {
+    auto* controller = static_cast<GameController*>(param);
+    int dir = g_button_swipe.direction;
+    if (controller) {
+        // Touch stays DOWN; we just move the contact point.
+        controller->SetTouchpadState(0, true, kButtonSwipeEndpoints[dir][0],
+                                     kButtonSwipeEndpoints[dir][1]);
+    }
+    SDL_AddTimer(kButtonSwipeHoldMs, ButtonSwipeReleaseCallback, param);
+    return 0; // one-shot
+}
+
+} // namespace
+
+void SetTouchpadSwipeButtonDelay(int delay_ms) {
+    if (delay_ms < 1) {
+        delay_ms = 1;
+    }
+    g_button_swipe_delay_ms.store(delay_ms, std::memory_order_release);
+    LOG_INFO(Input, "Touchpad swipe button delay set to {}ms", delay_ms);
+}
+
+void TriggerButtonSwipe(GameController* controller, int direction) {
+    if (!controller) {
+        return;
+    }
+    if (direction < 0 || direction > 3) {
+        LOG_WARNING(Input, "TriggerButtonSwipe: invalid direction {}", direction);
+        return;
+    }
+    // Atomically claim the swipe slot. If a swipe is already in flight, bail.
+    bool expected = false;
+    if (!g_button_swipe.active.compare_exchange_strong(expected, true,
+                                                       std::memory_order_acq_rel)) {
+        LOG_DEBUG(Input, "TriggerButtonSwipe: swipe already in flight, ignoring");
+        return;
+    }
+
+    g_button_swipe.controller = controller;
+    g_button_swipe.direction = direction;
+
+    // Phase 0: immediate touch DOWN at center.
+    controller->SetTouchpadState(0, true, 0.5f, 0.5f);
+    controller->CheckButton(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, true);
+
+    int delay_ms = g_button_swipe_delay_ms.load(std::memory_order_acquire);
+    SDL_TimerID move_timer = SDL_AddTimer(static_cast<Uint32>(delay_ms), ButtonSwipeMoveCallback,
+                                          static_cast<void*>(controller));
+    if (move_timer == 0) {
+        LOG_ERROR(Input, "TriggerButtonSwipe: SDL_AddTimer failed, releasing immediately");
+        controller->SetTouchpadState(0, false, 0.5f, 0.5f);
+        controller->CheckButton(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, false);
+        g_button_swipe.active.store(false, std::memory_order_release);
+        return;
+    }
+    LOG_INFO(Input, "Button swipe triggered dir={} delay={}ms hold={}ms", direction, delay_ms,
+             kButtonSwipeHoldMs);
+}
+
 // Switches mouse to a set mode or turns mouse emulation off if it was already in that mode.
 // Returns whether the mode is turned on.
 bool ToggleMouseModeTo(MouseMode m) {
@@ -34,6 +161,14 @@ bool ToggleMouseModeTo(MouseMode m) {
         mouse_mode = m;
     }
     return mouse_mode == m;
+}
+
+void SetMouseMode(MouseMode m) {
+    mouse_mode = m;
+}
+
+MouseMode GetMouseMode() {
+    return mouse_mode;
 }
 
 void SetMouseToJoystick(int joystick) {
@@ -48,6 +183,26 @@ void SetMouseParams(float mdo, float ms, float mso) {
 
 void SetMouseGyroRollMode(bool mode) {
     mouse_gyro_roll_mode = mode;
+}
+
+void SetTouchpadSwipeSpeed(float speed) {
+    touchpad_swipe_speed = speed;
+}
+
+void SetTouchpadSwipeThreshold(float threshold) {
+    touchpad_swipe_threshold = threshold;
+}
+
+void EnableTouchpadSwipe(bool enable) {
+    touchpad_swipe_enabled = enable;
+    LOG_INFO(Input, "TouchpadSwipe enabled: {}", enable);
+    if (!enable) {
+        swipe_active = false;
+    }
+}
+
+bool IsTouchpadSwipeEnabled() {
+    return touchpad_swipe_enabled;
 }
 
 void EmulateJoystick(GameController* controller, u32 interval) {
@@ -108,6 +263,104 @@ void EmulateTouchpad(GameController* controller, u32 interval) {
                             (mouse_buttons & SDL_BUTTON_RMASK) != 0);
 }
 
+// Touchpad swipe: on finger down, just record start position.
+// Cancels any in-progress playback from a previous swipe.
+void TouchpadSwipeOnFingerDown(GameController* controller, float abs_x, float abs_y) {
+    // If a previous swipe is still playing back, cancel it immediately
+    if (swipe_playback != SwipePlayback::Idle) {
+        controller->SetTouchpadState(0, false, swipe_end_x, swipe_end_y);
+        controller->CheckButton(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, false);
+        swipe_playback = SwipePlayback::Idle;
+    }
+    swipe_active = true;
+    swipe_start_x = abs_x;
+    swipe_start_y = abs_y;
+    LOG_INFO(Input, "TouchpadSwipe FINGER DOWN at ({}, {})", abs_x, abs_y);
+}
+
+// Touchpad swipe: on finger up, compute direction and start staged playback.
+void TouchpadSwipeOnFingerUp(GameController* controller, float abs_x, float abs_y) {
+    if (!swipe_active) {
+        return;
+    }
+    swipe_active = false;
+
+    float d_x = abs_x - swipe_start_x;
+    float d_y = abs_y - swipe_start_y;
+
+    swipe_end_x = 0.5f;
+    swipe_end_y = 0.5f;
+
+    // Only register a swipe if movement exceeds threshold
+    float dist = std::sqrt(d_x * d_x + d_y * d_y);
+    if (dist >= touchpad_swipe_threshold) {
+
+        // 8-way snap: compute angle, divide into 45-degree sectors
+        float angle = std::atan2(d_y, d_x); // radians, -PI to PI
+        // Normalize to 0-7 sector: 0=right, 1=down-right, 2=down, etc.
+        int sector = static_cast<int>(std::round(angle / (M_PI / 4.0f))) & 7;
+
+        constexpr float endpoints[8][2] = {
+            {0.9f, 0.5f}, // 0: right
+            {0.9f, 0.9f}, // 1: down-right
+            {0.5f, 0.9f}, // 2: down
+            {0.1f, 0.9f}, // 3: down-left
+            {0.1f, 0.5f}, // 4: left
+            {0.1f, 0.1f}, // 5: up-left
+            {0.5f, 0.1f}, // 6: up
+            {0.9f, 0.1f}, // 7: up-right
+        };
+
+        swipe_end_x = endpoints[sector][0];
+        swipe_end_y = endpoints[sector][1];
+
+        LOG_INFO(Input, "TouchpadSwipe DIRECTION: dx={}, dy={}, sector={}, endpoint=({}, {})",
+                 d_x, d_y, sector, swipe_end_x, swipe_end_y);
+    } else {
+        LOG_INFO(Input, "TouchpadSwipe TAP: dx={}, dy={}", d_x, d_y);
+    }
+
+    // Start staged playback — the polling timer will advance it frame by frame
+    swipe_playback = SwipePlayback::TouchDown;
+    swipe_frame_counter = 0;
+}
+
+// Called from MousePolling every 33ms — advances swipe playback across frames
+void AdvanceTouchpadSwipe(GameController* controller) {
+    switch (swipe_playback) {
+    case SwipePlayback::Idle:
+        return;
+
+    case SwipePlayback::TouchDown:
+        // Frames 0-1: finger pressed at center
+        controller->SetTouchpadState(0, true, 0.5f, 0.5f);
+        controller->CheckButton(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, true);
+        swipe_frame_counter++;
+        if (swipe_frame_counter >= 2) {
+            swipe_playback = SwipePlayback::SwipeMove;
+            swipe_frame_counter = 0;
+        }
+        break;
+
+    case SwipePlayback::SwipeMove:
+        // Frames 2-3: finger at swipe endpoint
+        controller->SetTouchpadState(0, true, swipe_end_x, swipe_end_y);
+        swipe_frame_counter++;
+        if (swipe_frame_counter >= 2) {
+            swipe_playback = SwipePlayback::Done;
+            swipe_frame_counter = 0;
+        }
+        break;
+
+    case SwipePlayback::Done:
+        // Frame 6: release
+        controller->SetTouchpadState(0, false, swipe_end_x, swipe_end_y);
+        controller->CheckButton(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, false);
+        swipe_playback = SwipePlayback::Idle;
+        break;
+    }
+}
+
 void ApplyMouseInputBlockers() {
     switch (mouse_mode) {
     case MouseMode::Touchpad:
@@ -138,6 +391,10 @@ Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
 
     default:
         break;
+    }
+    // Touchpad swipe playback runs independently of mouse_mode
+    if (touchpad_swipe_enabled) {
+        AdvanceTouchpadSwipe(controller);
     }
     return interval;
 }

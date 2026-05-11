@@ -7,6 +7,7 @@
 #include "SDL3/SDL_properties.h"
 #include "SDL3/SDL_timer.h"
 #include "SDL3/SDL_video.h"
+#include <mutex>
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/elf_info.h"
@@ -269,9 +270,14 @@ namespace Frontend {
 
 using namespace Libraries::Pad;
 
-static Uint32 SDLCALL PollController(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
+std::mutex motion_control_mutex;
+float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
+static Uint32 SDLCALL PollGyroAndAccel(void* userdata, SDL_TimerID timer_id, Uint32 interval) {
     auto* controller = reinterpret_cast<Input::GameController*>(userdata);
-    return controller->Poll();
+    std::scoped_lock l{motion_control_mutex};
+    controller->Gyro(0, gyro_buf);
+    controller->Acceleration(0, accel_buf);
+    return 4;
 }
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_,
@@ -349,6 +355,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
 
+    // Apply default mouse mode if one was set in the config
+    auto default_mouse_mode = Input::GetMouseMode();
+    if (default_mouse_mode != Input::MouseMode::Off &&
+        default_mouse_mode != Input::MouseMode::Touchpad) {
+        SDL_SetWindowRelativeMouseMode(window, true);
+    }
+
     if (Config::getBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
@@ -407,12 +420,16 @@ void WindowSDL::WaitEvent() {
     // AND IT DOESN'T EVEN USE PROPER ENUMS
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
         switch ((SDL_SensorType)event.gsensor.sensor) {
-        case SDL_SENSOR_GYRO:
-            controller->Gyro(0, event.gsensor.data);
+        case SDL_SENSOR_GYRO: {
+            std::scoped_lock l{motion_control_mutex};
+            memcpy(gyro_buf, event.gsensor.data, sizeof(gyro_buf));
             break;
-        case SDL_SENSOR_ACCEL:
-            controller->Acceleration(0, event.gsensor.data);
+        }
+        case SDL_SENSOR_ACCEL: {
+            std::scoped_lock l{motion_control_mutex};
+            memcpy(accel_buf, event.gsensor.data, sizeof(accel_buf));
             break;
+        }
         default:
             break;
         }
@@ -462,6 +479,9 @@ void WindowSDL::WaitEvent() {
                                        Input::ToggleMouseModeTo(Input::MouseMode::Touchpad));
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
         break;
+    case SDL_EVENT_MOUSE_TO_TOUCHPAD_SWIPE:
+        Input::EnableTouchpadSwipe(!Input::IsTouchpadSwipeEnabled());
+        break;
     case SDL_EVENT_RDOC_CAPTURE:
         VideoCore::TriggerCapture();
         break;
@@ -471,7 +491,7 @@ void WindowSDL::WaitEvent() {
 }
 
 void WindowSDL::InitTimers() {
-    SDL_AddTimer(100, &PollController, controller);
+    SDL_AddTimer(4, &PollGyroAndAccel, controller);
     SDL_AddTimer(33, Input::MousePolling, (void*)controller);
 }
 
@@ -509,6 +529,25 @@ Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
 
 void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
     using Libraries::Pad::OrbisPadButtonDataOffset;
+
+    // Touchpad swipe interception — completely independent of mouse mode.
+    // Only intercepts left mouse button down/up. All other events pass through.
+    if (Input::IsTouchpadSwipeEnabled()) {
+        if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+            event->button.button == SDL_BUTTON_LEFT) {
+            LOG_INFO(Input, "Swipe intercept: BUTTON_DOWN at ({}, {})", event->button.x,
+                     event->button.y);
+            Input::TouchpadSwipeOnFingerDown(controller, event->button.x, event->button.y);
+            return;
+        }
+        if (event->type == SDL_EVENT_MOUSE_BUTTON_UP &&
+            event->button.button == SDL_BUTTON_LEFT) {
+            LOG_INFO(Input, "Swipe intercept: BUTTON_UP at ({}, {})", event->button.x,
+                     event->button.y);
+            Input::TouchpadSwipeOnFingerUp(controller, event->button.x, event->button.y);
+            return;
+        }
+    }
 
     // get the event's id, if it's keyup or keydown
     const bool input_down = event->type == SDL_EVENT_KEY_DOWN ||

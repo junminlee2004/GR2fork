@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -14,6 +15,7 @@
 
 namespace AmdGpu {
 struct Liverpool;
+struct LiverpoolRegsSnapshot;
 }
 
 namespace Core {
@@ -22,6 +24,7 @@ class MemoryManager;
 
 namespace Vulkan {
 class GraphicsPipeline;
+class Rasterizer;  // Phase 1D-pre-F: back-ref for PushPresenterRecord
 }
 
 namespace VideoCore {
@@ -72,6 +75,17 @@ public:
                          PageManager& tracker);
     ~BufferCache();
 
+    /// Phase 1D-pre-F: back-ref to the Rasterizer that owns this BufferCache,
+    /// used so SendCommand-dispatched scheduler-touchers in ReadMemory can
+    /// route through Rasterizer::PushPresenterRecord (Phase E's closure
+    /// marker). Called from Rasterizer's ctor body once `bundle_assembler_`
+    /// is constructed; before SetRasterizer fires `rasterizer_` is nullptr
+    /// and the SendCommand path must not be reachable (the page-fault
+    /// signal handler is wired only after Rasterizer is fully constructed).
+    void SetRasterizer(Vulkan::Rasterizer* rasterizer) noexcept {
+        rasterizer_ = rasterizer;
+    }
+
     /// Returns a pointer to GDS device local buffer.
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
         return &gds_buffer;
@@ -112,10 +126,11 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
     /// Binds host vertex buffers for the current draw.
-    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline);
+    void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
+                           const AmdGpu::LiverpoolRegsSnapshot& regs);
 
     /// Bind host index buffer for the current draw.
-    void BindIndexBuffer(u32 index_offset);
+    void BindIndexBuffer(u32 index_offset, const AmdGpu::LiverpoolRegsSnapshot& regs);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -202,6 +217,10 @@ private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
+    // Phase 1D-pre-F: set by SetRasterizer post-construction. Used to
+    // route signal-handler-dispatched scheduler touchers in ReadMemory's
+    // SendCommand lambda through Rasterizer::PushPresenterRecord.
+    Vulkan::Rasterizer* rasterizer_{nullptr};
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     FaultManager fault_manager;
@@ -220,6 +239,40 @@ private:
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
+    // Per-thread hot-path cache: skip redundant vertex input/buffer binds.
+    u64 last_vertex_bind_sig = 0;
+    bool last_vertex_bind_sig_valid = false;
+
+    // Vertex input dynamic state cache (does NOT include guest buffer addresses).
+    u64 last_vertex_input_sig = 0;
+    bool last_vertex_input_sig_valid = false;
+
+    // PERF(GR2): BindVertexBuffers ultra-fast skip. When pipeline ptr + gfx
+    // pipeline stamp are unchanged since the previous successful call, no
+    // input to GetVertexInputs / vertex bind hashing could have moved
+    // (fetch_shader is pipeline-fixed; vgt_instance_step_rate_0/1 are
+    // context regs in the stamp; buffer sharps are SH regs in the stamp).
+    // Returning here saves ~0.76% of GpuComm time spent in
+    // GetVertexInputs + dual hash loops.
+    const Vulkan::GraphicsPipeline* last_vbb_pipeline_{};
+    u64 last_vbb_stamp_{};
+
+    // OPT(v18): Index buffer bind deduplication.
+    // Skip redundant vkCmdBindIndexBuffer when the same buffer/offset/type is already bound.
+    // Keyed on (stamp, tick) — tick advances on every primary cmdbuf rotation.
+    VAddr last_index_address_{};
+    u32 last_index_buffer_size_{};
+    vk::IndexType last_index_type_{};
+    u64 last_index_tick_{};
+    // PERF(GR2): BindIndexBuffer stamp ultra-fast skip. Inputs to the bind
+    // (regs.index_buffer_type, regs.index_base_address, regs.num_indices)
+    // are all context regs in the gfx_pipeline_stamp; combined with
+    // index_offset (the function arg) and tick, a stamp match
+    // proves the cmdbuf already has the correct index buffer bound.
+    // Avoids reading regs + computing index_address every draw.
+    u64 last_index_stamp_{};
+    u32 last_index_offset_{};
+
     PageTable page_table;
 };
 

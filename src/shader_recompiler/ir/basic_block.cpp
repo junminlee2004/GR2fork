@@ -32,10 +32,15 @@ Block::iterator Block::PrependNewInst(iterator insertion_point, Opcode op,
     if (inst->NumArgs() != args.size()) {
         UNREACHABLE_MSG("Invalid number of arguments {} in {}", args.size(), op);
     }
-    std::ranges::for_each(args, [inst, index = size_t{0}](const Value& arg) mutable {
-        inst->SetArg(index, arg);
-        ++index;
-    });
+    // PERF(GR2FORK v1.14): Plain index loop instead of ranges::for_each with a
+    // mutable lambda + captured counter. Same semantics, no closure object,
+    // and SetArg's address gets called directly rather than through the
+    // ranges machinery — easier for the optimizer to inline.
+    const size_t n = args.size();
+    const Value* const arg_data = args.begin();
+    for (size_t index = 0; index < n; ++index) {
+        inst->SetArg(index, arg_data[index]);
+    }
     return result_it;
 }
 

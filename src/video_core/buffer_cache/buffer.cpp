@@ -104,10 +104,22 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
-    // Create buffer object.
+    // Phase MQ-2: cross-queue sharing for guest buffers. Compute dispatches
+    // (detile, post-process, future async-compute paths) read/write the
+    // same buffers graphics does. When a dedicated compute family exists,
+    // declare the buffer as eConcurrent across [graphics, compute] so
+    // cross-queue access skips ownership transfer barriers.
+    //
+    // When async compute is unavailable, CrossQueueSharingMode() returns
+    // eExclusive and CrossQueueFamilyIndices() returns an empty span —
+    // identical behavior to the pre-MQ-2 code path.
+    const auto cross_queue_families = instance->CrossQueueFamilyIndices();
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = flags,
+        .sharingMode = instance->CrossQueueSharingMode(),
+        .queueFamilyIndexCount = static_cast<u32>(cross_queue_families.size()),
+        .pQueueFamilyIndices = cross_queue_families.data(),
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, usage, &alloc_info);
@@ -128,7 +140,7 @@ void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
     scheduler->EndRendering();
     ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer size must be a multiple of 4 bytes");
-    const auto cmdbuf = scheduler->CommandBuffer();
+    const auto cmdbuf = scheduler->PrimaryCommandBuffer();
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
@@ -188,6 +200,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         offset = Common::AlignUp(offset, alignment);
     }
 
+
     if (offset + size > this->size_bytes) {
         // The buffer would overflow, save the amount of used watches and reset the state.
         invalidation_mark = current_watch_cursor;
@@ -209,7 +222,11 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 }
 
 void StreamBuffer::Commit() {
-    if (!is_coherent) {
+    // PERF(GR2FORK v1.19): on AMD/RADV plus all integrated GPUs the staging
+    // host-visible memory is already coherent — skip the flush/invalidate
+    // dance on the dominant path. Discrete-GPU non-coherent staging is the
+    // outlier.
+    if (!is_coherent) [[unlikely]] {
         if (usage == MemoryUsage::Download) {
             vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset,
                                     mapped_size);
@@ -219,20 +236,37 @@ void StreamBuffer::Commit() {
     }
 
     offset += mapped_size;
-    if (current_watch_cursor != 0 &&
-        current_watches[current_watch_cursor].tick == scheduler->CurrentTick()) {
-        current_watches[current_watch_cursor].upper_bound = offset;
-        return;
+    // PERF(GR2FORK v1.19): hoist the atomic acquire-load of CurrentTick once.
+    // The prior code called CurrentTick() at line 237 and then again at line
+    // 250 on the prev.tick != cur_tick path — two atomic loads where one
+    // suffices. Hoisting it above the watch-cursor check covers both uses
+    // and saves one atomic op when the watches must be appended (the
+    // dominant case once Commit has been called more than once per submit).
+    const u64 cur_tick = scheduler->CurrentTick();
+    // PERF(GR2FORK v1.19): after the first Commit per submission, the
+    // watch cursor is non-zero; this branch dominates.
+    if (current_watch_cursor != 0) [[likely]] {
+        auto& prev = current_watches[current_watch_cursor - 1];
+        // PERF(GR2FORK v1.19): consecutive Commits within the same
+        // submission tick are the steady-state case — the watch entry
+        // simply extends. New-tick fall-through happens on submit
+        // boundaries.
+        if (prev.tick == cur_tick) [[likely]] {
+            prev.upper_bound = offset;
+            return;
+        }
     }
 
-    if (current_watch_cursor + 1 >= current_watches.size()) {
+    // PERF(GR2FORK v1.19): WATCHES_INITIAL_RESERVE is 0x4000 (16384)
+    // entries; reaching capacity is rare in normal play.
+    if (current_watch_cursor + 1 >= current_watches.size()) [[unlikely]] {
         // Ensure that there are enough watches.
         ReserveWatches(current_watches, WATCHES_RESERVE_CHUNK);
     }
 
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
-    watch.tick = scheduler->CurrentTick();
+    watch.tick = cur_tick;
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {

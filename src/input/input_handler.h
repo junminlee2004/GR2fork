@@ -26,6 +26,19 @@
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT SDL_GAMEPAD_BUTTON_COUNT + 1
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER SDL_GAMEPAD_BUTTON_COUNT + 2
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT SDL_GAMEPAD_BUTTON_COUNT + 3
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_UP SDL_GAMEPAD_BUTTON_COUNT + 4
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN SDL_GAMEPAD_BUTTON_COUNT + 5
+
+// Synthetic touchpad-swipe outputs. Bindable to a single button (or chord).
+// On rising edge they fire a timed sequence:
+//   t=0     touch DOWN at (0.5, 0.5)  + TouchPad button DOWN
+//   t=delay touch moves to direction endpoint (still DOWN)
+//   t=delay+hold  release
+// `delay` is configurable via `touchpad_swipe_button_delay` (default 200ms).
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP SDL_GAMEPAD_BUTTON_COUNT + 6
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN SDL_GAMEPAD_BUTTON_COUNT + 7
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT SDL_GAMEPAD_BUTTON_COUNT + 8
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT SDL_GAMEPAD_BUTTON_COUNT + 9
 
 #define SDL_EVENT_TOGGLE_FULLSCREEN SDL_EVENT_USER + 1
 #define SDL_EVENT_TOGGLE_PAUSE SDL_EVENT_USER + 2
@@ -35,6 +48,7 @@
 #define SDL_EVENT_MOUSE_TO_JOYSTICK SDL_EVENT_USER + 6
 #define SDL_EVENT_MOUSE_TO_GYRO SDL_EVENT_USER + 7
 #define SDL_EVENT_MOUSE_TO_TOUCHPAD SDL_EVENT_USER + 8
+#define SDL_EVENT_MOUSE_TO_TOUCHPAD_SWIPE SDL_EVENT_USER + 12
 #define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 9
 #define SDL_EVENT_QUIT_DIALOG SDL_EVENT_USER + 10
 #define SDL_EVENT_MOUSE_WHEEL_OFF SDL_EVENT_USER + 11
@@ -54,6 +68,7 @@
 #define HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK 0xf0000006
 #define HOTKEY_TOGGLE_MOUSE_TO_GYRO 0xf0000007
 #define HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD 0xf0000008
+#define HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD_SWIPE 0xf000000a
 #define HOTKEY_RENDERDOC 0xf0000009
 
 #define SDL_UNMAPPED UINT32_MAX - 1
@@ -125,6 +140,16 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"touchpad_left", SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT},
     {"touchpad_center", SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER},
     {"touchpad_right", SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT},
+    {"touchpad_up", SDL_GAMEPAD_BUTTON_TOUCHPAD_UP},
+    {"touchpad_down", SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN},
+
+    // synthetic touchpad-swipe outputs (output-only). Bind any button/chord here
+    // and pressing it will play back center -> direction -> release.
+    {"touchpad_swipe_up", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP},
+    {"touchpad_swipe_down", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN},
+    {"touchpad_swipe_left", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT},
+    {"touchpad_swipe_right", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT},
+
     {"leftjoystick_halfmode", LEFTJOYSTICK_HALFMODE},
     {"rightjoystick_halfmode", RIGHTJOYSTICK_HALFMODE},
 
@@ -144,6 +169,7 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"hotkey_toggle_mouse_to_joystick", HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK},
     {"hotkey_toggle_mouse_to_gyro", HOTKEY_TOGGLE_MOUSE_TO_GYRO},
     {"hotkey_toggle_mouse_to_touchpad", HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD},
+    {"hotkey_toggle_mouse_to_touchpad_swipe", HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD_SWIPE},
     {"hotkey_renderdoc_capture", HOTKEY_RENDERDOC},
 };
 
@@ -419,6 +445,9 @@ class ControllerOutput {
 public:
     static void SetControllerOutputController(GameController* c);
     static void LinkJoystickAxes();
+    static GameController* GetController() {
+        return controller;
+    }
 
     u32 button;
     u32 axis;

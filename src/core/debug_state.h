@@ -14,6 +14,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include <vulkan/vulkan.hpp>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

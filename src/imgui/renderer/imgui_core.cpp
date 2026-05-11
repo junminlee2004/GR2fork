@@ -6,6 +6,9 @@
 
 #include "common/config.h"
 #include "common/path_util.h"
+#include "video_core/renderer_vulkan/vk_common.h"
+#include <vulkan/vulkan.hpp>
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "imgui/imgui_layer.h"
@@ -20,7 +23,16 @@
 #include "imgui_fonts/notosansjp_regular.ttf.g.cpp"
 #include "imgui_fonts/proggyvector_regular.ttf.g.cpp"
 
+// Embedded HelveticaLTStd-BlkCond.otf used by Vulkan::LoadingScreenLayer for
+// the "LOADING SHADERS" overlay. Lives in video_core/ so the binary blob is
+// adjacent to the only consumer (LoadingScreenLayer); imgui_core just owns
+// the atlas registration and the accessor below.
+#include "video_core/renderer_vulkan/helvetica_blkcond_font.h"
+
 static void CheckVkResult(const vk::Result err) {
+    if (err == vk::Result::eSuccess) {
+        return;
+    }
     LOG_ERROR(ImGui, "Vulkan error {}", vk::to_string(err));
 }
 
@@ -33,6 +45,12 @@ static std::deque<std::pair<bool, ImGui::Layer*>> change_layers{};
 static std::mutex change_layers_mutex{};
 
 static ImGuiID dock_id;
+
+// Cached pointer to the embedded HelveticaLTStd Black Condensed font. Set
+// once during Initialize() (after AddFontFromMemoryTTF, before Vulkan::Init
+// builds the atlas texture). nullptr if registration fails — accessor
+// surfaces that to consumers so they can fall back gracefully.
+static ImFont* g_helvetica_blkcond_font = nullptr;
 
 namespace ImGui {
 
@@ -84,6 +102,32 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
                                              imgui_font_notosansjp_regular_compressed_size, 128.0f,
                                              &font_cfg, ranges.Data);
 
+    // HelveticaLTStd-BlkCond.otf — used for the "LOADING SHADERS" overlay
+    // painted by Vulkan::LoadingScreenLayer during the PipelineCache::WarmUp
+    // pause at gnmdriver registration. Registered here, before Vulkan::Init,
+    // so it lands in the same atlas texture upload as the other fonts and
+    // we don't need to trigger a CreateFontsTexture rebuild after init.
+    //
+    // Important: FontDataOwnedByAtlas MUST be false. The font bytes live in
+    // a constexpr `unsigned char[]` blob in helvetica_blkcond_font.h and
+    // would crash IM_FREE on shutdown if the atlas tried to own them.
+    // We rasterize at 128px for good headroom; LoadingScreenLayer renders at
+    // ~48-156px depending on viewport size, so we're never aggressively
+    // upscaling.
+    {
+        ImFontConfig helv_cfg{};
+        helv_cfg.OversampleH = 2;
+        helv_cfg.OversampleV = 1;
+        helv_cfg.FontDataOwnedByAtlas = false;
+        // AddFontFromMemoryTTF takes a void*, but the const_cast is safe
+        // because FontDataOwnedByAtlas=false guarantees ImGui never
+        // mutates or frees the buffer.
+        g_helvetica_blkcond_font = io.Fonts->AddFontFromMemoryTTF(
+            const_cast<unsigned char*>(Fonts::kHelveticaBlkCondFontData),
+            static_cast<int>(Fonts::kHelveticaBlkCondFontSize), 128.0f,
+            &helv_cfg);
+    }
+
     io.FontGlobalScale = 0.5f;
 
     StyleColorsDark();
@@ -91,6 +135,9 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     ::Core::Devtools::Layer::SetupSettings();
     Sdl::Init(window.GetSDLWindow());
 
+    vk::PipelineRenderingCreateInfo _prci{};
+    _prci.colorAttachmentCount = 1;
+    _prci.pColorAttachmentFormats = &surface_format;
     const Vulkan::InitInfo vk_info{
         .instance = instance.GetInstance(),
         .physical_device = instance.GetPhysicalDevice(),
@@ -99,10 +146,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         .queue = instance.GetPresentQueue(),
         .image_count = image_count,
         .min_allocation_size = 1024 * 1024,
-        .pipeline_rendering_create_info{
-            .colorAttachmentCount = 1,
-            .pColorAttachmentFormats = &surface_format,
-        },
+        .pipeline_rendering_create_info = _prci,
         .allocator = allocator,
         .check_vk_result_fn = &CheckVkResult,
     };
@@ -130,11 +174,7 @@ void OnSurfaceFormatChange(vk::Format surface_format) {
 }
 
 void Shutdown(const vk::Device& device) {
-    auto result = device.waitIdle();
-    if (result != vk::Result::eSuccess) {
-        LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on shutdown: {}",
-                    vk::to_string(result));
-    }
+    CheckVkResult(device.waitIdle());
 
     TextureManager::StopWorker();
 
@@ -220,24 +260,21 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
     }
 
     if (Config::getVkHostMarkersEnabled()) {
-        cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
-            .pLabelName = "ImGui Render",
-        });
+        vk::DebugUtilsLabelEXT _di_tmp1{};
+        _di_tmp1.pLabelName = "ImGui Render";
+        cmdbuf.beginDebugUtilsLabelEXT(_di_tmp1);
     }
 
-    vk::RenderingAttachmentInfo color_attachments[1]{
-        {
-            .imageView = image_view,
-            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
-            .loadOp = vk::AttachmentLoadOp::eClear,
-            .storeOp = vk::AttachmentStoreOp::eStore,
-        },
-    };
+    vk::RenderingAttachmentInfo color_attachments[1]{};
+    color_attachments[0].imageView = image_view;
+    color_attachments[0].imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    color_attachments[0].loadOp = vk::AttachmentLoadOp::eClear;
+    color_attachments[0].storeOp = vk::AttachmentStoreOp::eStore;
     vk::RenderingInfo render_info{};
-    render_info.renderArea = vk::Rect2D{
-        .offset = {0, 0},
-        .extent = extent,
-    };
+    vk::Rect2D _di_tmp2{};
+    _di_tmp2.offset = vk::Offset2D{0, 0};
+    _di_tmp2.extent = extent;
+    render_info.renderArea = _di_tmp2;
     render_info.layerCount = 1;
     render_info.colorAttachmentCount = 1;
     render_info.pColorAttachments = color_attachments;
@@ -251,6 +288,10 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
 
 bool MustKeepDrawing() {
     return layers.size() > 1 || change_layers.size() > 1 || DebugState.IsShowingDebugMenuBar();
+}
+
+ImFont* GetHelveticaFont() {
+    return g_helvetica_blkcond_font;
 }
 
 } // namespace Core

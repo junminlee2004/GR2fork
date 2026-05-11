@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include <cstdlib>
 
 #include "common/assert.h"
+#include "common/config.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -389,7 +391,11 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    // PERF(GR2FORK v1.19): vertex shaders without a fetch shader / without
+    // input attributes do exist (e.g. fullscreen-triangle pass-through with
+    // gl_VertexIndex) but they're a small minority of GR2's draws. Standard
+    // mesh draws have attributes.
+    if (!fetch_shader || fetch_shader->attributes.empty()) [[unlikely]] {
         return;
     }
     const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
@@ -457,13 +463,17 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
         for (const auto& image : stage->images) {
+            // PORT(upstream #4075): same mip-fallback descriptor expansion as
+            // vk_compute_pipeline.
+            const u32 num_bindings = image.NumBindings(*stage);
             bindings.push_back({
-                .binding = binding++,
+                .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
                                                    : vk::DescriptorType::eSampledImage,
-                .descriptorCount = 1,
+                .descriptorCount = num_bindings,
                 .stageFlags = stage_bit,
             });
+            binding += num_bindings;
         }
         for (const auto& sampler : stage->samplers) {
             bindings.push_back({
@@ -474,7 +484,31 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    // PERF(GR2): Mesa RADV push descriptors are a major CPU hot spot (memmove + radv_cmd_update_descriptor_sets).
+    // Default to descriptor sets on RADV; allow env overrides:
+    //   SHADPS4_FORCE_PUSH_DESCRIPTORS=1  -> always use push descriptors when possible
+    //   SHADPS4_DISABLE_PUSH_DESCRIPTORS=1 -> never use push descriptors
+    bool force_push = Config::vkForcePushDescriptorsEnabled();
+    bool force_no_push = Config::vkDisablePushDescriptorsEnabled();
+
+    // Env overrides (highest priority)
+    if (const char* e = std::getenv("SHADPS4_FORCE_PUSH_DESCRIPTORS"); e && e[0] != '0') {
+        force_push = true;
+    }
+    if (const char* e = std::getenv("SHADPS4_DISABLE_PUSH_DESCRIPTORS"); e && e[0] != '0') {
+        force_no_push = true;
+    }
+
+    // Force-push wins if both are set.
+    if (force_push) {
+        force_no_push = false;
+    }
+    bool is_radv = false;
+    #ifdef VK_DRIVER_ID_MESA_RADV
+    is_radv = static_cast<VkDriverId>(instance.GetDriverID()) == VK_DRIVER_ID_MESA_RADV;
+    #endif
+    const bool prefer_push = force_push ? true : (force_no_push ? false : !is_radv);
+    uses_push_descriptors = prefer_push && (binding < instance.MaxPushDescriptors());
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

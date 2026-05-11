@@ -490,7 +490,13 @@ struct Sampler {
         case AnisoRatio::Sixteen:
             return 16.0f;
         default:
-            UNREACHABLE();
+            // GCN spec reserves max_aniso encodings 5-7. GR2 produces samplers
+            // with these values (likely from partially-initialized S#s in the
+            // FAM/Lua sprite path). Saturate to 16x; the call site clamps to
+            // device-supported anisotropy after.
+            LOG_DEBUG(Render_Vulkan, "Sampler max_aniso has reserved encoding {}, clamping to 16x",
+                      static_cast<u32>(max_aniso.Value()));
+            return 16.0f;
         }
     }
 };

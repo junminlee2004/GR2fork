@@ -80,9 +80,16 @@ TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
         vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
 
+    // Phase MQ-2: scratch buffers are used by detile compute shaders and
+    // can transfer to/from graphics-side staging — eConcurrent when async
+    // compute is available.
+    const auto cross_queue_families = instance.CrossQueueFamilyIndices();
     const vk::BufferCreateInfo buffer_ci = {
         .size = size,
         .usage = usage,
+        .sharingMode = instance.CrossQueueSharingMode(),
+        .queueFamilyIndexCount = static_cast<u32>(cross_queue_families.size()),
+        .pQueueFamilyIndices = cross_queue_families.data(),
     };
 
     const VmaAllocationCreateInfo alloc_info{
@@ -193,7 +200,7 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     scheduler.EndRendering();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -235,6 +242,8 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
         },
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    // Cross-pipeline cache invalidation: see Scheduler::GetPushDescGen.
+    scheduler.BumpPushDescGen(vk::PipelineBindPoint::eCompute);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
@@ -276,7 +285,14 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         vmaDestroyBuffer(instance.GetAllocator(), temp_buffer, temp_allocation);
     });
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    // PHASE_1C audit fix: hoist EndRendering to this scope. Previously this
+    // function relied on Image::Download() calling EndRendering internally,
+    // but `cmdbuf` was captured at this line BEFORE Download ran. Under Phase
+    // 1C with cmdbuf state isolation, brittle ordering like that breaks.
+    // Mirror the pattern in TileTextureFromBuffer (line ~201).
+    scheduler.EndRendering();
+
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
@@ -320,6 +336,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         },
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    // Cross-pipeline cache invalidation: see Scheduler::GetPushDescGen.
+    scheduler.BumpPushDescGen(vk::PipelineBindPoint::eCompute);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);

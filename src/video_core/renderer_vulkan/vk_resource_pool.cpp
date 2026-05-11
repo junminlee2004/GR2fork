@@ -15,8 +15,22 @@ ResourcePool::ResourcePool(MasterSemaphore* master_semaphore_, std::size_t grow_
 
 std::size_t ResourcePool::CommitResource() {
     u64 gpu_tick = master_semaphore->KnownGpuTick();
-    const auto search = [this, gpu_tick](std::size_t begin,
-                                         std::size_t end) -> std::optional<std::size_t> {
+
+    // PERF(GR2FORK v1.14): Direct hot-path check on the hint slot. The pool
+    // overwhelmingly hits the hint slot on the first probe (commands buffers
+    // and similar resources are reused in round-robin order), and the prior
+    // implementation routed even that case through a lambda + std::optional
+    // construct/destruct. Fast-path this as a single branch.
+    const std::size_t pool_size = ticks.size();
+    if (hint_iterator < pool_size && gpu_tick >= ticks[hint_iterator]) [[likely]] {
+        const std::size_t found = hint_iterator;
+        ticks[found] = master_semaphore->CurrentTick();
+        hint_iterator = (found + 1) % pool_size;
+        return found;
+    }
+
+    const auto search = [this, &gpu_tick](std::size_t begin,
+                                          std::size_t end) -> std::optional<std::size_t> {
         for (std::size_t iterator = begin; iterator < end; ++iterator) {
             if (gpu_tick >= ticks[iterator]) {
                 ticks[iterator] = master_semaphore->CurrentTick();
@@ -27,12 +41,12 @@ std::size_t ResourcePool::CommitResource() {
     };
 
     // Try to find a free resource from the hinted position to the end.
-    auto found = search(hint_iterator, ticks.size());
+    auto found = search(hint_iterator, pool_size);
     if (!found) {
         // Refresh semaphore to query updated results
         master_semaphore->Refresh();
         gpu_tick = master_semaphore->KnownGpuTick();
-        found = search(hint_iterator, ticks.size());
+        found = search(hint_iterator, pool_size);
     }
     if (!found) {
         // Search from beginning to the hinted position.
@@ -60,19 +74,25 @@ std::size_t ResourcePool::ManageOverflow() {
 
 constexpr std::size_t COMMAND_BUFFER_POOL_SIZE = 4;
 
-CommandPool::CommandPool(const Instance& instance, MasterSemaphore* master_semaphore)
+CommandPool::CommandPool(const Instance& instance, MasterSemaphore* master_semaphore,
+                         u32 queue_family_index)
     : ResourcePool{master_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance} {
+    // UINT32_MAX sentinel = "default to graphics", preserves existing behavior
+    // for all pre-MQ-3 call sites that don't specify a queue family.
+    const u32 family =
+        (queue_family_index == UINT32_MAX) ? instance.GetGraphicsQueueFamilyIndex()
+                                           : queue_family_index;
     const vk::CommandPoolCreateInfo pool_create_info = {
         .flags = vk::CommandPoolCreateFlagBits::eTransient |
                  vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-        .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        .queueFamilyIndex = family,
     };
     const vk::Device device = instance.GetDevice();
     auto [pool_result, pool] = device.createCommandPoolUnique(pool_create_info);
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create command pool: {}",
                vk::to_string(pool_result));
     cmd_pool = std::move(pool);
-    SetObjectName(device, *cmd_pool, "CommandPool");
+    SetObjectName(device, *cmd_pool, "CommandPool (family {})", family);
 }
 
 CommandPool::~CommandPool() = default;
@@ -122,7 +142,11 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
     const auto [it, _] = descriptor_sets.try_emplace(set_key);
 
     // Check if allocated sets exist and pick one.
-    if (!it->second.empty()) {
+    // PERF(GR2FORK v1.17): Once warmed, each set_layout has a small batch of
+    // descriptor sets pre-allocated; the empty case fires only when the
+    // batch was just exhausted, which is uncommon relative to per-draw
+    // commits. Hint the cache-hit return.
+    if (!it->second.empty()) [[likely]] {
         const auto desc_set = it->second.back();
         it.value().pop_back();
         return desc_set;
@@ -140,7 +164,9 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
 
     // Attempt to allocate the descriptor set batch.
     auto result = device.allocateDescriptorSets(&alloc_info, desc_sets.data());
-    if (result == vk::Result::eSuccess) {
+    // PERF(GR2FORK v1.17): Allocation success is the dominant path; pool
+    // exhaustion only fires after the configured pool maxSets is reached.
+    if (result == vk::Result::eSuccess) [[likely]] {
         const auto desc_set = desc_sets.back();
         desc_sets.pop_back();
         it.value() = std::move(desc_sets);

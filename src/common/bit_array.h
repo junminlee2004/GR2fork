@@ -207,6 +207,38 @@ public:
         return !None();
     }
 
+    [[nodiscard]] bool AnyInRange(size_t start, size_t end) const {
+        if (start >= end || start >= N) {
+            return false;
+        }
+        if (end > N) {
+            end = N;
+        }
+
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const size_t start_bit = start % BITS_PER_WORD;
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+
+        const u64 start_mask = (start_bit == 0) ? ~0ULL : ~((1ULL << start_bit) - 1ULL);
+        const u64 end_mask =
+        (end_bit == BITS_PER_WORD - 1) ? ~0ULL : ((1ULL << (end_bit + 1)) - 1ULL);
+
+        if (first_word == last_word) {
+            return (data[first_word] & (start_mask & end_mask)) != 0;
+        }
+
+        if ((data[first_word] & start_mask) != 0) {
+            return true;
+        }
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            if (data[i] != 0) {
+                return true;
+            }
+        }
+        return (data[last_word] & end_mask) != 0;
+    }
+
     Range FirstRangeFrom(size_t start) const {
         if (start >= N) {
             return {N, N};

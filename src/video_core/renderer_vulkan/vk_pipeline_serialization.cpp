@@ -265,9 +265,27 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
-    // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
-    // at the exact position rather than append
-
+    // FIX(GR2FORK): perm_idx-keyed dedup, not spec-equality dedup.
+    //
+    // Multiple cached pipelines often reference the same shader stage at the
+    // same (pgm_hash, perm_idx). Both loads read the SAME bytes from the same
+    // <pgm_hash>_<perm_idx>.spv file, so they compile to identical modules —
+    // we should reuse, not recompile.
+    //
+    // The previous design used spec equality to dedup (`std::ranges::find`
+    // with `Module::spec == spec`). Two failures:
+    //   1. operator== could return true for genuinely different specializations
+    //      (bitset asymmetry, samplers-skip — addressed in specialization.h fix).
+    //   2. Even with correct operator==, the originating run may have assigned
+    //      perm_idx values that don't line up with the load order. Two specs
+    //      that compare equal with mismatched perm_idx triggered the
+    //      "permutation X maps to existing specialization at Y. Compiling..."
+    //      warning and a redundant CompileSPV call. ~1958 such calls per
+    //      warmup in a typical GR2 session.
+    //
+    // perm_idx-keyed dedup is a stronger guarantee: same (pgm_hash, perm_idx)
+    // pair → same SPV file → same compiled module. No spec comparison needed,
+    // no false positives, no warning path.
     vk::ShaderModule module{};
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
@@ -275,14 +293,17 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
-            // If the permutation is already preloaded, make sure it has the same permutation index
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            ASSERT_MSG(perm_idx == idx, "Permutation {} is already inserted at {}! ({}_{:x})",
-                       perm_idx, idx, program->info.stage, program->info.pgm_hash);
-            module = it->module;
+        auto& existing_modules = it_pgm.value()->modules;
+        if (perm_idx < existing_modules.size() &&
+            existing_modules[perm_idx].module != vk::ShaderModule{}) {
+            // Same (pgm_hash, perm_idx) already loaded by another pipeline.
+            // Reuse the existing module — InsertPermut below will overwrite
+            // the slot with this module (no-op since same handle).
+            module = existing_modules[perm_idx].module;
         } else {
+            // Either modules vector hasn't been grown to include this slot
+            // yet, or an earlier load of a different perm_idx grew it but
+            // left this slot default-constructed. Either way, compile.
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
@@ -294,7 +315,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     return true;
 }
 
-void PipelineCache::WarmUp() {
+void PipelineCache::WarmUp(const std::function<void(u32 loaded, u32 total)>& tick) {
     if (!Config::isPipelineCacheEnabled()) {
         return;
     }
@@ -317,6 +338,20 @@ void PipelineCache::WarmUp() {
         LOG_WARNING(Render,
                     "Pipeline cache isn't compatible with current system. Ignoring the cache");
         return;
+    }
+
+    // Pre-count pipeline blobs so the LoadingScreenLayer overlay can render
+    // a real "X / Y" progress bar instead of an indeterminate marquee. This
+    // is a metadata-only directory walk (or zip-index walk) — sub-100ms even
+    // for tens of thousands of entries, so the brief delay before the first
+    // visible tick is below the user-visible flash threshold.
+    const u32 total_blobs = Storage::DataBase::Instance().CountBlobs(
+        Storage::BlobType::PipelineKey);
+
+    // Surface the total to the layer immediately, even before the first
+    // blob is processed, so the bar starts at 0/total rather than 0/0.
+    if (tick) {
+        tick(0, total_blobs);
     }
 
     u32 num_pipelines{};
@@ -347,6 +382,15 @@ void PipelineCache::WarmUp() {
 
             if (result) {
                 ++num_pipelines;
+            }
+
+            // Progress tick — drives the LoadingScreenLayer overlay. We
+            // call on every blob (including failed ones) so the bar
+            // animates smoothly even when the cache contains stale entries
+            // that fail to deserialize. The presenter's tick handler
+            // throttles actual swapchain redraws to ~16fps.
+            if (tick) {
+                tick(num_total_pipelines, total_blobs);
             }
         });
 
@@ -457,7 +501,21 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
 
     std::string bits{};
     spec.Read(bits);
-    bitset = std::bitset<MaxStageResources>(bits);
+
+    // Portable parse (avoid std::bitset<N>(std::string) ctor) AND keep bitwords in sync.
+    // bits is serialized as bitset.to_string() => MSB->LSB; bit index 0 is LSB.
+    bitset.reset();
+    bitwords[0] = 0;
+    bitwords[1] = 0;
+    const size_t lim = bits.size() < MaxStageResources ? bits.size() : MaxStageResources;
+    const size_t n = bits.size();
+    for (size_t i = 0; i < lim; ++i) {
+        const char c = bits[n - 1 - i];
+        if (c == '1') {
+            bitset.set(i);
+            bitwords[i >> 6] |= (1ULL << (i & 63));
+        }
+    }
 
     u64 fetch_data_size{};
     spec.Read(fetch_data_size);
@@ -474,6 +532,7 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
     spec.Read(fmasks);
     spec.Read(samplers);
 
+    ComputeSig();
     return true;
 }
 

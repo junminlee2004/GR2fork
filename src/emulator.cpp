@@ -11,7 +11,9 @@
 #include <hwinfo/hwinfo.h>
 
 #include "common/config.h"
+#include "common/crash_handler.h"
 #include "common/debug.h"
+#include "common/hang_watchdog.h"
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "core/ipc/ipc.h"
@@ -25,6 +27,7 @@
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
+#include "common/thread.h"
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/file_format/psf.h"
@@ -33,6 +36,7 @@
 #include "core/libraries/disc_map/disc_map.h"
 #include "core/libraries/font/font.h"
 #include "core/libraries/font/fontft.h"
+#include "core/libraries/jpeg/jpegenc.h"
 #include "core/libraries/libc_internal/libc_internal.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/ngs2/ngs2.h"
@@ -42,8 +46,23 @@
 #include "core/linker.h"
 #include "core/memory.h"
 #include "emulator.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/texture_cache.h"
+
+// FIX(GR2FORK): globals owned by gnmdriver.cpp (presenter) and videoout (liverpool).
+// Declared extern here so the hang watchdog can sample them through its
+// null-safe callbacks. These unique_ptrs are lazily populated when the game
+// calls sceGnmDriverInitializer; callbacks below tolerate null.
+namespace Vulkan { class Presenter; }
+namespace AmdGpu  { struct Liverpool; }
+extern std::unique_ptr<Vulkan::Presenter>  presenter;
+extern std::unique_ptr<AmdGpu::Liverpool>  liverpool;
 
 #ifdef _WIN32
 #include <WinSock2.h>
@@ -59,7 +78,21 @@ Frontend::WindowSDL* g_window = nullptr;
 namespace Core {
 
 Emulator::Emulator() {
-    // Initialize NT API functions, set high priority and disable WER
+    // Initialize NT API functions, set high priority and disable WER.
+    //
+    // FIX(GR2FORK v3): CrashHandler::Install() was previously called HERE,
+    // before SEM_NOGPFAULTERRORBOX, on the theory that early WER suppression
+    // would otherwise lose silent deaths. In practice this ordering meant
+    // every LOG_INFO emitted by Install() (including the "[CrashHandler]
+    // installed: ..." banner that reports which inline hooks took) ran
+    // before Common::Log::Initialize() and got dropped by
+    // initialization_in_progress_suppress_logging — leaving zero evidence
+    // in the log of whether handlers/hooks were live for the run. Install()
+    // now runs in Run() right after Common::Log::Start(), so the banner
+    // actually reaches shad_log.txt. The window between SetErrorMode here
+    // and Install() in Run() is only the deterministic startup path
+    // (NtApi/WSA init, param.sfo parse, Config::load) — no game code runs
+    // there, so the loss of WER coverage in that window is inert.
 #ifdef _WIN32
     Common::NtApi::Initialize();
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
@@ -187,17 +220,35 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         Common::Log::Initialize();
     }
     Common::Log::Start();
+    // FIX(GR2FORK v3): install crash handler immediately after the log
+    // backend is up. Earlier (constructor-time) installs ran before
+    // Log::Initialize and the install banner was silently dropped by
+    // initialization_in_progress_suppress_logging — there was no way to
+    // verify post-mortem whether terminate/SEH/VEH/atexit/at_quick_exit/
+    // inv_param/purecall handlers and the four inline hooks (ExitProcess,
+    // TerminateProcess, RtlExitUserProcess, NtTerminateProcess) actually
+    // installed for that run. With this placement the
+    // "[CrashHandler] installed: ... hooks: ..." line now lands in
+    // shad_log.txt as the first non-initialization log entry, and any
+    // subsequent quick_exit/exit/SEH below this point is captured.
+    //
+    // The eboot.bin existence check just below uses std::quick_exit(0)
+    // on failure — that path now correctly trips OnAtQuickExit. As of
+    // this patch, no SignalCleanShutdown call precedes it, so it will
+    // be logged as a stack-walked crash entry. That matches the prior
+    // behavior of the constructor-time install (the handler was armed
+    // either way) and is fine: a missing eboot is an error condition
+    // worth a stack walk anyway.
+    Common::CrashHandler::Install();
     if (!std::filesystem::exists(file)) {
         LOG_CRITICAL(Loader, "eboot.bin does not exist: {}",
                      std::filesystem::absolute(file).string());
         std::quick_exit(0);
     }
 
-    LOG_INFO(Loader, "Starting shadps4 emulator v{} ", Common::g_version);
-    LOG_INFO(Loader, "Revision {}", Common::g_scm_rev);
-    LOG_INFO(Loader, "Branch {}", Common::g_scm_branch);
-    LOG_INFO(Loader, "Description {}", Common::g_scm_desc);
-    LOG_INFO(Loader, "Remote {}", Common::g_scm_remote_url);
+    LOG_INFO(Loader, "Starting gr2fork (shadps4 v{} base)", Common::g_version);
+    LOG_INFO(Loader, "Fork: Gravity Rush 2 focus");
+    LOG_INFO(Loader, "Build: v3.0");
 
     const bool has_game_config = std::filesystem::exists(
         Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"));
@@ -283,20 +334,26 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string window_title = "";
     std::string remote_url(Common::g_scm_remote_url);
     std::string remote_host = Common::GetRemoteNameFromLink();
+    // TITLE(GR2FORK v1.0): Personal branding — Common::g_version carries the
+    // upstream base (0.13.0) that the fork tracks; the "v1.0" is the fork's
+    // own release tag. Format: "Junmin Lee GR2FORK v1.0 (v0.13.0) | <game>".
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} | {}", Common::g_version, game_title);
+            window_title = fmt::format("Junmin Lee GR2FORK v2.0 (v{}) | {}", Common::g_version,
+                                       game_title);
         } else {
-            window_title =
-                fmt::format("shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
+            window_title = fmt::format("Junmin Lee GR2FORK v2.0 {}/(v{}) | {}", remote_host,
+                                       Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
+            window_title = fmt::format("Junmin Lee GR2FORK v2.0 (v{}) {} {} | {}",
+                                       Common::g_version, Common::g_scm_branch,
+                                       Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
+            window_title = fmt::format("Junmin Lee GR2FORK v2.0 (v{}) {}/{} {} | {}",
+                                       Common::g_version, remote_host, Common::g_scm_branch,
+                                       Common::g_scm_desc, game_title);
         }
     }
     window = std::make_unique<Frontend::WindowSDL>(
@@ -371,6 +428,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         start_time = std::chrono::steady_clock::now();
 
         std::thread([this, id]() {
+            Common::SetCurrentThreadName("shadPS4:PlayTimeUpdater");
             while (true) {
                 std::this_thread::sleep_for(std::chrono::seconds(60));
                 UpdatePlayTime(id);
@@ -380,6 +438,38 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     args.insert(args.begin(), eboot_name.generic_string());
+
+    // FIX(GR2FORK): install hang watchdog before guest execution starts.
+    // Callbacks tolerate null presenter/liverpool — they return 0 until the
+    // game initializes the renderer via sceGnmDriverInitializer.
+    {
+        Common::HangWatchdogCallbacks cb;
+        cb.scheduler_tick = []() -> u64 {
+            if (!presenter) return 0;
+            return presenter->GetRasterizer().GetScheduler().CurrentTick();
+        };
+        cb.num_submits = []() -> u32 {
+            if (!liverpool) return 0;
+            return liverpool->GetNumSubmits();
+        };
+        cb.vram_used = []() -> u64 {
+            if (!presenter) return 0;
+            const auto& inst = presenter->GetRasterizer().GetInstance();
+            return inst.CanReportMemoryUsage() ? inst.GetDeviceMemoryUsage() : 0;
+        };
+        cb.vram_budget = []() -> u64 {
+            if (!presenter) return 0;
+            return presenter->GetRasterizer().GetInstance().GetTotalMemoryBudget();
+        };
+        cb.texture_mem = []() -> u64 {
+            if (!presenter) return 0;
+            return presenter->GetRasterizer().GetTextureCache().GetTotalUsedMemory();
+        };
+        cb.num_images  = []() -> size_t { return 0; }; // not wired
+        cb.num_buffers = []() -> size_t { return 0; }; // not wired
+        Common::HangWatchdog::Start(std::move(cb));
+    }
+
     linker->Execute(args);
 
     window->InitTimers();
@@ -390,6 +480,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     UpdatePlayTime(id);
     Storage::DataBase::Instance().Close();
 
+    // FIX(GR2FORK v2): tell the crash handler this quick_exit is a
+    // routine shutdown (SDL loop exited because the window was closed,
+    // not a crash). Without this, every clean quit produces a spurious
+    // "*** quick_exit() / _Exit() (at_quick_exit) ***" crash entry in
+    // crash_dump.txt with a stack walk of the shutdown path.
+    Common::CrashHandler::SignalCleanShutdown();
     std::quick_exit(0);
 }
 
@@ -499,14 +595,28 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 void Emulator::LoadSystemModules(const std::string& game_serial) {
     constexpr auto ModulesToLoad = std::to_array<SysModules>(
         {{"libSceNgs2.sprx", &Libraries::Ngs2::RegisterLib},
-         {"libSceUlt.sprx", nullptr},
+        {"libSceUlt.sprx", nullptr},
+        {"libSceJpegDec.sprx", nullptr},
+        {"libSceJpegEnc.sprx", &Libraries::JpegEnc::RegisterLib},
+        {"libScePngEnc.sprx", nullptr},
          {"libSceJson.sprx", nullptr},
          {"libSceJson2.sprx", nullptr},
          {"libSceLibcInternal.sprx", &Libraries::LibcInternal::RegisterLib},
          {"libSceCesCs.sprx", nullptr},
          {"libSceFont.sprx", &Libraries::Font::RegisterlibSceFont},
          {"libSceFontFt.sprx", &Libraries::FontFt::RegisterlibSceFontFt},
-         {"libSceFreeTypeOt.sprx", nullptr}});
+         {"libSceFreeTypeOt.sprx", nullptr},
+         // GR2 gallery: load ScreenShot browse API as LLE.
+         // The fiber at 0x10914c0 calls browse functions from libSceScreenShot
+         // which are NOT covered by our HLE (capture-only). The LLE provides
+         // the browse functions. Dependency chain:
+         //   libSceScreenShot → libSceIpmi, libSceSysUtil
+         //   libSceIpmi → libkernel (HLE)
+         // HLE capture functions (RegisterLib in libs.cpp) still win for
+         // matching NIDs since the linker checks HLE first.
+         {"libSceIpmi.sprx", nullptr},
+         {"libSceSysUtil.sprx", nullptr},
+         {"libSceScreenShot.sprx", nullptr}});
 
     std::vector<std::filesystem::path> found_modules;
     const auto& sys_module_path = Config::getSysModulesPath();

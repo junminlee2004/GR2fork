@@ -347,9 +347,39 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, u32 arg, void** u
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+            // FIX(GR2FORK): downgraded from ASSERT_MSG. This race fires when a
+            // sibling EOP flip ran SubmitFlipInternal and zeroed this buffer's
+            // label as its "previous" (driver.cpp:204) before this IRQ's callback
+            // got to execute. Triggers reliably on AvPlayer cutscene skip /
+            // gallery preview transitions (StatePause + pad press + rapid
+            // transition flips).
+            //
+            // Original "continue anyway" path still called SubmitFlip with the
+            // late buf_id, which routes through SubmitFlipInternal and on the
+            // next Flip() drains buffer_labels[prev_index] = 0 — but prev_index
+            // by then points at the *correctly-ordered* in-flight buffer, so
+            // the label of a still-pending frame gets clobbered. The game's
+            // BG fiber workers (BGFiberWorkerHigh/Low/Sys) then deadlock on
+            // EF bit 0x10000000 forever — observable as pending_submits=1
+            // stuck and a flood of EF race-guard re-injects in the lead-up.
+            //
+            // Drop the late flip entirely. The earlier (out-of-order) sibling
+            // flip already presented something; missing one frame is exactly
+            // the "worst case" the previous downgrade comment accepted, and
+            // it leaves prev_index pointing at the actually-presented buffer
+            // so the next Flip() wipes the right slot.
+            if (port->buffer_labels[buf_id] != 1) [[unlikely]] {
+                LOG_WARNING(Lib_VideoOut,
+                            "Out-of-order flip IRQ (buf_id={} label={}) — dropping late flip",
+                            buf_id, port->buffer_labels[buf_id]);
+                return;
+            }
             const auto result = driver->SubmitFlip(port, buf_id, arg, true);
-            ASSERT_MSG(result, "EOP flip submission failed");
+            if (!result) [[unlikely]] {
+                LOG_WARNING(Lib_VideoOut,
+                            "EOP flip submission failed (buf_id={}) — dropping frame",
+                            buf_id);
+            }
         });
 
     return ORBIS_OK;

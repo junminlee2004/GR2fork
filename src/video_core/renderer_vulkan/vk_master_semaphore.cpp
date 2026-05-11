@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include <chrono>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
@@ -29,6 +30,20 @@ MasterSemaphore::MasterSemaphore(const Instance& instance_) : instance{instance_
 MasterSemaphore::~MasterSemaphore() = default;
 
 void MasterSemaphore::Refresh() {
+    // Rate-limit expensive getSemaphoreCounterValue() calls (often an ioctl on RADV).
+    // This reduces CPU overhead when Refresh() is called frequently in tight loops.
+    constexpr u64 kMinRefreshIntervalNs = 100'000; // 100us
+    const u64 now_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    const u64 last_ns = last_refresh_ns.load(std::memory_order_relaxed);
+    // PERF(GR2FORK v1.16): the rate-limit fast-path is the entire reason
+    // this guard exists — Refresh() is called on hot loops (CommitResource,
+    // Wait, scheduler tick checks) and the 100us throttle catches most of
+    // those. Hint the early return.
+    if (now_ns - last_ns < kMinRefreshIntervalNs) [[likely]] {
+        return;
+    }
+    last_refresh_ns.store(now_ns, std::memory_order_relaxed);
     u64 this_tick{};
     u64 counter{};
     do {
@@ -37,7 +52,10 @@ void MasterSemaphore::Refresh() {
         ASSERT_MSG(counter_result == vk::Result::eSuccess,
                    "Failed to get master semaphore value: {}", vk::to_string(counter_result));
         counter = cntr;
-        if (counter < this_tick) {
+        // PERF(GR2FORK v1.26): counter regressing below this_tick fires
+        // only when another thread bumped gpu_tick concurrently between
+        // the load and the getSemaphoreCounterValue call — a rare race.
+        if (counter < this_tick) [[unlikely]] {
             return;
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,

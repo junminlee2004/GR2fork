@@ -222,6 +222,8 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(Boost 1.84.0 CONFIG)
 find_package(FFmpeg 5.1.2 MODULE)
+# PhotoMode JPEG uses bundled stb headers (no system JPEG dependency)
+# find_package(JPEG REQUIRED)
 find_package(fmt 10.2.0 CONFIG)
 find_package(glslang 15 CONFIG)
 find_package(half 1.12.0 MODULE)
@@ -275,6 +277,7 @@ set(AJM_LIB src/core/libraries/ajm/ajm.cpp
             src/core/libraries/ajm/ajm_instance.h
             src/core/libraries/ajm/ajm_mp3.cpp
             src/core/libraries/ajm/ajm_mp3.h
+            src/core/libraries/ajm/ajm_result.h
 )
 
 set(AUDIO_LIB src/core/libraries/audio/audioin.cpp
@@ -323,6 +326,8 @@ set(KERNEL_LIB src/core/libraries/kernel/sync/mutex.cpp
                src/core/libraries/kernel/process.h
                src/core/libraries/kernel/debug.cpp
                src/core/libraries/kernel/debug.h
+               src/core/libraries/kernel/ipmimgr.cpp
+               src/core/libraries/kernel/ipmimgr.h
                src/core/libraries/kernel/equeue.cpp
                src/core/libraries/kernel/equeue.h
                src/core/libraries/kernel/file_system.cpp
@@ -352,6 +357,8 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/net_ctl_obj.cpp
                  src/core/libraries/network/net_ctl_obj.h
                  src/core/libraries/network/net_ctl_codes.h
+                 src/core/libraries/network/net_obj.cpp
+                 src/core/libraries/network/net_obj.h
                  src/core/libraries/network/net_util.cpp
                  src/core/libraries/network/net_util.h
                  src/core/libraries/network/net_epoll.cpp
@@ -374,6 +381,7 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
 
 set(AVPLAYER_LIB src/core/libraries/avplayer/avplayer_common.cpp
                  src/core/libraries/avplayer/avplayer_common.h
+                 src/core/libraries/avplayer/avplayer_data_streamer.h
                  src/core/libraries/avplayer/avplayer_file_streamer.cpp
                  src/core/libraries/avplayer/avplayer_file_streamer.h
                  src/core/libraries/avplayer/avplayer_impl.cpp
@@ -392,6 +400,7 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/system/msgdialog.cpp
                 src/core/libraries/system/msgdialog.h
                 src/core/libraries/system/msgdialog_ui.cpp
+                src/core/libraries/system/msgdialog_ui.h
                 src/core/libraries/system/posix.cpp
                 src/core/libraries/system/posix.h
                 src/core/libraries/save_data/save_backup.cpp
@@ -523,8 +532,12 @@ set(PNG_LIB src/core/libraries/libpng/pngdec.cpp
 )
 
 set(JPEG_LIB src/core/libraries/jpeg/jpeg_error.h
+             src/core/libraries/jpeg/jpegdec.cpp
+             src/core/libraries/jpeg/jpegdec.h
              src/core/libraries/jpeg/jpegenc.cpp
              src/core/libraries/jpeg/jpegenc.h
+             src/core/libraries/jpeg/gr2_photo_context_finder.h
+             src/core/libraries/jpeg/stb_jpeg_impl.cpp
 )
 
 set(PLAYGO_LIB src/core/libraries/playgo/playgo.cpp
@@ -571,8 +584,10 @@ set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
 )
 
 set(NP_LIBS src/core/libraries/np/np_error.h
+            src/core/libraries/np/np_types.h
             src/core/libraries/np/np_common.cpp
             src/core/libraries/np/np_common.h
+            src/core/libraries/np/np_common_error.h
             src/core/libraries/np/np_commerce.cpp
             src/core/libraries/np/np_commerce.h
             src/core/libraries/np/np_manager.cpp
@@ -581,14 +596,17 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_score.h
             src/core/libraries/np/np_trophy.cpp
             src/core/libraries/np/np_trophy.h
+            src/core/libraries/np/np_trophy_error.h
             src/core/libraries/np/trophy_ui.cpp
             src/core/libraries/np/trophy_ui.h
             src/core/libraries/np/np_web_api.cpp
             src/core/libraries/np/np_web_api.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
+            src/core/libraries/np/np_party_error.h
             src/core/libraries/np/np_auth.cpp
             src/core/libraries/np/np_auth.h
+            src/core/libraries/np/np_auth_error.h
             src/core/libraries/np/np_profile_dialog.cpp
             src/core/libraries/np/np_profile_dialog.h
             src/core/libraries/np/np_sns_facebook_dialog.cpp
@@ -604,14 +622,36 @@ set(VR_LIBS  src/core/libraries/hmd/hmd.cpp
              src/core/libraries/hmd/hmd_reprojection.cpp
              src/core/libraries/hmd/hmd_distortion.cpp
              src/core/libraries/hmd/hmd.h
+             src/core/libraries/hmd/hmd_error.h
              src/core/libraries/hmd/hmd_setup_dialog.cpp
              src/core/libraries/hmd/hmd_setup_dialog.h
              src/core/libraries/vr_tracker/vr_tracker.cpp
              src/core/libraries/vr_tracker/vr_tracker.h
+             src/core/libraries/vr_tracker/vr_tracker_error.h
 )
 
 set(MISC_LIBS  src/core/libraries/screenshot/screenshot.cpp
                src/core/libraries/screenshot/screenshot.h
+               src/core/libraries/screenshot/photo_pixel_store.cpp
+               src/core/libraries/screenshot/photo_pixel_store.h
+               src/core/libraries/screenshot/photo_texture_manager.cpp
+               src/core/libraries/screenshot/photo_texture_manager.h
+               src/core/libraries/screenshot/photo_gnf_generator.cpp
+               src/core/libraries/screenshot/photo_gnf_generator.h
+               src/core/libraries/screenshot_service/screenshot_service.cpp
+               src/core/libraries/screenshot_service/screenshot_service.h
+               src/core/libraries/aspect_patches/aspect_patches.cpp
+               src/core/libraries/aspect_patches/aspect_patches.h
+               src/core/libraries/resolution_patches/resolution_patches.cpp
+               src/core/libraries/resolution_patches/resolution_patches.h
+               src/core/libraries/content_search/content_search.cpp
+               src/core/libraries/content_search/content_search.h
+               src/core/libraries/content_export/content_export.cpp
+               src/core/libraries/content_export/content_export.h
+               src/core/libraries/content_delete/content_delete.cpp
+               src/core/libraries/content_delete/content_delete.h
+               src/core/libraries/share_utility/share_utility.cpp
+               src/core/libraries/share_utility/share_utility.h
                src/core/libraries/move/move.cpp
                src/core/libraries/move/move.h
                src/core/libraries/move/move_error.h
@@ -672,6 +712,7 @@ set(COMMON src/common/logging/backend.cpp
            src/common/logging/text_formatter.cpp
            src/common/logging/text_formatter.h
            src/common/logging/types.h
+           src/common/adaptive_mutex.h
            src/common/aes.h
            src/common/alignment.h
            src/common/arch.h
@@ -687,6 +728,7 @@ set(COMMON src/common/logging/backend.cpp
            src/common/debug.h
            src/common/decoder.cpp
            src/common/decoder.h
+           src/common/div_ceil.h
            src/common/elf_info.h
            src/common/endian.h
            src/common/enum.h
@@ -696,7 +738,10 @@ set(COMMON src/common/logging/backend.cpp
            src/common/error.cpp
            src/common/error.h
            src/common/fixed_value.h
+           src/common/frame_time_recorder.cpp
+           src/common/frame_time_recorder.h
            src/common/func_traits.h
+           src/common/hash.h
            src/common/native_clock.cpp
            src/common/native_clock.h
            src/common/path_util.cpp
@@ -716,6 +761,7 @@ set(COMMON src/common/logging/backend.cpp
            src/common/signal_context.cpp
            src/common/singleton.h
            src/common/slab_heap.h
+           src/common/slot_array.h
            src/common/slot_vector.h
            src/common/spin_lock.cpp
            src/common/spin_lock.h
@@ -730,12 +776,20 @@ set(COMMON src/common/logging/backend.cpp
            src/common/uint128.h
            src/common/unique_function.h
            src/common/va_ctx.h
+           src/common/support/avdec.h
            src/common/ntapi.h
            src/common/ntapi.cpp
            src/common/number_utils.h
            src/common/number_utils.cpp
            src/common/memory_patcher.h
            src/common/memory_patcher.cpp
+           # GR2FORK: diagnostic infrastructure (crash capture, hang sampler, sync ring)
+           src/common/crash_handler.cpp
+           src/common/crash_handler.h
+           src/common/hang_watchdog.cpp
+           src/common/hang_watchdog.h
+           src/common/sync_trace.cpp
+           src/common/sync_trace.h
            ${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp
            src/common/scm_rev.h
 )
@@ -783,6 +837,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_format/trp.h
          src/core/file_sys/fs.cpp
          src/core/file_sys/fs.h
+         src/core/file_sys/file.cpp
          src/core/ipc/ipc.cpp
          src/core/ipc/ipc.h
          src/core/loader/dwarf.cpp
@@ -793,6 +848,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/loader/symbols_resolver.cpp
          src/core/libraries/libs.h
          src/core/libraries/libs.cpp
+         src/core/libraries/error_codes.h
          ${AJM_LIB}
          ${AVPLAYER_LIB}
          ${AUDIO_LIB}
@@ -852,12 +908,14 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
                       src/shader_recompiler/specialization.h
+                      src/shader_recompiler/frontend/tessellation.h
                       src/shader_recompiler/backend/bindings.h
                       src/shader_recompiler/backend/spirv/emit_spirv.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv.h
                       src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_barriers.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_bitwise_conversion.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_bounds.h
                       src/shader_recompiler/backend/spirv/emit_spirv_composite.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_convert.cpp
@@ -900,6 +958,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/frontend/structured_control_flow.cpp
                       src/shader_recompiler/frontend/structured_control_flow.h
                       src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
+                      src/shader_recompiler/ir/passes/constant_propogation.h
                       src/shader_recompiler/ir/passes/dead_code_elimination_pass.cpp
                       src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
                       src/shader_recompiler/ir/passes/hull_shader_transform.cpp
@@ -914,6 +973,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp
                       src/shader_recompiler/ir/passes/shared_memory_simplify_pass.cpp
                       src/shader_recompiler/ir/passes/shared_memory_to_storage_pass.cpp
+                      src/shader_recompiler/ir/passes/srt.h
                       src/shader_recompiler/ir/passes/ssa_rewrite_pass.cpp
                       src/shader_recompiler/ir/abstract_syntax_list.cpp
                       src/shader_recompiler/ir/abstract_syntax_list.h
@@ -923,6 +983,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/basic_block.h
                       src/shader_recompiler/ir/breadth_first_search.h
                       src/shader_recompiler/ir/condition.h
+                      src/shader_recompiler/ir/debug_print.h
                       src/shader_recompiler/ir/ir_emitter.cpp
                       src/shader_recompiler/ir/ir_emitter.h
                       src/shader_recompiler/ir/microinstruction.cpp
@@ -932,6 +993,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/operand_helper.h
                       src/shader_recompiler/ir/patch.cpp
                       src/shader_recompiler/ir/patch.h
+                      src/shader_recompiler/ir/pattern_matching.h
                       src/shader_recompiler/ir/position.h
                       src/shader_recompiler/ir/post_order.cpp
                       src/shader_recompiler/ir/post_order.h
@@ -939,6 +1001,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/program.h
                       src/shader_recompiler/ir/reinterpret.h
                       src/shader_recompiler/ir/reg.h
+                      src/shader_recompiler/ir/srt_gvn_table.h
                       src/shader_recompiler/ir/type.cpp
                       src/shader_recompiler/ir/type.h
                       src/shader_recompiler/ir/value.cpp
@@ -958,8 +1021,12 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/regs.h
                src/video_core/amdgpu/regs_primitive.h
                src/video_core/amdgpu/regs_shader.h
+               src/video_core/amdgpu/regs_snapshot.h
+               src/video_core/amdgpu/regs_snapshot_pool.cpp
+               src/video_core/amdgpu/regs_snapshot_pool.h
                src/video_core/amdgpu/regs_texture.h
                src/video_core/amdgpu/regs_vertex.h
+               src/video_core/amdgpu/gpu_command_list.h
                src/video_core/amdgpu/resource.h
                src/video_core/amdgpu/tiling.cpp
                src/video_core/amdgpu/tiling.h
@@ -973,16 +1040,26 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
+               src/video_core/renderer_vulkan/gpucomm_metrics.h
+               src/video_core/renderer_vulkan/bindresources_metrics.h
+               src/video_core/renderer_vulkan/bundle_assembler.cpp
+               src/video_core/renderer_vulkan/bundle_assembler.h
+               src/video_core/renderer_vulkan/draw_intent.h
+               src/video_core/renderer_vulkan/helvetica_blkcond_font.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
+               src/video_core/renderer_vulkan/vk_compute_scheduler.cpp
+               src/video_core/renderer_vulkan/vk_compute_scheduler.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
+               src/video_core/renderer_vulkan/vk_loading_screen.cpp
+               src/video_core/renderer_vulkan/vk_loading_screen.h
                src/video_core/renderer_vulkan/vk_master_semaphore.cpp
                src/video_core/renderer_vulkan/vk_master_semaphore.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
@@ -1025,11 +1102,13 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/sampler.h
                src/video_core/texture_cache/texture_cache.cpp
                src/video_core/texture_cache/texture_cache.h
+               src/video_core/texture_cache/tile.h
                src/video_core/texture_cache/tile_manager.cpp
                src/video_core/texture_cache/tile_manager.h
                src/video_core/texture_cache/types.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
+               src/video_core/image.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
                src/video_core/multi_level_page_table.h
@@ -1084,6 +1163,10 @@ add_executable(shadps4
 create_target_directory_groups(shadps4)
 
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui gcn half::half ZLIB::ZLIB PNG::PNG)
+
+# PhotoMode JPEG uses bundled stb headers (no system JPEG dependency)
+# target_include_directories(shadps4 PRIVATE ${JPEG_INCLUDE_DIRS})
+# target_link_libraries(shadps4 PRIVATE ${JPEG_LIBRARIES})
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 SDL3_mixer::SDL3_mixer pugixml::pugixml)
 target_link_libraries(shadps4 PRIVATE stb::headers libusb::usb lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz)
 

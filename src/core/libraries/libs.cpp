@@ -22,6 +22,8 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libc_internal/libc_internal.h"
 #include "core/libraries/libpng/pngdec.h"
+#include "core/libraries/jpeg/jpegenc.h"
+#include "core/libraries/jpeg/jpegdec.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/mouse/mouse.h"
 #include "core/libraries/move/move.h"
@@ -51,6 +53,10 @@
 #include "core/libraries/save_data/dialog/savedatadialog.h"
 #include "core/libraries/save_data/savedata.h"
 #include "core/libraries/screenshot/screenshot.h"
+#include "core/libraries/share_utility/share_utility.h"
+#include "core/libraries/content_export/content_export.h"
+#include "core/libraries/content_search/content_search.h"
+#include "core/libraries/content_delete/content_delete.h"
 #include "core/libraries/share_play/shareplay.h"
 #include "core/libraries/signin_dialog/signindialog.h"
 #include "core/libraries/system/commondialog.h"
@@ -70,7 +76,6 @@
 #include "core/libraries/web_browser_dialog/webbrowserdialog.h"
 #include "core/libraries/zlib/zlib_sce.h"
 #include "fiber/fiber.h"
-#include "jpeg/jpegenc.h"
 
 namespace Libraries {
 
@@ -105,8 +110,14 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     Libraries::Np::NpAuth::RegisterLib(sym);
     Libraries::Np::NpParty::RegisterLib(sym);
     Libraries::ScreenShot::RegisterLib(sym);
+    Libraries::ShareUtility::RegisterLib(sym);
+    Libraries::ContentExport::RegisterLib(sym);
+    Libraries::ContentSearch::RegisterLib(sym);
+    Libraries::ContentDelete::RegisterLib(sym);
     Libraries::AppContent::RegisterLib(sym);
     Libraries::PngDec::RegisterLib(sym);
+    Libraries::JpegEnc::RegisterLib(sym);
+    Libraries::JpegDec::RegisterLib(sym);
     Libraries::PlayGo::RegisterLib(sym);
     Libraries::PlayGo::Dialog::RegisterLib(sym);
     Libraries::Random::RegisterLib(sym);
@@ -127,7 +138,6 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     Libraries::RazorCpu::RegisterLib(sym);
     Libraries::Move::RegisterLib(sym);
     Libraries::Fiber::RegisterLib(sym);
-    Libraries::JpegEnc::RegisterLib(sym);
     Libraries::Mouse::RegisterLib(sym);
     Libraries::WebBrowserDialog::RegisterLib(sym);
     Libraries::Zlib::RegisterLib(sym);

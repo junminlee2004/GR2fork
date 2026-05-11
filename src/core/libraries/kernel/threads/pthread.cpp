@@ -12,6 +12,22 @@
 #include "core/libraries/libs.h"
 #include "core/memory.h"
 
+// PERF(GR2FORK): platform headers for honoring Pthread::SetAffinity. Prior to
+// this change the entire SetAffinity body was commented out and the function
+// returned 0 (POSIX success) without applying the requested mask, which meant
+// every scePthreadSetaffinity() call from the guest game was silently ignored.
+// On a Z1 Extreme handheld with 16 logical CPUs and a fully-loaded PS4 guest
+// thread set (MTTW 31% / DrawThread 11% / JoBwOrKeR 9% etc.) this left thread
+// placement entirely up to the OS scheduler with no input from the game's
+// already-decided per-thread core preferences. Honoring the call here is the
+// ground-floor prerequisite for *any* downstream core-distribution policy.
+#ifdef _WIN64
+#include <windows.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace Libraries::Kernel {
 
 constexpr int PthreadInheritSched = 4;
@@ -548,8 +564,38 @@ int Pthread::SetAffinity(const Cpuset* cpuset) {
         return POSIX_ESRCH;
     }
 
-    // We don't use this currently because some games gets performance problems
-    // when applying affinity even on strong hardware
+    // GR2FORK: reverted to upstream shadPS4's no-op shape.
+    //
+    // Upstream rationale (preserved): "We don't use this currently because
+    // some games gets performance problems when applying affinity even on
+    // strong hardware."
+    //
+    // GR2FORK addendum: a previous fork revision honored scePthreadSet-
+    // affinity by passing the guest's mask through a strip+widen transform
+    // (Common::GetGuestExcludedCoreMask + GetGuestExpansionMask) and then
+    // applying it to the host kernel. That path turned out to be redundant
+    // with the host-side reservation already done in Liverpool::Process:
+    //
+    //   * GpuComm pins itself to GetReservedCoreMask().
+    //   * The assembler pins itself to GetGpuAssemblerCoreMask().
+    //   * ExcludeReservedCoresFromAllOtherThreads() walks /proc/self/task
+    //     (Linux) or Toolhelp32Snapshot (Windows) and AND-strips
+    //     (decision.mask | decision.assembler_mask) from every other
+    //     thread's affinity.
+    //   * StartPeriodicAffinityRewalk() re-runs that walk every 5 s on
+    //     Windows to catch CreateThread spawns (which don't inherit
+    //     thread-level affinity).
+    //
+    // That host-side machinery is what actually produces the desired
+    // scheduling outcome: guest threads end up on (full host CPUs) AND
+    // NOT (reserved cores), regardless of what the guest's
+    // scePthreadSetaffinity mask says. The strip+widen path inside this
+    // function was duplicating that work and reintroducing the upstream
+    // "performance problems" complaint by narrowing guest masks more
+    // aggressively than the exclusion walk does.
+    //
+    // Reverting to no-op restores upstream behavior on the guest side
+    // while preserving every host-side reservation primitive intact.
     /*
     u64 mask = cpuset->bits;
     #ifdef _WIN64

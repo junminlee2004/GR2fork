@@ -180,6 +180,9 @@ static ConfigEntry<bool> isHDRAllowed(false);
 static ConfigEntry<bool> fsrEnabled(false);
 static ConfigEntry<bool> rcasEnabled(true);
 static ConfigEntry<int> rcasAttenuation(250);
+static ConfigEntry<string> aspectRatioOverride("16:9");
+static ConfigEntry<string> resolutionOverride("Off");
+static ConfigEntry<bool> disableMotionBlur(false);
 
 // Vulkan
 static ConfigEntry<s32> gpuId(-1);
@@ -193,6 +196,8 @@ static ConfigEntry<bool> vkGuestMarkers(false);
 static ConfigEntry<bool> rdocEnable(false);
 static ConfigEntry<bool> pipelineCacheEnable(false);
 static ConfigEntry<bool> pipelineCacheArchive(false);
+static ConfigEntry<bool> vkForcePushDescriptors(false);
+static ConfigEntry<bool> vkDisablePushDescriptors(false);
 
 // Debug
 static ConfigEntry<bool> isDebugDump(false);
@@ -514,6 +519,14 @@ bool getVkGuestMarkersEnabled() {
     return vkGuestMarkers.get();
 }
 
+bool vkForcePushDescriptorsEnabled() {
+    return vkForcePushDescriptors.get();
+}
+
+bool vkDisablePushDescriptorsEnabled() {
+    return vkDisablePushDescriptors.get();
+}
+
 void setVkCrashDiagnosticEnabled(bool enable, bool is_game_specific) {
     vkCrashDiagnostic.set(enable, is_game_specific);
 }
@@ -524,6 +537,14 @@ void setVkHostMarkersEnabled(bool enable, bool is_game_specific) {
 
 void setVkGuestMarkersEnabled(bool enable, bool is_game_specific) {
     vkGuestMarkers.set(enable, is_game_specific);
+}
+
+void setVkForcePushDescriptors(bool enable, bool is_game_specific) {
+    vkForcePushDescriptors.set(enable, is_game_specific);
+}
+
+void setVkDisablePushDescriptors(bool enable, bool is_game_specific) {
+    vkDisablePushDescriptors.set(enable, is_game_specific);
 }
 
 bool getIsConnectedToNetwork() {
@@ -847,6 +868,30 @@ void setRcasAttenuation(int value, bool is_game_specific) {
     rcasAttenuation.set(value, is_game_specific);
 }
 
+std::string getAspectRatioOverride() {
+    return aspectRatioOverride.get();
+}
+
+void setAspectRatioOverride(const std::string& value, bool is_game_specific) {
+    aspectRatioOverride.set(value, is_game_specific);
+}
+
+std::string getResolutionOverride() {
+    return resolutionOverride.get();
+}
+
+void setResolutionOverride(const std::string& value, bool is_game_specific) {
+    resolutionOverride.set(value, is_game_specific);
+}
+
+bool getDisableMotionBlur() {
+    return disableMotionBlur.get();
+}
+
+void setDisableMotionBlur(bool value, bool is_game_specific) {
+    disableMotionBlur.set(value, is_game_specific);
+}
+
 int getUsbDeviceBackend() {
     return usbDeviceBackend.get();
 }
@@ -952,6 +997,9 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         fsrEnabled.setFromToml(gpu, "fsrEnabled", is_game_specific);
         rcasEnabled.setFromToml(gpu, "rcasEnabled", is_game_specific);
         rcasAttenuation.setFromToml(gpu, "rcasAttenuation", is_game_specific);
+        aspectRatioOverride.setFromToml(gpu, "aspectRatioOverride", is_game_specific);
+        resolutionOverride.setFromToml(gpu, "resolutionOverride", is_game_specific);
+        disableMotionBlur.setFromToml(gpu, "disableMotionBlur", is_game_specific);
     }
 
     if (data.contains("Vulkan")) {
@@ -968,6 +1016,8 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         rdocEnable.setFromToml(vk, "rdocEnable", is_game_specific);
         pipelineCacheEnable.setFromToml(vk, "pipelineCacheEnable", is_game_specific);
         pipelineCacheArchive.setFromToml(vk, "pipelineCacheArchive", is_game_specific);
+        vkForcePushDescriptors.setFromToml(vk, "forcePushDescriptors", is_game_specific);
+        vkDisablePushDescriptors.setFromToml(vk, "disablePushDescriptors", is_game_specific);
     }
 
     string current_version = {};
@@ -1126,6 +1176,9 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     fsrEnabled.setTomlValue(data, "GPU", "fsrEnabled", is_game_specific);
     rcasEnabled.setTomlValue(data, "GPU", "rcasEnabled", is_game_specific);
     rcasAttenuation.setTomlValue(data, "GPU", "rcasAttenuation", is_game_specific);
+    aspectRatioOverride.setTomlValue(data, "GPU", "aspectRatioOverride", is_game_specific);
+    resolutionOverride.setTomlValue(data, "GPU", "resolutionOverride", is_game_specific);
+    disableMotionBlur.setTomlValue(data, "GPU", "disableMotionBlur", is_game_specific);
     directMemoryAccessEnabled.setTomlValue(data, "GPU", "directMemoryAccess", is_game_specific);
 
     gpuId.setTomlValue(data, "Vulkan", "gpuId", is_game_specific);
@@ -1139,6 +1192,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     rdocEnable.setTomlValue(data, "Vulkan", "rdocEnable", is_game_specific);
     pipelineCacheEnable.setTomlValue(data, "Vulkan", "pipelineCacheEnable", is_game_specific);
     pipelineCacheArchive.setTomlValue(data, "Vulkan", "pipelineCacheArchive", is_game_specific);
+    vkForcePushDescriptors.setTomlValue(data, "Vulkan", "forcePushDescriptors", is_game_specific);
+    vkDisablePushDescriptors.setTomlValue(data, "Vulkan", "disablePushDescriptors", is_game_specific);
 
     isDebugDump.setTomlValue(data, "Debug", "DebugDump", is_game_specific);
     isShaderDebug.setTomlValue(data, "Debug", "CollectShader", is_game_specific);
@@ -1259,6 +1314,9 @@ void setDefaultValues(bool is_game_specific) {
     fsrEnabled.set(true, is_game_specific);
     rcasEnabled.set(true, is_game_specific);
     rcasAttenuation.set(250, is_game_specific);
+    aspectRatioOverride.set("16:9", is_game_specific);
+    resolutionOverride.set("Off", is_game_specific);
+    disableMotionBlur.set(false, is_game_specific);
 
     // GS - Vulkan
     gpuId.set(-1, is_game_specific);
@@ -1272,6 +1330,8 @@ void setDefaultValues(bool is_game_specific) {
     rdocEnable.set(false, is_game_specific);
     pipelineCacheEnable.set(false, is_game_specific);
     pipelineCacheArchive.set(false, is_game_specific);
+    vkForcePushDescriptors.set(false, is_game_specific);
+    vkDisablePushDescriptors.set(false, is_game_specific);
 
     // GS - Debug
     isDebugDump.set(false, is_game_specific);

@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/debug.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/file_system.h"
+#include "core/libraries/kernel/ipmimgr.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -311,6 +312,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     Libraries::Kernel::RegisterException(sym);
     Libraries::Kernel::RegisterAio(sym);
     Libraries::Kernel::RegisterDebug(sym);
+    Libraries::Kernel::RegisterIpmi(sym);
 
     LIB_OBJ("f7uOxY9mM1U", "libkernel", 1, "libkernel", &g_stack_chk_guard);
     LIB_FUNCTION("D4yla3vx4tY", "libkernel", 1, "libkernel", sceKernelError);

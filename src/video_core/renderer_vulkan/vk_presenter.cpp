@@ -4,18 +4,23 @@
 #include "common/config.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/frame_time_recorder.h"
 #include "common/singleton.h"
+#include "core/libraries/aspect_patches/aspect_patches.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/libraries/system/systemservice.h"
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/vk_loading_screen.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
+#include <chrono>
 #include <imgui.h>
 #include <vk_mem_alloc.h>
 
@@ -107,6 +112,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       instance{window, Config::getGpuId(), Config::vkValidationEnabled(),
                Config::getVkCrashDiagnosticEnabled()},
       draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      // MQ-3: shares draw_scheduler's MasterSemaphore as the unified timeline.
+      // Must be constructed AFTER draw_scheduler so GetMasterSemaphore() is valid.
+      compute_scheduler{instance, draw_scheduler.GetMasterSemaphore()},
       swapchain{instance, window},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -136,7 +144,18 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
 Presenter::~Presenter() {
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
-    draw_scheduler.Finish();
+    // Phase 1D-pre-E: route the draw_scheduler.Finish() touch through the
+    // BundleAssembler so under future async the assembler thread executes
+    // it (single-writer of draw_scheduler).
+    //
+    // Phase 1D-1 (Phase G): BLOCKING — Push + WaitFor. Finish must
+    // complete (device idle) before the rest of the destructor proceeds
+    // to vmaDestroyImage / device.destroyImageView / etc. — those Vulkan
+    // teardown calls are unsafe while GPU work is still in flight.
+    const u32 seq = rasterizer->PushPresenterRecord([this] {
+        draw_scheduler.Finish();
+    });
+    rasterizer->WaitForAssembler(seq);
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
@@ -240,7 +259,7 @@ Frame* Presenter::PrepareLastFrame() {
 
     auto& scheduler = flip_scheduler;
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -273,6 +292,129 @@ Frame* Presenter::PrepareLastFrame() {
     return frame;
 }
 
+bool Presenter::CaptureScreenshot(std::vector<u8>& out_pixels, u32& out_width, u32& out_height) {
+    if (last_submit_frame == nullptr) {
+        LOG_WARNING(Render_Vulkan, "CaptureScreenshot: no frame available");
+        return false;
+    }
+
+    Frame* frame = last_submit_frame;
+    out_width = frame->width;
+    out_height = frame->height;
+    const u64 pixel_count = static_cast<u64>(out_width) * out_height;
+    const u64 buffer_size = pixel_count * 4;
+
+    const vk::Device device = instance.GetDevice();
+
+    // Wait for the frame to finish presenting
+    {
+        vk::Result result = device.waitForFences(frame->present_done, true,
+                                                  std::numeric_limits<u64>::max());
+        if (result != vk::Result::eSuccess) {
+            LOG_ERROR(Render_Vulkan, "CaptureScreenshot: fence wait failed");
+            return false;
+        }
+    }
+
+    // Create staging buffer for GPU→CPU transfer
+    VkBufferCreateInfo buf_ci{};
+    buf_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buf_ci.size = buffer_size;
+    buf_ci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    VmaAllocationCreateInfo alloc_ci{};
+    alloc_ci.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+    alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer staging_buffer{};
+    VmaAllocation staging_alloc{};
+    VmaAllocationInfo staging_info{};
+
+    if (vmaCreateBuffer(instance.GetAllocator(), &buf_ci, &alloc_ci,
+                        &staging_buffer, &staging_alloc, &staging_info) != VK_SUCCESS) {
+        LOG_ERROR(Render_Vulkan, "CaptureScreenshot: failed to create staging buffer");
+        return false;
+    }
+
+    // Record copy commands using flip_scheduler
+    auto& sched = flip_scheduler;
+    sched.EndRendering();
+    const auto cmdbuf = sched.PrimaryCommandBuffer();
+
+    const auto subresource_range = vk::ImageSubresourceRange{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+
+    // Transition frame image to transfer src
+    const auto to_transfer = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .oldLayout = vk::ImageLayout::eGeneral,
+        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .image = frame->image,
+        .subresourceRange = subresource_range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_transfer,
+    });
+
+    // Copy image to buffer
+    const vk::BufferImageCopy copy_region{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {out_width, out_height, 1},
+    };
+    cmdbuf.copyImageToBuffer(frame->image, vk::ImageLayout::eTransferSrcOptimal,
+                             vk::Buffer{staging_buffer}, 1, &copy_region);
+
+    // Transition back to general
+    const auto to_general = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = frame->image,
+        .subresourceRange = subresource_range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_general,
+    });
+
+    // Submit and wait for completion
+    SubmitInfo submit_info{};
+    sched.Flush(submit_info);
+    sched.Finish();
+
+    // Read pixels from mapped staging buffer
+    out_pixels.resize(buffer_size);
+    std::memcpy(out_pixels.data(), staging_info.pMappedData, buffer_size);
+
+    // Cleanup
+    vmaDestroyBuffer(instance.GetAllocator(), staging_buffer, staging_alloc);
+
+    LOG_INFO(Render_Vulkan, "CaptureScreenshot: captured {}x{} frame ({} bytes)",
+             out_width, out_height, buffer_size);
+    return true;
+}
+
 static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat format) {
     switch (format) {
     case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
@@ -292,12 +434,73 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    // Phase 1D-pre-E: Presenter-thread prelude. These touch the texture
+    // cache and the free-frame queue but NOT the scheduler — safe to run
+    // on the caller's thread. The aspect-ratio computation is also
+    // Presenter-thread-only because `expected_ratio` is read from
+    // OnResize on the same thread; moving the write into the closure
+    // would race the read.
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
 
     Frame* frame = GetRenderFrame();
 
+    // Look up image (without LRU touch — see GetImageUntouched note below)
+    // to read its size for the aspect-ratio + DebugState computations.
+    // The actual image_view + image.Transit happen inside the closure on
+    // the assembler thread, where they belong.
+    auto& image_for_size = texture_cache.GetImageUntouched(image_id);
+    const vk::Extent2D image_size = {image_for_size.info.size.width,
+                                      image_for_size.info.size.height};
+
+    // [ASPECT OVERRIDE] When the user has selected a non-16:9 ratio via the
+    // [GPU] aspectRatioOverride config option, force expected_ratio to match
+    // so the presenter stops letterboxing the game's render to its native
+    // 16:9 aspect. When the option is "16:9" / Off (default), fall through
+    // to the original computation.
+    {
+        const auto _aspect_target = Libraries::AspectPatches::ParseAspectFromConfig(
+            Config::getAspectRatioOverride());
+        if (_aspect_target == Libraries::AspectPatches::TargetAspect::Off) {
+            expected_ratio =
+                static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+        } else {
+            expected_ratio = Libraries::AspectPatches::TargetAspectToRatio(_aspect_target);
+        }
+    }
+
+    DebugState.game_resolution = {image_size.width, image_size.height};
+    DebugState.output_resolution = {frame->width, frame->height};
+
+    // Phase 1D-pre-E: scheduler chunk routed through BundleAssembler.
+    // Closure captures by value: frame*, attribute, image_id, image_size.
+    // `this` capture gives the closure access to draw_scheduler, fsr_pass,
+    // pp_pass, fsr_settings, pp_settings, texture_cache.
+    //
+    // Phase 1D-1 (Phase G): BLOCKING — Push + WaitFor. The closure
+    // populates `frame->ready_semaphore` and `frame->ready_tick`; the
+    // caller (videoout flip path via Present()) reads them after this
+    // returns. WaitFor ensures the assembler has completed the body
+    // before we return frame*.
+    const u32 seq = rasterizer->PushPresenterRecord(
+        [this, frame, attribute, image_id, image_size] {
+            DoPrepareFrameRecord(frame, attribute, image_id, image_size);
+        });
+    rasterizer->WaitForAssembler(seq);
+    return frame;
+}
+
+void Presenter::DoPrepareFrameRecord(
+        Frame* frame,
+        const Libraries::VideoOut::BufferAttributeGroup& attribute,
+        VideoCore::ImageId image_id,
+        vk::Extent2D image_size) {
+    // Phase 1D-pre-E: the chunk that touches draw_scheduler. Runs on
+    // whichever thread the BundleAssembler dispatches on — under sync
+    // that's the producer (Presenter) thread; under future async it's
+    // the dedicated assembler thread, making the assembler the sole
+    // writer of draw_scheduler.
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
@@ -318,7 +521,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    const auto cmdbuf = draw_scheduler.CommandBuffer();
+    const auto cmdbuf = draw_scheduler.PrimaryCommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &pre_barrier,
@@ -329,36 +532,64 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
 
-    auto& image = texture_cache.GetImage(image_id);
+    // FIX(GR2FORK): use GetImageUntouched, NOT GetImage. The plain GetImage()
+    // calls TouchImage() → lru_cache.Touch() → Detach+Attach on the LRU
+    // linked list, but does NOT take the texture_cache mutex. We're on the
+    // PresentThread here (under sync) or the assembler thread (under async),
+    // either of which races with GpuCommandProcessor's RunGarbageCollector
+    // (which DOES hold the mutex while iterating that same linked list via
+    // ForEachItemBelow). Concurrent Detach/Attach can corrupt the list
+    // into a cyclic state, causing the GC iterator to spin forever and
+    // freezing the entire emulator.
+    //
+    // The presenter doesn't actually need to update the LRU — the
+    // framebuffer image we're presenting is touched constantly by the
+    // rendering thread anyway, so this Touch was incidental.
+    auto& image = texture_cache.GetImageUntouched(image_id);
     auto image_view = *image.FindView(view_info).image_view;
     image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {});
-
-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
-    expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
-
-    DebugState.game_resolution = {image_size.width, image_size.height};
-    DebugState.output_resolution = {frame->width, frame->height};
 
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetMasterSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
-    return frame;
 }
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
 
-    auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
+    // Phase 1D-pre-E: when `present_thread` is true (PrepareBlankFrame
+    // called from inside Present's reuse path) we touch present_scheduler,
+    // which the assembler doesn't write to — race-free, run inline.
+    // When false (called from PumpLoadingFrame at warmup) we touch
+    // draw_scheduler, which the assembler DOES write to — route through
+    // the marker so the assembler ends up the sole writer under future
+    // async.
+    //
+    // Phase 1D-1 (Phase G): false branch is BLOCKING — Push + WaitFor so
+    // the closure has populated frame->ready_* before we return frame*.
+    if (present_thread) {
+        DoPrepareBlankFrameRecord(frame, /*use_present_scheduler=*/true);
+    } else {
+        const u32 seq = rasterizer->PushPresenterRecord([this, frame] {
+            DoPrepareBlankFrameRecord(frame, /*use_present_scheduler=*/false);
+        });
+        rasterizer->WaitForAssembler(seq);
+    }
+    return frame;
+}
+
+void Presenter::DoPrepareBlankFrameRecord(Frame* frame, bool use_present_scheduler) {
+    auto& scheduler = use_present_scheduler ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
 
     constexpr vk::ImageSubresourceRange simple_subresource = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -421,7 +652,92 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
-    return frame;
+}
+
+void Presenter::WarmUpPipelineCache() {
+    // Always drive WarmUp through here, even when the cache is disabled or
+    // empty — WarmUp itself will short-circuit cheaply, and uniformly going
+    // through this path keeps the call site in gnmdriver::RegisterLib simple
+    // (no second branch on Config::isPipelineCacheEnabled).
+    auto& loading = GetLoadingScreenLayer();
+    loading.SetVisible(true);
+    loading.SetProgress(0, 0);
+    // Tell the layer the swapchain's actual extent. ImGui's io.DisplaySize
+    // comes from SDL_GetWindowSize (the SDL window's logical size, often
+    // 720p) but the swapchain is sized to the game's output resolution
+    // (typically 1080p). Without this push, ImGui's renderer would
+    // viewport-clamp to the SDL window size and our overlay would paint
+    // into only the top-left rectangle of the swapchain image. Updating
+    // each frame defends against swapchain recreation mid-warmup.
+    {
+        const auto extent = swapchain.GetExtent();
+        loading.SetSwapchainExtent(extent.width, extent.height);
+    }
+    ImGui::Layer::AddLayer(&loading);
+
+    // Pump one frame immediately so the user sees the overlay before the
+    // first blob is read off disk. Without this, on systems where ForEachBlob
+    // is fast enough to finish before any tick fires (e.g. tiny cache, fast
+    // SSD) the layer would never get a chance to render and the screen would
+    // stay black for the brief moment WarmUp is running.
+    PumpLoadingFrame();
+
+    // Throttle swapchain redraws while shaders deserialize. Without this,
+    // calling PumpLoadingFrame on every blob would dominate the warmup
+    // cost — a Present() involves AcquireNextImage / submit / present, each
+    // an order of magnitude more expensive than reading and decoding one
+    // pipeline blob. ~60ms ≈ 16 fps which is plenty for "the screen is
+    // alive" purposes; counter still advances on every blob via
+    // SetProgress which is just two atomic stores.
+    using clock = std::chrono::steady_clock;
+    auto last_present = clock::now();
+    constexpr auto kFrameInterval = std::chrono::milliseconds(60);
+
+    rasterizer->GetPipelineCache().WarmUp([&](u32 loaded, u32 total) {
+        loading.SetProgress(loaded, total);
+        const auto now = clock::now();
+        if (now - last_present >= kFrameInterval) {
+            last_present = now;
+            PumpLoadingFrame();
+        }
+    });
+
+    // One last frame in the "READY" state so the transition isn't a hard
+    // cut from "loading" to whatever the game's first real frame is. The
+    // overlay is removed immediately after; gnmdriver::RegisterLib returns
+    // and videoout::RegisterLib starts the PresentThread which takes over.
+    loading.MarkFinished();
+    PumpLoadingFrame();
+
+    loading.SetVisible(false);
+    ImGui::Layer::RemoveLayer(&loading);
+    // The remove queues into ImGui::Core's change_layers; it gets applied
+    // on the next NewFrame, which is fine — once visible_ flips to false
+    // the layer's Draw is a no-op anyway.
+}
+
+void Presenter::PumpLoadingFrame() {
+    // Manual single-frame pump driven by the gnmdriver registration thread
+    // (which is the only thread alive during warmup — videoout's
+    // PresentThread doesn't exist yet). PrepareBlankFrame produces a black
+    // frame using draw_scheduler, then Present runs it through the normal
+    // ImGui+swapchain path; the LoadingScreenLayer paints over the result
+    // via its own ImGui window.
+
+    // Refresh the swapchain extent on the layer every pump in case the
+    // swapchain was recreated since AddLayer (window resize, surface
+    // format change). PrepareBlankFrame doesn't itself recreate, but
+    // Present can.
+    {
+        auto& loading = GetLoadingScreenLayer();
+        const auto extent = swapchain.GetExtent();
+        loading.SetSwapchainExtent(extent.width, extent.height);
+    }
+
+    Frame* frame = PrepareBlankFrame(false);
+    if (frame != nullptr) {
+        Present(frame);
+    }
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
@@ -463,7 +779,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
 
     auto& scheduler = present_scheduler;
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
 
     if (Config::getVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
@@ -613,6 +929,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     if (!swapchain.Present()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
+
+    // PERF(Phase 0): record per-flip wall-clock delta for the FPS A/B harness.
+    // Writer is single-threaded (videoout vblank thread); cost is a steady_clock
+    // read + ring-slot store. See common/frame_time_recorder.h for the env-var
+    // contract (GR2_FPS_LOG_EVERY / GR2_FPS_OUT / GR2_FPS_DISABLE). Hooked
+    // *after* swapchain.Present() so frames skipped by AcquireNextImage failure
+    // earlier in this function don't pollute the percentile distribution.
+    //
+    // NOP'D (post-v1.58): CSV harness is no longer in active use — the v1.58
+    // floor is shipped and Phase 1C measurement will use perf-trace-driven
+    // methodology rather than per-flip CSV. Recorder source kept in tree
+    // (common/frame_time_recorder.{h,cpp}) so re-enabling is a one-line revert.
+    // Common::FrameTime::RecordFlip();
 
     free_frame();
     if (!is_reusing_frame) {

@@ -348,5 +348,13 @@ int PS4_SYSV_ABI Func_51E514BCD3A05CA5();
 int PS4_SYSV_ABI Func_89C9237E393DA243();
 int PS4_SYSV_ABI Func_EF103E845B6F0420();
 
+// Raw button state snapshot for external consumers (e.g., gallery HLE research).
+// Accumulates button presses from both scePadRead/scePadReadState AND an SDL
+// event watcher (installed lazily on first scePadRead call). Uses PS4 button
+// bitmask values (Triangle=0x1000, Circle=0x2000, Cross=0x4000, Square=0x8000,
+// D-pad Up=0x10, Right=0x20, Down=0x40, Left=0x80, L1=0x100, R1=0x200).
+u32 GetRawButtons();    // Consume-and-clear
+u32 PeekRawButtons();   // Non-destructive
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::Pad

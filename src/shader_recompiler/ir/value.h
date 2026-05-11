@@ -166,16 +166,27 @@ public:
 
     /// Get the number of arguments this instruction has.
     [[nodiscard]] size_t NumArgs() const {
-        return op == IR::Opcode::Phi ? phi_args.size() : NumArgsOf(op);
+        // PERF(GR2FORK v1.15): Phi instructions are a tiny minority of IR
+        // (only at control-flow merges); converting the ternary to an
+        // explicit if/else gives us the [[unlikely]] anchor and lets the
+        // optimizer keep the dynamic phi_args.size() load off the hot
+        // straight-line path used by every IR pass.
+        if (op == IR::Opcode::Phi) [[unlikely]] {
+            return phi_args.size();
+        }
+        return NumArgsOf(op);
     }
 
     /// Get the value of a given argument index.
     [[nodiscard]] Value Arg(size_t index) const noexcept {
-        if (op == IR::Opcode::Phi) {
+        // PERF(GR2FORK v1.15): Same reasoning — Phi is the rare branch in
+        // any IR pass that walks args (constant prop, DCE, identity removal,
+        // SSA, info-collection). Keep the args[index] return on the
+        // straight-line fast path.
+        if (op == IR::Opcode::Phi) [[unlikely]] {
             return phi_args[index].second;
-        } else {
-            return args[index];
         }
+        return args[index];
     }
 
     /// Set the value of a given argument index.

@@ -680,11 +680,21 @@ void* AddressSpace::Map(VAddr virtual_addr, size_t size, u64 alignment, PAddr ph
 #if ARCH_X86_64
     const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
 #else
-    // On non-native architectures, we can simplify things by ignoring the execute flag for the
-    // canonical copy of the memory and rely on the JIT to map translated code as executable.
     constexpr auto prot = PAGE_READWRITE;
 #endif
-    return impl->Map(virtual_addr, phys_addr, size, prot);
+
+    // GR2FORK: Capture pointer to apply Huge Page hint
+    void* ptr = impl->Map(virtual_addr, phys_addr, size, prot);
+
+#ifdef __linux__
+    // Force Huge Pages (2MB) on Ryzen 7840U to reduce TLB overhead.
+    // This stabilizes frame times in open-world titles like Gravity Rush 2.
+    if (ptr != (void*)-1 && size >= 0x200000) {
+        madvise(ptr, size, MADV_HUGEPAGE);
+    }
+#endif
+
+    return ptr;
 }
 
 void* AddressSpace::MapFile(VAddr virtual_addr, size_t size, size_t offset, u32 prot,

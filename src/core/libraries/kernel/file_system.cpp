@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/file_sys/devices/console_device.h"
@@ -27,6 +28,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/network/sockets.h"
 #include "core/memory.h"
+#include "core/libraries/screenshot/photo_gnf_generator.h"
 #include "kernel.h"
 
 #ifdef _WIN32
@@ -129,6 +131,78 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     file->m_guest_name = path;
     file->m_host_name = mnt->GetHostPath(file->m_guest_name, &read_only);
     bool exists = fs::exists(file->m_host_name);
+
+    // v57: GR2 gallery fiber redirect — if a "photo/" path fails to resolve,
+    // try looking in the screenshots directory directly. FIOS2 may pass paths
+    // like "photo/CONTENT_ID.jpg" or "/app0/photo/CONTENT_ID.jpg" that don't
+    // match any mount. Extract the filename and try the screenshots dir.
+    // Also try adding/removing .jpg since we don't know the exact fiber format.
+    if (!exists && std::string_view{raw_path}.find("photo") != std::string_view::npos) {
+        std::string_view pv{raw_path};
+        auto photo_pos = pv.find("photo/");
+        if (photo_pos != std::string_view::npos) {
+            auto filename = std::string(pv.substr(photo_pos + 6));
+            auto screenshots_dir = Common::FS::GetUserPath(
+                Common::FS::PathType::ScreenshotsDir) / "GR2_PhotoApp_HLE";
+            
+            // Try exact name first
+            auto try_path = screenshots_dir / filename;
+            if (!fs::exists(try_path) && !filename.ends_with(".jpg")) {
+                // Try adding .jpg
+                try_path = screenshots_dir / (filename + ".jpg");
+            }
+            if (!fs::exists(try_path) && filename.ends_with(".jpg")) {
+                // Try without .jpg
+                try_path = screenshots_dir / filename.substr(0, filename.size() - 4);
+            }
+            
+            if (fs::exists(try_path)) {
+                file->m_host_name = try_path;
+                exists = true;
+                read_only = true;
+                LOG_INFO(Kernel_Fs,
+                    "[GR2v57] Photo redirect: '{}' → '{}'",
+                    raw_path, try_path.string());
+            } else {
+                LOG_WARNING(Kernel_Fs,
+                    "[GR2v57] Photo path not found: '{}' (tried '{}')",
+                    raw_path, (screenshots_dir / filename).string());
+            }
+        }
+    }
+
+    // v57: Log ALL file opens that contain "photo" for debugging fiber paths
+    if (std::string_view{raw_path}.find("photo") != std::string_view::npos) {
+        LOG_INFO(Kernel_Fs,
+            "[GR2v57] open() with photo path: '{}' exists={} host='{}'",
+            raw_path, exists, file->m_host_name.string());
+    }
+
+    // v155x: Log ANY file open containing "j=" — detect if CDtex system
+    // uses FIOS2/sceKernelOpen for j= overlay entries
+    if (std::string_view{raw_path}.find("j=") != std::string_view::npos) {
+        LOG_INFO(Kernel_Fs,
+            "[GR2v155x] ★ j= file open: '{}' exists={} host='{}'",
+            raw_path, exists, file->m_host_name.string());
+    }
+
+    // v142: GNF photo substitution — swap paw-print texture with decoded photos
+    // When CDtex/FAM loads film_dummy.gnf for a gallery slot, redirect to our
+    // decoded photo GNF file. Each slot gets a different photo via atomic counter.
+    if (std::string_view{raw_path}.find("film_dummy") != std::string_view::npos) {
+        auto& gnf_mgr = Libraries::ScreenShot::PhotoGnfManager::Instance();
+        if (gnf_mgr.IsReady()) {
+            auto photo_path = gnf_mgr.ConsumeNextSlotPath();
+            if (!photo_path.empty() && fs::exists(photo_path)) {
+                file->m_host_name = photo_path;
+                exists = true;
+                read_only = true;
+                LOG_INFO(Kernel_Fs, "[GR2v155] film_dummy.gnf → {}",
+                         photo_path.string());
+            }
+        }
+    }
+
     s32 e = 0;
 
     if (create) {

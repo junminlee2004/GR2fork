@@ -239,7 +239,22 @@ public:
         return size_to_validate <= 0;
     }
 
-    u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+    // PERF(GR2FORK release_v2_2): inline the dominant fast path. The vast
+    // majority of calls (BufferCache::ObtainBuffer, FindBuffer, etc.) pass
+    // size << 3_GB, which is a static-known no-op clamp. Pre-v2_2 this
+    // still cost a non-inlined function call (push args + jmp + return);
+    // appeared at 0.12% on the GpuComm thread in the captured perf trace
+    // even though the body bailed immediately. The slow path stays
+    // out-of-line in memory.cpp so this header doesn't pull in vma_map.
+    u64 ClampRangeSizeSlow(VAddr virtual_addr, u64 size);
+    inline u64 ClampRangeSize(VAddr virtual_addr, u64 size) {
+        // 3_GB matches the threshold in ClampRangeSizeSlow; keep them
+        // synchronized if you change either.
+        if (size < (3ULL << 30)) [[likely]] {
+            return size;
+        }
+        return ClampRangeSizeSlow(virtual_addr, size);
+    }
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 

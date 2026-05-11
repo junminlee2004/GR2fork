@@ -55,7 +55,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
         .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
     };
-    scheduler.CommandBuffer().pipelineBarrier(
+    scheduler.PrimaryCommandBuffer().pipelineBarrier(
         vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
         vk::DependencyFlagBits::eByRegion, READ_BARRIER, {}, {});
 
@@ -109,11 +109,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Execute buffer copies.
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
-        scheduler.CommandBuffer().copyBuffer(src_buf->Handle(), dst_buf->Handle(), vk_copies);
+        scheduler.PrimaryCommandBuffer().copyBuffer(src_buf->Handle(), dst_buf->Handle(), vk_copies);
         batch_start = batch_end;
     }
 
-    scheduler.CommandBuffer().pipelineBarrier(
+    scheduler.PrimaryCommandBuffer().pipelineBarrier(
         vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
         vk::DependencyFlagBits::eByRegion, WRITE_BARRIER, {}, {});
 

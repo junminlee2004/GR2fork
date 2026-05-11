@@ -54,7 +54,10 @@ struct BufferResource {
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer{};
-        if (inline_cbuf) {
+        // PERF(GR2FORK v1.19): inline cbuf is set only for shaders that
+        // embed constants directly (rare); the dominant path reads the
+        // V# from the user_data sharp slot.
+        if (inline_cbuf) [[unlikely]] {
             buffer = inline_cbuf;
             if (inline_cbuf.base_address > 1) {
                 buffer.base_address += info.pgm_base; // address fixup
@@ -62,7 +65,9 @@ struct BufferResource {
         } else {
             buffer = info.template ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
         }
-        if (!buffer.Valid()) {
+        // PERF(GR2FORK v1.19): invalid sharps are an error path —
+        // valid V#s dominate steady-state draws.
+        if (!buffer.Valid()) [[unlikely]] {
             LOG_DEBUG(Render, "Encountered invalid buffer sharp");
             return AmdGpu::Buffer::Null();
         }
@@ -71,6 +76,12 @@ struct BufferResource {
 };
 using BufferResourceList = boost::container::static_vector<BufferResource, NUM_BUFFERS>;
 
+// PORT(upstream #4075): IMAGE_STORE_MIP fallback — when the driver does not
+// expose VK_AMD_shader_image_load_store_lod (or we explicitly disable it for
+// correctness), a shader that writes to an explicit mip level must instead
+// bind each mip level as a separate descriptor and index into them.
+enum class MipStorageFallbackMode : u32 { None, DynamicIndex, ConstantIndex };
+
 struct ImageResource {
     u32 sharp_idx;
     bool is_depth{};
@@ -78,28 +89,47 @@ struct ImageResource {
     bool is_array{};
     bool is_written{};
     bool is_r128{};
+    MipStorageFallbackMode mip_fallback_mode{};
+    u32 constant_mip_index{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
-        if (!is_r128) {
+        // PERF(GR2FORK v1.19): r128 (read-128-bit-as-buffer-shaped image)
+        // is a rarely used shader-image format on shadPS4 — the dominant
+        // path reads a regular T# (sharp) from user_data.
+        if (!is_r128) [[likely]] {
             image = info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
         } else {
             const auto raw = info.template ReadUdSharp<u128>(sharp_idx);
             std::memcpy(&image, &raw, sizeof(raw));
         }
-        if (!image.Valid()) {
+        // PERF(GR2FORK v1.19): invalid T# is an error path; valid sharps
+        // dominate. The is_depth corrective branch fires only when a
+        // shader uses an image-depth instruction on a non-depth-format
+        // image — also an error case.
+        if (!image.Valid()) [[unlikely]] {
             LOG_DEBUG(Render_Vulkan, "Encountered invalid image sharp");
             image = AmdGpu::Image::Null(is_depth);
-        } else if (is_depth) {
+        } else if (is_depth) [[unlikely]] {
             const auto data_fmt = image.GetDataFmt();
             if (data_fmt != AmdGpu::DataFormat::Format16 &&
-                data_fmt != AmdGpu::DataFormat::Format32) {
+                data_fmt != AmdGpu::DataFormat::Format32) [[unlikely]] {
                 LOG_DEBUG(Render_Vulkan,
                           "Encountered non-depth image used with depth instruction!");
                 image = AmdGpu::Image::Null(true);
             }
         }
         return image;
+    }
+
+    // PORT(upstream #4075): how many consecutive descriptor slots this image
+    // consumes. DynamicIndex mode binds one slot per mip level so the shader
+    // can index with a runtime lod value; everything else uses a single slot.
+    u32 NumBindings(const auto& info) const {
+        const AmdGpu::Image tsharp = GetSharp(info);
+        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
+                   ? (tsharp.last_level - tsharp.base_level + 1)
+                   : 1;
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;

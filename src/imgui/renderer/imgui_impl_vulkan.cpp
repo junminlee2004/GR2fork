@@ -193,19 +193,19 @@ static uint32_t FindMemoryType(vk::MemoryPropertyFlags properties, uint32_t type
 }
 
 template <typename T>
+static T CheckVkResult(T res) {
+    return res;
+}
+
+template <typename T>
 static T CheckVkResult(vk::ResultValue<T> res) {
-    if (res.result == vk::Result::eSuccess) {
-        return res.value;
+    if (res.result != vk::Result::eSuccess) {
+        const VkData* bd = GetBackendData();
+        if (bd && bd->init_info.check_vk_result_fn) {
+            bd->init_info.check_vk_result_fn(res.result);
+        }
     }
-    const VkData* bd = GetBackendData();
-    if (!bd) {
-        return res.value;
-    }
-    const InitInfo& v = bd->init_info;
-    if (v.check_vk_result_fn) {
-        v.check_vk_result_fn(res.result);
-    }
-    return res.value;
+    return std::move(res.value);
 }
 
 static void CheckVkErr(vk::Result res) {
@@ -231,10 +231,9 @@ void UploadTextureData::Upload() {
     VkData* bd = GetBackendData();
     const InitInfo& v = bd->init_info;
 
-    vk::SubmitInfo submit_info{
-        .commandBufferCount = 1,
-        .pCommandBuffers = &command_buffer,
-    };
+    vk::SubmitInfo submit_info{};
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
     CheckVkErr(v.queue.submit({submit_info}));
     CheckVkErr(v.queue.waitIdle());
 
@@ -277,31 +276,24 @@ ImTextureID AddTexture(vk::ImageView image_view, vk::ImageLayout image_layout,
     // Create Descriptor Set:
     vk::DescriptorSet descriptor_set;
     {
-        vk::DescriptorSetAllocateInfo alloc_info{
-            .descriptorPool = bd->descriptor_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &bd->descriptor_set_layout,
-        };
+        vk::DescriptorSetAllocateInfo alloc_info{};
+        alloc_info.descriptorPool = bd->descriptor_pool;
+        alloc_info.descriptorSetCount = 1;
+        alloc_info.pSetLayouts = &bd->descriptor_set_layout;
         descriptor_set = CheckVkResult(v.device.allocateDescriptorSets(alloc_info)).front();
     }
 
     // Update the Descriptor Set:
     {
-        vk::DescriptorImageInfo desc_image[1]{
-            {
-                .sampler = sampler,
-                .imageView = image_view,
-                .imageLayout = image_layout,
-            },
-        };
-        vk::WriteDescriptorSet write_desc[1]{
-            {
-                .dstSet = descriptor_set,
-                .descriptorCount = 1,
-                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                .pImageInfo = desc_image,
-            },
-        };
+        vk::DescriptorImageInfo desc_image[1]{};
+        desc_image[0].sampler = sampler;
+        desc_image[0].imageView = image_view;
+        desc_image[0].imageLayout = image_layout;
+        vk::WriteDescriptorSet write_desc[1]{};
+        write_desc[0].dstSet = descriptor_set;
+        write_desc[0].descriptorCount = 1;
+        write_desc[0].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+        write_desc[0].pImageInfo = desc_image;
         v.device.updateDescriptorSets({write_desc}, {});
     }
     return new Texture{
@@ -317,58 +309,50 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
     UploadTextureData info{};
     {
         std::unique_lock lk(bd->command_pool_mutex);
+        vk::CommandBufferAllocateInfo _di_tmp1{};
+        _di_tmp1.commandPool = bd->command_pool;
+        _di_tmp1.commandBufferCount = 1;
         info.command_buffer =
-            CheckVkResult(v.device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
-                              .commandPool = bd->command_pool,
-                              .commandBufferCount = 1,
-                          }))
+            CheckVkResult(v.device.allocateCommandBuffers(_di_tmp1))
                 .front();
-        CheckVkErr(info.command_buffer.begin(vk::CommandBufferBeginInfo{
-            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-        }));
+        vk::CommandBufferBeginInfo _di_tmp2{};
+        _di_tmp2.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+        CheckVkErr(info.command_buffer.begin(_di_tmp2));
     }
 
     // Create Image
     {
-        vk::ImageCreateInfo image_info{
-            .imageType = vk::ImageType::e2D,
-            .format = format,
-            .extent{
-                .width = width,
-                .height = height,
-                .depth = 1,
-            },
-            .mipLevels = 1,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
-            .sharingMode = vk::SharingMode::eExclusive,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        };
+        vk::ImageCreateInfo image_info{};
+        image_info.imageType = vk::ImageType::e2D;
+        image_info.format = format;
+        image_info.extent.width = width;
+        image_info.extent.height = height;
+        image_info.extent.depth = 1;
+        image_info.mipLevels = 1;
+        image_info.arrayLayers = 1;
+        image_info.samples = vk::SampleCountFlagBits::e1;
+        image_info.tiling = vk::ImageTiling::eOptimal;
+        image_info.usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled;
+        image_info.sharingMode = vk::SharingMode::eExclusive;
+        image_info.initialLayout = vk::ImageLayout::eUndefined;
         info.image = CheckVkResult(v.device.createImage(image_info, v.allocator));
         auto req = v.device.getImageMemoryRequirements(info.image);
-        vk::MemoryAllocateInfo alloc_info{
-            .allocationSize = IM_MAX(v.min_allocation_size, req.size),
-            .memoryTypeIndex =
-                FindMemoryType(vk::MemoryPropertyFlagBits::eDeviceLocal, req.memoryTypeBits),
-        };
+        vk::MemoryAllocateInfo alloc_info{};
+        alloc_info.allocationSize = IM_MAX(v.min_allocation_size, req.size);
+        alloc_info.memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eDeviceLocal, req.memoryTypeBits);
         info.image_memory = CheckVkResult(v.device.allocateMemory(alloc_info, v.allocator));
         CheckVkErr(v.device.bindImageMemory(info.image, info.image_memory, 0));
     }
 
     // Create Image View
     {
-        vk::ImageViewCreateInfo view_info{
-            .image = info.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = format,
-            .subresourceRange{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        };
+        vk::ImageViewCreateInfo view_info{};
+        view_info.image = info.image;
+        view_info.viewType = vk::ImageViewType::e2D;
+        view_info.format = format;
+        view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        view_info.subresourceRange.levelCount = 1;
+        view_info.subresourceRange.layerCount = 1;
         info.image_view = CheckVkResult(v.device.createImageView(view_info, v.allocator));
     }
 
@@ -377,19 +361,16 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
 
     // Create Upload Buffer
     {
-        vk::BufferCreateInfo buffer_info{
-            .size = size,
-            .usage = vk::BufferUsageFlagBits::eTransferSrc,
-            .sharingMode = vk::SharingMode::eExclusive,
-        };
+        vk::BufferCreateInfo buffer_info{};
+        buffer_info.size = size;
+        buffer_info.usage = vk::BufferUsageFlagBits::eTransferSrc;
+        buffer_info.sharingMode = vk::SharingMode::eExclusive;
         info.upload_buffer = CheckVkResult(v.device.createBuffer(buffer_info, v.allocator));
         auto req = v.device.getBufferMemoryRequirements(info.upload_buffer);
         auto alignemtn = IM_MAX(bd->buffer_memory_alignment, req.alignment);
-        vk::MemoryAllocateInfo alloc_info{
-            .allocationSize = IM_MAX(v.min_allocation_size, req.size),
-            .memoryTypeIndex =
-                FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible, req.memoryTypeBits),
-        };
+        vk::MemoryAllocateInfo alloc_info{};
+        alloc_info.allocationSize = IM_MAX(v.min_allocation_size, req.size);
+        alloc_info.memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible, req.memoryTypeBits);
         info.upload_buffer_memory = CheckVkResult(v.device.allocateMemory(alloc_info, v.allocator));
         CheckVkErr(v.device.bindBufferMemory(info.upload_buffer, info.upload_buffer_memory, 0));
     }
@@ -398,65 +379,49 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
     {
         char* map = (char*)CheckVkResult(v.device.mapMemory(info.upload_buffer_memory, 0, size));
         memcpy(map, data, size);
-        vk::MappedMemoryRange range[1]{
-            {
-                .memory = info.upload_buffer_memory,
-                .size = size,
-            },
-        };
+        vk::MappedMemoryRange range[1]{};
+        range[0].memory = info.upload_buffer_memory;
+        range[0].size = size;
         CheckVkErr(v.device.flushMappedMemoryRanges(range));
         v.device.unmapMemory(info.upload_buffer_memory);
     }
 
     // Copy to Image
     {
-        vk::ImageMemoryBarrier copy_barrier[1]{
-            {
-                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = info.image,
-                .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .levelCount = 1,
-                    .layerCount = 1,
-                },
-            },
-        };
+        vk::ImageMemoryBarrier copy_barrier[1]{};
+        copy_barrier[0].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        copy_barrier[0].oldLayout = vk::ImageLayout::eUndefined;
+        copy_barrier[0].newLayout = vk::ImageLayout::eTransferDstOptimal;
+        copy_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        copy_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        copy_barrier[0].image = info.image;
+        copy_barrier[0].subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        copy_barrier[0].subresourceRange.levelCount = 1;
+        copy_barrier[0].subresourceRange.layerCount = 1;
         info.command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eHost,
                                             vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
                                             {copy_barrier});
 
-        vk::BufferImageCopy region{
-            .imageSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .layerCount = 1,
-            },
-            .imageExtent{
-                .width = width,
-                .height = height,
-                .depth = 1,
-            },
-        };
+        vk::BufferImageCopy region{};
+        region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent.width = width;
+        region.imageExtent.height = height;
+        region.imageExtent.depth = 1;
         info.command_buffer.copyBufferToImage(info.upload_buffer, info.image,
                                               vk::ImageLayout::eTransferDstOptimal, {region});
 
-        vk::ImageMemoryBarrier use_barrier[1]{{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = info.image,
-            .subresourceRange{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        }};
+        vk::ImageMemoryBarrier use_barrier[1]{};
+        use_barrier[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        use_barrier[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
+        use_barrier[0].oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        use_barrier[0].newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        use_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        use_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        use_barrier[0].image = info.image;
+        use_barrier[0].subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        use_barrier[0].subresourceRange.levelCount = 1;
+        use_barrier[0].subresourceRange.layerCount = 1;
         info.command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                                             vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {},
                                             {use_barrier});
@@ -488,20 +453,17 @@ static void CreateOrResizeBuffer(RenderBuffer& rb, size_t new_size, vk::BufferUs
 
     const vk::DeviceSize buffer_size_aligned =
         AlignBufferSize(IM_MAX(v.min_allocation_size, new_size), bd->buffer_memory_alignment);
-    vk::BufferCreateInfo buffer_info{
-        .size = buffer_size_aligned,
-        .usage = usage,
-        .sharingMode = vk::SharingMode::eExclusive,
-    };
+    vk::BufferCreateInfo buffer_info{};
+    buffer_info.size = buffer_size_aligned;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = vk::SharingMode::eExclusive;
     rb.buffer = CheckVkResult(v.device.createBuffer(buffer_info, v.allocator));
 
     const vk::MemoryRequirements req = v.device.getBufferMemoryRequirements(rb.buffer);
     bd->buffer_memory_alignment = IM_MAX(bd->buffer_memory_alignment, req.alignment);
-    vk::MemoryAllocateInfo alloc_info{
-        .allocationSize = req.size,
-        .memoryTypeIndex =
-            FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible, req.memoryTypeBits),
-    };
+    vk::MemoryAllocateInfo alloc_info{};
+    alloc_info.allocationSize = req.size;
+    alloc_info.memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible, req.memoryTypeBits);
     rb.buffer_memory = CheckVkResult(v.device.allocateMemory(alloc_info, v.allocator));
 
     CheckVkErr(v.device.bindBufferMemory(rb.buffer, rb.buffer_memory, 0));
@@ -526,14 +488,13 @@ static void SetupRenderState(ImDrawData& draw_data, vk::Pipeline pipeline, vk::C
 
     // Setup viewport:
     {
-        vk::Viewport viewport{
-            .x = 0,
-            .y = 0,
-            .width = (float)fb_width,
-            .height = (float)fb_height,
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
-        };
+        vk::Viewport viewport{};
+        viewport.x = 0;
+        viewport.y = 0;
+        viewport.width = (float)fb_width;
+        viewport.height = (float)fb_height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
         cmdbuf.setViewport(0, {viewport});
     }
 
@@ -605,16 +566,11 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
             vtx_dst += cmd_list->VtxBuffer.Size;
             idx_dst += cmd_list->IdxBuffer.Size;
         }
-        vk::MappedMemoryRange range[2]{
-            {
-                .memory = frb.vertex.buffer_memory,
-                .size = VK_WHOLE_SIZE,
-            },
-            {
-                .memory = frb.index.buffer_memory,
-                .size = VK_WHOLE_SIZE,
-            },
-        };
+        vk::MappedMemoryRange range[2]{};
+        range[0].memory = frb.vertex.buffer_memory;
+        range[0].size = VK_WHOLE_SIZE;
+        range[1].memory = frb.index.buffer_memory;
+        range[1].size = VK_WHOLE_SIZE;
         CheckVkErr(v.device.flushMappedMemoryRanges({range}));
         v.device.unmapMemory(frb.vertex.buffer_memory);
         v.device.unmapMemory(frb.index.buffer_memory);
@@ -671,16 +627,11 @@ void RenderDrawData(ImDrawData& draw_data, vk::CommandBuffer command_buffer,
                     continue;
 
                 // Apply scissor/clipping rectangle
-                vk::Rect2D scissor{
-                    .offset{
-                        .x = (int32_t)(clip_min.x),
-                        .y = (int32_t)(clip_min.y),
-                    },
-                    .extent{
-                        .width = (uint32_t)(clip_max.x - clip_min.x),
-                        .height = (uint32_t)(clip_max.y - clip_min.y),
-                    },
-                };
+                vk::Rect2D scissor{};
+                scissor.offset.x = (int32_t)(clip_min.x);
+                scissor.offset.y = (int32_t)(clip_min.y);
+                scissor.extent.width = (uint32_t)(clip_max.x - clip_min.x);
+                scissor.extent.height = (uint32_t)(clip_max.y - clip_min.y);
                 command_buffer.setScissor(0, 1, &scissor);
 
                 // Bind DescriptorSet with font or user texture
@@ -715,10 +666,9 @@ static bool CreateFontsTexture() {
 
     // Create command buffer
     if (bd->font_command_buffer == VK_NULL_HANDLE) {
-        vk::CommandBufferAllocateInfo info{
-            .commandPool = bd->command_pool,
-            .commandBufferCount = 1,
-        };
+        vk::CommandBufferAllocateInfo info{};
+        info.commandPool = bd->command_pool;
+        info.commandBufferCount = 1;
         std::unique_lock lk(bd->command_pool_mutex);
         bd->font_command_buffer = CheckVkResult(v.device.allocateCommandBuffers(info)).front();
     }
@@ -728,7 +678,7 @@ static bool CreateFontsTexture() {
         CheckVkErr(bd->font_command_buffer.reset());
         vk::CommandBufferBeginInfo begin_info{};
         begin_info.flags |= vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-        CheckVkErr(bd->font_command_buffer.begin(&begin_info));
+        CheckVkErr(bd->font_command_buffer.begin(begin_info));
     }
 
     unsigned char* pixels;
@@ -738,45 +688,37 @@ static bool CreateFontsTexture() {
 
     // Create the Image:
     {
-        vk::ImageCreateInfo info{
-            .imageType = vk::ImageType::e2D,
-            .format = vk::Format::eR8G8B8A8Unorm,
-            .extent{
-                .width = static_cast<uint32_t>(width),
-                .height = static_cast<uint32_t>(height),
-                .depth = 1,
-            },
-            .mipLevels = 1,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
-            .sharingMode = vk::SharingMode::eExclusive,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        };
+        vk::ImageCreateInfo info{};
+        info.imageType = vk::ImageType::e2D;
+        info.format = vk::Format::eR8G8B8A8Unorm;
+        info.extent.width = static_cast<uint32_t>(width);
+        info.extent.height = static_cast<uint32_t>(height);
+        info.extent.depth = 1;
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = vk::SampleCountFlagBits::e1;
+        info.tiling = vk::ImageTiling::eOptimal;
+        info.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+        info.sharingMode = vk::SharingMode::eExclusive;
+        info.initialLayout = vk::ImageLayout::eUndefined;
         bd->font_image = CheckVkResult(v.device.createImage(info, v.allocator));
         vk::MemoryRequirements req = v.device.getImageMemoryRequirements(bd->font_image);
-        vk::MemoryAllocateInfo alloc_info{
-            .allocationSize = IM_MAX(v.min_allocation_size, req.size),
-            .memoryTypeIndex =
-                FindMemoryType(vk::MemoryPropertyFlagBits::eDeviceLocal, req.memoryTypeBits),
-        };
+        vk::MemoryAllocateInfo alloc_info{};
+        alloc_info.allocationSize = IM_MAX(v.min_allocation_size, req.size);
+        alloc_info.memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eDeviceLocal, req.memoryTypeBits);
         bd->font_memory = CheckVkResult(v.device.allocateMemory(alloc_info, v.allocator));
         CheckVkErr(v.device.bindImageMemory(bd->font_image, bd->font_memory, 0));
     }
 
     // Create the Image View:
     {
-        vk::ImageViewCreateInfo info{
-            .image = bd->font_image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = vk::Format::eR8G8B8A8Unorm,
-            .subresourceRange{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        };
+        vk::ImageViewCreateInfo info{};
+        info.image = bd->font_image;
+        info.viewType = vk::ImageViewType::e2D;
+        info.format = vk::Format::eR8G8B8A8Unorm;
+        info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        info.subresourceRange.levelCount = 1;
+        info.subresourceRange.layerCount = 1;
         bd->font_view = CheckVkResult(v.device.createImageView(info, v.allocator));
     }
 
@@ -787,19 +729,16 @@ static bool CreateFontsTexture() {
     vk::DeviceMemory upload_buffer_memory{};
     vk::Buffer upload_buffer{};
     {
-        vk::BufferCreateInfo buffer_info{
-            .size = upload_size,
-            .usage = vk::BufferUsageFlagBits::eTransferSrc,
-            .sharingMode = vk::SharingMode::eExclusive,
-        };
+        vk::BufferCreateInfo buffer_info{};
+        buffer_info.size = upload_size;
+        buffer_info.usage = vk::BufferUsageFlagBits::eTransferSrc;
+        buffer_info.sharingMode = vk::SharingMode::eExclusive;
         upload_buffer = CheckVkResult(v.device.createBuffer(buffer_info, v.allocator));
         vk::MemoryRequirements req = v.device.getBufferMemoryRequirements(upload_buffer);
         bd->buffer_memory_alignment = IM_MAX(bd->buffer_memory_alignment, req.alignment);
-        vk::MemoryAllocateInfo alloc_info{
-            .allocationSize = IM_MAX(v.min_allocation_size, req.size),
-            .memoryTypeIndex =
-                FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible, req.memoryTypeBits),
-        };
+        vk::MemoryAllocateInfo alloc_info{};
+        alloc_info.allocationSize = IM_MAX(v.min_allocation_size, req.size);
+        alloc_info.memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible, req.memoryTypeBits);
         upload_buffer_memory = CheckVkResult(v.device.allocateMemory(alloc_info, v.allocator));
         CheckVkErr(v.device.bindBufferMemory(upload_buffer, upload_buffer_memory, 0));
     }
@@ -808,65 +747,49 @@ static bool CreateFontsTexture() {
     {
         char* map = (char*)CheckVkResult(v.device.mapMemory(upload_buffer_memory, 0, upload_size));
         memcpy(map, pixels, upload_size);
-        vk::MappedMemoryRange range[1]{
-            {
-                .memory = upload_buffer_memory,
-                .size = upload_size,
-            },
-        };
+        vk::MappedMemoryRange range[1]{};
+        range[0].memory = upload_buffer_memory;
+        range[0].size = upload_size;
         CheckVkErr(v.device.flushMappedMemoryRanges({range}));
         v.device.unmapMemory(upload_buffer_memory);
     }
 
     // Copy to Image:
     {
-        vk::ImageMemoryBarrier copy_barrier[1]{
-            {
-                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = bd->font_image,
-                .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .levelCount = 1,
-                    .layerCount = 1,
-                },
-            },
-        };
+        vk::ImageMemoryBarrier copy_barrier[1]{};
+        copy_barrier[0].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+        copy_barrier[0].oldLayout = vk::ImageLayout::eUndefined;
+        copy_barrier[0].newLayout = vk::ImageLayout::eTransferDstOptimal;
+        copy_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        copy_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        copy_barrier[0].image = bd->font_image;
+        copy_barrier[0].subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        copy_barrier[0].subresourceRange.levelCount = 1;
+        copy_barrier[0].subresourceRange.layerCount = 1;
         bd->font_command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eHost,
                                                 vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
                                                 {copy_barrier});
 
-        vk::BufferImageCopy region{
-            .imageSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .layerCount = 1,
-            },
-            .imageExtent{
-                .width = static_cast<uint32_t>(width),
-                .height = static_cast<uint32_t>(height),
-                .depth = 1,
-            },
-        };
+        vk::BufferImageCopy region{};
+        region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent.width = static_cast<uint32_t>(width);
+        region.imageExtent.height = static_cast<uint32_t>(height);
+        region.imageExtent.depth = 1;
         bd->font_command_buffer.copyBufferToImage(upload_buffer, bd->font_image,
                                                   vk::ImageLayout::eTransferDstOptimal, {region});
 
-        vk::ImageMemoryBarrier use_barrier[1]{{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = bd->font_image,
-            .subresourceRange{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        }};
+        vk::ImageMemoryBarrier use_barrier[1]{};
+        use_barrier[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        use_barrier[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
+        use_barrier[0].oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        use_barrier[0].newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        use_barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        use_barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        use_barrier[0].image = bd->font_image;
+        use_barrier[0].subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        use_barrier[0].subresourceRange.levelCount = 1;
+        use_barrier[0].subresourceRange.layerCount = 1;
         bd->font_command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                                                 vk::PipelineStageFlagBits::eFragmentShader, {}, {},
                                                 {}, {use_barrier});
@@ -944,17 +867,15 @@ static void CreateShaderModules(vk::Device device, const vk::AllocationCallbacks
     // Create the shader modules
     VkData* bd = GetBackendData();
     if (bd->shader_module_vert == VK_NULL_HANDLE) {
-        vk::ShaderModuleCreateInfo vert_info{
-            .codeSize = sizeof(glsl_shader_vert_spv),
-            .pCode = (uint32_t*)glsl_shader_vert_spv,
-        };
+        vk::ShaderModuleCreateInfo vert_info{};
+        vert_info.codeSize = sizeof(glsl_shader_vert_spv);
+        vert_info.pCode = (uint32_t*)glsl_shader_vert_spv;
         bd->shader_module_vert = CheckVkResult(device.createShaderModule(vert_info, allocator));
     }
     if (bd->shader_module_frag == VK_NULL_HANDLE) {
-        vk::ShaderModuleCreateInfo frag_info{
-            .codeSize = sizeof(glsl_shader_frag_spv),
-            .pCode = (uint32_t*)glsl_shader_frag_spv,
-        };
+        vk::ShaderModuleCreateInfo frag_info{};
+        frag_info.codeSize = sizeof(glsl_shader_frag_spv);
+        frag_info.pCode = (uint32_t*)glsl_shader_frag_spv;
         bd->shader_module_frag = CheckVkResult(device.createShaderModule(frag_info, allocator));
     }
 }
@@ -967,121 +888,95 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
 
     CreateShaderModules(device, allocator);
 
-    vk::PipelineShaderStageCreateInfo stage[2]{
-        {
-            .stage = vk::ShaderStageFlagBits::eVertex,
-            .module = bd->shader_module_vert,
-            .pName = "main",
-        },
-        {
-            .stage = vk::ShaderStageFlagBits::eFragment,
-            .module = bd->shader_module_frag,
-            .pName = "main",
-        },
-    };
+    vk::PipelineShaderStageCreateInfo stage[2]{};
+    stage[0].stage = vk::ShaderStageFlagBits::eVertex;
+    stage[0].module = bd->shader_module_vert;
+    stage[0].pName = "main";
+    stage[1].stage = vk::ShaderStageFlagBits::eFragment;
+    stage[1].module = bd->shader_module_frag;
+    stage[1].pName = "main";
 
-    vk::VertexInputBindingDescription binding_desc[1]{
-        {
-            .stride = sizeof(ImDrawVert),
-            .inputRate = vk::VertexInputRate::eVertex,
-        },
-    };
+    vk::VertexInputBindingDescription binding_desc[1]{};
+    binding_desc[0].stride = sizeof(ImDrawVert);
+    binding_desc[0].inputRate = vk::VertexInputRate::eVertex;
 
-    vk::VertexInputAttributeDescription attribute_desc[3]{
-        {
-            .location = 0,
-            .binding = binding_desc[0].binding,
-            .format = vk::Format::eR32G32Sfloat,
-            .offset = offsetof(ImDrawVert, pos),
-        },
-        {
-            .location = 1,
-            .binding = binding_desc[0].binding,
-            .format = vk::Format::eR32G32Sfloat,
-            .offset = offsetof(ImDrawVert, uv),
-        },
-        {
-            .location = 2,
-            .binding = binding_desc[0].binding,
-            .format = vk::Format::eR8G8B8A8Unorm,
-            .offset = offsetof(ImDrawVert, col),
-        },
-    };
+    vk::VertexInputAttributeDescription attribute_desc[3]{};
+    attribute_desc[0].location = 0;
+    attribute_desc[0].binding = binding_desc[0].binding;
+    attribute_desc[0].format = vk::Format::eR32G32Sfloat;
+    attribute_desc[0].offset = offsetof(ImDrawVert, pos);
+    attribute_desc[1].location = 1;
+    attribute_desc[1].binding = binding_desc[0].binding;
+    attribute_desc[1].format = vk::Format::eR32G32Sfloat;
+    attribute_desc[1].offset = offsetof(ImDrawVert, uv);
+    attribute_desc[2].location = 2;
+    attribute_desc[2].binding = binding_desc[0].binding;
+    attribute_desc[2].format = vk::Format::eR8G8B8A8Unorm;
+    attribute_desc[2].offset = offsetof(ImDrawVert, col);
 
-    vk::PipelineVertexInputStateCreateInfo vertex_info{
-        .vertexBindingDescriptionCount = 1,
-        .pVertexBindingDescriptions = binding_desc,
-        .vertexAttributeDescriptionCount = 3,
-        .pVertexAttributeDescriptions = attribute_desc,
-    };
+    vk::PipelineVertexInputStateCreateInfo vertex_info{};
+    vertex_info.vertexBindingDescriptionCount = 1;
+    vertex_info.pVertexBindingDescriptions = binding_desc;
+    vertex_info.vertexAttributeDescriptionCount = 3;
+    vertex_info.pVertexAttributeDescriptions = attribute_desc;
 
-    vk::PipelineInputAssemblyStateCreateInfo ia_info{
-        .topology = vk::PrimitiveTopology::eTriangleList,
-    };
+    vk::PipelineInputAssemblyStateCreateInfo ia_info{};
+    ia_info.topology = vk::PrimitiveTopology::eTriangleList;
 
-    vk::PipelineViewportStateCreateInfo viewport_info{
-        .viewportCount = 1,
-        .scissorCount = 1,
-    };
+    vk::PipelineViewportStateCreateInfo viewport_info{};
+    viewport_info.viewportCount = 1;
+    viewport_info.scissorCount = 1;
 
-    vk::PipelineRasterizationStateCreateInfo raster_info{
-        .polygonMode = vk::PolygonMode::eFill,
-        .cullMode = vk::CullModeFlagBits::eNone,
-        .frontFace = vk::FrontFace::eCounterClockwise,
-        .lineWidth = 1.0f,
-    };
+    vk::PipelineRasterizationStateCreateInfo raster_info{};
+    raster_info.polygonMode = vk::PolygonMode::eFill;
+    raster_info.cullMode = vk::CullModeFlagBits::eNone;
+    raster_info.frontFace = vk::FrontFace::eCounterClockwise;
+    raster_info.lineWidth = 1.0f;
 
-    vk::PipelineMultisampleStateCreateInfo ms_info{
-        .rasterizationSamples = vk::SampleCountFlagBits::e1,
-    };
+    vk::PipelineMultisampleStateCreateInfo ms_info{};
+    ms_info.rasterizationSamples = vk::SampleCountFlagBits::e1;
 
-    vk::PipelineColorBlendAttachmentState color_attachment[1]{
-        {
-            .blendEnable = VK_TRUE,
-            .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
-            .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
-            .colorBlendOp = vk::BlendOp::eAdd,
-            .srcAlphaBlendFactor = vk::BlendFactor::eOne,
-            .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
-            .alphaBlendOp = vk::BlendOp::eAdd,
-            .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
-        },
-    };
+    vk::PipelineColorBlendAttachmentState color_attachment[1]{};
+    color_attachment[0].blendEnable = VK_TRUE;
+    color_attachment[0].srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+    color_attachment[0].dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+    color_attachment[0].colorBlendOp = vk::BlendOp::eAdd;
+    color_attachment[0].srcAlphaBlendFactor = vk::BlendFactor::eOne;
+    color_attachment[0].dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+    color_attachment[0].alphaBlendOp = vk::BlendOp::eAdd;
+    color_attachment[0].colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
 
     vk::PipelineDepthStencilStateCreateInfo depth_info{};
 
-    vk::PipelineColorBlendStateCreateInfo blend_info{
-        .attachmentCount = 1,
-        .pAttachments = color_attachment,
-    };
+    vk::PipelineColorBlendStateCreateInfo blend_info{};
+    blend_info.attachmentCount = 1;
+    blend_info.pAttachments = color_attachment;
 
     vk::DynamicState dynamic_states[2]{
         vk::DynamicState::eViewport,
         vk::DynamicState::eScissor,
     };
-    vk::PipelineDynamicStateCreateInfo dynamic_state{
-        .dynamicStateCount = (uint32_t)IM_ARRAYSIZE(dynamic_states),
-        .pDynamicStates = dynamic_states,
-    };
+    vk::PipelineDynamicStateCreateInfo dynamic_state{};
+    dynamic_state.dynamicStateCount = (uint32_t)IM_ARRAYSIZE(dynamic_states);
+    dynamic_state.pDynamicStates = dynamic_states;
 
-    vk::GraphicsPipelineCreateInfo info{
-        .pNext = &v.pipeline_rendering_create_info,
-        .flags = bd->pipeline_create_flags,
-        .stageCount = 2,
-        .pStages = stage,
-        .pVertexInputState = &vertex_info,
-        .pInputAssemblyState = &ia_info,
-        .pViewportState = &viewport_info,
-        .pRasterizationState = &raster_info,
-        .pMultisampleState = &ms_info,
-        .pDepthStencilState = &depth_info,
-        .pColorBlendState = &blend_info,
-        .pDynamicState = &dynamic_state,
-        .layout = bd->pipeline_layout,
-        .renderPass = render_pass,
-        .subpass = subpass,
-    };
+    vk::GraphicsPipelineCreateInfo info{};
+    info.pNext = &v.pipeline_rendering_create_info;
+    info.flags = bd->pipeline_create_flags;
+    info.stageCount = 2;
+    info.pStages = stage;
+    info.pVertexInputState = &vertex_info;
+    info.pInputAssemblyState = &ia_info;
+    info.pViewportState = &viewport_info;
+    info.pRasterizationState = &raster_info;
+    info.pMultisampleState = &ms_info;
+    info.pDepthStencilState = &depth_info;
+    info.pColorBlendState = &blend_info;
+    info.pDynamicState = &dynamic_state;
+    info.layout = bd->pipeline_layout;
+    info.renderPass = render_pass;
+    info.subpass = subpass;
 
     *pipeline =
         CheckVkResult(device.createGraphicsPipelines(pipeline_cache, {info}, allocator)).front();
@@ -1108,28 +1003,23 @@ bool CreateDeviceObjects() {
             {vk::DescriptorType::eInputAttachment, 1000},
         };
 
-        vk::DescriptorPoolCreateInfo pool_info{
-            .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-            .maxSets = 1000,
-            .poolSizeCount = std::size(pool_sizes),
-            .pPoolSizes = pool_sizes,
-        };
+        vk::DescriptorPoolCreateInfo pool_info{};
+        pool_info.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+        pool_info.maxSets = 1000;
+        pool_info.poolSizeCount = std::size(pool_sizes);
+        pool_info.pPoolSizes = pool_sizes;
 
         bd->descriptor_pool = CheckVkResult(v.device.createDescriptorPool(pool_info));
     }
 
     if (!bd->descriptor_set_layout) {
-        vk::DescriptorSetLayoutBinding binding[1]{
-            {
-                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-                .descriptorCount = 1,
-                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-            },
-        };
-        vk::DescriptorSetLayoutCreateInfo info{
-            .bindingCount = 1,
-            .pBindings = binding,
-        };
+        vk::DescriptorSetLayoutBinding binding[1]{};
+        binding[0].descriptorType = vk::DescriptorType::eCombinedImageSampler;
+        binding[0].descriptorCount = 1;
+        binding[0].stageFlags = vk::ShaderStageFlagBits::eFragment;
+        vk::DescriptorSetLayoutCreateInfo info{};
+        info.bindingCount = 1;
+        info.pBindings = binding;
         bd->descriptor_set_layout =
             CheckVkResult(v.device.createDescriptorSetLayout(info, v.allocator));
     }
@@ -1137,20 +1027,16 @@ bool CreateDeviceObjects() {
     if (!bd->pipeline_layout) {
         // Constants: we are using 'vec2 offset' and 'vec2 scale' instead of a full 3d projection
         // matrix
-        vk::PushConstantRange push_constants[1]{
-            {
-                .stageFlags = vk::ShaderStageFlagBits::eVertex,
-                .offset = sizeof(float) * 0,
-                .size = sizeof(float) * 4,
-            },
-        };
+        vk::PushConstantRange push_constants[1]{};
+        push_constants[0].stageFlags = vk::ShaderStageFlagBits::eVertex;
+        push_constants[0].offset = sizeof(float) * 0;
+        push_constants[0].size = sizeof(float) * 4;
         vk::DescriptorSetLayout set_layout[1] = {bd->descriptor_set_layout};
-        vk::PipelineLayoutCreateInfo layout_info{
-            .setLayoutCount = 1,
-            .pSetLayouts = set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = push_constants,
-        };
+        vk::PipelineLayoutCreateInfo layout_info{};
+        layout_info.setLayoutCount = 1;
+        layout_info.pSetLayouts = set_layout;
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = push_constants;
         bd->pipeline_layout =
             CheckVkResult(v.device.createPipelineLayout(layout_info, v.allocator));
     }
@@ -1158,10 +1044,9 @@ bool CreateDeviceObjects() {
     CreatePipeline(v.device, v.allocator, v.pipeline_cache, nullptr, &bd->pipeline, v.subpass);
 
     if (bd->command_pool == VK_NULL_HANDLE) {
-        vk::CommandPoolCreateInfo info{
-            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-            .queueFamilyIndex = v.queue_family,
-        };
+        vk::CommandPoolCreateInfo info{};
+        info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+        info.queueFamilyIndex = v.queue_family;
         std::unique_lock lk(bd->command_pool_mutex);
         bd->command_pool = CheckVkResult(v.device.createCommandPool(info, v.allocator));
     }
@@ -1170,17 +1055,16 @@ bool CreateDeviceObjects() {
         // Bilinear sampling is required by default. Set 'io.Fonts->Flags |=
         // ImFontAtlasFlags_NoBakedLines' or 'style.AntiAliasedLinesUseTex = false' to allow
         // point/nearest sampling.
-        vk::SamplerCreateInfo info{
-            .magFilter = vk::Filter::eLinear,
-            .minFilter = vk::Filter::eLinear,
-            .mipmapMode = vk::SamplerMipmapMode::eLinear,
-            .addressModeU = vk::SamplerAddressMode::eRepeat,
-            .addressModeV = vk::SamplerAddressMode::eRepeat,
-            .addressModeW = vk::SamplerAddressMode::eRepeat,
-            .maxAnisotropy = 1.0f,
-            .minLod = -1000,
-            .maxLod = 1000,
-        };
+        vk::SamplerCreateInfo info{};
+        info.magFilter = vk::Filter::eLinear;
+        info.minFilter = vk::Filter::eLinear;
+        info.mipmapMode = vk::SamplerMipmapMode::eLinear;
+        info.addressModeU = vk::SamplerAddressMode::eRepeat;
+        info.addressModeV = vk::SamplerAddressMode::eRepeat;
+        info.addressModeW = vk::SamplerAddressMode::eRepeat;
+        info.maxAnisotropy = 1.0f;
+        info.minLod = -1000;
+        info.maxLod = 1000;
         bd->simple_sampler = CheckVkResult(v.device.createSampler(info, v.allocator));
     }
 

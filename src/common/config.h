@@ -91,6 +91,10 @@ bool getVkHostMarkersEnabled();
 void setVkHostMarkersEnabled(bool enable, bool is_game_specific = false);
 bool getVkGuestMarkersEnabled();
 void setVkGuestMarkersEnabled(bool enable, bool is_game_specific = false);
+bool vkForcePushDescriptorsEnabled();
+void setVkForcePushDescriptors(bool enable, bool is_game_specific = false);
+bool vkDisablePushDescriptorsEnabled();
+void setVkDisablePushDescriptors(bool enable, bool is_game_specific = false);
 bool getEnableDiscordRPC();
 void setEnableDiscordRPC(bool enable);
 bool isRdocEnabled();
@@ -149,6 +153,17 @@ bool getRcasEnabled();
 void setRcasEnabled(bool enable, bool is_game_specific = false);
 int getRcasAttenuation();
 void setRcasAttenuation(int value, bool is_game_specific = false);
+std::string getAspectRatioOverride();
+void setAspectRatioOverride(const std::string& value, bool is_game_specific = false);
+
+std::string getResolutionOverride();
+void setResolutionOverride(const std::string& value, bool is_game_specific = false);
+
+// GR2 (CUSA04943) motion-blur disable toggle. When true, the motion-blur
+// post-process pass is skipped at game load by NOPing the two pass-
+// registration calls in the render-graph builder. Default: false.
+bool getDisableMotionBlur();
+void setDisableMotionBlur(bool value, bool is_game_specific = false);
 bool getIsConnectedToNetwork();
 void setConnectedToNetwork(bool enable, bool is_game_specific = false);
 void setUserName(const std::string& name, bool is_game_specific = false);

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include <SDL3/SDL_audio.h>
 #include <magic_enum/magic_enum.hpp>
 
@@ -80,7 +82,12 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOutputs(AudioOut::OrbisAudioOutOutputParam* p
 }
 
 static s32 PortQueueAudio(Port& port, const OrbisAudio3dPcm& pcm, const u32 num_channels) {
-    // Audio3d output is configured for stereo signed 16-bit PCM. Convert the data to match.
+    // Audio3d output is configured for stereo signed 16-bit PCM.
+    // Some games (including GR2) will submit buffers whose sample count is *not* equal to the
+    // port granularity, so we must split/pad the converted buffer to exactly that size.
+    const u32 granularity =
+        port.parameters.granularity ? port.parameters.granularity : AUDIO3D_OUTPUT_BUFFER_FRAMES;
+
     const SDL_AudioSpec src_spec = {
         .format = pcm.format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16 ? SDL_AUDIO_S16LE
                                                                              : SDL_AUDIO_F32LE,
@@ -96,18 +103,64 @@ static s32 PortQueueAudio(Port& port, const OrbisAudio3dPcm& pcm, const u32 num_
                           (pcm.format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16 ? 2 : 4) *
                           num_channels;
 
-    u8* dst_data;
-    int dst_len;
+    u8* dst_data = nullptr;
+    int dst_len = 0;
     if (!SDL_ConvertAudioSamples(&src_spec, static_cast<u8*>(pcm.sample_buffer),
                                  static_cast<int>(src_size), &dst_spec, &dst_data, &dst_len)) {
         LOG_ERROR(Lib_Audio3d, "SDL_ConvertAudioSamples failed: {}", SDL_GetError());
         return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
     }
 
-    port.queue.emplace_back(AudioData{
-        .sample_buffer = dst_data,
-        .num_samples = pcm.num_samples,
-    });
+    // Expected output size for one "push" (port granularity), in bytes.
+    const u32 bytes_per_frame = sizeof(s16) * AUDIO3D_OUTPUT_NUM_CHANNELS;
+    const u32 expected_bytes = granularity * bytes_per_frame;
+
+    // Clamp queue to the configured depth by dropping the oldest buffers.
+    // (Prevents unbounded latency when the game temporarily writes faster than it advances.)
+    const u32 queue_depth = port.parameters.queue_depth ? port.parameters.queue_depth : 2;
+
+    const u8* src = dst_data;
+    u32 remaining = static_cast<u32>(dst_len);
+
+    // If SDL gave us nothing, still queue a silent buffer so timing doesn't drift.
+    if (remaining == 0) {
+        u8* chunk = static_cast<u8*>(SDL_calloc(1, expected_bytes));
+        if (!chunk) {
+            SDL_free(dst_data);
+            return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
+        }
+        while (port.queue.size() >= queue_depth && !port.queue.empty()) {
+            SDL_free(port.queue.front().sample_buffer);
+            port.queue.pop_front();
+        }
+        port.queue.emplace_back(AudioData{.sample_buffer = chunk, .num_samples = granularity});
+        SDL_free(dst_data);
+        return ORBIS_OK;
+    }
+
+    while (remaining > 0) {
+        const u32 to_copy = std::min(expected_bytes, remaining);
+
+        u8* chunk = static_cast<u8*>(SDL_calloc(1, expected_bytes));
+        if (!chunk) {
+            SDL_free(dst_data);
+            return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
+        }
+
+        SDL_memcpy(chunk, src, to_copy);
+
+        while (port.queue.size() >= queue_depth && !port.queue.empty()) {
+            SDL_free(port.queue.front().sample_buffer);
+            port.queue.pop_front();
+        }
+
+        port.queue.emplace_back(AudioData{.sample_buffer = chunk, .num_samples = granularity});
+
+        src += to_copy;
+        remaining -= to_copy;
+    }
+
+    SDL_free(dst_data);
     return ORBIS_OK;
 }
 
@@ -296,6 +349,7 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
             }
             break;
         }
+    break;
         default:
             LOG_ERROR(Lib_Audio3d, "Unsupported attribute ID: {:#x}",
                       static_cast<u32>(attribute.attribute_id));

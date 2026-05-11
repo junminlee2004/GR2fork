@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <SDL3/SDL.h>
 #include "common/config.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -15,6 +17,40 @@ using Input::GameController;
 
 static bool g_initialized = false;
 static bool g_opened = false;
+static std::atomic<u32> s_raw_buttons{0};
+static bool s_event_watch_installed = false;
+
+// SDL event callback — fires instantly on main thread when button pressed.
+// Accumulates raw button state into s_raw_buttons for external consumers
+// (gallery HLE research, etc.). Uses PS4 bitmask values.
+static bool GalleryButtonEventWatch(void* /*userdata*/, SDL_Event* event) {
+    if (event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        u32 btn = 0;
+        switch (event->gbutton.button) {
+            case SDL_GAMEPAD_BUTTON_NORTH: btn = 0x1000; break; // Triangle/Y
+            case SDL_GAMEPAD_BUTTON_EAST:  btn = 0x2000; break; // Circle/B
+            case SDL_GAMEPAD_BUTTON_SOUTH: btn = 0x4000; break; // Cross/A
+            case SDL_GAMEPAD_BUTTON_WEST:  btn = 0x8000; break; // Square/X
+            case SDL_GAMEPAD_BUTTON_DPAD_UP:    btn = 0x0010; break;
+            case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: btn = 0x0020; break;
+            case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  btn = 0x0040; break;
+            case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  btn = 0x0080; break;
+            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:  btn = 0x0100; break; // L1
+            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: btn = 0x0200; break; // R1
+        }
+        if (btn) {
+            s_raw_buttons.fetch_or(btn, std::memory_order_relaxed);
+        }
+        LOG_INFO(Lib_Pad, "[PAD_EVENT] button_down: sdl={} mapped={:#x}",
+                 static_cast<int>(event->gbutton.button), btn);
+    }
+    return true;
+}
+
+// Consume-and-clear accessor for external readers.
+u32 GetRawButtons() { return s_raw_buttons.exchange(0, std::memory_order_relaxed); }
+// Non-destructive peek — does NOT clear the accumulated mask.
+u32 PeekRawButtons() { return s_raw_buttons.load(std::memory_order_relaxed); }
 
 int PS4_SYSV_ABI scePadClose(s32 handle) {
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
@@ -263,13 +299,6 @@ int PS4_SYSV_ABI scePadOpen(s32 userId, s32 type, s32 index, const OrbisPadOpenP
     if (userId == -1) {
         return ORBIS_PAD_ERROR_DEVICE_NO_HANDLE;
     }
-    if (Config::getUseSpecialPad()) {
-        if (type != ORBIS_PAD_PORT_TYPE_SPECIAL)
-            return ORBIS_PAD_ERROR_DEVICE_NOT_CONNECTED;
-    } else {
-        if (type != ORBIS_PAD_PORT_TYPE_STANDARD && type != ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL)
-            return ORBIS_PAD_ERROR_DEVICE_NOT_CONNECTED;
-    }
     LOG_INFO(Lib_Pad, "(DUMMY) called user_id = {} type = {} index = {}", userId, type, index);
     g_opened = true;
     scePadResetLightBar(userId);
@@ -280,13 +309,6 @@ int PS4_SYSV_ABI scePadOpen(s32 userId, s32 type, s32 index, const OrbisPadOpenP
 int PS4_SYSV_ABI scePadOpenExt(s32 userId, s32 type, s32 index,
                                const OrbisPadOpenExtParam* pParam) {
     LOG_ERROR(Lib_Pad, "(STUBBED) called");
-    if (Config::getUseSpecialPad()) {
-        if (type != ORBIS_PAD_PORT_TYPE_SPECIAL)
-            return ORBIS_PAD_ERROR_DEVICE_NOT_CONNECTED;
-    } else {
-        if (type != ORBIS_PAD_PORT_TYPE_STANDARD && type != ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL)
-            return ORBIS_PAD_ERROR_DEVICE_NOT_CONNECTED;
-    }
     return 1; // dummy
 }
 
@@ -315,6 +337,7 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
 
     for (int i = 0; i < ret_num; i++) {
         pData[i].buttons = states[i].buttonsState;
+        s_raw_buttons.fetch_or(static_cast<u32>(states[i].buttonsState), std::memory_order_relaxed);
         pData[i].leftStick.x = states[i].axes[static_cast<int>(Input::Axis::LeftX)];
         pData[i].leftStick.y = states[i].axes[static_cast<int>(Input::Axis::LeftY)];
         pData[i].rightStick.x = states[i].axes[static_cast<int>(Input::Axis::RightX)];
@@ -442,6 +465,12 @@ int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     Input::State state;
     controller->ReadState(&state, &isConnected, &connectedCount);
     pData->buttons = state.buttonsState;
+    s_raw_buttons.fetch_or(static_cast<u32>(state.buttonsState), std::memory_order_relaxed);
+    // Install SDL event watch once — captures gamepad buttons instantly on main thread
+    if (!s_event_watch_installed) {
+        s_event_watch_installed = true;
+        SDL_AddEventWatch(GalleryButtonEventWatch, nullptr);
+    }
     pData->leftStick.x = state.axes[static_cast<int>(Input::Axis::LeftX)];
     pData->leftStick.y = state.axes[static_cast<int>(Input::Axis::LeftY)];
     pData->rightStick.x = state.axes[static_cast<int>(Input::Axis::RightX)];

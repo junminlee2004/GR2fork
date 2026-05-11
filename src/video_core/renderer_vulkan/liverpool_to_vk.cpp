@@ -6,6 +6,7 @@
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
+#include <atomic>
 #include <magic_enum/magic_enum.hpp>
 
 #define INVALID_NUMBER_FORMAT_COMBO                                                                \
@@ -756,12 +757,46 @@ static auto surface_format_table = []() constexpr {
 }();
 
 vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
-    vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
-    bool found =
-        result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
-    ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
-               static_cast<u32>(num_format));
-    return result;
+    const size_t idx = GetSurfaceFormatTableIndex(data_format, num_format);
+    vk::Format result = surface_format_table[idx];
+    if (result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid) {
+        return result;
+    }
+    // Unknown (data_format, num_format) combo. Observed in GR2 boss-fight
+    // T#s: reserved num_format encodings (8, 14, 15) and the Format32_As_*
+    // family don't have direct Vulkan analogs. Rather than crash the emulator
+    // mid-frame, substitute a same-storage-size format so image creation
+    // succeeds; the shader's own typing drives interpretation. Dedupe per
+    // combo to avoid log spam.
+    static std::array<std::atomic<u64>, 16> warned_combos{}; // 1024 bits
+    const u64 bit = u64(1) << (idx & 63);
+    auto& word = warned_combos[idx >> 6];
+    if ((word.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Unknown surface format data_format={} num_format={}, substituting fallback",
+                    static_cast<u32>(data_format), static_cast<u32>(num_format));
+    }
+    switch (data_format) {
+    case AmdGpu::DataFormat::Format32_As_8:
+        return vk::Format::eR8Uint;
+    case AmdGpu::DataFormat::Format32_As_8_8:
+        return vk::Format::eR8G8Uint;
+    case AmdGpu::DataFormat::Format32_As_32_32_32_32:
+        return vk::Format::eR32G32B32A32Uint;
+    default:
+        break;
+    }
+    // Known data_format with reserved num_format: retry the lookup with Float,
+    // which covers the most common interpretations.
+    const auto retry_idx = GetSurfaceFormatTableIndex(data_format, AmdGpu::NumberFormat::Float);
+    const auto retry = surface_format_table[retry_idx];
+    if (retry != vk::Format::eUndefined) {
+        return retry;
+    }
+    // Last resort: a generic 32-bit format. Image creation will succeed; if
+    // the shader actually samples this resource the result will be wrong, but
+    // that is preferable to a hard crash.
+    return vk::Format::eR8G8B8A8Unorm;
 }
 
 static constexpr DepthFormatInfo CreateDepthFormatInfo(

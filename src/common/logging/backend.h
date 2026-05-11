@@ -31,4 +31,17 @@ void SetColorConsoleBackendEnabled(bool enabled);
 
 void SetAppend();
 
+/// Drains the async log queue, stops the backend thread, and switches
+/// every subsequent LOG_* call to a synchronous write that fflush()es
+/// before returning. Idempotent. Used by the crash handler so that
+/// LOG_CRITICAL output during crash processing actually lands in the
+/// main log file before the process dies, rather than sitting in the
+/// MPSC queue when the consumer thread gets killed by process exit.
+///
+/// Safe to call from any thread, including (defensively) the backend
+/// thread itself: a self-thread call sets the sync flag but skips the
+/// join to avoid deadlock — in that case the backend thread will exit
+/// when it returns from whatever it was doing.
+void StopAsyncAndForceSync();
+
 } // namespace Common::Log

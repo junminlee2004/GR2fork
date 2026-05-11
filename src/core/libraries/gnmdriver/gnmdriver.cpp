@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
+#include "gnm_error.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -64,7 +67,8 @@ static constexpr std::array indirect_sgpr_offsets{0u, 0u, 0x4cu, 0u, 0xccu, 0u, 
 static constexpr bool UseNeoCompatSequences = false;
 
 // In case if `submitDone` is issued we need to block submissions until GPU idle
-static u32 submission_lock{};
+
+static std::atomic_bool submission_lock{false};
 std::condition_variable cv_lock{};
 std::mutex m_submission{};
 static u64 frames_submitted{};      // frame counter
@@ -79,14 +83,19 @@ static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_submission};
-    submission_lock = 0;
+    submission_lock.store(false, std::memory_order_release);
     cv_lock.notify_all();
 }
 
 static void WaitGpuIdle() {
     HLE_TRACE;
+    if (!submission_lock.load(std::memory_order_acquire)) [[likely]] {
+        return;
+    }
     std::unique_lock lock{m_submission};
-    cv_lock.wait(lock, [] { return submission_lock == 0; });
+    cv_lock.wait(lock, [] {
+        return !submission_lock.load(std::memory_order_acquire);
+    });
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -158,7 +167,7 @@ s32 PS4_SYSV_ABI sceGnmAddEqEvent(SceKernelEqueue eq, u64 id, void* udata) {
 
 int PS4_SYSV_ABI sceGnmAreSubmitsAllowed() {
     LOG_TRACE(Lib_GnmDriver, "called");
-    return submission_lock == 0;
+    return !submission_lock.load(std::memory_order_relaxed);
 }
 
 int PS4_SYSV_ABI sceGnmBeginWorkload(u32 workload_stream, u64* workload) {
@@ -2281,7 +2290,7 @@ int PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     WaitGpuIdle();
     if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+        submission_lock.store(true, std::memory_order_release);
     }
     liverpool->SubmitDone();
     send_init_packet = true;
@@ -2844,6 +2853,16 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
     liverpool = std::make_unique<AmdGpu::Liverpool>();
     presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+
+    // Drive the on-disk pipeline cache deserialization (PipelineCache::WarmUp)
+    // here, after the Presenter is fully constructed. Historically WarmUp
+    // ran from inside the PipelineCache ctor, blocking this thread for up
+    // to a minute on large caches (~30s with 41,896 cached pipelines, per
+    // the GR2 baseline) — and since videoout's PresentThread isn't started
+    // until the next RegisterLib down, the user got a black window for the
+    // full duration and reasonably mistook it for a hang. Now WarmUp paints
+    // a "LOADING SHADERS" overlay on the swapchain while it works.
+    presenter->WarmUpPipelineCache();
 
     const s32 result = sceKernelGetCompiledSdkVersion(&sdk_version);
     if (result != ORBIS_OK) {

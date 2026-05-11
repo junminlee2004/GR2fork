@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <thread>
+#include <vector>
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_hints.h>
 
@@ -14,10 +18,18 @@
 #define SDL_INVALID_AUDIODEVICEID 0 // Defined in SDL_audio.h but not made a macro
 namespace Libraries::AudioOut {
 
+// One-time mute window for first Audio3D activity (ms).
+// Helps dodge the initial Audio3D SFX burst some games trigger on first use.
+constexpr u32 AUDIO3D_WARMUP_MUTE_MS = 325;
+
 class SDLPortBackend : public PortBackend {
 public:
     explicit SDLPortBackend(const PortOut& port)
-        : frame_size(port.format_info.FrameSize()), guest_buffer_size(port.BufferSize()) {
+        : frame_size(port.format_info.FrameSize()),
+          guest_buffer_size(port.BufferSize()),
+          sample_rate(port.sample_rate),
+          is_audio3d(port.type == OrbisAudioOutPort::Audio3d),
+          is_float(port.format_info.is_float) {
         const SDL_AudioSpec fmt = {
             .format = port.format_info.is_float ? SDL_AUDIO_F32LE : SDL_AUDIO_S16LE,
             .channels = port.format_info.num_channels,
@@ -93,6 +105,7 @@ public:
         if (!stream) {
             return;
         }
+
         // AudioOut library manages timing, but we still need to guard against the SDL
         // audio queue stalling, which may happen during device changes, for example.
         // Otherwise, latency may grow over time unbounded.
@@ -103,7 +116,103 @@ public:
             // Recalculate the threshold in case this happened because of a device change.
             CalculateQueueThreshold();
         }
-        if (!SDL_PutAudioStreamData(stream, ptr, static_cast<int>(guest_buffer_size))) {
+
+        // Default output pointer is the guest buffer; if it's null, output silence.
+        const void* out_ptr = ptr;
+
+        if (out_ptr == nullptr) [[unlikely]] {
+            if (zero_buf.size() != guest_buffer_size) {
+                zero_buf.assign(guest_buffer_size, 0);
+            } else {
+                std::memset(zero_buf.data(), 0, guest_buffer_size);
+            }
+            out_ptr = zero_buf.data();
+        }
+
+        // One-time Audio3D warmup mute + safety sanitization.
+        if (is_audio3d && ptr != nullptr) {
+            const u32 buffer_frames = frame_size ? (guest_buffer_size / frame_size) : 0;
+            const u32 buf_ms = (buffer_frames && sample_rate)
+                                   ? static_cast<u32>((static_cast<u64>(buffer_frames) * 1000ull +
+                                                      static_cast<u64>(sample_rate) - 1) /
+                                                     static_cast<u64>(sample_rate))
+                                   : 1;
+
+            if (is_float) {
+                const float* in = static_cast<const float*>(ptr);
+                const size_t n = static_cast<size_t>(guest_buffer_size) / sizeof(float);
+
+                float peak = 0.0f;
+                bool bad = false;
+                for (size_t i = 0; i < n; ++i) {
+                    const float v = in[i];
+                    if (!std::isfinite(v)) {
+                        bad = true;
+                        continue;
+                    }
+                    peak = std::max(peak, std::fabs(v));
+                }
+
+                // If we saw non-finite samples, sanitize through a scratch copy.
+                if (bad) {
+                    if (f32_buf.size() != n) {
+                        f32_buf.resize(n);
+                    }
+                    for (size_t i = 0; i < n; ++i) {
+                        const float v = in[i];
+                        f32_buf[i] = std::isfinite(v) ? v : 0.0f;
+                    }
+                    out_ptr = f32_buf.data();
+                }
+
+                // First time Audio3D becomes non-silent, mute a short window to dodge one-time spikes.
+                if (!audio3d_seen_non_silent && peak > 1e-4f) {
+                    audio3d_seen_non_silent = true;
+                    const u32 mute_buffers =
+                        std::max<u32>(1, (AUDIO3D_WARMUP_MUTE_MS + buf_ms - 1) / buf_ms);
+                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, mute_buffers);
+                }
+
+                // If we saw NaNs/Infs or an absurdly hot buffer, force silence briefly.
+                if (bad || peak > 1.5f) {
+                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, 8u);
+                }
+            } else {
+                const auto* in = static_cast<const int16_t*>(ptr);
+                const size_t n = static_cast<size_t>(guest_buffer_size) / sizeof(int16_t);
+
+                int peak = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const int a = std::abs(static_cast<int>(in[i]));
+                    peak = std::max(peak, a);
+                }
+
+                // First time Audio3D becomes non-silent, mute a short window to dodge one-time spikes.
+                if (!audio3d_seen_non_silent && peak > 4) {
+                    audio3d_seen_non_silent = true;
+                    const u32 mute_buffers =
+                        std::max<u32>(1, (AUDIO3D_WARMUP_MUTE_MS + buf_ms - 1) / buf_ms);
+                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, mute_buffers);
+                }
+
+                // If it's absurdly loud/clipped, mute briefly.
+                if (peak >= 32768 || peak > 32000) {
+                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, 8u);
+                }
+            }
+
+            if (audio3d_mute_buffers > 0) {
+                if (zero_buf.size() != guest_buffer_size) {
+                    zero_buf.assign(guest_buffer_size, 0);
+                } else {
+                    std::memset(zero_buf.data(), 0, guest_buffer_size);
+                }
+                out_ptr = zero_buf.data();
+                --audio3d_mute_buffers;
+            }
+        }
+
+        if (!SDL_PutAudioStreamData(stream, out_ptr, static_cast<int>(guest_buffer_size))) {
             LOG_ERROR(Lib_AudioOut, "Failed to output to SDL audio stream: {}", SDL_GetError());
         }
     }
@@ -144,6 +253,13 @@ private:
 
     u32 frame_size;
     u32 guest_buffer_size;
+    u32 sample_rate;
+    bool is_audio3d;
+    bool is_float;
+    bool audio3d_seen_non_silent{false};
+    u32 audio3d_mute_buffers{0};
+    std::vector<std::uint8_t> zero_buf{};
+    std::vector<float> f32_buf{};
     u32 host_buffer_size{};
     u32 queue_threshold{};
     SDL_AudioStream* stream{};

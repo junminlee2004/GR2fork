@@ -6,6 +6,7 @@
 
 #include "common/assert.h"
 #include "common/native_clock.h"
+#include "common/rdtsc.h"
 #include "common/thread.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
@@ -49,7 +50,9 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
 }
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
-    return clock->GetUptime();
+    // Hard guarantee: this is just an instruction sequence (lfence/rdtsc/lfence on x86_64),
+    // so perf cannot attribute any syscall to it.
+    return Common::FencedRDTSC();
 }
 
 static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,

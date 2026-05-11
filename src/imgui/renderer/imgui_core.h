@@ -5,12 +5,17 @@
 
 #include <imgui.h>
 
-#include "video_core/renderer_vulkan/vk_instance.h"
-#include "vulkan/vulkan_handles.hpp"
+#include "video_core/renderer_vulkan/vk_common.h"
+#include <vulkan/vulkan.hpp>
 
 union SDL_Event;
 
+namespace Frontend {
+class WindowSDL;
+}
+
 namespace Vulkan {
+class Instance;
 struct Frame;
 }
 
@@ -34,5 +39,12 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
             const vk::Extent2D& extent);
 
 bool MustKeepDrawing(); // Force the emulator redraw
+
+// Returns the embedded HelveticaLTStd Black Condensed font registered during
+// Initialize(). Used by Vulkan::LoadingScreenLayer for the "LOADING SHADERS"
+// overlay rendered while PipelineCache::WarmUp deserializes the on-disk
+// shader cache. Returns nullptr if the font failed to register (in which
+// case callers should fall back to io.FontDefault scaled up).
+ImFont* GetHelveticaFont();
 
 } // namespace ImGui::Core

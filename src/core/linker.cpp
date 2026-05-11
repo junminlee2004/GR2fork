@@ -268,6 +268,14 @@ void Linker::Relocate(Module* module) {
             case STB_GLOBAL:
             case STB_WEAK: {
                 rel_name = names_tlb + sym.st_name;
+                // v87: Log resolutions targeting the browse GOT range
+                {
+                    auto rel_offset = rel_virtual_addr - rel_base_virtual_addr;
+                    if (rel_offset >= 0x16bcc00 && rel_offset <= 0x16bcd18) {
+                        LOG_ERROR(Core_Linker, "[GR2v87] Browse GOT {:#x}: raw='{}'",
+                                  rel_offset, rel_name);
+                    }
+                }
                 if (Resolve(rel_name, rel_sym_type, module, &symrec)) {
                     // Only set the rela bit if the symbol was actually resolved and not stubbed.
                     module->SetRelaBit(bit_idx);
@@ -349,6 +357,7 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         return_info->virtual_address = AeroLib::GetStub(sr.name.c_str());
         return_info->name = "Unknown !!!";
     }
+    // v87: Log all unresolved symbols with their lib/mod names
     LOG_ERROR(Core_Linker, "Linker: Stub resolved {} as {} (lib: {}, mod: {})", sr.name,
               return_info->name, library->name, module->name);
     return false;

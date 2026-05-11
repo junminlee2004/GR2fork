@@ -155,7 +155,11 @@ void Inst::SetArg(size_t index, Value value) {
     if (!value.IsImmediate()) {
         Use(value.Inst(), index);
     }
-    if (op == Opcode::Phi) {
+    // PERF(GR2FORK v1.16): Phi instructions live only at control-flow
+    // merges; the rest of the IR is non-Phi and uses args[index]. Hint the
+    // straight-line writes-args path so the dynamic phi_args[] write moves
+    // to the cold tail.
+    if (op == Opcode::Phi) [[unlikely]] {
         phi_args[index].second = value;
     } else {
         args[index] = value;
@@ -186,19 +190,29 @@ void Inst::Invalidate() {
 
 void Inst::ClearArgs() {
     if (op == Opcode::Phi) {
-        for (auto i = 0; i < phi_args.size(); i++) {
+        // PERF(GR2FORK v1.14): Cache size before the loop. With the SetArg/UndoUse
+        // body, the compiler cannot prove phi_args.size() is loop-invariant, so it
+        // would otherwise reload the size on every iteration through the small_vector
+        // size pointer. Using size_t for the index also matches the .size() return
+        // type and avoids a sign-mismatch zero-extension on each compare.
+        const size_t n = phi_args.size();
+        for (size_t i = 0; i < n; ++i) {
             auto& pair = phi_args[i];
             IR::Value& value{pair.second};
             if (!value.IsImmediate()) {
-                UndoUse(value.Inst(), i);
+                UndoUse(value.Inst(), static_cast<u32>(i));
             }
         }
         phi_args.clear();
     } else {
-        for (auto i = 0; i < args.size(); i++) {
+        // PERF(GR2FORK v1.14): args is std::array<Value, 6> — size is a
+        // compile-time constant. Make that constant explicit so the compiler
+        // can fully unroll the loop and keep all six iterations in registers.
+        constexpr size_t n = std::tuple_size_v<decltype(args)>;
+        for (size_t i = 0; i < n; ++i) {
             auto& value = args[i];
             if (!value.IsImmediate()) {
-                UndoUse(value.Inst(), i);
+                UndoUse(value.Inst(), static_cast<u32>(i));
             }
         }
         // Reset arguments to null

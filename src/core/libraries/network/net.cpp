@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#ifdef WIN32
+// FIX(GR2FORK): #ifdef WIN32 -> _WIN32 (see netctl.cpp for rationale).
+#ifdef _WIN32
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <Ws2tcpip.h>
 #include <iphlpapi.h>
@@ -1053,7 +1054,7 @@ u16 PS4_SYSV_ABI sceNetHtons(u16 host16) {
     return htons(host16);
 }
 
-#if defined(WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__)
 // there isn't a strlcpy function in windows/glibc so implement one
 u64 strlcpy(char* dst, const char* src, u64 size) {
     u64 src_len = strlen(src);
@@ -1206,7 +1207,7 @@ int PS4_SYSV_ABI sceNetInetNtopWithScopeId() {
 }
 
 int PS4_SYSV_ABI sceNetInetPton(int af, const char* src, void* dst) {
-#ifdef WIN32
+#ifdef _WIN32
     int res = InetPtonA(ConvertFamilies(af), src, dst);
 #else
     int res = inet_pton(ConvertFamilies(af), src, dst);

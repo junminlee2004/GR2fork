@@ -41,10 +41,10 @@ constexpr size_t PAGE_BITS = 12;
 
 struct PageManager::Impl {
     struct PageState {
-        u8 num_write_watchers : 7;
-        // At the moment only buffer cache can request read watchers.
-        // And buffers cannot overlap, thus only 1 can exist per page.
-        u8 num_read_watchers : 1;
+        u8 num_write_watchers : 5;
+        // Read watchers can come from both buffer cache and texture cache
+        // (e.g. when readbackLinearImages is enabled for photo mode).
+        u8 num_read_watchers : 3;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write

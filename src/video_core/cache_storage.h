@@ -41,6 +41,13 @@ public:
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
+    // Returns the number of blobs of `type` present on disk without reading
+    // their contents — directory metadata only (or zip-index for archived
+    // caches). Used by Vulkan::Presenter::WarmUpPipelineCache to size the
+    // "LOADING SHADERS" progress bar before the slow ForEachBlob pass that
+    // actually deserializes each pipeline.
+    [[nodiscard]] u32 CountBlobs(BlobType type);
+
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};

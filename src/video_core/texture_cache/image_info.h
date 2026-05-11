@@ -83,6 +83,7 @@ struct ImageInfo {
     std::array<MipInfo, 16> mips_layout;
     VAddr guest_address{};
     u32 guest_size{};
+    u64 size_sig{};
     u8 bank_swizzle{};
     bool alt_tile{};
 

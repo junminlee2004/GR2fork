@@ -15,7 +15,7 @@ namespace Libraries::Kernel {
 extern boost::asio::io_context io_context;
 extern void KernelSignalRequest();
 
-static constexpr auto HrTimerSpinlockThresholdUs = 1200u;
+static constexpr auto HrTimerSpinlockThresholdUs = 25u;
 
 // Events are uniquely identified by id and filter.
 
@@ -198,38 +198,76 @@ bool EqueueInternal::AddSmallTimer(EqueueEvent& ev) {
         std::scoped_lock lock{m_mutex};
         m_small_timers[st.event.ident] = std::move(st);
     }
+
+    // Wake any thread sleeping in WaitForSmallTimer / WaitForEvents.
+    m_cond.notify_all();
     return true;
 }
 
 int EqueueInternal::WaitForSmallTimer(SceKernelEvent* ev, int num, u32 micros) {
     ASSERT(num >= 1);
+    using clock = std::chrono::steady_clock;
 
-    auto curr_clock = std::chrono::steady_clock::now();
-    const auto wait_end_us = (micros == 0) ? std::chrono::steady_clock::time_point::max()
-                                           : curr_clock + std::chrono::microseconds{micros};
+    auto now = clock::now();
+    const auto deadline = (micros == 0) ? clock::time_point::max()
+    : now + std::chrono::microseconds{micros};
+
+    // Final busy window for accuracy (keep small).
+    constexpr auto FinalSpin = std::chrono::microseconds{50};
+
     int count = 0;
-    do {
-        curr_clock = std::chrono::steady_clock::now();
-        {
-            std::scoped_lock lock{m_mutex};
-            for (auto it = m_small_timers.begin(); it != m_small_timers.end() && count < num;) {
-                const SmallTimer& st = it->second;
+    std::unique_lock lk{m_mutex};
 
-                if (curr_clock - st.added >= st.interval) {
-                    ev[count++] = st.event;
-                    it = m_small_timers.erase(it);
-                } else {
-                    ++it;
-                }
+    while (true) {
+        now = clock::now();
+
+        // Collect expired timers (up to num)
+        for (auto it = m_small_timers.begin(); it != m_small_timers.end() && count < num;) {
+            const SmallTimer& st = it->second;
+            if (now - st.added >= st.interval) {
+                ev[count++] = st.event;
+                it = m_small_timers.erase(it);
+            } else {
+                ++it;
             }
-
-            if (count > 0)
-                return count;
         }
-        std::this_thread::yield();
-    } while (curr_clock < wait_end_us);
+        if (count > 0) {
+            return count;
+        }
 
-    return 0;
+        // Timeout?
+        if (now >= deadline) {
+            return 0;
+        }
+
+        // Compute earliest expiry (or deadline if none)
+        clock::time_point next = deadline;
+        for (const auto& [id, st] : m_small_timers) {
+            const auto exp = st.added + st.interval;
+            if (exp < next) next = exp;
+        }
+
+        const auto remain = next - now;
+
+        // If we’re within the final window: release lock and do a tight wait.
+        if (remain <= FinalSpin) {
+            lk.unlock();
+            while (clock::now() < next) {
+                #if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+                #else
+                std::this_thread::yield();
+                #endif
+            }
+            lk.lock();
+            continue;
+        }
+
+        // Sleep until we’re near expiry (or deadline), and wake early on notify.
+        auto wake = next - FinalSpin;
+        if (wake > deadline) wake = deadline;
+        m_cond.wait_until(lk, wake);
+    }
 }
 
 bool EqueueInternal::EventExists(u64 id, s16 filter) {

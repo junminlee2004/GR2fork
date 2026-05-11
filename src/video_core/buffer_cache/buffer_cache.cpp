@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -9,6 +11,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+// Phase 1D-pre-F: needs full Rasterizer type for PushPresenterRecord template
+// instantiation in BufferCache::ReadMemory.
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -82,9 +87,44 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    liverpool->SendCommand<true>([this, device_addr, size, is_write] {
-        Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-        DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
+    const u64 page = device_addr >> CACHING_PAGEBITS;
+    const BufferId buffer_id = page_table[page].buffer_id;
+
+    // --- RYZEN 7840U / Z1 EXTREME OPTIMIZATION ---
+    // Gravity Rush 2 Physics Hack
+    // Forces small physics buffers (Havok data) to sync asynchronously.
+    // This eliminates the heavy stuttering during gravity shifts and combat.
+    bool likely_physics_stall = (size > 1024 && size < 24576);
+    // ---------------------------------------------
+
+    // Phase 1D-pre-F: the SendCommand<true> outer lambda runs on `gpu_id`
+    // (the PM4 thread). Under sync today PM4 is also the assembler thread
+    // — so the inner DownloadBufferMemory's scheduler touches
+    // (EndRendering / PrimaryCommandBuffer / copyBuffer / Finish or
+    // DeferOperation) execute on the same thread that owns draw_scheduler.
+    //
+    // Phase 1D-1 (Phase G): PM4 ≠ assembler. The closure runs on the
+    // assembler thread. `SendCommand<true>`'s contract is "wait until the
+    // lambda completes" — its `sem.release()` fires when this outer lambda
+    // returns. To preserve the contract under async, we MUST WaitFor the
+    // closure's completion before returning, so the GAME-thread caller
+    // (signal handler) doesn't wake before the buffer has actually been
+    // downloaded into host memory. This is the obligation Phase F's
+    // banner foreshadowed — the WaitFor below closes it.
+    liverpool->SendCommand<true>([this, device_addr, size, is_write, likely_physics_stall] {
+        const u32 seq = rasterizer_->PushPresenterRecord(
+            [this, device_addr, size, is_write, likely_physics_stall] {
+                Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+
+                if (likely_physics_stall) {
+                    // Fast Path: Don't wait for GPU. Great for ragdolls/debris.
+                    DownloadBufferMemory<true>(buffer, device_addr, size, is_write);
+                } else {
+                    // Safe Path: Wait for GPU. Necessary for game logic/visuals.
+                    DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
+                }
+            });
+        rasterizer_->WaitForAssembler(seq);
     });
 }
 
@@ -121,7 +161,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
     download_buffer.Commit();
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
@@ -144,48 +184,172 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     }
 }
 
-void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
-    const auto& regs = liverpool->regs;
+void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
+                                    const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    // PERF(GR2): Stamp ultra-fast skip.
+    //
+    // When pipeline pointer + gfx-pipeline stamp are unchanged since the last
+    // successful BindVertexBuffers, NO input that this function consults can
+    // have moved:
+    //   - fetch_shader.attributes is a per-pipeline immutable
+    //   - vgt_instance_step_rate_0/1 are context regs (in stamp)
+    //   - per-attrib buffer sharps come from regs.user_data — SH regs (in stamp)
+    //   - IsVertexInputDynamicState() is fixed at instance init
+    //
+    // Whatever cmdbuf state we last set (setVertexInputEXT + bindVertexBuffers)
+    // is therefore still byte-identical to what would be set this call. Skip
+    // the GetVertexInputs walk + dual hash loops + driver bind calls entirely.
+    //
+    // last_vertex_bind_sig_valid gates this so the skip never fires on the
+    // first BindVertexBuffers of a cmdbuf (or after explicit invalidation).
+    //
+    // Phase 1D-pre-C: stamp from snapshot, not `liverpool->GetGfxPipelineStamp()`.
+    const u64 cur_stamp = regs.gfx_pipeline_stamp;
+    // PERF(GR2FORK v1.16): pipeline+stamp invariance is the same condition
+    // GetGraphicsPipeline rides for its tier-1 cache hit, so the same draws
+    // that resolved the pipeline from cache also resolve their vertex bind
+    // state from this skip. Hint it as the dominant exit.
+    if (last_vbb_pipeline_ == &pipeline && last_vbb_stamp_ == cur_stamp &&
+        last_vertex_bind_sig_valid) [[likely]] {
+        return;
+    }
+
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    // Hot-path: split "vertex input state" from "guest buffer binds".
+    // - setVertexInputEXT depends only on bindings/attributes/divisors (+ step rates), NOT buffer addresses.
+    // - bindVertexBuffers depends on guest buffer addresses/offsets and can change every draw.
+    auto mix = [](u64& h, u64 v) {
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    };
 
-    if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+    u64 input_sig = 0xcbf29ce484222325ULL; // arbitrary non-zero seed
+    mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
+    mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
+    mix(input_sig, static_cast<u64>(instance.IsVertexInputDynamicState() ? 1 : 0));
+    mix(input_sig, reinterpret_cast<u64>(&pipeline));
+
+    for (const auto& b : bindings) {
+        mix(input_sig, (static_cast<u64>(b.binding) << 32) | static_cast<u64>(b.stride));
+        mix(input_sig, static_cast<u64>(static_cast<u32>(b.inputRate)));
     }
+    for (const auto& a : attributes) {
+        mix(input_sig, (static_cast<u64>(a.location) << 32) | static_cast<u64>(a.binding));
+        mix(input_sig, (static_cast<u64>(static_cast<u32>(a.format)) << 32) | static_cast<u64>(a.offset));
+    }
+    for (const auto& d : divisors) {
+        mix(input_sig, (static_cast<u64>(d.binding) << 32) | static_cast<u64>(d.divisor));
+    }
+
+    // Full bind signature includes guest buffers (addresses/sizes/strides).
+    u64 bind_sig = input_sig;
+    for (const auto& gb : guest_buffers) {
+        mix(bind_sig, static_cast<u64>(gb.base_address));
+        mix(bind_sig, static_cast<u64>(gb.GetSize()));
+        mix(bind_sig, static_cast<u64>(gb.GetStride()));
+    }
+
+    // If NOTHING changed (vertex input + guest buffers), skip ALL rebinding work.
+    if (last_vertex_bind_sig_valid && bind_sig == last_vertex_bind_sig) {
+        // PERF(GR2): cmdbuf state is still valid — record stamp so the next
+        // call can take the ultra-fast skip without the hash loops.
+        last_vbb_pipeline_ = &pipeline;
+        last_vbb_stamp_ = cur_stamp;
+        return;
+    }
+
+    // Only call setVertexInputEXT when vertex INPUT state changed.
+    if (instance.IsVertexInputDynamicState()) {
+        if (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig) {
+            const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            last_vertex_input_sig = input_sig;
+            last_vertex_input_sig_valid = true;
+        }
+    }
+
+    last_vertex_bind_sig = bind_sig;
+    last_vertex_bind_sig_valid = true;
+    // PERF(GR2): publish for ultra-fast skip on next call.
+    last_vbb_pipeline_ = &pipeline;
+    last_vbb_stamp_ = cur_stamp;
+
 
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
         return;
     }
 
-    struct BufferRange {
-        VAddr base_address;
-        VAddr end_address;
-        vk::Buffer vk_buffer;
-        u64 offset;
+    // PERF(GR2 v16): Fast path for the common single-active-buffer case.
+    // GR2 draws typically bind 1-2 vertex buffers. When there's only one non-empty
+    // buffer, skip the sort + merge + find_if entirely (saves ~0.3% of GpuComm).
+    Vulkan::VertexInputs<vk::Buffer> host_buffers;
+    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
+    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
+    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
+    const auto null_buffer =
+        instance.IsNullDescriptorSupported() ? VK_NULL_HANDLE : GetBuffer(NULL_BUFFER_ID).Handle();
 
-        [[nodiscard]] size_t GetSize() const {
-            return end_address - base_address;
-        }
-    };
-
-    // Build list of ranges covering the requested buffers
-    Vulkan::VertexInputs<BufferRange> ranges{};
+    // Count non-empty buffers to decide which path to take.
+    u32 non_empty_count = 0;
     for (const auto& buffer : guest_buffers) {
-        if (buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
-        }
+        non_empty_count += (buffer.GetSize() > 0) ? 1 : 0;
     }
 
-    // Merge connecting ranges together
-    Vulkan::VertexInputs<BufferRange> ranges_merged{};
-    if (!ranges.empty()) {
+    if (non_empty_count <= 1) {
+        // Single-buffer fast path: no sort/merge needed.
+        // Just obtain the one buffer directly and map all guest buffers to it.
+        vk::Buffer single_vk_buffer{};
+        u64 single_offset = 0;
+        VAddr single_base = 0;
+        VAddr single_end = 0;
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0 && !single_vk_buffer) {
+                const u64 size = memory->ClampRangeSize(buffer.base_address, buffer.GetSize());
+                const auto [obtained, offset] = ObtainBuffer(buffer.base_address, size, false);
+                single_vk_buffer = obtained->buffer;
+                single_offset = offset;
+                single_base = buffer.base_address;
+                single_end = buffer.base_address + buffer.GetSize();
+            }
+        }
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0) {
+                host_buffers.emplace_back(single_vk_buffer);
+                host_offsets.push_back(single_offset + buffer.base_address - single_base);
+            } else {
+                host_buffers.emplace_back(null_buffer);
+                host_offsets.push_back(0);
+            }
+            host_sizes.push_back(buffer.GetSize());
+            host_strides.push_back(buffer.GetStride());
+        }
+    } else {
+        // Multi-buffer path: sort, merge, then map.
+        struct BufferRange {
+            VAddr base_address;
+            VAddr end_address;
+            vk::Buffer vk_buffer;
+            u64 offset;
+
+            [[nodiscard]] size_t GetSize() const {
+                return end_address - base_address;
+            }
+        };
+
+        Vulkan::VertexInputs<BufferRange> ranges{};
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0) {
+                ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+            }
+        }
+
+        // Merge connecting ranges together
+        Vulkan::VertexInputs<BufferRange> ranges_merged{};
         std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) {
             return lhv.base_address < rhv.base_address;
         });
@@ -198,43 +362,36 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
                 prev_range.end_address = std::max(prev_range.end_address, range.end_address);
             }
         }
-    }
 
-    // Map buffers for merged ranges
-    for (auto& range : ranges_merged) {
-        const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
-        range.vk_buffer = buffer->buffer;
-        range.offset = offset;
-    }
-
-    // Bind vertex buffers
-    Vulkan::VertexInputs<vk::Buffer> host_buffers;
-    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
-    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
-    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
-    const auto null_buffer =
-        instance.IsNullDescriptorSupported() ? VK_NULL_HANDLE : GetBuffer(NULL_BUFFER_ID).Handle();
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.GetSize() > 0) {
-            const auto host_buffer_info =
-                std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
-                    return buffer.base_address >= range.base_address &&
-                           buffer.base_address < range.end_address;
-                });
-            ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->vk_buffer);
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
-                                   host_buffer_info->base_address);
-        } else {
-            host_buffers.emplace_back(null_buffer);
-            host_offsets.push_back(0);
+        // Map buffers for merged ranges
+        for (auto& range : ranges_merged) {
+            const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+            const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+            range.vk_buffer = buffer->buffer;
+            range.offset = offset;
         }
-        host_sizes.push_back(buffer.GetSize());
-        host_strides.push_back(buffer.GetStride());
+
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0) {
+                const auto host_buffer_info =
+                    std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
+                        return buffer.base_address >= range.base_address &&
+                               buffer.base_address < range.end_address;
+                    });
+                ASSERT(host_buffer_info != ranges_merged.cend());
+                host_buffers.emplace_back(host_buffer_info->vk_buffer);
+                host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+                                       host_buffer_info->base_address);
+            } else {
+                host_buffers.emplace_back(null_buffer);
+                host_offsets.push_back(0);
+            }
+            host_sizes.push_back(buffer.GetSize());
+            host_strides.push_back(buffer.GetStride());
+        }
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
@@ -244,8 +401,20 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline) {
     }
 }
 
-void BufferCache::BindIndexBuffer(u32 index_offset) {
-    const auto& regs = liverpool->regs;
+void BufferCache::BindIndexBuffer(u32 index_offset, const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    // PERF(GR2): Stamp ultra-fast skip. cur_stamp+index_offset+tick
+    // captures every input to a successful bind: regs.index_buffer_type,
+    // regs.index_base_address, regs.num_indices are all context regs in the
+    // stamp. When all three match the previous successful bind, the cmdbuf
+    // already has bindIndexBuffer recorded — avoid reading regs entirely.
+    // Phase 1D-pre-C: stamp from snapshot.
+    const u64 cur_stamp = regs.gfx_pipeline_stamp;
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+    const u64 tick = scheduler.CurrentTick();
+    if (last_index_stamp_ == cur_stamp && last_index_offset_ == index_offset &&
+        last_index_tick_ == tick) {
+        return;
+    }
 
     // Figure out index type and size.
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
@@ -253,13 +422,32 @@ void BufferCache::BindIndexBuffer(u32 index_offset) {
     const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
     const VAddr index_address =
         regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    const u32 index_buffer_size = regs.num_indices * index_size;
+
+    // OPT(v18): Existing fallback dedup — catches the rare case where the
+    // stamp moved but the (address, size, type) tuple is bit-identical
+    // (e.g., a SetShReg to an unrelated SH region bumped the stamp without
+    // changing index buffer state).
+    if (last_index_address_ == index_address && last_index_buffer_size_ == index_buffer_size &&
+        last_index_type_ == index_type && last_index_tick_ == tick) {
+        // Record stamp so future stamp-skip fires on this draw's repeats.
+        last_index_stamp_ = cur_stamp;
+        last_index_offset_ = index_offset;
+        return;
+    }
 
     // Bind index buffer.
-    const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
-    const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+
+    last_index_address_ = index_address;
+    last_index_buffer_size_ = index_buffer_size;
+    last_index_type_ = index_type;
+    last_index_tick_ = tick;
+    last_index_stamp_ = cur_stamp;
+    last_index_offset_ = index_offset;
 }
+
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
@@ -319,18 +507,25 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     };
     const vk::BufferMemoryBarrier2 buf_barriers_before[2] = {
         {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            // OPT: Narrow from eAllCommands. Dst buffer only needs to wait for prior
+            // shader/transfer writes before becoming a transfer destination.
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                            vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
             .buffer = dst_buffer.Handle(),
             .offset = dst_buffer.Offset(dst),
             .size = num_bytes,
         },
         {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            // OPT: Source buffer needs prior writes visible before transfer read.
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                            vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
             .buffer = src_buffer.Handle(),
             .offset = src_buffer.Offset(src),
@@ -338,7 +533,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         },
     };
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 2,
@@ -347,19 +542,23 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     cmdbuf.copyBuffer(src_buffer.Handle(), dst_buffer.Handle(), region);
     const vk::BufferMemoryBarrier2 buf_barriers_after[2] = {
         {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            // OPT: After transfer write, make visible to shader reads/writes.
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                            vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
             .buffer = dst_buffer.Handle(),
             .offset = dst_buffer.Offset(dst),
             .size = num_bytes,
         },
         {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            // OPT: Source buffer after transfer read only needs future writes visible.
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                            vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
             .buffer = src_buffer.Handle(),
             .offset = src_buffer.Offset(src),
             .size = num_bytes,
@@ -375,11 +574,224 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
+    // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+    //
+    // PERF(GR2FORK v1.16): The stream-buffer fast path covers small read-only
+    // UBO copies, which is the dominant ObtainBuffer call shape: BindBuffers
+    // overwhelmingly dispatches UBOs not SSBOs, sizes hit under CACHING_PAGESIZE,
+    // and the typical CPU-side written / GPU-untouched ranges hit the
+    // `!IsRegionGpuModified` short-circuit. Hint the body so the slow-path
+    // FindBuffer + SynchronizeBuffer ladder lays out as the cold tail.
+    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) [[likely]] {
+        // ULTRA(GR2): XXH3 hashing of small UBO payloads became a top GpuComm hotspot.
+        // Avoid hashing entirely by using the CPU page tracker:
+        //   - only reuse a prior stream-buffer copy when the range is currently NOT CPU-modified
+        //   - otherwise do a fresh Copy().
+        // PERF(GR2FORK v1.32 Fix 1): bump cache from 256 → 4096 entries.
+        // PERF(GR2FORK v1.38): 2-way set associative + path-D trust-within-cmdbuf
+        //
+        // ----------------------------------------------------------------
+        // The v1.31 diagnostic split stream-path traffic into:
+        //     hit_clean   2.3%  | NO memmove (the only good path)
+        //     hit_dirty  30.7%  | memmove (sticky-dirty bit forces re-Copy)
+        //     miss_inv    0.0%
+        //     miss_stale 20.3%  | memmove (cmdbuf/tick rotation)
+        //     miss_coll  46.7%  | memmove (cache hash collision)
+        //  ──────────────────────
+        //     stream-path memmove rate ≈ 97.7%
+        //
+        // v1.34 size bump (256→4096, splittable64 hash) was a free-lunch
+        // pass that brought miss_coll down ~30pp but the freed traffic
+        // redistributed almost entirely into hit_dirty and miss_stale,
+        // because the IsRegionCpuModified gate is sticky-true for
+        // stream-eligible UBO ranges (the bit is set at first-fault
+        // during boot and effectively never clears — only the regular
+        // SynchronizeBuffer path clears it, and stream-path ranges
+        // almost never go through there). Net memmove rate: unchanged.
+        // The cache-size knob is tapped out.
+        //
+        // v1.38 attacks the structural blocker on two layers:
+        //
+        // (1) PATH D — TRUST WITHIN CMDBUF. When (addr, size, cmdbuf,
+        //     tick) all match, the entry was populated by an explicit
+        //     Copy() earlier in the same recording session. The bet:
+        //     GR2's UBO write pattern is rolling-buffer (per-draw
+        //     constants land at fresh allocator offsets), not
+        //     mutate-in-place, so the source range hasn't been
+        //     rewritten between Copy and re-bind. Drop the
+        //     IsRegionCpuModified check on identity-match hits.
+        //
+        //     This is the path the v1.36 "track writes correctly"
+        //     attempt was avoiding — that attempt called
+        //     UnmarkRegionAsCpuModified() to clear the sticky bit and
+        //     re-protect the page, and deadlocked the game because
+        //     shadPS4 host-side write paths (file I/O, fiber worker
+        //     memcpy, emulator-internal copies) bypass the SIGSEGV
+        //     dirty hook. After clear+re-protect, a host write
+        //     doesn't re-set the bit, the next hit_clean returns a
+        //     stale offset, the GPU reads garbage, work never retires,
+        //     worker fibers wait forever. v1.36's 28000× mprotect-
+        //     frequency reduction had zero effect on hang signature
+        //     or timing — the issue is structural, not rate-related.
+        //
+        //     Path D sidesteps the dirty-tracking problem entirely by
+        //     not relying on dirty bits within a cmdbuf. Risk: if
+        //     GR2 has any pattern of "Copy → guest CPU rewrites same
+        //     UBO range mid-cmdbuf → re-bind/draw," the GPU sees the
+        //     pre-rewrite snapshot. The kill switch
+        //     `GR2FORK_OBTAIN_TRUST_INTRA_CMDBUF=0` reverts to the
+        //     v1.35 IsRegionCpuModified gate.
+        //
+        //     Expected impact: hit_dirty (30.7%) → effective hit_clean.
+        //     Stream-path memmove rate drops 97.7% → 67%; ObtainBuffer
+        //     contribution to GpuComm drops 4.13% → ~2.84%, i.e.
+        //     ~1.3pp of GpuComm.
+        //
+        // (2) 2-WAY SET ASSOCIATIVE. With ~768-key working set in 4096
+        //     direct-mapped sets and good hashing, ~70 sets get 2 keys
+        //     and thrash continually (the residual 47% miss_coll after
+        //     v1.34). 2-way absorbs the 2-key collisions while keeping
+        //     each set at exactly 64 bytes — one Zen 4 cache line — so
+        //     a lookup still touches one cache line. Compaction (was
+        //     48 → 32 bytes per entry) made this fit:
+        //         - drop the `valid` bool; addr=0 is never a real
+        //           guest VAddr, so it's a free invalid sentinel.
+        //         - shrink offset u64→u32; UboStreamBufferSize=64MB
+        //           (per the v48 root-cause cap) sits well inside u32.
+        //         - reorder for natural alignment: 8+8+8+4+4 = 32, no
+        //           tail padding.
+        //
+        //     Without path D, 2-way mostly redistributes miss_coll into
+        //     hit_dirty (same memmove cost). Path D is what makes the
+        //     2-way win compound: collisions become hits, hits become
+        //     no-memmove returns.
+        //
+        // FIX(GR2FORK v1.33): heap-allocated, only an 8-byte unique_ptr
+        // lives in TLS — the SCE pthread emulator's small-stack TLS
+        // budget rejected the prior in-TLS array (EINVAL on
+        // pthread_create during boot). 256 KB heap fits L2 once warm.
+        //
+        // Diagnostic to re-add for measurement (per MEMMOVE_HANDOFF.md):
+        // a per-thread {outer_skip, hit_clean, hit_dirty, miss_invalid,
+        // miss_stale, miss_collision, total} counter struct with a
+        // log_if_due lambda firing every 200K calls. Strip before
+        // shipping.
+        // ----------------------------------------------------------------
+        struct StreamCopyCacheEntry {
+            VAddr addr;                // 8 bytes (0 = invalid sentinel)
+            u64 tick;                  // 8 bytes
+            vk::CommandBuffer cmdbuf;  // 8 bytes (single VkCommandBuffer pointer)
+            u32 offset;                // 4 bytes (UboStreamBufferSize=64MB fits in u32)
+            u32 size;                  // 4 bytes
+        };
+        static_assert(sizeof(StreamCopyCacheEntry) == 32,
+                      "StreamCopyCacheEntry must be 32 bytes (two per cache line)");
+
+        constexpr size_t kStreamCacheSets = 4096;
+        constexpr size_t kStreamCacheWays = 2;
+        struct alignas(64) StreamCopyCacheSet {
+            StreamCopyCacheEntry ways[kStreamCacheWays];
+        };
+        static_assert(sizeof(StreamCopyCacheSet) == 64,
+                      "StreamCopyCacheSet must occupy exactly one cache line");
+
+        struct StreamCopyCache {
+            std::array<StreamCopyCacheSet, kStreamCacheSets> sets{};
+            // 1-bit pseudo-LRU per set: index of the way to evict next.
+            // Stored separately to keep the set itself at 64 bytes.
+            std::array<u8, kStreamCacheSets> lru{};
+        };
+        static thread_local std::unique_ptr<StreamCopyCache> cache_storage;
+        if (!cache_storage) [[unlikely]] {
+            cache_storage = std::make_unique<StreamCopyCache>();
+        }
+        auto& cache = *cache_storage;
+
+        // Path D kill switch — read once per thread.
+        // Default: trust enabled. Set GR2FORK_OBTAIN_TRUST_INTRA_CMDBUF=0
+        // to disable and fall back to v1.35's IsRegionCpuModified gate.
+        static const bool kTrustIntraCmdbuf = []() noexcept {
+            const char* e = std::getenv("GR2FORK_OBTAIN_TRUST_INTRA_CMDBUF");
+            return !e || e[0] != '0';
+        }();
+
+        const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+        const u64 tick = scheduler.CurrentTick();
+
+        // splittable64-style mix (from v1.32 Fix 1). `size * 0x9e37…`
+        // folds size into all 64 bits before XORing into addr, so
+        // common-size collisions (256/512/1024/2048 all having
+        // identical low bits) avalanche apart. Two xor-shift-mul rounds
+        // ensure all 12 set-index bits carry roughly equal entropy.
+        u64 key = static_cast<u64>(device_addr);
+        key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        const size_t set_idx = key & (kStreamCacheSets - 1);
+        StreamCopyCacheSet& set = cache.sets[set_idx];
+
+        // Probe both ways. The two-way comparison is one cache line and
+        // mostly speculative-execution-friendly: way 0 is hit in the
+        // dominant case, way 1 only matters when way 0 was evicted by a
+        // colliding key. The `addr != 0` invalid-sentinel check is
+        // folded into the equality (`addr == device_addr` with
+        // device_addr ≠ 0 implies a populated entry).
+        StreamCopyCacheEntry* hit = nullptr;
+        if (set.ways[0].addr == device_addr && set.ways[0].size == size &&
+            set.ways[0].cmdbuf == cmdbuf && set.ways[0].tick == tick) [[likely]] {
+            hit = &set.ways[0];
+        } else if (set.ways[1].addr == device_addr && set.ways[1].size == size &&
+                   set.ways[1].cmdbuf == cmdbuf && set.ways[1].tick == tick) {
+            hit = &set.ways[1];
+        }
+
+        if (hit) [[likely]] {
+            // 1-bit LRU update: the OTHER way is the next eviction target.
+            cache.lru[set_idx] = static_cast<u8>(hit == &set.ways[0] ? 1u : 0u);
+            // Path D: skip the sticky-dirty check by default. v1.35
+            // behavior is restored when kTrustIntraCmdbuf is false.
+            if (kTrustIntraCmdbuf || !IsRegionCpuModified(device_addr, size)) [[likely]] {
+                return {&stream_buffer, hit->offset};
+            }
+            // Hit-but-dirty with path D disabled (kill-switch path):
+            // re-Copy into the same entry so subsequent reads in this
+            // (cmdbuf, tick) window pick up the fresh offset. This is
+            // the v1.35 hit_dirty path preserved verbatim.
+            const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+            hit->offset = static_cast<u32>(offset);
+            return {&stream_buffer, offset};
+        }
+
+        // Miss in both ways. Copy fresh and insert into the LRU way.
+        // The LRU bit was last set so that:
+        //   - after a hit on way W: lru = (W ^ 1)  → other way evicts next
+        //   - after a miss inserting into way V: lru = (V ^ 1)
+        // so cache.lru[set_idx] always names the next victim.
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        const u8 victim_way = cache.lru[set_idx] & 1u;
+        StreamCopyCacheEntry& victim = set.ways[victim_way];
+        victim.addr = device_addr;
+        victim.tick = tick;
+        victim.cmdbuf = cmdbuf;
+        victim.offset = static_cast<u32>(offset);
+        victim.size = size;
+        cache.lru[set_idx] = static_cast<u8>(victim_way ^ 1u);
+
+        // PERF(GR2FORK v1.32 Fix 2 → REVERTED in v1.34, see path-D notes
+        // above): UnmarkRegionAsCpuModified() here would clear the
+        // sticky dirty bit, but doing so deadlocks the game because
+        // host-side write paths bypass the SIGSEGV dirty hook. v1.38
+        // sidesteps the whole issue by trusting (cmdbuf, tick) identity
+        // instead of the bit.
+
         return {&stream_buffer, offset};
     }
-    if (IsBufferInvalid(buffer_id)) {
+
+    // PERF(GR2FORK v1.16): caller-supplied buffer_id was looked up moments
+    // ago and is overwhelmingly still valid — re-FindBuffer is the rare
+    // recovery path triggered only by intervening GC.
+    if (IsBufferInvalid(buffer_id)) [[unlikely]] {
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[buffer_id];
@@ -424,16 +836,25 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
-    if (device_addr == 0) {
+    // PERF(GR2FORK v1.16): three layered hot-path hints.
+    //   - device_addr == 0 is essentially never the case for a real binding;
+    //     it only fires for truly null guest pointers (which a sanitizer
+    //     check above would normally catch).
+    //   - !buffer_id is the first-touch path that creates a buffer for a
+    //     fresh page; rare after warmup.
+    //   - IsInBounds(addr, size) is what we want to be true on every
+    //     subsequent FindBuffer for a stable resource — that's the dominant
+    //     return of a successfully-cached buffer_id.
+    if (device_addr == 0) [[unlikely]] {
         return NULL_BUFFER_ID;
     }
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page].buffer_id;
-    if (!buffer_id) {
+    if (!buffer_id) [[unlikely]] {
         return CreateBuffer(device_addr, size);
     }
     const Buffer& buffer = slot_buffers[buffer_id];
-    if (buffer.IsInBounds(device_addr, size)) {
+    if (buffer.IsInBounds(device_addr, size)) [[likely]] {
         return buffer_id;
     }
     return CreateBuffer(device_addr, size);
@@ -529,7 +950,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
         .size = overlap.SizeBytes(),
     };
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
 
     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> pre_barriers{};
     if (auto src_barrier = overlap.GetBarrier(vk::AccessFlagBits2::eTransferRead,
@@ -647,10 +1068,28 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             total_size_bytes += range_size;
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
-
+    // Coalesce adjacent upload ranges to reduce CopySparseMemory/memmove calls.
+    // Safe because copies are constructed with contiguous srcOffset (total_size_bytes accumulator).
+    if (copies.size() > 1) {
+        size_t out = 0;
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const auto cur = copies[i];
+            if (out > 0) {
+                auto& prev = copies[out - 1];
+                const bool contiguous_src = (cur.srcOffset == prev.srcOffset + prev.size);
+                const bool contiguous_dst = (cur.dstOffset == prev.dstOffset + prev.size);
+                if (contiguous_src && contiguous_dst) {
+                    prev.size += cur.size;
+                    continue;
+                }
+            }
+            copies[out++] = cur;
+        }
+        copies.resize(out);
+    }
     if (src_buffer) {
         scheduler.EndRendering();
-        const auto cmdbuf = scheduler.CommandBuffer();
+        const auto cmdbuf = scheduler.PrimaryCommandBuffer();
         const vk::BufferMemoryBarrier2 pre_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
@@ -801,10 +1240,14 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable {});
     }
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
     const vk::BufferMemoryBarrier2 pre_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        // OPT: Only need to wait for prior shader/transfer access before writing.
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                        vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                         vk::AccessFlagBits2::eTransferRead,
         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .buffer = buffer.Handle(),
@@ -812,10 +1255,12 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .size = num_bytes,
     };
     const vk::BufferMemoryBarrier2 post_barrier = {
+        // OPT: After write, make visible to shader reads/writes.
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllGraphics |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
         .buffer = buffer.Handle(),
         .offset = buffer.Offset(address),
         .size = num_bytes,

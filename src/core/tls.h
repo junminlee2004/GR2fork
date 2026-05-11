@@ -60,8 +60,29 @@ void ClearStack() {
 template <class ReturnType, class... FuncArgs, class... CallArgs>
 ReturnType ExecuteGuest(PS4_SYSV_ABI ReturnType (*func)(FuncArgs...), CallArgs&&... args) {
     EnsureThreadInitialized();
-    // clear stack to avoid trash from EnsureThreadInitialized
-    ClearStack<12_KB>();
+
+    // MTTW optimization (fork): only clear stack ONCE per thread.
+    // The original comment says this is to clear trash from EnsureThreadInitialized,
+    // which is only relevant the first time the thread enters guest.
+    //
+    // PORT(upstream #4033, GR2-win-crash-fix, commit 0f92285): additional guard
+    // to skip the clear when a PS4 fiber is active on this thread. In that case
+    // the "stack" is the fiber's stack (not the OS thread stack), and 12 KB of
+    // alloca() + memset corrupts fiber state on Windows.
+    //
+    // Composition: we only clear once per thread AND only when no fiber is
+    // active. If the first ExecuteGuest on a thread happens inside a fiber,
+    // we defer the clear until the next call where the fiber is inactive.
+    // Once cleared, never clear again on this thread.
+    static thread_local bool cleared_after_init = false;
+    if (!cleared_after_init) {
+        auto* tcb = GetTcbBase();
+        if (tcb != nullptr && tcb->tcb_fiber == nullptr) {
+            ClearStack<12_KB>();
+            cleared_after_init = true;
+        }
+    }
+
     return func(std::forward<CallArgs>(args)...);
 }
 

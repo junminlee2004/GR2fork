@@ -115,6 +115,27 @@ static auto UserPaths = [] {
 
     create_path(PathType::UserDir, user_dir);
     create_path(PathType::LogDir, user_dir / LOG_DIR);
+
+    // MIGRATION(GR2FORK v1.0): if the legacy "screenshots" directory exists
+    // and the new "Capture Gallery" doesn't, rename in place so existing
+    // photos and GR2 gallery entries carry over without user intervention.
+    {
+        const auto legacy = user_dir / "screenshots";
+        const auto current = user_dir / SCREENSHOTS_DIR;
+        std::error_code ec;
+        if (std::filesystem::exists(legacy, ec) && !std::filesystem::exists(current, ec)) {
+            std::filesystem::rename(legacy, current, ec);
+            // If rename fails (e.g. cross-device), the create_path below
+            // just creates the new dir empty. Old dir stays around.
+        }
+        // Sub-rename: "GR2_PhotoApp_HLE" -> "Gravity Rush 2" inside the gallery.
+        const auto legacy_gr2 = current / "GR2_PhotoApp_HLE";
+        const auto new_gr2 = current / "Gravity Rush 2";
+        if (std::filesystem::exists(legacy_gr2, ec) && !std::filesystem::exists(new_gr2, ec)) {
+            std::filesystem::rename(legacy_gr2, new_gr2, ec);
+        }
+    }
+
     create_path(PathType::ScreenshotsDir, user_dir / SCREENSHOTS_DIR);
     create_path(PathType::ShaderDir, user_dir / SHADER_DIR);
     create_path(PathType::GameDataDir, user_dir / GAMEDATA_DIR);

@@ -68,7 +68,12 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
              total_flexible_size, total_direct_size);
 }
 
-u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
+// PERF(GR2FORK release_v2_2): renamed to ClampRangeSizeSlow. The fast
+// path (size < 3_GB) is now inlined in memory.h; this body is only
+// reached for genuinely large ranges that may straddle multiple VMAs.
+// The size<3_GB short-circuit is preserved as a defensive check in case
+// this is called directly.
+u64 MemoryManager::ClampRangeSizeSlow(VAddr virtual_addr, u64 size) {
     static constexpr u64 MinSizeToClamp = 3_GB;
     // Dont bother with clamping if the size is small so we dont pay a map lookup on every buffer.
     if (size < MinSizeToClamp) {

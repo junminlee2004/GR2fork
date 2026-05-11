@@ -81,10 +81,17 @@ auto output_array = std::array{
     ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT),   // TouchPad
     ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER), // TouchPad
     ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT),  // TouchPad
-    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_UP),         // Up
-    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_DOWN),       // Down
-    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_LEFT),       // Left
-    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_RIGHT),      // Right
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_UP),     // TouchPad
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN),   // TouchPad
+    // Synthetic touchpad-swipe button outputs (timed center -> direction -> release).
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT),
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_UP),    // Up
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_DOWN),  // Down
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_LEFT),  // Left
+    ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_RIGHT), // Right
 
     // Axis mappings
     // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX, false),
@@ -107,6 +114,7 @@ auto output_array = std::array{
     ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK),
     ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_GYRO),
     ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD),
+    ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD_SWIPE),
     ControllerOutput(HOTKEY_RENDERDOC),
 
     ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_INVALID),
@@ -148,6 +156,15 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER:
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
+        return OPBDO::TouchPad;
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_UP:
+        return OPBDO::TouchPad;
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN:
+        return OPBDO::TouchPad;
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_BACK:
         return OPBDO::TouchPad;
@@ -229,7 +246,7 @@ void ParseInputConfig(const std::string game_id = "") {
     float mouse_speed_offset = 0.125;
 
     leftjoystick_deadzone = {1, 127};
-    rightjoystick_deadzone = {1, 127};
+    rightjoystick_deadzone = {0, 127};
     lefttrigger_deadzone = {1, 127};
     righttrigger_deadzone = {1, 127};
 
@@ -328,6 +345,59 @@ void ParseInputConfig(const std::string game_id = "") {
                 return;
             }
             SetMouseParams(mouse_deadzone_offset, mouse_speed, mouse_speed_offset);
+            return;
+        } else if (output_string == "touchpad_swipe_speed") {
+            std::stringstream ss(input_string);
+            float speed;
+            ss >> speed;
+            if (ss.fail() || speed <= 0.0f) {
+                LOG_WARNING(Input, "Failed to parse touchpad swipe speed from line: {}", line);
+                return;
+            }
+            SetTouchpadSwipeSpeed(speed);
+            return;
+        } else if (output_string == "touchpad_swipe_threshold") {
+            std::stringstream ss(input_string);
+            float threshold;
+            ss >> threshold;
+            if (ss.fail() || threshold <= 0.0f) {
+                LOG_WARNING(Input, "Failed to parse touchpad swipe threshold from line: {}", line);
+                return;
+            }
+            SetTouchpadSwipeThreshold(threshold);
+            return;
+        } else if (output_string == "touchpad_swipe_enabled") {
+            EnableTouchpadSwipe(input_string == "true" || input_string == "1");
+            return;
+        } else if (output_string == "touchpad_swipe_button_delay") {
+            // Delay in ms between the center-press and the directional press
+            // for the button-triggered touchpad swipe. Default 200.
+            auto delay = parseInt(input_string);
+            if (!delay || *delay < 1) {
+                LOG_WARNING(Input,
+                            "Invalid touchpad_swipe_button_delay at line {}: \"{}\", skipping.",
+                            lineCount, line);
+                return;
+            }
+            SetTouchpadSwipeButtonDelay(*delay);
+            return;
+        } else if (output_string == "mouse_default_mode") {
+            if (input_string == "joystick") {
+                SetMouseMode(Input::MouseMode::Joystick);
+            } else if (input_string == "gyro") {
+                SetMouseMode(Input::MouseMode::Gyro);
+            } else if (input_string == "touchpad") {
+                SetMouseMode(Input::MouseMode::Touchpad);
+            } else if (input_string == "touchpad_swipe") {
+                // Touchpad swipe is independent of mouse mode
+                EnableTouchpadSwipe(true);
+            } else if (input_string == "off" || input_string == "none") {
+                SetMouseMode(Input::MouseMode::Off);
+                EnableTouchpadSwipe(false);
+            } else {
+                LOG_WARNING(Input, "Invalid mouse_default_mode value: {}", input_string);
+                SetMouseMode(Input::MouseMode::Off);
+            }
             return;
         } else if (output_string == "analog_deadzone") {
             std::stringstream ss(input_string);
@@ -556,6 +626,38 @@ void ControllerOutput::FinalizeUpdate() {
             controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
             controller->CheckButton(0, SDLGamepadToOrbisButton(button), new_button_state);
             break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_UP:
+            controller->SetTouchpadState(0, new_button_state, 0.5f, 0.25f);
+            controller->CheckButton(0, SDLGamepadToOrbisButton(button), new_button_state);
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN:
+            controller->SetTouchpadState(0, new_button_state, 0.5f, 0.75f);
+            controller->CheckButton(0, SDLGamepadToOrbisButton(button), new_button_state);
+            break;
+        // Synthetic touchpad-swipe outputs: rising-edge-only, fire a timed
+        // center -> direction -> release sequence. The button state itself
+        // does not drive the touchpad — the SDL_AddTimer chain in
+        // input_mouse.cpp owns the playback.
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_UP);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_DOWN);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_LEFT);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_RIGHT);
+            }
+            break;
         case LEFTJOYSTICK_HALFMODE:
             leftjoystick_halfmode = new_button_state;
             break;
@@ -582,6 +684,9 @@ void ControllerOutput::FinalizeUpdate() {
             break;
         case HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD:
             PushSDLEvent(SDL_EVENT_MOUSE_TO_TOUCHPAD);
+            break;
+        case HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD_SWIPE:
+            PushSDLEvent(SDL_EVENT_MOUSE_TO_TOUCHPAD_SWIPE);
             break;
         case HOTKEY_RENDERDOC:
             PushSDLEvent(SDL_EVENT_RDOC_CAPTURE);

@@ -293,11 +293,13 @@ public:
         const VectorIds* data_types;
         Id id;
         Id sampled_type;
-        Id pointer_type;
         Id image_type;
         AmdGpu::ImageType view_type;
         bool is_integer = false;
         bool is_storage = false;
+        // PORT(upstream #4075): distinguishes None / DynamicIndex / ConstantIndex
+        // at emit time so EmitImageRead/Write can pick the right path.
+        MipStorageFallbackMode mip_fallback_mode{};
     };
 
     enum class PointerType : u32 {

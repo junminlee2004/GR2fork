@@ -5,6 +5,8 @@
 
 #include <imgui.h>
 #include "common/config.h"
+#include "video_core/renderer_vulkan/vk_common.h"
+#include <vulkan/vulkan.hpp>
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "imgui_impl_sdl3.h"

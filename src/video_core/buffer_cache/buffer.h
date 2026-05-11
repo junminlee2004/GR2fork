@@ -125,9 +125,14 @@ public:
     }
 
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
-                                                       vk::PipelineStageFlagBits2 dst_stage,
+                                                       vk::PipelineStageFlags2 dst_stage,
                                                        u32 offset = 0) {
-        if (dst_acess_mask == access_mask && stage == dst_stage) {
+        // PERF(GR2FORK v1.21): consecutive draws using the same buffer
+        // with the same access pattern (e.g. UBO read across many draws
+        // in a single render pass) hit this no-barrier-needed early
+        // return. Only first-touch and access-mode transitions construct
+        // a barrier. Hint the steady-state path.
+        if (dst_acess_mask == access_mask && stage == dst_stage) [[likely]] {
             return {};
         }
 
@@ -162,10 +167,15 @@ public:
     Vulkan::Scheduler* scheduler;
     MemoryUsage usage;
     UniqueBuffer buffer;
+    // OPT: Narrowed default access mask and stage. eAllCommands creates maximum GPU pipeline
+    // bubbles by forcing full drain before any subsequent work. Use eAllGraphics | eComputeShader
+    // which covers actual shader usage without blocking transfer-only or host stages.
     vk::Flags<vk::AccessFlagBits2> access_mask{
-        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
-    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eAllGraphics |
+                                   vk::PipelineStageFlagBits2::eComputeShader |
+                                   vk::PipelineStageFlagBits2::eTransfer};
 };
 
 class StreamBuffer : public Buffer {

@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ranges>
+#include <limits>
+#include <cstring>
+#include <mutex>
+#include <vector>
+#include <xxhash.h>
 
 #include "common/config.h"
 #include "common/hash.h"
@@ -22,11 +27,196 @@
 
 namespace Vulkan {
 
+namespace {
+
+// =========================================================================
+// OPT(GR2 v78): Pipeline compile graveyard.
+// =========================================================================
+// std::future<T>'s destructor joins the worker thread. When a Vulkan driver
+// hangs inside vkCreateGraphicsPipelines, that thread never returns, and
+// any future destruction (PipelineCache dtor, pending-map erase) blocks
+// forever. We dump "abandoned" futures here on permafail and on PipelineCache
+// teardown; this storage is intentionally never freed so futures never get
+// destructed. On process exit the OS reaps the hung threads via _exit.
+struct PipelineCompileGraveyard {
+    std::mutex mu;
+    // Heap-allocated vector we never delete — this is the leak-on-purpose.
+    std::vector<std::future<std::unique_ptr<GraphicsPipeline>>>* graves = nullptr;
+    void Bury(std::future<std::unique_ptr<GraphicsPipeline>> f) {
+        std::lock_guard lk{mu};
+        if (!graves) {
+            graves = new std::vector<std::future<std::unique_ptr<GraphicsPipeline>>>();
+        }
+        graves->push_back(std::move(f));
+    }
+};
+
+PipelineCompileGraveyard& Graveyard() {
+    // Leaked Meyers-style singleton — heap allocated + never deleted, so its
+    // dtor never runs (which is exactly what we want; see comment above).
+    static auto* g = new PipelineCompileGraveyard();
+    return *g;
+}
+
+} // namespace
+
 using Shader::LogicalStage;
 using Shader::Output;
 using Shader::Stage;
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
+
+// PERF(GR2 v16): Hash RuntimeInfo by stage, matching operator== semantics exactly.
+// Cannot hash raw bytes because the union has padding and some stages use custom
+// equality (e.g. FragmentRuntimeInfo only compares inputs[0..num_inputs]).
+static u64 HashRuntimeInfoForStage(const Shader::RuntimeInfo& ri) {
+    // Combine helper: boost::hash_combine style
+    auto mix = [](u64 seed, u64 v) -> u64 {
+        return seed ^ (v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+    };
+    u64 h = static_cast<u64>(ri.stage);
+    switch (ri.stage) {
+    case Shader::Stage::Local:
+        h = mix(h, ri.ls_info.ls_stride);
+        break;
+    case Shader::Stage::Export:
+        h = mix(h, ri.es_info.vertex_data_size);
+        break;
+    case Shader::Stage::Vertex: {
+        const auto& v = ri.vs_info;
+        h = mix(h, XXH3_64bits(v.outputs.data(), sizeof(v.outputs)));
+        // PERF(GR2FORK v1.18): pack the eight scalar fields into three
+        // packed mix calls. Each scalar pair fits naturally in a u64:
+        //   - step_rate_0 | step_rate_1   (two u32s, exact 64-bit pack)
+        //   - num_outputs | hs_output_cp_stride (two u32s, exact 64-bit pack)
+        //   - tess bools (3 bits) + tess_type/topology/partitioning (small enums)
+        // Cuts the per-Vertex mix-chain length from 9 to 4 iterations,
+        // saving ~25 cycles of serial dependency per call. Each packed u64
+        // still diffuses through mix() with the same quality as separate
+        // calls would have produced.
+        h = mix(h, (static_cast<u64>(v.step_rate_0)) |
+                    (static_cast<u64>(v.step_rate_1) << 32));
+        h = mix(h, (static_cast<u64>(v.num_outputs)) |
+                    (static_cast<u64>(v.hs_output_cp_stride) << 32));
+        h = mix(h, static_cast<u64>(v.tess_emulated_primitive ? 1u : 0u) |
+                    (static_cast<u64>(v.emulate_depth_negative_one_to_one ? 1u : 0u) << 1) |
+                    (static_cast<u64>(v.clip_disable ? 1u : 0u) << 2) |
+                    (static_cast<u64>(static_cast<u32>(v.tess_type)) << 8) |
+                    (static_cast<u64>(static_cast<u32>(v.tess_topology)) << 16) |
+                    (static_cast<u64>(static_cast<u32>(v.tess_partitioning)) << 24));
+        break;
+    }
+    case Shader::Stage::Hull:
+        // Uses default operator==, so hash all fields.
+        h = mix(h, XXH3_64bits(&ri.hs_info, sizeof(ri.hs_info)));
+        break;
+    case Shader::Stage::Geometry: {
+        const auto& g = ri.gs_info;
+        // PERF(GR2FORK v1.18): pack four small scalar fields into a single
+        // packed mix instead of four separate ones. num_outputs/num_invocations/
+        // output_vertices are bounded by GS spec limits (< 256 each in any
+        // realistic pipeline), in_primitive is a small AmdGpu enum. All
+        // comfortably fit in a u64 with 16-bit slots.
+        const u64 packed_scalars =
+            static_cast<u64>(g.num_outputs) |
+            (static_cast<u64>(g.num_invocations) << 16) |
+            (static_cast<u64>(g.output_vertices) << 32) |
+            (static_cast<u64>(static_cast<u32>(g.in_primitive)) << 48);
+        h = mix(h, packed_scalars);
+        // PERF(GR2FORK v1.18): g.outputs is std::array<OutputMap,3> = 12B.
+        // XXH3 function-call overhead dominates the actual hashing for this
+        // size. Read as 8B + 4B inline (Output is u8, OutputMap is 4B array).
+        // Two mix iterations replace 1 XXH3 + 1 mix — same chain length, but
+        // the XXH3 function call is gone (~15-20 cycles saved).
+        static_assert(sizeof(g.outputs) == 12);
+        u64 outputs_lo;
+        u32 outputs_hi;
+        std::memcpy(&outputs_lo, g.outputs.data(), 8);
+        std::memcpy(&outputs_hi,
+                    reinterpret_cast<const u8*>(g.outputs.data()) + 8, 4);
+        h = mix(h, outputs_lo);
+        h = mix(h, static_cast<u64>(outputs_hi));
+        // PERF(GR2FORK v1.18): out_primitive is std::array<GsOutputPrimitiveType,4>
+        // = 16 bytes, but each enum value occupies only 6 bits in the source
+        // hardware (regs_vertex.h: outprim_type : 6). Pack all 4 into a single
+        // u64 byte-aligned for safety. Saves the XXH3 function call (~15-20
+        // cycles) plus 1 mix iteration.
+        static_assert(sizeof(g.out_primitive) == 16);
+        const auto& op = g.out_primitive;
+        const u64 op_packed =
+            static_cast<u64>(static_cast<u32>(op[0])) |
+            (static_cast<u64>(static_cast<u32>(op[1])) << 8) |
+            (static_cast<u64>(static_cast<u32>(op[2])) << 16) |
+            (static_cast<u64>(static_cast<u32>(op[3])) << 24);
+        h = mix(h, op_packed);
+        h = mix(h, g.vs_copy_hash); // Not the span pointer!
+        break;
+    }
+    case Shader::Stage::Fragment: {
+        const auto& f = ri.fs_info;
+        h = mix(h, XXH3_64bits(f.color_buffers.data(), sizeof(f.color_buffers)));
+        // PERF(GR2FORK v1.18): en_flags and addr_flags are AmdGpu::PsInput,
+        // which is a 4-byte u32 bitfield register. XXH3_64bits has ~10-15
+        // cycles of plain function-call + setup overhead before doing any
+        // work, which is dwarfing the actual hashing for a 4-byte input.
+        // Read both as u32 (they're trivially memcpyable bitfield types)
+        // and pack into a single mix call. Saves 2 XXH3 function calls and
+        // 1 mix iteration per Fragment hash.
+        static_assert(sizeof(f.en_flags) == 4);
+        static_assert(sizeof(f.addr_flags) == 4);
+        u32 en32, addr32;
+        std::memcpy(&en32, &f.en_flags, sizeof(en32));
+        std::memcpy(&addr32, &f.addr_flags, sizeof(addr32));
+        h = mix(h, (static_cast<u64>(en32) << 32) | static_cast<u64>(addr32));
+        // PERF(GR2FORK v1.18): pack four small scalars into a single mix
+        // call instead of three separate ones. num_inputs <= 32 (array bound),
+        // z_export_format is a small enum, mrtz_mask is u8, dual_source_blending
+        // is bool — all comfortably fit into a single u64 with room to spare.
+        // Cuts 2 mix iterations off the chain per Fragment hash.
+        const u64 packed_scalars =
+            static_cast<u64>(f.num_inputs) |
+            (static_cast<u64>(static_cast<u32>(f.z_export_format)) << 8) |
+            (static_cast<u64>(f.mrtz_mask) << 16) |
+            (static_cast<u64>(f.dual_source_blending ? 1u : 0u) << 24);
+        h = mix(h, packed_scalars);
+        if (f.num_inputs > 0) {
+            h = mix(h, XXH3_64bits(f.inputs.data(),
+                                    f.num_inputs * sizeof(f.inputs[0])));
+        }
+        break;
+    }
+    case Shader::Stage::Compute: {
+        const auto& c = ri.cs_info;
+        // PERF(GR2FORK v1.18): workgroup_size is std::array<u32,3> = 12 bytes.
+        // XXH3 function-call overhead dominates for this size. Pack all three
+        // axes (each well under 2^20 by Vulkan/AMD hardware limits — typical
+        // values 8..1024) plus the three tgid_enable bools into a single u64.
+        // Replaces 1 XXH3 + 2 mix calls with 1 mix — saves ~25 cycles per
+        // Compute hash (function call elision + 1 mix iteration off chain).
+        // Bit layout:
+        //   bits  0-19: workgroup_size[0]   (20 bits, max 2^20 = 1,048,576)
+        //   bits 20-39: workgroup_size[1]   (20 bits)
+        //   bits 40-59: workgroup_size[2]   (20 bits)
+        //   bit  60   : tgid_enable[0]
+        //   bit  61   : tgid_enable[1]
+        //   bit  62   : tgid_enable[2]
+        //   bit  63   : free
+        const auto& wg = c.workgroup_size;
+        const u64 packed =
+            (static_cast<u64>(wg[0]) & 0xFFFFFu) |
+            ((static_cast<u64>(wg[1]) & 0xFFFFFu) << 20) |
+            ((static_cast<u64>(wg[2]) & 0xFFFFFu) << 40) |
+            (static_cast<u64>(c.tgid_enable[0] ? 1u : 0u) << 60) |
+            (static_cast<u64>(c.tgid_enable[1] ? 1u : 0u) << 61) |
+            (static_cast<u64>(c.tgid_enable[2] ? 1u : 0u) << 62);
+        h = mix(h, packed);
+        break;
+    }
+    default:
+        break;
+    }
+    return h;
+}
 
 constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
@@ -87,9 +277,9 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
-const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalStage l_stage) {
+const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalStage l_stage,
+                                                           const AmdGpu::LiverpoolRegsSnapshot& regs) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
     const auto BuildCommon = [&](const auto& program) {
         info.num_user_data = program.settings.num_user_regs;
         info.num_input_vgprs = program.settings.vgpr_comp_cnt;
@@ -119,7 +309,15 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     }
     case Stage::Export: {
         BuildCommon(regs.es_program);
-        info.es_info.vertex_data_size = regs.vgt_esgs_ring_itemsize;
+        if (l_stage == LogicalStage::TessellationEval) {
+            // Combined LS+HS+ES+GS pipeline: ES acts as domain shader.
+            info.vs_info.num_outputs = regs.vgt_esgs_ring_itemsize;
+            info.vs_info.tess_type = regs.tess_config.type;
+            info.vs_info.tess_topology = regs.tess_config.topology;
+            info.vs_info.tess_partitioning = regs.tess_config.partitioning;
+        } else {
+            info.es_info.vertex_data_size = regs.vgt_esgs_ring_itemsize;
+        }
         break;
     }
     case Stage::Vertex: {
@@ -149,6 +347,19 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         gs_info.num_invocations =
             regs.vgt_gs_instance_cnt.IsEnabled() ? regs.vgt_gs_instance_cnt.count : 1;
         gs_info.in_primitive = regs.primitive_type;
+        // In combined tess+GS pipelines, primitive_type is PatchPrimitive which isn't
+        // meaningful for GS input. Resolve to the actual post-tessellation output type.
+        if (gs_info.in_primitive == AmdGpu::PrimitiveType::PatchPrimitive) {
+            switch (regs.tess_config.type) {
+            case AmdGpu::TessellationType::Isoline:
+                gs_info.in_primitive = AmdGpu::PrimitiveType::LineList;
+                break;
+            case AmdGpu::TessellationType::Triangle:
+            case AmdGpu::TessellationType::Quad:
+                gs_info.in_primitive = AmdGpu::PrimitiveType::TriangleList;
+                break;
+            }
+        }
         for (u32 stream_id = 0; stream_id < Shader::GsMaxOutputStreams; ++stream_id) {
             gs_info.out_primitive[stream_id] =
                 regs.vgt_gs_out_prim_type.GetPrimitiveType(stream_id);
@@ -202,7 +413,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         break;
     }
     case Stage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = regs.cs_program;
         info.num_user_data = cs_pgm.settings.num_user_regs;
         info.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.cs_info.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
@@ -242,7 +453,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
         .support_legacy_vertex_attributes = instance_.IsLegacyVertexAttributesSupported(),
-        .supports_image_load_store_lod = instance_.IsImageLoadStoreLodSupported(),
+        // PORT(upstream #4075, IMAGE_STORE_MIP fallback, commit — merged Mar 17 2026):
+        // upstream hardcodes this to false with a // TEST marker. The fallback path
+        // is preferred on both AMD and NVIDIA for GR2 per compat issue #1429
+        // (mipmap-only-level-0 bug affects both vendors). Small perf cost on AMD
+        // where native load-store-lod works — each IMAGE_STORE_MIP image uses
+        // N descriptor slots instead of 1.
+        .supports_image_load_store_lod = /*instance_.IsImageLoadStoreLodSupported()*/ false, // TEST
         .supports_native_cube_calc = instance_.IsAmdGcnShaderSupported(),
         .supports_trinary_minmax = instance_.IsAmdShaderTrinaryMinMaxSupported(),
         // TODO: Emitted bounds checks cause problems with phi control flow; needs to be fixed.
@@ -268,7 +485,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMoltenvk,
     };
 
-    WarmUp();
+    // NOTE: WarmUp() used to be invoked from here. It was moved out to
+    // Presenter::WarmUpPipelineCache(), called from gnmdriver::RegisterLib
+    // *after* the Presenter is fully constructed, so the swapchain and
+    // schedulers are available and we can drive a "LOADING SHADERS"
+    // overlay on the screen instead of presenting a black window for the
+    // 30+ seconds a large pipeline cache can take to deserialize.
+    //
+    // The vk::PipelineCache below is created here so it is available when
+    // WarmUp runs externally — LoadGraphicsPipeline / LoadComputePipeline
+    // dereference *pipeline_cache to construct GraphicsPipeline /
+    // ComputePipeline objects.
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
@@ -276,44 +503,275 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    // OPT(GR2 v78): Dump any still-in-flight async compiles to the graveyard.
+    // The map's own destructor would destruct each std::future, which joins
+    // its worker thread — and if any of those threads are hung inside the
+    // Vulkan driver, the emulator would freeze on its way out. Move futures
+    // out first so map destruction sees already-empty PendingGraphicsPipeline
+    // objects.
+    for (auto& [key, pending] : pending_graphics_pipelines) {
+        if (pending && pending->future.valid()) {
+            Graveyard().Bury(std::move(pending->future));
+        }
+    }
+    pending_graphics_pipelines.clear();
+}
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    if (!RefreshGraphicsKey()) {
+
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
+    const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    // Phase 1D-pre-C: read stamp + dirty bit from the captured snapshot
+    // rather than the live Liverpool. Under sync this is identical; under
+    // async (Phase G) it eliminates the v1 hotfix1 race where a relaxed
+    // load of `liverpool->gfx_pipeline_stamp` plus a plain bool read of
+    // `liverpool->gfx_key_dirty_` could disagree with the regs we
+    // captured for THIS intent.
+    const u64 stamp = regs.gfx_pipeline_stamp;
+    // PERF(GR2FORK v1.15): The gfx-stamp early-out is the dominant exit —
+    // consecutive draws share a pipeline and the stamp only bumps on register
+    // writes that affect pipeline state. The metrics + the FilterDraw same-
+    // pipeline cache directly track this rate. Hint it.
+    if (stamp == last_gfx_stamp && last_gfx_pipeline) [[likely]] {
+        return last_gfx_pipeline;
+    }
+    // Level 2: stamp bumped but only dynamic-state regs changed (viewport, scissor, etc.)
+    // Skip the entire RefreshGraphicsKey rebuild — pipeline key cannot have changed.
+    // PERF(GR2FORK v1.23): once we've passed the v1.15 stamp-equal early
+    // exit, the next-most-common case is dynamic-state-only changes
+    // (viewport scrolls, scissor moves, blend constants) — those bump the
+    // stamp but don't dirty the key. Hint as the dominant exit among the
+    // post-stamp-mismatch cases.
+    if (!regs.gfx_key_dirty && last_gfx_pipeline) [[likely]] {
+        last_gfx_stamp = stamp;
+        return last_gfx_pipeline;
+    }
+    // Phase 1D-pre-C: the prior `liverpool->ClearGfxKeyDirty()` call here
+    // is gone — PM4 cleared the live `gfx_key_dirty_` flag inside
+    // `Liverpool::CaptureSnapshot()` under sole-writer ownership. The
+    // snapshot's `regs.gfx_key_dirty` is a frozen "was dirty AT capture"
+    // view; consuming it doesn't need to clear anything.
+    if (!RefreshGraphicsKey(regs)) [[unlikely]] {
         return nullptr;
     }
+    // Key-level dedup: when only dynamic state changed (viewport, scissor, blend constants),
+    // the stamp bumps but the pipeline key is byte-identical. Skip the hash + map lookup.
+    if (last_gfx_pipeline &&
+        std::memcmp(&graphics_key, &prev_graphics_key_,
+                    offsetof(GraphicsPipelineKey, cached_hash_)) == 0) {
+        last_gfx_stamp = stamp;
+        return last_gfx_pipeline;
+    }
+
+    // =========================================================================
+    // OPT(GR2 v78): Pending-async check first.
+    // =========================================================================
+    // If a previous call for this key launched an async compile that didn't
+    // finish within the sync budget, the future lives in pending_graphics_pipelines.
+    // Poll non-blockingly; finalize into graphics_pipelines on ready.
+    // PERF(GR2FORK v1.23): post-warmup pipelines are all already compiled
+    // and live in graphics_pipelines, not pending — the find() returning
+    // end() is the dominant case.
+    if (auto pit = pending_graphics_pipelines.find(graphics_key);
+        pit != pending_graphics_pipelines.end()) [[unlikely]] {
+        if (TryFinalizePending(*pit->second, graphics_key)) {
+            // Result moved into graphics_pipelines[graphics_key]. Erase pending.
+            pending_graphics_pipelines.erase(pit);
+            // Fall through to the main-path update below.
+        } else {
+            // Still compiling (or permafailed). Skip this draw.
+            return nullptr;
+        }
+    }
+
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
-    if (is_new) {
+    // PERF(GR2FORK v1.23): post-warmup is_new is the rare case — most
+    // distinct pipelines have already been compiled during early-game.
+    if (is_new) [[unlikely]] {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
-        GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+        auto pending = LaunchAsyncPipelineCompile(graphics_key, pipeline_hash);
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
-
-        if (Config::collectShadersForDebug()) {
-            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (infos[stage]) {
-                    auto& m = modules[stage];
-                    module_related_pipelines[m].emplace_back(graphics_key);
+        // Synchronous fast-path wait. Most compiles complete in <50ms; waiting
+        // kInitialSyncBudget catches them without triggering frame-skip.
+        if (pending->future.wait_for(kInitialSyncBudget) == std::future_status::ready) {
+            std::unique_ptr<GraphicsPipeline> pipeline;
+            try {
+                pipeline = pending->future.get();
+            } catch (const std::exception& e) {
+                LOG_ERROR(Render_Vulkan, "Async pipeline compile threw: {}", e.what());
+            }
+            if (!pipeline) {
+                // Compile failed. Drop the empty map slot so we can retry next tick.
+                graphics_pipelines.erase(it);
+                return nullptr;
+            }
+            // Move result into the cache slot.
+            it.value() = std::move(pipeline);
+            // Finalize side effects — these need post-ctor state (sdata, modules).
+            RegisterPipelineData(graphics_key, pipeline_hash, pending->sdata);
+            ++num_new_pipelines;
+            if (Config::collectShadersForDebug()) {
+                for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+                    if (pending->infos_copy[stage]) {
+                        auto& m = pending->modules_copy[stage];
+                        module_related_pipelines[m].emplace_back(graphics_key);
+                    }
                 }
             }
+            fetch_shader.reset();
+        } else {
+            // Slow path: compile hasn't finished. Stash the pending entry, leave
+            // graphics_pipelines[key] as null (indicates "in-flight"), return
+            // null so the Rasterizer skips this draw. Subsequent draws for the
+            // same key hit the TryFinalizePending branch above.
+            pending_graphics_pipelines.emplace(graphics_key, std::move(pending));
+            fetch_shader.reset();
+            return nullptr;
         }
-        fetch_shader.reset();
+    } else if (!it->second) {
+        // Defensive: is_new=false but slot is null. This shouldn't happen if
+        // invariants hold (TryFinalizePending always writes non-null on success,
+        // and we already checked pending above). Treat as "still compiling."
+        return nullptr;
     }
-    return it->second.get();
+
+    last_gfx_stamp = stamp;
+    last_gfx_pipeline = it->second.get();
+    std::memcpy(&prev_graphics_key_, &graphics_key, sizeof(GraphicsPipelineKey));
+    return last_gfx_pipeline;
 }
 
-const ComputePipeline* PipelineCache::GetComputePipeline() {
-    if (!RefreshComputeKey()) {
+bool PipelineCache::TryFinalizePending(PendingGraphicsPipeline& pending,
+                                       const GraphicsPipelineKey& key) {
+    if (pending.permafailed) {
+        return false;
+    }
+    if (pending.future.wait_for(std::chrono::milliseconds{0}) !=
+        std::future_status::ready) {
+        // Still compiling. Check thresholds for escalation.
+        const auto elapsed = std::chrono::steady_clock::now() - pending.started_at;
+        if (elapsed >= kPermaFailThreshold) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Pipeline {:#x} stuck >{}s — permafailed. Moving to graveyard; "
+                         "this pipeline's draws will be skipped for the rest of the session. "
+                         "This is almost certainly a Vulkan driver hang "
+                         "(Mesa/RADV). Try updating your GPU driver.",
+                         pending.pipeline_hash,
+                         std::chrono::duration_cast<std::chrono::seconds>(kPermaFailThreshold)
+                             .count());
+            Graveyard().Bury(std::move(pending.future));
+            pending.permafailed = true;
+        } else if (elapsed >= kHangLogThreshold && !pending.hang_warned) {
+            LOG_WARNING(Render_Vulkan,
+                        "Pipeline {:#x} compile exceeded {}s — likely driver hang. "
+                        "Draws using this pipeline are being skipped. Will permafail at {}s.",
+                        pending.pipeline_hash,
+                        std::chrono::duration_cast<std::chrono::seconds>(kHangLogThreshold)
+                            .count(),
+                        std::chrono::duration_cast<std::chrono::seconds>(kPermaFailThreshold)
+                            .count());
+            pending.hang_warned = true;
+        }
+        return false;
+    }
+    // Ready. Collect the result.
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    try {
+        pipeline = pending.future.get();
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Async pipeline {:#x} threw: {}", pending.pipeline_hash,
+                  e.what());
+    }
+    if (!pipeline) {
+        // Compile failed. Don't leave a permafail marker — let the outer code
+        // retry next tick by erasing the pending entry (caller does this).
+        return false;
+    }
+    // Install into the main map (create slot if missing; it usually exists as null).
+    auto [it, is_new] = graphics_pipelines.try_emplace(key);
+    it.value() = std::move(pipeline);
+    // Finalize side effects.
+    RegisterPipelineData(key, pending.pipeline_hash, pending.sdata);
+    ++num_new_pipelines;
+    if (Config::collectShadersForDebug()) {
+        for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+            if (pending.infos_copy[stage]) {
+                auto& m = pending.modules_copy[stage];
+                module_related_pipelines[m].emplace_back(key);
+            }
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Pipeline {:#x} compile finished after {} ms",
+             pending.pipeline_hash,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - pending.started_at)
+                 .count());
+    return true;
+}
+
+std::unique_ptr<PipelineCache::PendingGraphicsPipeline>
+PipelineCache::LaunchAsyncPipelineCompile(const GraphicsPipelineKey& key, u64 pipeline_hash) {
+    auto pending = std::make_unique<PendingGraphicsPipeline>();
+    pending->started_at = std::chrono::steady_clock::now();
+    pending->pipeline_hash = pipeline_hash;
+
+    // Deep-copy stage data. The PipelineCache::infos/runtime_infos/modules
+    // members are span-targets and get overwritten by the next RefreshGraphicsStages.
+    // The async task must not alias them.
+    pending->infos_copy = infos;
+    pending->runtime_infos_copy = runtime_infos;
+    pending->modules_copy = modules;
+    pending->fetch_shader_copy = fetch_shader;
+
+    // Capture by raw pointer into the pending entry. The pending entry lives
+    // in the map owned by PipelineCache until finalize/permafail, so pointers
+    // into it are stable for the lifetime of the worker's execution (worker
+    // result is harvested before erase in TryFinalizePending, or moved to the
+    // graveyard where it's never touched again).
+    PendingGraphicsPipeline* raw = pending.get();
+
+    // Snapshot fields the ctor needs but that reference PipelineCache members.
+    const Instance* instance_ptr = &instance;
+    Scheduler* scheduler_ptr = &scheduler;
+    DescriptorHeap* desc_heap_ptr = &desc_heap;
+    const Shader::Profile* profile_ptr = &profile;
+    vk::PipelineCache cache_handle = *pipeline_cache;
+    GraphicsPipelineKey key_copy = key;
+
+    pending->future = std::async(
+        std::launch::async,
+        [raw, instance_ptr, scheduler_ptr, desc_heap_ptr, profile_ptr, cache_handle,
+         key_copy]() -> std::unique_ptr<GraphicsPipeline> {
+            // Spans over the pending-owned copies — stable for the async task's lifetime.
+            std::span<const Shader::Info*, MaxShaderStages> infos_span{raw->infos_copy};
+            std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_span{
+                raw->runtime_infos_copy};
+            std::span<const vk::ShaderModule> modules_span{raw->modules_copy};
+            // Note: GraphicsPipeline ctor ASSERTs on driver-return failure, which
+            // kills the process. We can't soften that; it's only the hang case
+            // (no return at all) that this whole mechanism addresses.
+            return std::make_unique<GraphicsPipeline>(
+                *instance_ptr, *scheduler_ptr, *desc_heap_ptr, *profile_ptr, key_copy,
+                cache_handle, infos_span, runtime_span, raw->fetch_shader_copy, modules_span,
+                raw->sdata, false);
+        });
+    return pending;
+}
+
+const ComputePipeline* PipelineCache::GetComputePipeline(
+    const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    // PERF(GR2FORK v1.26): RefreshComputeKey returns false only on
+    // unrecognised / invalid compute state — error path. Steady-state
+    // dispatches refresh successfully.
+    if (!RefreshComputeKey(regs)) [[unlikely]] {
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
-    if (is_new) {
+    // PERF(GR2FORK v1.26): post-warmup is_new is rare — every distinct
+    // compute pipeline has been compiled once during early game.
+    if (is_new) [[unlikely]] {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -324,7 +782,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
-        if (Config::collectShadersForDebug()) {
+        // PERF(GR2FORK v1.26): debug-only config for the shader-collector
+        // workflow — disabled in release.
+        if (Config::collectShadersForDebug()) [[unlikely]] {
             auto& m = modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
@@ -332,10 +792,68 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
-    std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = liverpool->regs;
+bool PipelineCache::RefreshGraphicsKey(const AmdGpu::LiverpoolRegsSnapshot& regs) {
     auto& key = graphics_key;
+    // PERF(GR2FORK B1, post-v1.57): selective field-range zeroing replaces
+    // the whole-struct memset. The original cleared ~390 bytes; this clears
+    // only the conditionally-written ranges plus the anonymous-bitfield
+    // padding. The skipped fields (patch_control_points, num_color_attachments,
+    // cb_shader_mask, logic_op, num_samples, depth_samples, mrt_mask, and
+    // the bitfield member bits themselves) are unconditionally rewritten by
+    // this function or by RefreshGraphicsStages, so pre-zeroing them is
+    // wasted work. cached_hash_/hash_valid_ are excluded from the comparison
+    // hash range and don't need pre-zeroing — hash_valid_ is reset below.
+    //
+    // Risk: the v1.57 rollback established that some "dead" stores act as
+    // load-bearing cache prefetch for nearby hot code. The conditional
+    // arrays still get zeroed here so their cache lines stay warm; only the
+    // scalar lines lose their prefetch. FPS-harness validation (Phase 0) is
+    // mandatory before promoting this change past initial A/B.
+    //
+    // The static_asserts encode the field-order assumption — a future struct
+    // reorder will fail the build instead of silently corrupting keys.
+    static_assert(offsetof(GraphicsPipelineKey, stage_hashes) <
+                      offsetof(GraphicsPipelineKey, vertex_buffer_formats) &&
+                  offsetof(GraphicsPipelineKey, vertex_buffer_formats) <
+                      offsetof(GraphicsPipelineKey, patch_control_points),
+                  "stage_hashes/vertex_buffer_formats must precede patch_control_points");
+    static_assert(offsetof(GraphicsPipelineKey, num_color_attachments) <
+                      offsetof(GraphicsPipelineKey, color_buffers) &&
+                  offsetof(GraphicsPipelineKey, color_buffers) <
+                      offsetof(GraphicsPipelineKey, blend_controls) &&
+                  offsetof(GraphicsPipelineKey, blend_controls) <
+                      offsetof(GraphicsPipelineKey, write_masks) &&
+                  offsetof(GraphicsPipelineKey, write_masks) <
+                      offsetof(GraphicsPipelineKey, cb_shader_mask),
+                  "color_buffers/blend_controls/write_masks must be contiguous");
+    static_assert(offsetof(GraphicsPipelineKey, depth_samples) <
+                      offsetof(GraphicsPipelineKey, color_samples) &&
+                  offsetof(GraphicsPipelineKey, color_samples) <
+                      offsetof(GraphicsPipelineKey, mrt_mask) &&
+                  offsetof(GraphicsPipelineKey, mrt_mask) <
+                      offsetof(GraphicsPipelineKey, cached_hash_),
+                  "color_samples/mrt_mask/bitfields must precede cached_hash_");
+
+    auto* const key_bytes = reinterpret_cast<char*>(&key);
+    // Range A: stage_hashes + vertex_buffer_formats (conditional fills, unused
+    // slots must be 0 for memcmp determinism).
+    std::memset(key_bytes, 0, offsetof(GraphicsPipelineKey, patch_control_points));
+    // Range B: color_buffers + blend_controls + write_masks (conditional
+    // fills; PsColorBuffer/BlendControl are bit-field structs whose padding
+    // bits would not be cleared by member-by-member assignment).
+    std::memset(key_bytes + offsetof(GraphicsPipelineKey, color_buffers), 0,
+                offsetof(GraphicsPipelineKey, cb_shader_mask) -
+                    offsetof(GraphicsPipelineKey, color_buffers));
+    // Range C: color_samples + mrt_mask + both anonymous bitfield words.
+    // mrt_mask is unconditionally rewritten so zeroing it is wasted but
+    // harmless; including it keeps the range contiguous and clears the
+    // bitfield padding bits in the same store stream.
+    std::memset(key_bytes + offsetof(GraphicsPipelineKey, color_samples), 0,
+                offsetof(GraphicsPipelineKey, cached_hash_) -
+                    offsetof(GraphicsPipelineKey, color_samples));
+    // hash_valid_ is excluded from the comparison range but must be reset
+    // so GetHash() rebuilds the cached hash on the next call.
+    key.hash_valid_ = false;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
 
@@ -378,7 +896,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    if (!RefreshGraphicsStages(regs)) {
         return false;
     }
 
@@ -425,8 +943,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
-bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = liverpool->regs;
+bool PipelineCache::RefreshGraphicsStages(const AmdGpu::LiverpoolRegsSnapshot& regs) {
     auto& key = graphics_key;
     fetch_shader = std::nullopt;
 
@@ -434,26 +951,40 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
-        if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
+        // PERF(GR2FORK v1.28): bind_stage is called only for stages the
+        // surrounding switch already knows are active for the current
+        // pipeline configuration (Fragment unconditionally, plus the
+        // VgtStages-specific subset). The IsStageEnabled re-check is
+        // defensive and almost always passes.
+        if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) [[unlikely]] {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto* pgm = regs.ProgramForStage(stage_in_idx);
-        if (!pgm || !pgm->Address<u32*>()) {
+        // PERF(GR2FORK v1.28): null program / null pgm address is a
+        // defensive guard against malformed PM4; well-formed shader
+        // emission has both populated.
+        if (!pgm || !pgm->Address<u32*>()) [[unlikely]] {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
+        // PERF(GR2FORK v1.60): GetProgram now returns a const-pointer to
+        // the program-owned optional<FetchShaderData> instead of a copy.
+        // Eliminates one heap-allocating copy through std::tie. The
+        // single deep copy below (only when the pointer is non-null and
+        // the optional has a value) writes into PipelineCache's own
+        // member, which is the only persistent storage that needs it.
+        const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader_ptr = nullptr;
+        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_ptr,
                  key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
-        if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
+            GetProgram(stage_in, stage_out, params, binding, regs);
+        if (fetch_shader_ptr && fetch_shader_ptr->has_value()) {
+            fetch_shader = *fetch_shader_ptr;
         }
         return true;
     };
@@ -468,39 +999,84 @@ bool PipelineCache::RefreshGraphicsStages() {
 
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
-        if (!instance.IsGeometryStageSupported()) {
+        // PERF(GR2FORK v1.28): RADV/Mesa with VK_EXT_extended_dynamic_state3
+        // exposes geometry shader support — the unsupported warning path
+        // is for outlier configurations.
+        if (!instance.IsGeometryStageSupported()) [[unlikely]] {
             LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
             return false;
         }
-        if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+        // PERF(GR2FORK v1.28): stream output is unimplemented in shadPS4;
+        // games that use it hit this warning path. The vast majority of
+        // GS-using shaders don't enable stream output.
+        if (regs.vgt_strmout_config.raw) [[unlikely]] {
+            LOG_WARNING(Render_Vulkan, "Stream output unsupported, skipping");
             return false;
         }
-        if (!bind_stage(Stage::Export, LogicalStage::Vertex)) {
+        // PERF(GR2FORK v1.28): on the EsGs path both ES and GS stages
+        // are required and stage_enable already gates entry — bind_stage
+        // failures here are defensive recovery paths.
+        if (!bind_stage(Stage::Export, LogicalStage::Vertex)) [[unlikely]] {
             return false;
         }
-        if (!bind_stage(Stage::Geometry, LogicalStage::Geometry)) {
+        if (!bind_stage(Stage::Geometry, LogicalStage::Geometry)) [[unlikely]] {
             return false;
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::LsHs:
         if (!instance.IsTessellationSupported() ||
             (regs.tess_config.type == AmdGpu::TessellationType::Isoline &&
-             !instance.IsTessellationIsolinesSupported())) {
+             !instance.IsTessellationIsolinesSupported())) [[unlikely]] {
             return false;
         }
-        if (!bind_stage(Stage::Hull, LogicalStage::TessellationControl)) {
+        // PERF(GR2FORK v1.28): bind_stage failures on the active LsHs path
+        // are defensive recovery — well-formed PM4 has all three stages
+        // populated.
+        if (!bind_stage(Stage::Hull, LogicalStage::TessellationControl)) [[unlikely]] {
             return false;
         }
-        if (!bind_stage(Stage::Vertex, LogicalStage::TessellationEval)) {
+        if (!bind_stage(Stage::Vertex, LogicalStage::TessellationEval)) [[unlikely]] {
             return false;
         }
-        if (!bind_stage(Stage::Local, LogicalStage::Vertex)) {
+        if (!bind_stage(Stage::Local, LogicalStage::Vertex)) [[unlikely]] {
             return false;
         }
         break;
     default:
-        bind_stage(Stage::Vertex, LogicalStage::Vertex);
+        // PERF(GR2FORK v1.28): the combined LS+HS+ES+GS pipeline (foliage
+        // with tessellation + geometry) is rare in shadPS4 workloads —
+        // the dominant default path is plain Vertex+Pixel handled by the
+        // simple `else` branch.
+        if (regs.stage_enable.hs_en && regs.stage_enable.gs_en) [[unlikely]] {
+            // Combined LS+HS+ES+GS pipeline (e.g. foliage with tessellation + geometry).
+            if (!instance.IsTessellationSupported() || !instance.IsGeometryStageSupported()) {
+                LOG_WARNING(Render_Vulkan,
+                            "Combined tessellation+geometry pipeline unsupported, skipping");
+                return false;
+            }
+            if (regs.tess_config.type == AmdGpu::TessellationType::Isoline &&
+                !instance.IsTessellationIsolinesSupported()) {
+                return false;
+            }
+            if (regs.vgt_strmout_config.raw) {
+                LOG_WARNING(Render_Vulkan, "Stream output unsupported, skipping");
+                return false;
+            }
+            if (!bind_stage(Stage::Hull, LogicalStage::TessellationControl)) {
+                return false;
+            }
+            if (!bind_stage(Stage::Export, LogicalStage::TessellationEval)) {
+                return false;
+            }
+            if (!bind_stage(Stage::Local, LogicalStage::Vertex)) {
+                return false;
+            }
+            if (!bind_stage(Stage::Geometry, LogicalStage::Geometry)) {
+                return false;
+            }
+        } else {
+            bind_stage(Stage::Vertex, LogicalStage::Vertex);
+        }
         break;
     }
 
@@ -520,12 +1096,22 @@ bool PipelineCache::RefreshGraphicsStages() {
     return true;
 }
 
-bool PipelineCache::RefreshComputeKey() {
+bool PipelineCache::RefreshComputeKey(const AmdGpu::LiverpoolRegsSnapshot& regs) {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = regs.cs_program;
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
-        GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
+    // PERF(GR2FORK v1.60): pointer return — see comment in
+    // RefreshGraphicsStages bind_stage above. Compute stages don't have a
+    // fetch shader (the returned pointer points to a nullopt or is null
+    // itself), so the assign below typically resets fetch_shader.
+    const std::optional<Shader::Gcn::FetchShaderData>* fetch_shader_ptr = nullptr;
+    std::tie(infos[0], modules[0], fetch_shader_ptr, compute_key.value) =
+        GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding, regs);
+    if (fetch_shader_ptr && fetch_shader_ptr->has_value()) {
+        fetch_shader = *fetch_shader_ptr;
+    } else {
+        fetch_shader.reset();
+    }
     return true;
 }
 
@@ -564,10 +1150,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
-                                                Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+                                                Shader::Backend::Bindings& binding,
+                                                const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    Shader::RuntimeInfo runtime_info = BuildRuntimeInfo(stage, l_stage, regs);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
-    if (new_program) {
+    // PERF(GR2FORK v1.25): after early-game warmup every distinct shader
+    // hash has been compiled once and lives in program_cache. New-program
+    // insertion is the rare path.
+    if (new_program) [[unlikely]] {
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
@@ -577,8 +1167,20 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        // PERF(GR2FORK v1.60): return pointer into program-owned spec
+        // storage instead of copying the optional<FetchShaderData>. The
+        // FetchShaderData wraps a std::vector<VertexAttribute>; the
+        // previous by-value return forced a heap-alloc + memcpy here AND
+        // a second copy in std::tie's assignment at the call site. With
+        // the new pointer-typed Result, RefreshGraphicsStages performs
+        // exactly one deep copy at the call site (into PipelineCache's
+        // own member). Lifetime: program is owned by program_cache (a
+        // tsl::robin_map<size_t, std::unique_ptr<Program>>); the unique_ptr
+        // keeps Program at a stable heap address, so &spec.fetch_shader_data
+        // remains valid for the duration of the GetProgram call's return
+        // path (the caller copies before any subsequent map mutation).
+        return std::make_tuple(&program->info, module,
+                               &program->modules[0].spec.fetch_shader_data, perm_hash);
     }
 
     auto& program = it_pgm.value();
@@ -586,28 +1188,252 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
+    // PERF(GR2 v16): Fast-path to skip StageSpecialization construction.
+    // Hash (user_data, runtime_info by stage, full binding) and compare to cached result.
+    // When only context regs change (viewport, scissor, blend) but SH regs stay the same,
+    // this avoids constructing StageSpecialization (~2.26% of GpuComm).
+    u64 ud_hash;
+    u64 ri_bind_hash;
+    {
+        ud_hash = XXH3_64bits(params.user_data.data(), params.user_data.size_bytes());
+        // Mix in stage-aware runtime_info hash (handles union padding + custom operator==)
+        ri_bind_hash = HashRuntimeInfoForStage(runtime_info);
+        // PERF(GR2FORK v1.21): pack the three binding counters into a
+        // single u64 and fold them into ri_bind_hash with one mix step
+        // instead of two. Each Backend::Bindings field is u32 but bounded
+        // by shadPS4 resource constants (NUM_BUFFERS=40 + NUM_IMAGES=64 +
+        // NUM_SAMPLERS=16 + NUM_FMASKS=8 = 128 max for `unified` per stage,
+        // 40 max for `buffer`, 16 max for `user_data` — even accumulated
+        // across all 5 graphics stages they stay well under 16 bits each).
+        // The 16-bit slot allocation has ~50× headroom over realistic
+        // values; impossible to overflow. Saves one mix-chain iteration
+        // (~5-6 cycles) per GetProgram call.
+        const u64 binding_packed =
+            static_cast<u64>(binding.unified) |
+            (static_cast<u64>(binding.buffer) << 16) |
+            (static_cast<u64>(binding.user_data) << 32);
+        ri_bind_hash ^= binding_packed +
+                    0x9e3779b97f4a7c15ULL + (ri_bind_hash << 6) + (ri_bind_hash >> 2);
+
+        ud_hash ^= ri_bind_hash + 0x9e3779b97f4a7c15ULL + (ud_hash << 6) + (ud_hash >> 2);
+
+        // PERF(GR2FORK v1.15): When user_data is stable across consecutive
+        // calls (the dominant case in steady state — same shader bound, same
+        // resource layout), this branch returns the cached module without
+        // touching ud_hash_lru, sig lookup, or perm_index. Hint it.
+        if (program->last_result.valid && program->last_result.ud_hash == ud_hash) [[likely]] {
+            const auto perm_idx = program->last_result.perm_idx;
+            if (perm_idx < program->modules.size()) {
+                info.AddBindings(binding);
+                // PERF(GR2FORK v1.60): pointer return — see comment at the
+                // new-program return site above.
+                return std::make_tuple(&program->info, program->last_result.module,
+                                       &program->modules[perm_idx].spec.fetch_shader_data,
+                                       program->last_result.perm_hash);
+            }
+        }
+
+        // PERF(GR2FORK): ud_hash → perm_idx LRU. Skips StageSpecialization
+        // construction (~0.69% of GpuComm in the trace) when this ud_hash
+        // has been resolved for this program before. Distinct from the
+        // banned v17 stable-shortcut — see Program::UdHashCacheEntry doc
+        // comment in vk_pipeline_cache.h.
+        {
+            const u32 slot = static_cast<u32>(ud_hash) &
+                             (Program::kUdHashCacheSize - 1);
+            const auto& e = program->ud_hash_lru[slot];
+            // PERF(GR2FORK v1.25): once the v1.15 last_result fast path
+            // misses, the ud_hash_lru is the next-best resolver — it
+            // keeps recently-used permutations warm for shaders that
+            // rotate between a small set (UI vs effect, multiple LOD
+            // variants). After warmup the LRU hit is the dominant exit
+            // among the post-last_result paths.
+            if (e.valid && e.ud_hash == ud_hash &&
+                e.perm_idx < program->modules.size()) [[likely]] {
+                const size_t perm_idx = e.perm_idx;
+                const auto& m = program->modules[perm_idx];
+                const u64 perm_hash = HashCombine(params.hash, perm_idx);
+                info.AddBindings(binding);
+                // Promote into last_result so the next call hits the
+                // cheaper line-978 fast-path instead of running this
+                // lookup again.
+                program->last_result.ud_hash = ud_hash;
+                program->last_result.ri_bind_hash = ri_bind_hash;
+                program->last_result.perm_idx = perm_idx;
+                program->last_result.perm_hash = perm_hash;
+                program->last_result.module = m.module;
+                program->last_result.valid = true;
+                // PERF(GR2FORK v1.60): pointer return — see comment at the
+                // new-program return site above.
+                return std::make_tuple(&program->info, m.module,
+                                       &m.spec.fetch_shader_data, perm_hash);
+            }
+        }
+
+        // FIX(GR2FORK): PERF(GR2 v17) "Stable single-permutation shortcut" removed.
+        //
+        // The removed shortcut assumed that if `ri_bind_hash` (hash of
+        // runtime_info + binding offsets) matched the cached value for 64+
+        // consecutive calls, the cached shader module remained valid even
+        // when `user_data` (the SGPRs) differed — on the rationale that
+        // "stride/format/etc. are extremely unlikely to change" once a
+        // program has been stable.
+        //
+        // That assumption is wrong. `user_data` values ARE the guest
+        // pointers (or inline encodings) to the image/buffer sharps that
+        // StageSpecialization codegens against — see Info::ReadUdReg in
+        // shader_recompiler/info.h, which dereferences user_data[i] to
+        // reach sharp memory. Different user_data → different sharp
+        // address → potentially different image type / dst_select /
+        // num_conversion / srgb / storage / array-ness / fetch-shader
+        // layout. A module specialized against sharp set A is NOT safe to
+        // serve for sharp set B, even if both have the same slot layout.
+        //
+        // GR2 (CUSA03694) exposes this. The same fragment shader is used
+        // both for comic/UI panels (RGBA8_SRGB 2D textures) and for
+        // in-world effect draws (different image types / num_conversion).
+        // Ditto vertex shaders used for UI quads and for high-velocity
+        // character animation. After ~64 UI draws the shortcut locks the
+        // cache to the UI spec; subsequent effect/fall draws then read
+        // the stale module and produce green garbled effect textures and
+        // vertex explosions. The shortcut also rewrote last_result.ud_hash
+        // to the new user_data, so Fast-path 1 above would keep firing on
+        // the stale module for the remainder of the 512-call revalidate
+        // window — self-reinforcing.
+        //
+        // Fast-path 1 (ud_hash-keyed) above remains correct: ud_hash is
+        // XXH3 of the user_data BYTES, so any SGPR change — which is what
+        // changes when sharp pointers change — invalidates the hit. We
+        // lose the v17 perf win for programs that receive genuinely new
+        // user_data every frame but point to structurally identical
+        // sharps; that case pays one StageSpecialization construct per
+        // call, which is what the sig-based lookup below is optimized for.
+        //
+        // Store hashes for later cache update (after spec construction + lookup)
+        program->last_result.ud_hash = ud_hash;
+        program->last_result.ri_bind_hash = ri_bind_hash;
+    }
+
+    const std::optional<Shader::Gcn::FetchShaderData>* cached_fetch = nullptr;
+    if (stage == Stage::Vertex && !program->modules.empty()) {
+        cached_fetch = &program->modules.front().spec.fetch_shader_data;
+    }
+    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding, cached_fetch);
+
+    // Fast path: look up by specialization signature.
+    // We use a *pair* of signatures (sig + sig2) so we can avoid expensive deep comparisons.
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end()) {
-        auto new_info = Shader::Info(stage, l_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
-    } else {
-        info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+    bool found = false;
+    if (const auto it_sig = program->perm_index_by_sig.find(spec.sig);
+        it_sig != program->perm_index_by_sig.end() && it_sig->second < program->modules.size()) {
+        const auto& ms = program->modules[it_sig->second].spec;
+        // PERF(GR2FORK v1.25): perm_index_by_sig just returned a hit on
+        // spec.sig, so the indexed module's stored sig matches except
+        // under a 64-bit hash collision (~2^-64 per pair, negligible).
+        // sig2 is computed from the same StageSpecialization fields and
+        // confirms the match.
+        if (ms.sig == spec.sig && ms.sig2 == spec.sig2) [[likely]] {
+            info.AddBindings(binding);
+            perm_idx = it_sig->second;
+            perm_hash = HashCombine(params.hash, perm_idx);
+            module = program->modules[perm_idx].module;
+            found = true;
+            // Update per-program result cache.
+            program->last_result.perm_idx = perm_idx;
+            program->last_result.perm_hash = perm_hash;
+            program->last_result.module = module;
+            program->last_result.valid = true;
+            // PERF(GR2FORK): also populate ud_hash_lru so the next call
+            // with this ud_hash skips the StageSpecialization ctor above.
+            {
+                const u32 slot = static_cast<u32>(ud_hash) &
+                                 (Program::kUdHashCacheSize - 1);
+                program->ud_hash_lru[slot] = Program::UdHashCacheEntry{
+                    .ud_hash = ud_hash,
+                    .perm_idx = static_cast<u32>(perm_idx),
+                    .valid = true,
+                };
+            }
+        }
     }
+
+    if (!found) {
+        // Fallback: linear scan by (sig,sig2) without deep comparisons.
+        size_t found_idx = std::numeric_limits<size_t>::max();
+        for (size_t i = 0; i < program->modules.size(); ++i) {
+            const auto& ms = program->modules[i].spec;
+            if (ms.sig == spec.sig && ms.sig2 == spec.sig2) {
+                found_idx = i;
+                break;
+            }
+        }
+
+        if (found_idx == std::numeric_limits<size_t>::max()) {
+            auto new_info = Shader::Info(stage, l_stage, params);
+            module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+            program->AddPermut(module, std::move(spec));
+            // FIX(GR2FORK): update last_result on the new-permutation path.
+            //
+            // Pre-existing latent bug: lines 1057-1058 above unconditionally
+            // overwrote last_result.ud_hash with the new ud_hash before the
+            // spec ctor ran. If last_result.valid was already true from a
+            // prior call (perm_idx/module pointing to the prior result), and
+            // the new permutation path was taken (this branch), last_result
+            // ended up with NEW ud_hash but STALE perm_idx/module. The next
+            // call with the same ud_hash would hit the line-978 fast-path
+            // and return the stale module. Setting last_result fully here
+            // makes it self-consistent — same shape as the sig-hit and
+            // linear-scan-hit branches below.
+            program->last_result.perm_idx = perm_idx;
+            program->last_result.perm_hash = perm_hash;
+            program->last_result.module = module;
+            program->last_result.valid = true;
+            // PERF(GR2FORK): populate ud_hash_lru so the second call with
+            // this ud_hash skips the StageSpecialization ctor.
+            {
+                const u32 slot = static_cast<u32>(ud_hash) &
+                                 (Program::kUdHashCacheSize - 1);
+                program->ud_hash_lru[slot] = Program::UdHashCacheEntry{
+                    .ud_hash = ud_hash,
+                    .perm_idx = static_cast<u32>(perm_idx),
+                    .valid = true,
+                };
+            }
+        } else {
+            info.AddBindings(binding);
+            module = program->modules[found_idx].module;
+            perm_idx = found_idx;
+            perm_hash = HashCombine(params.hash, perm_idx);
+            // Keep the map warm for future lookups.
+            program->perm_index_by_sig.try_emplace(spec.sig, perm_idx);
+            // Update per-program result cache.
+            program->last_result.perm_idx = perm_idx;
+            program->last_result.perm_hash = perm_hash;
+            program->last_result.module = module;
+            program->last_result.valid = true;
+            // PERF(GR2FORK): also populate ud_hash_lru.
+            {
+                const u32 slot = static_cast<u32>(ud_hash) &
+                                 (Program::kUdHashCacheSize - 1);
+                program->ud_hash_lru[slot] = Program::UdHashCacheEntry{
+                    .ud_hash = ud_hash,
+                    .perm_idx = static_cast<u32>(perm_idx),
+                    .valid = true,
+                };
+            }
+        }
+    }
+    // PERF(GR2FORK v1.60): pointer return — see comment at the
+    // new-program return site above.
     return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+                           &program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
@@ -620,6 +1446,25 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 d.destroyShaderModule(m.module);
                 m.module = CompileSPV(spv_code, d);
                 new_module = m.module;
+                // FIX(GR2FORK): last_result caches a vk::ShaderModule HANDLE
+                // by value (not a reference into program->modules). Replacing
+                // the module above leaves last_result.module pointing at the
+                // destroyed handle. Next GetProgram call hitting the
+                // line-978 fast-path would return a use-after-destroy module.
+                // Invalidate last_result for any program whose cached module
+                // has been swapped.
+                //
+                // ud_hash_lru does NOT need invalidation: it stores perm_idx
+                // and reads program->modules[perm_idx].module fresh on every
+                // lookup, so the new module is picked up automatically.
+                //
+                // Note: this is the devtools live-shader-replace path
+                // (core/devtools/widget/shader_list.cpp). It runs on the UI
+                // thread, not GpuComm. The pre-existing m.module = ...
+                // assignment already races against GpuComm's reads in that
+                // case; this invalidation is a strict improvement, not a
+                // new race.
+                program->last_result.valid = false;
             }
         }
     }
@@ -680,5 +1525,5 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     std::vector<u32> code(file.GetSize() / sizeof(u32));
     file.Read(code);
     return code;
-}
+                                                              }
 } // namespace Vulkan

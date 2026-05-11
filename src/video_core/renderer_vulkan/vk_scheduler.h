@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -32,6 +34,9 @@ struct RenderState {
     bool has_stencil;
     u32 width;
     u32 height;
+    // OPT: Lightweight hash for fast equality rejection.
+    // Updated by ComputeHash() after all fields are set.
+    u64 state_hash{};
 
     RenderState() {
         std::memset(this, 0, sizeof(*this));
@@ -41,7 +46,41 @@ struct RenderState {
         num_layers = 1;
     }
 
+    /// Call after all fields are populated to enable fast equality checks.
+    void ComputeHash() noexcept {
+        // Hash the fields most likely to differ between draws.
+        // This covers ~98% of state changes without touching the full 700 bytes.
+        auto mix = [](u64 h, u64 v) noexcept {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
+        };
+        u64 h = 0x84222325cbf29ce4ULL;
+        h = mix(h, (static_cast<u64>(width) << 32) | static_cast<u64>(height));
+        h = mix(h, (static_cast<u64>(num_color_attachments) << 32) | static_cast<u64>(num_layers));
+        h = mix(h, (static_cast<u64>(has_depth) << 1) | static_cast<u64>(has_stencil));
+        // Hash attachment imageViews and loadOps (most frequently changing parts).
+        for (u32 i = 0; i < num_color_attachments; ++i) {
+            h = mix(h, reinterpret_cast<u64>(
+                           static_cast<VkImageView>(color_attachments[i].imageView)));
+            h = mix(h, static_cast<u64>(static_cast<u32>(color_attachments[i].loadOp)));
+        }
+        if (has_depth) {
+            h = mix(h, reinterpret_cast<u64>(
+                           static_cast<VkImageView>(depth_attachment.imageView)));
+            h = mix(h, static_cast<u64>(static_cast<u32>(depth_attachment.loadOp)));
+        }
+        if (has_stencil) {
+            h = mix(h, reinterpret_cast<u64>(
+                           static_cast<VkImageView>(stencil_attachment.imageView)));
+        }
+        state_hash = h;
+    }
+
     bool operator==(const RenderState& other) const noexcept {
+        // OPT: Fast reject on hash before expensive memcmp.
+        if (state_hash != other.state_hash) [[likely]] {
+            return false;
+        }
         return std::memcmp(this, &other, sizeof(RenderState)) == 0;
     }
 };
@@ -162,6 +201,11 @@ struct DynamicState {
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+    }
+
+    /// Clear dirty flags without issuing any commands (for threaded recording).
+    void ClearDirty() {
+        std::memset(&dirty_state, 0, sizeof(dirty_state));
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -378,7 +422,19 @@ public:
     }
 
     /// Returns the current command buffer.
+    /// DEPRECATED ALIAS for PrimaryCommandBuffer.
+    /// All recording — resource ops, barriers, rendering passes, draws,
+    /// compute dispatches — goes to the same primary command buffer.
     vk::CommandBuffer CommandBuffer() const {
+        return current_cmdbuf;
+    }
+
+    /// Returns the primary cmdbuf. All vkCmd* recording (resource ops,
+    /// barriers, BeginRendering/EndRendering, transfers, image transitions,
+    /// compute dispatches, draws inside a rendering pass) targets this
+    /// single primary cmdbuf. Secondary command buffers are permanently
+    /// banned in this codebase — see HANDOFF_y_series_assembler_only §2.
+    vk::CommandBuffer PrimaryCommandBuffer() const {
         return current_cmdbuf;
     }
 
@@ -387,6 +443,70 @@ public:
         return master_semaphore.CurrentTick();
     }
 
+    // =========================================================================
+    // Cross-pipeline cmdbuf state generation counters.
+    //
+    // The per-Pipeline push-descriptor / push-constant / bind-descriptor-set
+    // caches are scoped to ONE Pipeline instance, but the cmdbuf state they
+    // track is SHARED. When Pipeline X has cached "I pushed sig S to cmdbuf C
+    // at tick T with layout L_X" and Pipeline Y subsequently pushes its own
+    // descriptors to set 0 (with layout L_Y), the cmdbuf set 0 shadow is now
+    // L_Y's data, not L_X's. X's cache will still cache-hit on the next call
+    // (cmdbuf, tick, sig all unchanged from X's view) and skip the push,
+    // leaving the draw to fire with set 0 holding L_Y data while bindPipeline
+    // re-binds X (layout L_X). RADV reports VUID-08600 ("descriptor set 0
+    // not compatible with the layout used in pushDescriptorSetKHR") and may
+    // DEVICE_LOST.
+    //
+    // Fix: each push/bind that touches cmdbuf state bumps a per-bind-point
+    // generation counter. Pipeline caches store the gen at the time of
+    // their update; on read, the gen must still match. Any cross-pipeline
+    // push/bind invalidates everyone's caches automatically.
+    //
+    // Reset to 0 in AllocateWorkerCommandBuffers — fresh cmdbuf, no state.
+    [[nodiscard]] u64 GetPushDescGen(vk::PipelineBindPoint bp) const noexcept {
+        return bp == vk::PipelineBindPoint::eCompute ? cmdbuf_gen_push_desc_compute_
+                                                     : cmdbuf_gen_push_desc_gfx_;
+    }
+    void BumpPushDescGen(vk::PipelineBindPoint bp) noexcept {
+        if (bp == vk::PipelineBindPoint::eCompute) {
+            ++cmdbuf_gen_push_desc_compute_;
+        } else {
+            ++cmdbuf_gen_push_desc_gfx_;
+        }
+    }
+    [[nodiscard]] u64 GetPushConstGen(vk::PipelineBindPoint bp) const noexcept {
+        return bp == vk::PipelineBindPoint::eCompute ? cmdbuf_gen_push_const_compute_
+                                                     : cmdbuf_gen_push_const_gfx_;
+    }
+    void BumpPushConstGen(vk::PipelineBindPoint bp) noexcept {
+        if (bp == vk::PipelineBindPoint::eCompute) {
+            ++cmdbuf_gen_push_const_compute_;
+        } else {
+            ++cmdbuf_gen_push_const_gfx_;
+        }
+    }
+    [[nodiscard]] u64 GetBoundDescGen(vk::PipelineBindPoint bp) const noexcept {
+        return bp == vk::PipelineBindPoint::eCompute ? cmdbuf_gen_bound_desc_compute_
+                                                     : cmdbuf_gen_bound_desc_gfx_;
+    }
+    void BumpBoundDescGen(vk::PipelineBindPoint bp) noexcept {
+        if (bp == vk::PipelineBindPoint::eCompute) {
+            ++cmdbuf_gen_bound_desc_compute_;
+        } else {
+            ++cmdbuf_gen_bound_desc_gfx_;
+        }
+    }
+    void ResetCmdbufStateGens() noexcept {
+        cmdbuf_gen_push_desc_gfx_ = 0;
+        cmdbuf_gen_push_desc_compute_ = 0;
+        cmdbuf_gen_push_const_gfx_ = 0;
+        cmdbuf_gen_push_const_compute_ = 0;
+        cmdbuf_gen_bound_desc_gfx_ = 0;
+        cmdbuf_gen_bound_desc_compute_ = 0;
+    }
+
+    // =========================================================================
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
         if (master_semaphore.IsFree(tick)) {
@@ -419,6 +539,27 @@ public:
 
     static std::mutex submit_mutex;
 
+    // FIX(GR2FORK): VK_ERROR_DEVICE_LOST diagnostics. When a queue.submit()
+    // returns DEVICE_LOST (NVIDIA Windows TDR is the dominant trigger on this
+    // fork — see hang_watchdog "STALL DETECTED" 5s before), the device is
+    // unrecoverable and the only path forward is process termination via
+    // ASSERT. The crash log itself only ever said "Device lost during submit"
+    // with no GPU-side detail, because vk_instance.cpp:340 enables
+    // VK_EXT_device_fault but no caller queried it. This helper closes that
+    // gap: on DEVICE_LOST we run the two-pass vkGetDeviceFaultInfoEXT query
+    // (counts pass + info pass), log every VkDeviceFaultAddressInfoEXT and
+    // VkDeviceFaultVendorInfoEXT entry, and only THEN fall through to the
+    // ASSERT. Result: future DEVICE_LOST crashes ship the fault address,
+    // fault type (Read / Write / Execution / None), driver-side description,
+    // and vendor-specific fault code/data alongside the existing crash dump.
+    //
+    // Static / does not touch any Scheduler instance state, so it is also
+    // callable from ComputeScheduler::Submit on its symmetric DEVICE_LOST
+    // assert. `context` is a short literal ("graphics submit" or
+    // "compute submit") inserted into the log lines so the side that lost
+    // the device is unambiguous.
+    static void DumpDeviceFaultInfo(const Instance& instance, const char* context) noexcept;
+
 private:
     void AllocateWorkerCommandBuffers();
 
@@ -445,6 +586,18 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+
+    // --- Cross-pipeline cmdbuf state generation counters ---
+    // Bumped by Pipeline::BindResources whenever it pushes/binds; read by
+    // Pipeline cache hit checks to detect that another Pipeline has touched
+    // the same cmdbuf state since the last cache update.
+    // See public GetPushDescGen/BumpPushDescGen for rationale.
+    u64 cmdbuf_gen_push_desc_gfx_{0};
+    u64 cmdbuf_gen_push_desc_compute_{0};
+    u64 cmdbuf_gen_push_const_gfx_{0};
+    u64 cmdbuf_gen_push_const_compute_{0};
+    u64 cmdbuf_gen_bound_desc_gfx_{0};
+    u64 cmdbuf_gen_bound_desc_compute_{0};
 };
 
 } // namespace Vulkan

@@ -13,6 +13,7 @@
 
 #include <miniz.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -21,11 +22,24 @@
 
 namespace {
 
-std::mutex submit_mutex{};
-u32 num_requests{};
-std::condition_variable_any request_cv{};
-std::queue<std::packaged_task<void()>> req_queue{};
-std::mutex m_request{};
+// Single-mutex producer-consumer queue for cache I/O.
+//
+// FIX(GR2FORK): the original implementation used two mutexes (`submit_mutex`
+// guarding a `num_requests` counter, `m_request` guarding `req_queue`) which
+// could drift apart: count > queue.size() was reachable, and the worker's
+// inner `while (num_requests) { ... if queue.empty() continue; ... }` would
+// spin forever in that state. This rewrite drops the counter entirely — the
+// queue itself is the source of truth — and uses one mutex for both the
+// queue and the wakeup predicate.
+//
+// Also drops the redundant `request.get_future().wait()` after running the
+// task: `std::packaged_task::operator()` runs the underlying callable
+// synchronously and stores the result; the future was never retrieved, so
+// the wait was always a no-op (and a future-already-consumed UB risk on
+// some implementations).
+std::mutex io_queue_mutex{};
+std::condition_variable_any io_queue_cv{};
+std::queue<std::packaged_task<void()>> io_queue{};
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
@@ -38,32 +52,20 @@ void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
 
     while (!stoken.stop_requested()) {
+        std::packaged_task<void()> request{};
         {
-            std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
-        }
-
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        while (num_requests) {
-            std::packaged_task<void()> request{};
-            {
-                std::scoped_lock lock{m_request};
-                if (req_queue.empty()) {
-                    continue;
-                }
-                request = std::move(req_queue.front());
-                req_queue.pop();
+            std::unique_lock lk{io_queue_mutex};
+            Common::CondvarWait(io_queue_cv, lk, stoken,
+                                [&] { return !io_queue.empty(); });
+            if (stoken.stop_requested()) {
+                break;
             }
-
-            if (request.valid()) {
-                request();
-                request.get_future().wait();
-            }
-
-            --num_requests;
+            // Predicate guarantees non-empty queue here.
+            request = std::move(io_queue.front());
+            io_queue.pop();
+        }
+        if (request.valid()) {
+            request();
         }
     }
 }
@@ -125,7 +127,28 @@ void DataBase::Close() {
         return;
     }
 
+    // FIX(GR2FORK): drain pending writes BEFORE requesting stop. The worker
+    // exits on stop_requested without draining; previously any writes still
+    // in flight at shutdown were silently lost. Spin-wait briefly with a
+    // short sleep — the queue is small (one entry per shader/pipeline blob)
+    // and drains in milliseconds. cv.notify_one ensures the worker wakes
+    // and processes each entry.
+    while (true) {
+        bool empty;
+        {
+            std::scoped_lock lk{io_queue_mutex};
+            empty = io_queue.empty();
+        }
+        if (empty) break;
+        io_queue_cv.notify_one();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
     io_worker.request_stop();
+    // Worker is currently inside CondvarWait waiting on a non-empty queue —
+    // request_stop flips the stop_token but the wait predicate is still
+    // !empty. Wake it via notify_one so it observes the stop request.
+    io_queue_cv.notify_all();
     io_worker.join();
 
     if (Config::isPipelineCacheArchived()) {
@@ -133,35 +156,34 @@ void DataBase::Close() {
         mz_zip_writer_end(&zip_ar);
     }
 
+    opened = false;
+
     LOG_INFO(Render, "Cache dumped");
 }
 
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
-    {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
-            path.replace_extension(GetBlobFileExtension(type));
-            if (Config::isPipelineCacheArchived()) {
-                ASSERT_MSG(!ar_is_read_only,
-                           "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
-                    LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
-                }
-            } else {
-                using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+    auto request = std::packaged_task<void()>{[=]() {
+        auto path{path_};
+        path.replace_extension(GetBlobFileExtension(type));
+        if (Config::isPipelineCacheArchived()) {
+            ASSERT_MSG(!ar_is_read_only,
+                       "The archive is read-only. Did you forget to call `FinishPreload`?");
+            if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
+                                       v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
             }
-        }};
-        std::scoped_lock lock{m_request};
-        req_queue.emplace(std::move(request));
+        } else {
+            using namespace Common::FS;
+            const auto file = IOFile{path, FileAccessMode::Create};
+            file.Write(v);
+        }
+    }};
+    {
+        std::scoped_lock lk{io_queue_mutex};
+        io_queue.emplace(std::move(request));
     }
-
-    std::scoped_lock lk{submit_mutex};
-    ++num_requests;
-    request_cv.notify_one();
+    io_queue_cv.notify_one();
     return true;
 }
 
@@ -259,6 +281,42 @@ void DataBase::FinishPreload() {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;
     }
+}
+
+u32 DataBase::CountBlobs(BlobType type) {
+    if (!opened) {
+        return 0;
+    }
+    // Counts blobs of `type` without reading their data — directory metadata
+    // only (filesystem mode) or zip-index walk (archived mode). Used to size
+    // the "LOADING SHADERS" progress bar before the slow ForEachBlob pass
+    // that actually deserializes each pipeline. For 41,896-pipeline caches
+    // this is a sub-100ms scan on any reasonable filesystem, well below the
+    // user-visible flash threshold.
+    const auto& ext = GetBlobFileExtension(type);
+    u32 count = 0;
+    if (Config::isPipelineCacheArchived()) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (int index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            file_name.fill(0);
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            if (std::string{file_name.data()}.ends_with(ext)) {
+                ++count;
+            }
+        }
+    } else {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+            if (ec) {
+                break;
+            }
+            if (entry.path().extension().string().ends_with(ext)) {
+                ++count;
+            }
+        }
+    }
+    return count;
 }
 
 } // namespace Storage

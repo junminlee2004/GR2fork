@@ -215,7 +215,8 @@ bool Instance::CreateDevice() {
                           vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
                           vk::PhysicalDevicePortabilitySubsetFeaturesKHR,
                           vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
-                          vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
+                          vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+                          vk::PhysicalDeviceFaultFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -336,6 +337,20 @@ bool Instance::CreateDevice() {
 
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
+    // VK_EXT_device_fault: enables querying detailed GPU fault info on
+    // VK_ERROR_DEVICE_LOST. Optional — if unavailable, scheduler still
+    // asserts on device-lost but with no diagnostic detail.
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (device_fault) {
+        const auto device_fault_features =
+            feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>();
+        LOG_INFO(Render_Vulkan, "- deviceFault: {}", device_fault_features.deviceFault);
+        if (!device_fault_features.deviceFault) {
+            // Extension advertised but feature not actually supported.
+            device_fault = false;
+        }
+    }
+
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
         LOG_CRITICAL(Render_Vulkan, "Physical device reported no queues.");
@@ -356,12 +371,56 @@ bool Instance::CreateDevice() {
         return false;
     }
 
+    // Phase MQ-1: prefer a queue family that supports COMPUTE but NOT GRAPHICS,
+    // i.e. a dedicated async-compute family. AMD/RADV exposes one. If absent
+    // (some integrated/older GPUs), fall back to the graphics family — in
+    // that case GetComputeQueue() == GetGraphicsQueue() and async compute
+    // is not actually parallel; subsequent phases will detect this via
+    // IsAsyncComputeAvailable() and route compute to the graphics queue.
+    async_compute_available = false;
+    compute_queue_family_index = queue_family_index;
+    for (std::size_t i = 0; i < family_properties.size(); i++) {
+        const u32 index = static_cast<u32>(i);
+        const auto flags = family_properties[i].queueFlags;
+        if ((flags & vk::QueueFlagBits::eCompute) &&
+            !(flags & vk::QueueFlagBits::eGraphics)) {
+            compute_queue_family_index = index;
+            async_compute_available = true;
+            break;
+        }
+    }
+    if (async_compute_available) {
+        LOG_INFO(Render_Vulkan,
+                 "Async compute queue family found: graphics={} compute={}",
+                 queue_family_index, compute_queue_family_index);
+        cross_queue_family_indices_ = {queue_family_index, compute_queue_family_index};
+    } else {
+        LOG_INFO(Render_Vulkan,
+                 "No dedicated async compute family; compute will share "
+                 "graphics family {}",
+                 queue_family_index);
+    }
+
     static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
+    // Compute queue priority left at 1.0; on RADV the priority value is
+    // largely advisory. Adjusted in MQ-3+ if scheduling tuning is needed.
+    static constexpr std::array compute_queue_priorities = {1.0f};
+
+    // Build queueCreateInfo array. Single entry when families collide,
+    // two entries when async compute is on a separate family.
+    boost::container::static_vector<vk::DeviceQueueCreateInfo, 2> queue_infos;
+    queue_infos.push_back(vk::DeviceQueueCreateInfo{
         .queueFamilyIndex = queue_family_index,
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
-    };
+    });
+    if (async_compute_available) {
+        queue_infos.push_back(vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = compute_queue_family_index,
+            .queueCount = static_cast<u32>(compute_queue_priorities.size()),
+            .pQueuePriorities = compute_queue_priorities.data(),
+        });
+    }
 
     const auto topology_list_restart_features =
         feature_chain.get<vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT>();
@@ -370,8 +429,8 @@ bool Instance::CreateDevice() {
     const auto vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = static_cast<u32>(queue_infos.size()),
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -497,6 +556,10 @@ bool Instance::CreateDevice() {
             .workgroupMemoryExplicitLayout16BitAccess =
                 workgroup_memory_explicit_layout_features.workgroupMemoryExplicitLayout16BitAccess,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+            .deviceFaultVendorBinary = false,
+        },
 #ifdef __APPLE__
         vk::PhysicalDevicePortabilitySubsetFeaturesKHR{
             .constantAlphaColorBlendFactors = portability_features.constantAlphaColorBlendFactors,
@@ -563,6 +626,9 @@ bool Instance::CreateDevice() {
     if (!workgroup_memory_explicit_layout) {
         device_chain.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
     }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -575,6 +641,12 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (async_compute_available) {
+        compute_queue = device->getQueue(compute_queue_family_index, 0);
+    } else {
+        // Fallback: compute shares the graphics queue.
+        compute_queue = graphics_queue;
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -682,16 +754,34 @@ void Instance::CollectPhysicalMemoryInfo() {
         }
         if (supports_memory_budget) {
             device_initial_usage += budget.heapUsage[i];
-            total_memory_budget += budget.heapBudget[i];
+            // FIX(GR2FORK): on discrete GPUs report the full physical heap
+            // size instead of heapBudget for device-local heaps. heapBudget
+            // pre-deducts the desktop compositor and other apps' current
+            // VRAM (e.g. ~3367 MiB on a 4096 MiB 3050 Ti), leaving usable
+            // VRAM on the table — the game can in practice use almost the
+            // full physical heap before VK_ERROR_OUT_OF_DEVICE_MEMORY
+            // fires. Integrated GPUs still need heapBudget since they
+            // share the system pool.
+            if (!IsIntegrated() && is_device_local) {
+                total_memory_budget += memory_props.memoryHeaps[i].size;
+            } else {
+                total_memory_budget += budget.heapBudget[i];
+            }
             continue;
         }
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
     if (!IsIntegrated()) {
-        // We reserve some memory for the system.
-        const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
-        total_memory_budget -= system_memory;
+        // FIX(GR2FORK): no additional system reserve on discrete GPUs.
+        // VK_EXT_memory_budget already reports a dynamic heapBudget that
+        // accounts for the desktop compositor, other apps' current VRAM
+        // usage, and driver overhead — subtracting another min(budget/8,
+        // 1_GB) on top double-counts and eats 16-25% of usable VRAM on
+        // small cards (4 GB / 3050 Ti reported ~2.9 GB instead of ~3.3+).
+        // If actual allocations approach the limit the driver will return
+        // VK_ERROR_OUT_OF_DEVICE_MEMORY and the texture cache can react;
+        // we don't need a precautionary skim.
         return;
     }
     // Leave at least 8 GB for the system on integrated GPUs.
