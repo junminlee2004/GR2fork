@@ -550,8 +550,33 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
 
 void Image::CopyImage(Image& src_image) {
     const auto& src_info = src_image.info;
-    const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
-    ASSERT(src_info.resources.layers == info.resources.layers || num_mips == 1);
+    u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
+
+    // FIX(GR2FORK): the previous ASSERT here:
+    //     ASSERT(src.layers == dst.layers || num_mips == 1);
+    // was crashing GR2 whenever the texture cache resolved an overlap or
+    // expand between an image with a clamped layer count (see the 2048-cap
+    // policy in image_info.cpp ImageInfo(AmdGpu::Image&) ctor) and an image
+    // with the natural layer count. The 2048 clamp deliberately produces a
+    // wrong-but-creatable layer count for garbage T#s with depth bits in
+    // (2048, 8191]; the explicit design intent recorded at the clamp site
+    // is "render wrong rather than missing". An ASSERT here defeats that
+    // intent by converting "render wrong" into "process exit".
+    //
+    // SanitizeCopyLayers() already reconciles mismatched layer counts per
+    // mip (2D↔2D: std::min; 2D↔3D: coerce to per-mip depth), so the copy
+    // itself is Vulkan-legal. The one corner the old assertion guarded
+    // against is multi-mip 2D↔3D copies where the per-mip depth no longer
+    // equals the static layer count — in that case the static SanitizeCopyLayers
+    // coercion silently truncates beyond mip 0. Mirror the old assertion's
+    // implicit guarantee by clamping num_mips to 1 when layers mismatch.
+    if (src_info.resources.layers != info.resources.layers && num_mips > 1) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan,
+                    "CopyImage layer mismatch (src={}, dst={}); copying mip 0 only "
+                    "(downstream of clamped garbage T# or 2D<->3D overlap).",
+                    src_info.resources.layers, info.resources.layers);
+        num_mips = 1;
+    }
 
     const u32 width = src_info.size.width;
     const u32 height = src_info.size.height;
@@ -599,9 +624,22 @@ void Image::CopyImage(Image& src_image) {
 
 void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
     const auto& src_info = src_image.info;
-    const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
+    u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
-    ASSERT(src_info.resources.layers == info.resources.layers || num_mips == 1);
+
+    // FIX(GR2FORK): same rationale as CopyImage above — the old ASSERT here
+    // converted the deliberate 2048-layer clamp policy from "render wrong"
+    // into a process-killing assertion. num_layers is already min-clamped,
+    // which is Vulkan-legal for every mip in the 2D↔2D case. Only clamp the
+    // mip count when the source/dest layer counts differ, which mirrors the
+    // old assertion's implicit guarantee without crashing.
+    if (src_info.resources.layers != info.resources.layers && num_mips > 1) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan,
+                    "CopyImageWithBuffer layer mismatch (src={}, dst={}); copying mip 0 "
+                    "only (downstream of clamped garbage T# or 2D<->3D overlap).",
+                    src_info.resources.layers, info.resources.layers);
+        num_mips = 1;
+    }
 
     SetBackingSamples(info.num_samples, false);
     src_image.SetBackingSamples(src_info.num_samples);
