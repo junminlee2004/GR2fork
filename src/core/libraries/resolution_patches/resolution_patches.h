@@ -115,6 +115,7 @@ enum class TargetResolution {
     Off,    // No-op; do not patch resolution constants at all.
     R540p,  // Base 960x540
     R720p,  // Base 1280x720
+    R900p,  // Base 1600x900
     R1080p, // Base 1920x1080  (native — patches are mostly idempotent at 16:9)
     R1440p, // Base 2560x1440
     R2160p, // Base 3840x2160  (4K)
@@ -478,7 +479,7 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
                               float aspect_ratio, bool disable_motion_blur);
 
 // Parse a config string into a TargetResolution. ("Off", "540p", "720p",
-// "1080p", "1440p", "2160p"/"4K", "4320p"/"8K", or "WxH" forms.)
+// "900p", "1080p", "1440p", "2160p"/"4K", "4320p"/"8K", or "WxH" forms.)
 TargetResolution ParseResolutionFromConfig(std::string_view s);
 
 // Return the *base* (16:9) (W, H) for a given TargetResolution.

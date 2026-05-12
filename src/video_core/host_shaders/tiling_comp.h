@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright 2022 Citra Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <string_view>
+
+namespace HostShaders {
+
+constexpr std::string_view TILING_COMP = R"shader_src(
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -442,3 +452,7 @@ void main() {
     linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
 #endif
 }
+
+)shader_src";
+
+} // namespace HostShaders

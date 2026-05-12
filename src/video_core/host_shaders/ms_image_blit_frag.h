@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright 2022 Citra Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <string_view>
+
+namespace HostShaders {
+
+constexpr std::string_view MS_IMAGE_BLIT_FRAG = R"shader_src(
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -21,3 +31,7 @@ void main()
     out_color = texelFetch(in_tex, ivec2(gl_FragCoord.xy), 0);
 #endif
 }
+
+)shader_src";
+
+} // namespace HostShaders

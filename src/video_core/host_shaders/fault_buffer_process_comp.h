@@ -1,3 +1,13 @@
+// SPDX-FileCopyrightText: Copyright 2022 Citra Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <string_view>
+
+namespace HostShaders {
+
+constexpr std::string_view FAULT_BUFFER_PROCESS_COMP = R"shader_src(
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -33,3 +43,7 @@ void main() {
         download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
     }
 }
+
+)shader_src";
+
+} // namespace HostShaders

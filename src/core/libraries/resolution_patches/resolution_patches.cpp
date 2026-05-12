@@ -904,6 +904,7 @@ constexpr Resolution BaseSizeFor(TargetResolution t) {
     switch (t) {
     case TargetResolution::R540p:  return { 960,  540};
     case TargetResolution::R720p:  return {1280,  720};
+    case TargetResolution::R900p:  return {1600,  900};
     case TargetResolution::R1080p: return {1920, 1080};
     case TargetResolution::R1440p: return {2560, 1440};
     case TargetResolution::R2160p: return {3840, 2160};
@@ -1008,6 +1009,7 @@ const char* TargetName(TargetResolution t) {
     switch (t) {
     case TargetResolution::R540p:  return "540p";
     case TargetResolution::R720p:  return "720p";
+    case TargetResolution::R900p:  return "900p";
     case TargetResolution::R1080p: return "1080p";
     case TargetResolution::R1440p: return "1440p";
     case TargetResolution::R2160p: return "2160p (4K)";
@@ -1262,6 +1264,7 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
 TargetResolution ParseResolutionFromConfig(std::string_view s) {
     if (s == "540p"  || s == "960x540")                  return TargetResolution::R540p;
     if (s == "720p"  || s == "1280x720")                 return TargetResolution::R720p;
+    if (s == "900p"  || s == "1600x900")                 return TargetResolution::R900p;
     if (s == "1080p" || s == "1920x1080")                return TargetResolution::R1080p;
     if (s == "1440p" || s == "2560x1440")                return TargetResolution::R1440p;
     if (s == "2160p" || s == "3840x2160" || s == "4K")   return TargetResolution::R2160p;
