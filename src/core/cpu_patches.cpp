@@ -1,10 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <Zydis/Zydis.h>
 #include <xbyak/xbyak.h>
@@ -13,6 +19,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/logging/log.h"
 #include "common/signal_context.h"
 #include "common/types.h"
 #include "core/signals.h"
@@ -772,17 +779,377 @@ static void TryPatchAot(void* code_address, u64 code_size) {
     }
 }
 
+#if defined(_WIN32)
+
+/// Returns true for SSE4a mnemonics that are safe to AOT-patch regardless of
+/// TLS / FS-segment state. EXTRQ/INSERTQ/MOVNTSS/MOVNTSD generators emit pure
+/// XMM+GPR code and have no segment-register dependencies.
+static bool IsSSE4aMnemonic(ZydisMnemonic mnemonic) {
+    return mnemonic == ZYDIS_MNEMONIC_EXTRQ || mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
+           mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
+}
+
+// =====================================================================
+// AOT relocator for 4-byte EXTRQ_rr / INSERTQ_rr.
+//
+// The default Windows-only AOT path patches >=5-byte SSE4a sites with a
+// JMP-to-trampoline. The 4-byte reg/reg forms are shorter than a near-jmp
+// (5 bytes) so they cannot be patched in place — they're left to trap at
+// runtime via the illegal-instruction VEH handler.
+//
+// On Intel Windows, that runtime trap path is a frame-time killer
+// (~1.3M traps/sec observed in GR2; ~10k+ cycles per trap on intel-win due
+// to kernel-side exception dispatch and "mutex-style" waits in the kernel
+// during delivery). The fix here is to relocate the 4-byte rr-form to a
+// trampoline by also consuming the NEXT instruction's bytes:
+//
+//   original bytes:  [4-byte EXTRQ_rr][next instr, len L]
+//   patched window:  [5-byte JMP rel32 → trampoline][NOPx(4+L-5)]
+//   trampoline:      [emulate EXTRQ_rr][replay next instr][JMP back]
+//
+// Constraints on the next instruction (verified pre-patch):
+//   - Must be decodable.
+//   - Must not be a branch (we can't reorder a branch into the trampoline
+//     without rewriting its target).
+//   - Must not use RIP-relative addressing (relocation would shift the
+//     effective address). We could fix up rip-rel disps but for GR2 v1.11
+//     none of the 40 trap sites have a rip-rel next instruction, so we
+//     simply refuse to relocate when one would be needed.
+//
+// If the next instruction is itself an SSE4a op (the adjacent EXTRQ_rr
+// cases) we emit emulation for it instead of copying bytes verbatim,
+// otherwise the copy would just trap again from inside the trampoline.
+//
+// Diagnostics: counters track how many 4-byte rr sites are seen, how many
+// are relocated, and how many are skipped (with reasons). A per-module
+// summary line is logged at the end of the AOT pass. The runtime trap
+// counters (g_ud_trap_4byte_sse4a_count, g_ud_trap_other_count, g_av_count
+// below) are the cross-check: if relocation is working, the SSE4a-rr
+// counter stays at 0 in steady state.
+// =====================================================================
+
+struct AotSse4aStats {
+    std::atomic<u64> rr_sites_seen{0};
+    std::atomic<u64> rr_sites_relocated{0};
+    std::atomic<u64> rr_skipped_next_decode_fail{0};
+    std::atomic<u64> rr_skipped_next_is_branch{0};
+    std::atomic<u64> rr_skipped_next_rip_rel{0};
+    std::atomic<u64> rr_skipped_at_module_end{0};
+    std::atomic<u64> rr_skipped_other{0};
+
+    u64 total_skipped() const {
+        return rr_skipped_next_decode_fail.load(std::memory_order_relaxed) +
+               rr_skipped_next_is_branch.load(std::memory_order_relaxed) +
+               rr_skipped_next_rip_rel.load(std::memory_order_relaxed) +
+               rr_skipped_at_module_end.load(std::memory_order_relaxed) +
+               rr_skipped_other.load(std::memory_order_relaxed);
+    }
+};
+static AotSse4aStats g_aot_sse4a_stats;
+
+static bool IsBranchOrCall(const ZydisDecodedInstruction& inst) {
+    switch (inst.meta.category) {
+    case ZYDIS_CATEGORY_UNCOND_BR:
+    case ZYDIS_CATEGORY_COND_BR:
+    case ZYDIS_CATEGORY_CALL:
+    case ZYDIS_CATEGORY_RET:
+    case ZYDIS_CATEGORY_SYSCALL:
+    case ZYDIS_CATEGORY_SYSRET:
+    case ZYDIS_CATEGORY_INTERRUPT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool UsesRipRelative(const ZydisDecodedInstruction& inst,
+                            const ZydisDecodedOperand* operands) {
+    for (u8 i = 0; i < inst.operand_count_visible; ++i) {
+        const auto& op = operands[i];
+        if (op.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            op.mem.base == ZYDIS_REGISTER_RIP) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns true and the new advance length if the 4-byte EXTRQ_rr / INSERTQ_rr
+/// at `code` was successfully relocated to a trampoline. Returns false (and
+/// `inst.length` = 4 for the caller to advance) if the site was skipped.
+static std::pair<bool, u64> TryRelocate4ByteSse4aRr(
+    u8* code, PatchModule* module, const ZydisDecodedInstruction& inst,
+    const ZydisDecodedOperand* operands) {
+
+    g_aot_sse4a_stats.rr_sites_seen.fetch_add(1, std::memory_order_relaxed);
+
+    // Decode the next instruction.
+    if (code + inst.length >= module->end) {
+        g_aot_sse4a_stats.rr_skipped_at_module_end.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+    ZydisDecodedInstruction next_inst;
+    ZydisDecodedOperand next_operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto next_status = Common::Decoder::Instance()->decodeInstruction(
+        next_inst, next_operands, code + inst.length, module->end - (code + inst.length));
+    if (!ZYAN_SUCCESS(next_status)) {
+        g_aot_sse4a_stats.rr_skipped_next_decode_fail.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+
+    if (IsBranchOrCall(next_inst)) {
+        g_aot_sse4a_stats.rr_skipped_next_is_branch.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+    if (UsesRipRelative(next_inst, next_operands)) {
+        g_aot_sse4a_stats.rr_skipped_next_rip_rel.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+
+    // Combined window = 4 + L. With L >= 1 this is always >= 5 for the JMP rel32.
+    const u64 total_window = inst.length + next_inst.length;
+    if (total_window < 5) {
+        // Shouldn't happen — even a 1-byte next yields a 5-byte window — but guard.
+        g_aot_sse4a_stats.rr_skipped_other.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+
+    auto& trampoline_gen = module->trampoline_gen;
+    auto& patch_gen = module->patch_gen;
+    const auto* tramp_ptr = trampoline_gen.getCurr();
+
+    // Trampoline body 1: emulate the 4-byte EXTRQ_rr / INSERTQ_rr.
+    if (inst.mnemonic == ZYDIS_MNEMONIC_EXTRQ) {
+        GenerateEXTRQ(code, operands, trampoline_gen);
+    } else {
+        ASSERT(inst.mnemonic == ZYDIS_MNEMONIC_INSERTQ);
+        GenerateINSERTQ(code, operands, trampoline_gen);
+    }
+
+    // Trampoline body 2: handle the next instruction.
+    //   - If it's itself SSE4a, emit emulation (don't copy verbatim or it would
+    //     just trap from inside the trampoline).
+    //   - Otherwise, copy bytes verbatim — safety has been verified
+    //     (no branch, no rip-rel).
+    if (next_inst.mnemonic == ZYDIS_MNEMONIC_EXTRQ) {
+        GenerateEXTRQ(code + inst.length, next_operands, trampoline_gen);
+    } else if (next_inst.mnemonic == ZYDIS_MNEMONIC_INSERTQ) {
+        GenerateINSERTQ(code + inst.length, next_operands, trampoline_gen);
+    } else if (next_inst.mnemonic == ZYDIS_MNEMONIC_MOVNTSS ||
+               next_inst.mnemonic == ZYDIS_MNEMONIC_MOVNTSD) {
+        // These have non-trampoline generators that emit in-place replacement
+        // bytes equal in length to the original. We can call them and they'll
+        // emit into the trampoline stream — same effect as inline replacement,
+        // since the trampoline isn't being checked for size here.
+        if (next_inst.mnemonic == ZYDIS_MNEMONIC_MOVNTSS) {
+            ReplaceMOVNTSS(code + inst.length, next_operands, trampoline_gen);
+        } else {
+            ReplaceMOVNTSD(code + inst.length, next_operands, trampoline_gen);
+        }
+    } else {
+        // Verbatim copy of the next instruction's bytes.
+        for (u64 i = 0; i < next_inst.length; ++i) {
+            trampoline_gen.db(code[inst.length + i]);
+        }
+    }
+
+    // Trampoline tail: jump back to (original_VA + 4 + next.length).
+    trampoline_gen.jmp(code + total_window);
+
+    // Now overwrite the source site: 5-byte JMP to trampoline + NOPs.
+    patch_gen.reset();
+    patch_gen.setSize(code - patch_gen.getCode());
+    patch_gen.jmp(tramp_ptr, Xbyak::CodeGenerator::LabelType::T_NEAR);
+    const auto patch_size = patch_gen.getCurr() - code;
+    if (patch_size < 0 || static_cast<u64>(patch_size) > total_window) {
+        // Should not happen — JMP rel32 is always 5 bytes — but stay defensive.
+        g_aot_sse4a_stats.rr_skipped_other.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+    patch_gen.nop(total_window - static_cast<u64>(patch_size));
+    module->patched.insert(code);
+
+    g_aot_sse4a_stats.rr_sites_relocated.fetch_add(1, std::memory_order_relaxed);
+    LOG_DEBUG(Core,
+              "AOT relocated 4-byte SSE4a-rr at {} ({}+{}b next={} → window={}b)",
+              fmt::ptr(code), ZydisMnemonicGetString(inst.mnemonic),
+              static_cast<int>(next_inst.length),
+              ZydisMnemonicGetString(next_inst.mnemonic),
+              static_cast<int>(total_window));
+
+    return std::make_pair(true, total_window);
+}
+
+/// Like TryPatch, but only patches SSE4a mnemonics. Other patchable
+/// instructions (FS-segment stack canary, Tcb access) are left to lazy
+/// patching via the illegal-instruction VEH handler, since they depend on
+/// the PS4 TLS layout being established after module load.
+///
+/// If the existing dispatcher can't handle the site (e.g., 4-byte EXTRQ_rr
+/// or INSERTQ_rr), TryRelocate4ByteSse4aRr is invoked to claim 4 + next_len
+/// bytes and emit a combined trampoline.
+static std::pair<bool, u64> TryPatchSSE4aOnly(u8* code, PatchModule* module) {
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status = Common::Decoder::Instance()->decodeInstruction(instruction, operands, code,
+                                                                       module->end - code);
+    if (!ZYAN_SUCCESS(status)) {
+        return std::make_pair(false, 1);
+    }
+    if (!IsSSE4aMnemonic(instruction.mnemonic)) {
+        return std::make_pair(false, instruction.length);
+    }
+
+    // First, try the existing dispatcher. This handles >= 5-byte forms cleanly
+    // (EXTRQ_imm, INSERTQ_imm, MOVNTSS, MOVNTSD with REX, etc.).
+    auto result = TryPatch(code, module);
+    if (result.first) {
+        return result;
+    }
+
+    // The existing path declined. If this is a 4-byte rr-form of EXTRQ or
+    // INSERTQ, try the relocator.
+    const bool is_4byte_rr = (instruction.length == 4) &&
+                             (instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
+                              instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ);
+    if (is_4byte_rr) {
+        return TryRelocate4ByteSse4aRr(code, module, instruction, operands);
+    }
+
+    return std::make_pair(false, instruction.length);
+}
+
+/// AOT walk that only patches SSE4a mnemonics. Used on Windows where the
+/// generic AOT path is otherwise disabled. This eliminates VEH dispatch cost
+/// for first-time execution of patchable SSE4a sites (6-byte EXTRQ-imm,
+/// INSERTQ-imm, MOVNTSS, MOVNTSD). The 4-byte register-register EXTRQ/INSERTQ
+/// forms used to remain unpatchable and were left to the illegal-instruction
+/// handler; the relocator above now claims them too by consuming the next
+/// instruction's bytes.
+static void TryPatchAotSSE4aOnly(void* code_address, u64 code_size) {
+    auto* code = static_cast<u8*>(code_address);
+    auto* module = GetModule(code);
+    if (module == nullptr) {
+        return;
+    }
+
+    std::unique_lock lock{module->mutex};
+
+    // Snapshot counters so we can report deltas for this pass (the global
+    // counters are cumulative across modules).
+    const u64 before_seen = g_aot_sse4a_stats.rr_sites_seen.load(std::memory_order_relaxed);
+    const u64 before_reloc = g_aot_sse4a_stats.rr_sites_relocated.load(std::memory_order_relaxed);
+    const u64 before_skip = g_aot_sse4a_stats.total_skipped();
+
+    const auto* end = code + code_size;
+    while (code < end) {
+        code += TryPatchSSE4aOnly(code, module).second;
+    }
+
+    const u64 seen   = g_aot_sse4a_stats.rr_sites_seen.load(std::memory_order_relaxed) - before_seen;
+    const u64 reloc  = g_aot_sse4a_stats.rr_sites_relocated.load(std::memory_order_relaxed) - before_reloc;
+    const u64 skip   = g_aot_sse4a_stats.total_skipped() - before_skip;
+    if (seen > 0) {
+        LOG_INFO(Core,
+                 "AOT SSE4a-rr relocator: segment [{} +{:#x}b] — 4-byte rr sites: seen={}, "
+                 "relocated={}, skipped={} (decode_fail={}, branch={}, rip_rel={}, "
+                 "module_end={}, other={})",
+                 fmt::ptr(code_address), code_size, seen, reloc, skip,
+                 g_aot_sse4a_stats.rr_skipped_next_decode_fail.load(std::memory_order_relaxed),
+                 g_aot_sse4a_stats.rr_skipped_next_is_branch.load(std::memory_order_relaxed),
+                 g_aot_sse4a_stats.rr_skipped_next_rip_rel.load(std::memory_order_relaxed),
+                 g_aot_sse4a_stats.rr_skipped_at_module_end.load(std::memory_order_relaxed),
+                 g_aot_sse4a_stats.rr_skipped_other.load(std::memory_order_relaxed));
+    }
+}
+
+#endif
+
+// =====================================================================
+// Runtime trap diagnostics.
+//
+// Three independent counters cover all kernel exception-dispatch paths
+// that can blocking-stall threads on Intel Windows:
+//
+//   g_ud_trap_4byte_sse4a_count
+//       Increments when a 4-byte EXTRQ_rr / INSERTQ_rr traps post-AOT.
+//       The AOT relocator should drive this to 0. Any growth means a
+//       site slipped through (check the AOT summary's `skipped=*`
+//       breakdown).
+//
+//   g_ud_trap_other_count
+//       Increments on any other illegal-instruction trap — typically
+//       Windows-lazy FS-segment patches that present as UD (stack canary
+//       `mov`, Tcb-access `mov`, etc.). These should taper as the working
+//       set of patchable sites is exhausted; sustained growth implies a
+//       persistent untraversed-code-path cost.
+//
+//   g_av_count / g_av_handled_count
+//       Access-violation handler hits. On Windows the FS-segment patches
+//       (`fs:[0x28]` stack canary, `fs:[0x0]` Tcb) trap as access
+//       violations until lazily patched. `handled` = TryPatchJit
+//       succeeded. Persistent unpatched AVs flow elsewhere (other
+//       handlers / crash).
+//
+// All counters use the same coarse geometric log schedule so a fully-
+// working state produces no output, and a hot bottleneck produces one
+// log line per ~1 second at typical trap rates.
+// =====================================================================
+
+static std::atomic<u64> g_ud_trap_4byte_sse4a_count{0};
+static std::atomic<u64> g_ud_trap_other_count{0};
+static std::atomic<u64> g_av_count{0};
+static std::atomic<u64> g_av_handled_count{0};
+
+static inline bool ShouldLogTrapCounter(u64 n) {
+    // 1st, 1K, 16K, 256K, then every 1M.
+    return n == 1 || n == 1024 || n == 16384 || n == 262144 ||
+           (n & ((1ull << 20) - 1)) == 0;
+}
+
 static bool PatchesAccessViolationHandler(void* context, void* /* fault_address */) {
-    return TryPatchJit(Common::GetRip(context));
+    const u64 n = g_av_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool handled = TryPatchJit(Common::GetRip(context));
+    if (handled) {
+        g_av_handled_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (ShouldLogTrapCounter(n)) {
+        LOG_WARNING(Core,
+                    "Access-violation patch handler fired (cumulative_seen={}, "
+                    "cumulative_handled={}). First-execution FS-segment patches "
+                    "amortize to ~0 over time; sustained growth implies persistent "
+                    "page-fault dispatch cost on Intel Windows.",
+                    n, g_av_handled_count.load(std::memory_order_relaxed));
+    }
+    return handled;
 }
 
 static bool PatchesIllegalInstructionHandler(void* context) {
     void* code_address = Common::GetRip(context);
     if (Is4ByteExtrqOrInsertq(code_address)) {
+        const u64 n =
+            g_ud_trap_4byte_sse4a_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogTrapCounter(n)) {
+            LOG_WARNING(Core,
+                        "4-byte SSE4a-rr trap fired post-AOT (cumulative={}). "
+                        "The AOT relocator should have covered this site — check "
+                        "its summary line's `skipped=*` breakdown.",
+                        n);
+        }
         // The instruction is not big enough for a relative jump, don't try to patch it and pass it
         // to our illegal instruction interpreter directly
         return TryExecuteIllegalInstruction(context, code_address);
     } else {
+        const u64 n =
+            g_ud_trap_other_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogTrapCounter(n)) {
+            LOG_WARNING(Core,
+                        "Non-SSE4a illegal-instruction trap fired (cumulative={}). "
+                        "Most likely a Windows-lazy FS-segment patch (stack canary / "
+                        "Tcb access) presenting as UD. Should taper as new code paths "
+                        "are exhausted.",
+                        n);
+        }
         if (!TryPatchJit(code_address)) {
             ZydisDecodedInstruction instruction;
             ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
@@ -829,6 +1196,22 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
     // ahead-of-time patching for now until a better solution is worked out.
     if (!Patches.empty()) {
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
+    }
+#elif defined(_WIN32) && defined(ARCH_X86_64)
+    // Windows: AOT-patch SSE4a mnemonics only. FS-segment patches (stack
+    // canary, Tcb access) must remain lazy because they depend on the PS4
+    // TLS layout being set up after module load.
+    //
+    // PS4 libc uses EXTRQ/INSERTQ aggressively in memcpy/memmove and other
+    // hot SIMD paths. With this disabled, every first-execution of those
+    // sites traps as an illegal-instruction exception, dispatched via
+    // KiUserExceptionDispatcher -> our VEH handler -> TryPatchJit. On Intel
+    // Windows this dispatch path has been observed to be a significant
+    // frame-time cost in profiling (mutex-style kernel waits inside
+    // exception delivery), and on AMD it's a smaller but still real cost.
+    // AOT-patching at module load amortizes this to a one-time bulk pass.
+    if (!Patches.empty()) {
+        TryPatchAotSSE4aOnly(reinterpret_cast<void*>(segment_addr), segment_size);
     }
 #endif
 }
