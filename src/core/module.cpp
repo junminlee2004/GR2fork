@@ -254,7 +254,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             // density × the chosen aspect → final framebuffer dims).
             //
             // [GPU] resolutionOverride
-            //     "Off" | "540p" | "720p" | "1080p" | "1440p" | "2160p"/"4K" | "4320p"/"8K"
+            //     "Off" | "540p" | "720p" | "900p" | "1080p" | "1440p" |
+            //     "2160p"/"4K" | "2880p"/"5K" | "3456p"/"6K" | "4032p"/"7K" |
+            //     "4320p"/"8K"
             //
             // [GPU] disableMotionBlur (bool, default false)
             //     When true, the MotionBlur post-process pass is skipped

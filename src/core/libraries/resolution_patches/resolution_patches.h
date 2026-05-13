@@ -119,6 +119,9 @@ enum class TargetResolution {
     R1080p, // Base 1920x1080  (native — patches are mostly idempotent at 16:9)
     R1440p, // Base 2560x1440
     R2160p, // Base 3840x2160  (4K)
+    R2880p, // Base 5120x2880  (5K)
+    R3456p, // Base 6144x3456  (6K)
+    R4032p, // Base 7168x4032  (7K)
     R4320p, // Base 7680x4320  (8K)
 };
 

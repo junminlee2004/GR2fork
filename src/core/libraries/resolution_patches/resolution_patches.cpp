@@ -908,6 +908,9 @@ constexpr Resolution BaseSizeFor(TargetResolution t) {
     case TargetResolution::R1080p: return {1920, 1080};
     case TargetResolution::R1440p: return {2560, 1440};
     case TargetResolution::R2160p: return {3840, 2160};
+    case TargetResolution::R2880p: return {5120, 2880};
+    case TargetResolution::R3456p: return {6144, 3456};
+    case TargetResolution::R4032p: return {7168, 4032};
     case TargetResolution::R4320p: return {7680, 4320};
     default:                       return {1920, 1080};
     }
@@ -1013,6 +1016,9 @@ const char* TargetName(TargetResolution t) {
     case TargetResolution::R1080p: return "1080p";
     case TargetResolution::R1440p: return "1440p";
     case TargetResolution::R2160p: return "2160p (4K)";
+    case TargetResolution::R2880p: return "2880p (5K)";
+    case TargetResolution::R3456p: return "3456p (6K)";
+    case TargetResolution::R4032p: return "4032p (7K)";
     case TargetResolution::R4320p: return "4320p (8K)";
     default:                       return "Off";
     }
@@ -1268,6 +1274,9 @@ TargetResolution ParseResolutionFromConfig(std::string_view s) {
     if (s == "1080p" || s == "1920x1080")                return TargetResolution::R1080p;
     if (s == "1440p" || s == "2560x1440")                return TargetResolution::R1440p;
     if (s == "2160p" || s == "3840x2160" || s == "4K")   return TargetResolution::R2160p;
+    if (s == "2880p" || s == "5120x2880" || s == "5K")   return TargetResolution::R2880p;
+    if (s == "3456p" || s == "6144x3456" || s == "6K")   return TargetResolution::R3456p;
+    if (s == "4032p" || s == "7168x4032" || s == "7K")   return TargetResolution::R4032p;
     if (s == "4320p" || s == "7680x4320" || s == "8K")   return TargetResolution::R4320p;
     return TargetResolution::Off;
 }
