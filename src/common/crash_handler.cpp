@@ -23,6 +23,65 @@
 #include <psapi.h>
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
+#else
+// FIX(GR2FORK R-2B-3): Linux OnTerminate previously just printed the
+// exception type with no stack trace, which made `boost::container::bad_alloc`
+// untraceable. Add execinfo-based backtrace so we can see where bad_alloc
+// is actually thrown from (static_vector overflow vs heap corruption vs
+// real OOM produce identical strings without a trace).
+#include <execinfo.h>
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <cstring>
+
+// FIX(GR2FORK R-2B-3): capture backtrace at THROW time, not at terminate
+// time. By the time std::terminate calls our OnTerminate handler the stack
+// has already been unwound — backtrace() inside OnTerminate only sees the
+// worker-thread invoker plumbing, not where the exception was actually
+// raised. Solution: override __cxa_throw (the C++ ABI entry point every
+// `throw` compiles down to), snapshot frames before forwarding to the real
+// __cxa_throw via dlsym(RTLD_NEXT). Per-thread storage so concurrent throws
+// from compile threads / Recorder / etc. don't clobber each other.
+//
+// __thread (not thread_local) to avoid dynamic-TLS init paths which can
+// themselves throw on first access in pathological cases.
+namespace Common::CrashHandler {
+namespace {
+constexpr int kThrowFrameCap = 64;
+__thread void* g_throw_frames[kThrowFrameCap];
+__thread int   g_throw_nframes = 0;
+__thread char  g_throw_type_name[256] = {};
+} // namespace
+} // namespace Common::CrashHandler
+
+extern "C" {
+using cxa_throw_fn = void (*)(void*, std::type_info*, void (*)(void*));
+
+// noreturn: the real __cxa_throw never returns, so neither do we.
+__attribute__((noreturn))
+void __cxa_throw(void* obj, std::type_info* tinfo, void (*dest)(void*)) {
+    using namespace Common::CrashHandler;
+    // Snapshot the throw site BEFORE the unwinder runs.
+    g_throw_nframes = ::backtrace(g_throw_frames, kThrowFrameCap);
+    if (tinfo && tinfo->name()) {
+        std::strncpy(g_throw_type_name, tinfo->name(),
+                     sizeof(g_throw_type_name) - 1);
+        g_throw_type_name[sizeof(g_throw_type_name) - 1] = '\0';
+    } else {
+        g_throw_type_name[0] = '\0';
+    }
+
+    // Resolve the real __cxa_throw once, then cache. RTLD_NEXT walks the
+    // dynamic loader's lookup order past us (the executable) and finds
+    // libstdc++'s implementation.
+    static cxa_throw_fn real = nullptr;
+    if (!real) {
+        real = reinterpret_cast<cxa_throw_fn>(::dlsym(RTLD_NEXT, "__cxa_throw"));
+    }
+    real(obj, tinfo, dest);
+    __builtin_unreachable();
+}
+} // extern "C"
 #endif
 
 namespace Common::CrashHandler {
@@ -481,6 +540,72 @@ void OnTerminate() noexcept {
     LogCurrentThreadStack(what);
 #else
     CrashPrintf("*** %s ***\n", what);
+
+    // FIX(GR2FORK R-2B-3): print the backtrace captured at __cxa_throw
+    // time first. By the time we run here the stack has been unwound so
+    // backtrace() at this point only shows the std::terminate path —
+    // useless. The override above stashed the real throw-site frames
+    // into thread-local storage; emit those.
+    auto emit_frames = [&](const char* tag, void** frames, int nframes) {
+        CrashPrintf("*** %s (%d frames): ***\n", tag, nframes);
+        for (int i = 0; i < nframes; ++i) {
+            Dl_info info{};
+            const int got = ::dladdr(frames[i], &info);
+            const char* obj = (got && info.dli_fname) ? info.dli_fname : "??";
+            const uintptr_t file_off = (got && info.dli_fbase)
+                ? reinterpret_cast<uintptr_t>(frames[i])
+                  - reinterpret_cast<uintptr_t>(info.dli_fbase)
+                : 0;
+            if (got && info.dli_sname) {
+                char demangled_buf[1024];
+                const char* display = info.dli_sname;
+                int status = 0;
+                size_t buflen = sizeof(demangled_buf);
+                char* res = abi::__cxa_demangle(info.dli_sname, demangled_buf,
+                                                &buflen, &status);
+                if (status == 0 && res) {
+                    display = res;
+                }
+                const uintptr_t sym_off = info.dli_saddr
+                    ? reinterpret_cast<uintptr_t>(frames[i])
+                      - reinterpret_cast<uintptr_t>(info.dli_saddr)
+                    : 0;
+                CrashPrintf("  #%02d %p %s+0x%lx (%s+0x%lx)\n", i, frames[i],
+                            display, static_cast<unsigned long>(sym_off), obj,
+                            static_cast<unsigned long>(file_off));
+            } else {
+                CrashPrintf("  #%02d %p (%s+0x%lx)\n", i, frames[i], obj,
+                            static_cast<unsigned long>(file_off));
+            }
+        }
+    };
+
+    if (g_throw_nframes > 0) {
+        // Demangle the type name for clarity.
+        char demangled[512];
+        const char* type_display = g_throw_type_name;
+        if (g_throw_type_name[0]) {
+            int status = 0;
+            size_t buflen = sizeof(demangled);
+            char* res = abi::__cxa_demangle(g_throw_type_name, demangled,
+                                            &buflen, &status);
+            if (status == 0 && res) {
+                type_display = res;
+            }
+        }
+        CrashPrintf("*** Exception type at throw site: %s ***\n",
+                    type_display[0] ? type_display : "<unknown>");
+        emit_frames("Throw-site backtrace", g_throw_frames, g_throw_nframes);
+    } else {
+        CrashPrintf("*** No throw-site backtrace captured (rethrow without "
+                    "original frame or non-throw terminate) ***\n");
+    }
+
+    // Also print the current stack (terminate handler context) for
+    // completeness — useful if the throw-site capture failed.
+    void* now_frames[64];
+    const int now_nframes = ::backtrace(now_frames, 64);
+    emit_frames("Terminate-handler backtrace", now_frames, now_nframes);
 #endif
     std::abort();
 }

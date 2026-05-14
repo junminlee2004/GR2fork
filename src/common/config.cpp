@@ -183,6 +183,24 @@ static ConfigEntry<int> rcasAttenuation(250);
 static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<bool> disableMotionBlur(false);
+// GR2 granular render-pass disable toggles. See config.h for per-pass docs.
+static ConfigEntry<bool> disableShadowCast0(false);
+static ConfigEntry<bool> disableShadowCast1(false);
+static ConfigEntry<bool> disableShadowCast2(false);
+static ConfigEntry<bool> disableShadowTrace(false);
+static ConfigEntry<bool> disableSSAO(false);
+static ConfigEntry<bool> disableIBL(false);
+static ConfigEntry<bool> disableContour(false);
+static ConfigEntry<bool> disableSelfTranslucent(false);
+static ConfigEntry<bool> disableBloom(false);
+static ConfigEntry<bool> disableAntialias(false);
+static ConfigEntry<bool> disableEffector(false);
+static ConfigEntry<bool> disableFogRender(false);
+static ConfigEntry<bool> disableFogCloud(false);
+static ConfigEntry<bool> disableFogDist(false);
+static ConfigEntry<bool> disableFogCast(false);
+static ConfigEntry<bool> disableParticleCompute(false);
+static ConfigEntry<bool> disableParticleDistortion(false);
 
 // Vulkan
 static ConfigEntry<s32> gpuId(-1);
@@ -892,6 +910,76 @@ void setDisableMotionBlur(bool value, bool is_game_specific) {
     disableMotionBlur.set(value, is_game_specific);
 }
 
+// --- GR2 granular pass-disable getters/setters ---
+bool getDisableShadowCast0() { return disableShadowCast0.get(); }
+void setDisableShadowCast0(bool value, bool is_game_specific) {
+    disableShadowCast0.set(value, is_game_specific);
+}
+bool getDisableShadowCast1() { return disableShadowCast1.get(); }
+void setDisableShadowCast1(bool value, bool is_game_specific) {
+    disableShadowCast1.set(value, is_game_specific);
+}
+bool getDisableShadowCast2() { return disableShadowCast2.get(); }
+void setDisableShadowCast2(bool value, bool is_game_specific) {
+    disableShadowCast2.set(value, is_game_specific);
+}
+bool getDisableShadowTrace() { return disableShadowTrace.get(); }
+void setDisableShadowTrace(bool value, bool is_game_specific) {
+    disableShadowTrace.set(value, is_game_specific);
+}
+bool getDisableSSAO() { return disableSSAO.get(); }
+void setDisableSSAO(bool value, bool is_game_specific) {
+    disableSSAO.set(value, is_game_specific);
+}
+bool getDisableIBL() { return disableIBL.get(); }
+void setDisableIBL(bool value, bool is_game_specific) {
+    disableIBL.set(value, is_game_specific);
+}
+bool getDisableContour() { return disableContour.get(); }
+void setDisableContour(bool value, bool is_game_specific) {
+    disableContour.set(value, is_game_specific);
+}
+bool getDisableSelfTranslucent() { return disableSelfTranslucent.get(); }
+void setDisableSelfTranslucent(bool value, bool is_game_specific) {
+    disableSelfTranslucent.set(value, is_game_specific);
+}
+bool getDisableBloom() { return disableBloom.get(); }
+void setDisableBloom(bool value, bool is_game_specific) {
+    disableBloom.set(value, is_game_specific);
+}
+bool getDisableAntialias() { return disableAntialias.get(); }
+void setDisableAntialias(bool value, bool is_game_specific) {
+    disableAntialias.set(value, is_game_specific);
+}
+bool getDisableEffector() { return disableEffector.get(); }
+void setDisableEffector(bool value, bool is_game_specific) {
+    disableEffector.set(value, is_game_specific);
+}
+bool getDisableFogRender() { return disableFogRender.get(); }
+void setDisableFogRender(bool value, bool is_game_specific) {
+    disableFogRender.set(value, is_game_specific);
+}
+bool getDisableFogCloud() { return disableFogCloud.get(); }
+void setDisableFogCloud(bool value, bool is_game_specific) {
+    disableFogCloud.set(value, is_game_specific);
+}
+bool getDisableFogDist() { return disableFogDist.get(); }
+void setDisableFogDist(bool value, bool is_game_specific) {
+    disableFogDist.set(value, is_game_specific);
+}
+bool getDisableFogCast() { return disableFogCast.get(); }
+void setDisableFogCast(bool value, bool is_game_specific) {
+    disableFogCast.set(value, is_game_specific);
+}
+bool getDisableParticleCompute() { return disableParticleCompute.get(); }
+void setDisableParticleCompute(bool value, bool is_game_specific) {
+    disableParticleCompute.set(value, is_game_specific);
+}
+bool getDisableParticleDistortion() { return disableParticleDistortion.get(); }
+void setDisableParticleDistortion(bool value, bool is_game_specific) {
+    disableParticleDistortion.set(value, is_game_specific);
+}
+
 int getUsbDeviceBackend() {
     return usbDeviceBackend.get();
 }
@@ -1000,6 +1088,24 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         aspectRatioOverride.setFromToml(gpu, "aspectRatioOverride", is_game_specific);
         resolutionOverride.setFromToml(gpu, "resolutionOverride", is_game_specific);
         disableMotionBlur.setFromToml(gpu, "disableMotionBlur", is_game_specific);
+        // GR2 granular pass-disable toggles
+        disableShadowCast0.setFromToml(gpu, "disableShadowCast0", is_game_specific);
+        disableShadowCast1.setFromToml(gpu, "disableShadowCast1", is_game_specific);
+        disableShadowCast2.setFromToml(gpu, "disableShadowCast2", is_game_specific);
+        disableShadowTrace.setFromToml(gpu, "disableShadowTrace", is_game_specific);
+        disableSSAO.setFromToml(gpu, "disableSSAO", is_game_specific);
+        disableIBL.setFromToml(gpu, "disableIBL", is_game_specific);
+        disableContour.setFromToml(gpu, "disableContour", is_game_specific);
+        disableSelfTranslucent.setFromToml(gpu, "disableSelfTranslucent", is_game_specific);
+        disableBloom.setFromToml(gpu, "disableBloom", is_game_specific);
+        disableAntialias.setFromToml(gpu, "disableAntialias", is_game_specific);
+        disableEffector.setFromToml(gpu, "disableEffector", is_game_specific);
+        disableFogRender.setFromToml(gpu, "disableFogRender", is_game_specific);
+        disableFogCloud.setFromToml(gpu, "disableFogCloud", is_game_specific);
+        disableFogDist.setFromToml(gpu, "disableFogDist", is_game_specific);
+        disableFogCast.setFromToml(gpu, "disableFogCast", is_game_specific);
+        disableParticleCompute.setFromToml(gpu, "disableParticleCompute", is_game_specific);
+        disableParticleDistortion.setFromToml(gpu, "disableParticleDistortion", is_game_specific);
     }
 
     if (data.contains("Vulkan")) {
@@ -1179,6 +1285,24 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     aspectRatioOverride.setTomlValue(data, "GPU", "aspectRatioOverride", is_game_specific);
     resolutionOverride.setTomlValue(data, "GPU", "resolutionOverride", is_game_specific);
     disableMotionBlur.setTomlValue(data, "GPU", "disableMotionBlur", is_game_specific);
+    // GR2 granular pass-disable toggles
+    disableShadowCast0.setTomlValue(data, "GPU", "disableShadowCast0", is_game_specific);
+    disableShadowCast1.setTomlValue(data, "GPU", "disableShadowCast1", is_game_specific);
+    disableShadowCast2.setTomlValue(data, "GPU", "disableShadowCast2", is_game_specific);
+    disableShadowTrace.setTomlValue(data, "GPU", "disableShadowTrace", is_game_specific);
+    disableSSAO.setTomlValue(data, "GPU", "disableSSAO", is_game_specific);
+    disableIBL.setTomlValue(data, "GPU", "disableIBL", is_game_specific);
+    disableContour.setTomlValue(data, "GPU", "disableContour", is_game_specific);
+    disableSelfTranslucent.setTomlValue(data, "GPU", "disableSelfTranslucent", is_game_specific);
+    disableBloom.setTomlValue(data, "GPU", "disableBloom", is_game_specific);
+    disableAntialias.setTomlValue(data, "GPU", "disableAntialias", is_game_specific);
+    disableEffector.setTomlValue(data, "GPU", "disableEffector", is_game_specific);
+    disableFogRender.setTomlValue(data, "GPU", "disableFogRender", is_game_specific);
+    disableFogCloud.setTomlValue(data, "GPU", "disableFogCloud", is_game_specific);
+    disableFogDist.setTomlValue(data, "GPU", "disableFogDist", is_game_specific);
+    disableFogCast.setTomlValue(data, "GPU", "disableFogCast", is_game_specific);
+    disableParticleCompute.setTomlValue(data, "GPU", "disableParticleCompute", is_game_specific);
+    disableParticleDistortion.setTomlValue(data, "GPU", "disableParticleDistortion", is_game_specific);
     directMemoryAccessEnabled.setTomlValue(data, "GPU", "directMemoryAccess", is_game_specific);
 
     gpuId.setTomlValue(data, "Vulkan", "gpuId", is_game_specific);
@@ -1317,6 +1441,24 @@ void setDefaultValues(bool is_game_specific) {
     aspectRatioOverride.set("16:9", is_game_specific);
     resolutionOverride.set("Off", is_game_specific);
     disableMotionBlur.set(false, is_game_specific);
+    // GR2 granular pass-disable toggles
+    disableShadowCast0.set(false, is_game_specific);
+    disableShadowCast1.set(false, is_game_specific);
+    disableShadowCast2.set(false, is_game_specific);
+    disableShadowTrace.set(false, is_game_specific);
+    disableSSAO.set(false, is_game_specific);
+    disableIBL.set(false, is_game_specific);
+    disableContour.set(false, is_game_specific);
+    disableSelfTranslucent.set(false, is_game_specific);
+    disableBloom.set(false, is_game_specific);
+    disableAntialias.set(false, is_game_specific);
+    disableEffector.set(false, is_game_specific);
+    disableFogRender.set(false, is_game_specific);
+    disableFogCloud.set(false, is_game_specific);
+    disableFogDist.set(false, is_game_specific);
+    disableFogCast.set(false, is_game_specific);
+    disableParticleCompute.set(false, is_game_specific);
+    disableParticleDistortion.set(false, is_game_specific);
 
     // GS - Vulkan
     gpuId.set(-1, is_game_specific);
