@@ -43,6 +43,12 @@
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/rtc/rtc.h"
 #include "core/libraries/save_data/save_backup.h"
+// FIX(GR2FORK v3.1): pulled in for the window-size-follows-resolutionOverride
+// path below. The window dimensions need to be computed from the resolution
+// patch target BEFORE WindowSDL is constructed, so we need to peek at the
+// same enums/helpers that module.cpp later passes to ApplyGr2ResolutionPatches.
+#include "core/libraries/aspect_patches/aspect_patches.h"
+#include "core/libraries/resolution_patches/resolution_patches.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "emulator.h"
@@ -356,8 +362,63 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_desc, game_title);
         }
     }
+    // FIX(GR2FORK v3.1): output resolution follows [GPU] resolutionOverride.
+    //
+    // Previously the SDL window was created at the user's configured
+    // (screenWidth, screenHeight) — i.e. 1280x720 in stock shadPS4, 1920x1080
+    // in this fork's typical config.toml — regardless of whether a resolution
+    // override was active. The chain was:
+    //
+    //   game RT (patched, e.g. 4K) → blit-target Frame (window-size, 1080p)
+    //     → swapchain (window-size, 1080p) → SDL surface (1080p) → monitor
+    //
+    // So enabling [GPU] resolutionOverride = "2160p" got you 4K internal
+    // rendering but the very first hop downsampled the game image to the
+    // window's 1080p before it ever reached the swapchain. The "output" the
+    // user saw was always the window size, not the patched render size.
+    //
+    // Fix: when resolutionOverride is anything other than "Off", compute the
+    // composed (W, H) the eboot will be patched with (same helpers
+    // module.cpp uses one game-module-load later) and feed THAT to WindowSDL
+    // instead of the configured screenWidth/Height. The aspect override
+    // composes with the resolution target the same way it does inside
+    // ApplyGr2ResolutionPatches — so e.g. 2160p × 21:9 yields 5040x2160.
+    //
+    // When resolutionOverride is "Off" (default for non-GR2 titles, since
+    // this option is loaded from the game-specific {id}.toml), behaviour
+    // is unchanged from stock — the configured screenWidth/Height wins.
+    //
+    // SDL constraints: the window may end up larger than the user's display
+    // (e.g. 4K window on a 1920x1200 Legion Go panel). SDL still creates the
+    // window; the window manager will clip or scale per the user's setup.
+    // When [General] isFullScreen=true, sdl_window.cpp's SetWindowFullscreen
+    // path will switch to display-mode size anyway and the swapchain will
+    // recreate to the surface extent at first present, so this override is
+    // inert in fullscreen — exactly what we want.
+    s32 window_w = static_cast<s32>(Config::getWindowWidth());
+    s32 window_h = static_cast<s32>(Config::getWindowHeight());
+    {
+        const auto _res_target = Libraries::ResolutionPatches::ParseResolutionFromConfig(
+            Config::getResolutionOverride());
+        if (_res_target != Libraries::ResolutionPatches::TargetResolution::Off) {
+            const auto _aspect_target = Libraries::AspectPatches::ParseAspectFromConfig(
+                Config::getAspectRatioOverride());
+            const float _ar =
+                Libraries::AspectPatches::TargetAspectToRatio(_aspect_target);
+            const auto _final =
+                Libraries::ResolutionPatches::ComputeFinalResolution(_res_target, _ar);
+            LOG_INFO(Loader,
+                     "[GR2FORK] window size overridden by [GPU] resolutionOverride='{}' "
+                     "× aspectRatioOverride='{}': {}x{} → {}x{}",
+                     Config::getResolutionOverride(), Config::getAspectRatioOverride(),
+                     window_w, window_h, _final.width, _final.height);
+            window_w = _final.width;
+            window_h = _final.height;
+        }
+    }
+
     window = std::make_unique<Frontend::WindowSDL>(
-        Config::getWindowWidth(), Config::getWindowHeight(), controller, window_title);
+        window_w, window_h, controller, window_title);
 
     g_window = window.get();
 

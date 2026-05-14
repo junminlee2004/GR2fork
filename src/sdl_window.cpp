@@ -325,6 +325,68 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
     }
     SDL_SetWindowFullscreen(window, Config::getIsFullscreen());
 
+    // FIX(GR2FORK v3.1): "fullscreen stays at 1080p" bug.
+    //
+    // Before this block, the ctor returned with `width`/`height` still
+    // holding the values passed in by the caller (e.g. 1920x1080 from
+    // config screenWidth/Height) regardless of whether SDL had just
+    // transitioned the window to a 4K fullscreen surface. OnResize is the
+    // only thing that ever read back the real size — and OnResize only
+    // runs when SDL_EVENT_WINDOW_RESIZED actually fires on the main
+    // event loop. The event loop doesn't run during ctor, and on some
+    // platforms (gamescope, certain Wayland compositors, exclusive
+    // fullscreen with no logical-size delta) the RESIZED event for the
+    // construct-time fullscreen transition either fires late or not at
+    // all.
+    //
+    // Meanwhile Presenter -> Swapchain -> ImGui::Core::Initialize ran
+    // soon after, and Initialize sets `io.DisplaySize` from
+    // `window.GetWidth()/GetHeight()`. Stale 1080p propagated to
+    // io.DisplaySize -> DockSpaceOverViewport WorkSize -> contentArea ->
+    // SetExpectedGameSize -> the blit-target Frame image. The swapchain
+    // itself was the real surface size (Vulkan WSI gives us
+    // capabilities.currentExtent = 4K), so the chain became:
+    //
+    //   game RT (4K, patched) -> Frame (1080p) -> swapchain (4K) -> monitor
+    //
+    // The 4K -> 1080p downscale at the Frame blit is what users saw as
+    // "stays at 1080p" even with fullscreen enabled on a 4K display.
+    //
+    // SDL_SyncWindow() blocks (up to ~100ms) until the window manager
+    // has finished applying the pending state changes — exactly the
+    // settling step we need before reading sizes back. We then re-read
+    // the actual surface pixel size and write it into the member
+    // variables, so the values io.DisplaySize sees in Initialize match
+    // ground truth.
+    //
+    // Done unconditionally: even in windowed mode it's safe (no-op WM
+    // sync, read back returns the same requested size), and it catches
+    // the windowed-but-clamped case where a compositor refuses the
+    // requested size (e.g. a 4K window request on a 1080p display).
+    if (!SDL_SyncWindow(window)) {
+        LOG_WARNING(Frontend, "[GR2FORK] SDL_SyncWindow returned false (timeout?): {}",
+                    SDL_GetError());
+    }
+    {
+        int actual_w = width;
+        int actual_h = height;
+        SDL_GetWindowSizeInPixels(window, &actual_w, &actual_h);
+        if (actual_w != width || actual_h != height) {
+            LOG_INFO(Frontend,
+                     "[GR2FORK] window size reconciled after SDL setup: "
+                     "requested {}x{} → actual {}x{} (fullscreen={}, mode='{}')",
+                     width, height, actual_w, actual_h,
+                     Config::getIsFullscreen(), Config::getFullscreenMode());
+        } else {
+            LOG_INFO(Frontend,
+                     "[GR2FORK] window size confirmed: {}x{} (fullscreen={}, mode='{}')",
+                     actual_w, actual_h,
+                     Config::getIsFullscreen(), Config::getFullscreenMode());
+        }
+        width = actual_w;
+        height = actual_h;
+    }
+
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     controller->SetEngine(std::make_unique<Input::SDLInputEngine>());
 

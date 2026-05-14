@@ -405,7 +405,28 @@ u32 getWindowHeight() {
 }
 
 u32 getInternalScreenWidth() {
-    return internalScreenHeight.get();
+    // FIX(GR2FORK v3.1): typo bug — getter returned `internalScreenHeight`
+    // instead of `internalScreenWidth`. Inherited from pre-0.15.0 upstream
+    // (fixed in shadPS4 0.15.0 changelog: "Fixed in Settings:
+    // InternalScreenWidth would get internalScreenHeight instead of
+    // InternalScreenWidth").
+    //
+    // Symptom: VideoOutDriver in videoout::RegisterLib is constructed as
+    // `VideoOutDriver(getInternalScreenWidth(), getInternalScreenHeight())`,
+    // so with the typo `main_port.resolution.full_width/pane_width` got the
+    // *height* value. Games that honor sceVideoOutGetResolutionStatus
+    // (i.e. read the videoout port resolution to size their own
+    // framebuffers) therefore rendered at (H × H) — a square — regardless
+    // of what the user set internalScreenWidth to in config.toml. Changing
+    // internalScreenWidth was a no-op; changing internalScreenHeight
+    // changed both dimensions to the same value. From the user's seat that
+    // looks like "the resolution settings do nothing, output is stuck".
+    //
+    // Independent of the SDL window size fix in emulator.cpp — that one
+    // governs the host-side blit/swapchain output size; this one governs
+    // what the guest game thinks the display resolution is for its own
+    // framebuffer allocation.
+    return internalScreenWidth.get();
 }
 
 u32 getInternalScreenHeight() {
