@@ -1193,6 +1193,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     // Hash (user_data, runtime_info by stage, full binding) and compare to cached result.
     // When only context regs change (viewport, scissor, blend) but SH regs stay the same,
     // this avoids constructing StageSpecialization (~2.26% of GpuComm).
+    //
+    // ud_hash_lru is the 32-slot per-Program LRU below the last_result fast
+    // path. Gated on Config::isPipelineUdHashLruEnabled() — on by default;
+    // set pipelineUdHashLruEnable=false in [Vulkan] to disable if warmup
+    // flicker returns. The line-1225 last_result fast-path is NOT gated
+    // (its correctness invariant is separately maintained and it has not
+    // produced visual issues).
+    const bool ud_hash_lru_enabled = Config::isPipelineUdHashLruEnabled();
     u64 ud_hash;
     u64 ri_bind_hash;
     {
@@ -1239,7 +1247,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         // has been resolved for this program before. Distinct from the
         // banned v17 stable-shortcut — see Program::UdHashCacheEntry doc
         // comment in vk_pipeline_cache.h.
-        {
+        if (ud_hash_lru_enabled) {
             const u32 slot = static_cast<u32>(ud_hash) &
                              (Program::kUdHashCacheSize - 1);
             const auto& e = program->ud_hash_lru[slot];
@@ -1350,7 +1358,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             program->last_result.valid = true;
             // PERF(GR2FORK): also populate ud_hash_lru so the next call
             // with this ud_hash skips the StageSpecialization ctor above.
-            {
+            if (ud_hash_lru_enabled) {
                 const u32 slot = static_cast<u32>(ud_hash) &
                                  (Program::kUdHashCacheSize - 1);
                 program->ud_hash_lru[slot] = Program::UdHashCacheEntry{
@@ -1397,7 +1405,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             program->last_result.valid = true;
             // PERF(GR2FORK): populate ud_hash_lru so the second call with
             // this ud_hash skips the StageSpecialization ctor.
-            {
+            if (ud_hash_lru_enabled) {
                 const u32 slot = static_cast<u32>(ud_hash) &
                                  (Program::kUdHashCacheSize - 1);
                 program->ud_hash_lru[slot] = Program::UdHashCacheEntry{
@@ -1419,7 +1427,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             program->last_result.module = module;
             program->last_result.valid = true;
             // PERF(GR2FORK): also populate ud_hash_lru.
-            {
+            if (ud_hash_lru_enabled) {
                 const u32 slot = static_cast<u32>(ud_hash) &
                                  (Program::kUdHashCacheSize - 1);
                 program->ud_hash_lru[slot] = Program::UdHashCacheEntry{

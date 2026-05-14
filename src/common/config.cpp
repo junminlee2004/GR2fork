@@ -216,6 +216,16 @@ static ConfigEntry<bool> pipelineCacheEnable(false);
 static ConfigEntry<bool> pipelineCacheArchive(false);
 static ConfigEntry<bool> vkForcePushDescriptors(false);
 static ConfigEntry<bool> vkDisablePushDescriptors(false);
+// GR2FORK: stamp-skip cache in Rasterizer::BeginRendering that caches the
+// eLoad-forced RenderState keyed on {pipeline, gfx_pipeline_stamp, tick}.
+// Default ON. Set false to disable if shadow flicker or other rendering
+// artifacts return (e.g. register-driven depth_clear_enable edge cases).
+static ConfigEntry<bool> beginRenderingCacheEnable(true);
+// GR2FORK: 32-slot LRU on Program (vk_pipeline_cache) keyed on ud_hash that
+// skips the StageSpecialization constructor when a permutation has been
+// resolved for this ud_hash before. Default ON. Set false to disable if
+// warmup flicker or stale-permutation artifacts return.
+static ConfigEntry<bool> pipelineUdHashLruEnable(true);
 
 // Debug
 static ConfigEntry<bool> isDebugDump(false);
@@ -545,6 +555,14 @@ bool vkDisablePushDescriptorsEnabled() {
     return vkDisablePushDescriptors.get();
 }
 
+bool isBeginRenderingCacheEnabled() {
+    return beginRenderingCacheEnable.get();
+}
+
+bool isPipelineUdHashLruEnabled() {
+    return pipelineUdHashLruEnable.get();
+}
+
 void setVkCrashDiagnosticEnabled(bool enable, bool is_game_specific) {
     vkCrashDiagnostic.set(enable, is_game_specific);
 }
@@ -563,6 +581,14 @@ void setVkForcePushDescriptors(bool enable, bool is_game_specific) {
 
 void setVkDisablePushDescriptors(bool enable, bool is_game_specific) {
     vkDisablePushDescriptors.set(enable, is_game_specific);
+}
+
+void setBeginRenderingCacheEnabled(bool enable, bool is_game_specific) {
+    beginRenderingCacheEnable.set(enable, is_game_specific);
+}
+
+void setPipelineUdHashLruEnabled(bool enable, bool is_game_specific) {
+    pipelineUdHashLruEnable.set(enable, is_game_specific);
 }
 
 bool getIsConnectedToNetwork() {
@@ -1124,6 +1150,8 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         pipelineCacheArchive.setFromToml(vk, "pipelineCacheArchive", is_game_specific);
         vkForcePushDescriptors.setFromToml(vk, "forcePushDescriptors", is_game_specific);
         vkDisablePushDescriptors.setFromToml(vk, "disablePushDescriptors", is_game_specific);
+        beginRenderingCacheEnable.setFromToml(vk, "beginRenderingCacheEnable", is_game_specific);
+        pipelineUdHashLruEnable.setFromToml(vk, "pipelineUdHashLruEnable", is_game_specific);
     }
 
     string current_version = {};
@@ -1318,6 +1346,10 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     pipelineCacheArchive.setTomlValue(data, "Vulkan", "pipelineCacheArchive", is_game_specific);
     vkForcePushDescriptors.setTomlValue(data, "Vulkan", "forcePushDescriptors", is_game_specific);
     vkDisablePushDescriptors.setTomlValue(data, "Vulkan", "disablePushDescriptors", is_game_specific);
+    beginRenderingCacheEnable.setTomlValue(data, "Vulkan", "beginRenderingCacheEnable",
+                                           is_game_specific);
+    pipelineUdHashLruEnable.setTomlValue(data, "Vulkan", "pipelineUdHashLruEnable",
+                                         is_game_specific);
 
     isDebugDump.setTomlValue(data, "Debug", "DebugDump", is_game_specific);
     isShaderDebug.setTomlValue(data, "Debug", "CollectShader", is_game_specific);
@@ -1474,6 +1506,8 @@ void setDefaultValues(bool is_game_specific) {
     pipelineCacheArchive.set(false, is_game_specific);
     vkForcePushDescriptors.set(false, is_game_specific);
     vkDisablePushDescriptors.set(false, is_game_specific);
+    beginRenderingCacheEnable.set(true, is_game_specific);
+    pipelineUdHashLruEnable.set(true, is_game_specific);
 
     // GS - Debug
     isDebugDump.set(false, is_game_specific);

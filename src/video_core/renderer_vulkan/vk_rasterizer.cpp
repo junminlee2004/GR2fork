@@ -2016,7 +2016,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
     // needs_rebind set (texture cache merge/expand can free the cached
     // image_id and assign a new one — must fall through to the rebind
     // path in that case).
-    {
+    //
+    // Gated on Config::isBeginRenderingCacheEnabled() — on by default; set
+    // beginRenderingCacheEnable=false in [Vulkan] to disable if shadow flicker
+    // or other rendering artifacts return.
+    const bool br_cache_enabled = Config::isBeginRenderingCacheEnabled();
+    if (br_cache_enabled) {
         // Phase 1D-pre-C: read pipeline stamp from the snapshot.
         const u64 cur_stamp = regs.gfx_pipeline_stamp;
         const u64 cur_tick = scheduler.CurrentTick();
@@ -2296,7 +2301,11 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
     // wiping out the clear and preserving stale depth from the previous draw.
     // This was the cause of permanently flickering shadows in GR2: shadow
     // cascade passes hold depth_clear_enable=true across stamp-equal draws.
-    {
+    //
+    // Gated on Config::isBeginRenderingCacheEnabled() — when off, valid stays
+    // false (set at slow-path entry) so subsequent calls never hit and the
+    // function always runs the slow path.
+    if (br_cache_enabled) {
         const bool reg_clear_active =
             regs.depth_render_control.depth_clear_enable ||
             regs.depth_render_control.stencil_clear_enable;
