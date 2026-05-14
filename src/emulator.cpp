@@ -339,19 +339,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // own release tag. Format: "Junmin Lee GR2FORK v1.0 (v0.13.0) | <game>".
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v2.0 (v{}) | {}", Common::g_version,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.0 (v{}) | {}", Common::g_version,
                                        game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v2.0 {}/(v{}) | {}", remote_host,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.0 {}/(v{}) | {}", remote_host,
                                        Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v2.0 (v{}) {} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.0 (v{}) {} {} | {}",
                                        Common::g_version, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v2.0 (v{}) {}/{} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.0 (v{}) {}/{} {} | {}",
                                        Common::g_version, remote_host, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         }
