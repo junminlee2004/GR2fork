@@ -754,34 +754,16 @@ void Instance::CollectPhysicalMemoryInfo() {
         }
         if (supports_memory_budget) {
             device_initial_usage += budget.heapUsage[i];
-            // FIX(GR2FORK): on discrete GPUs report the full physical heap
-            // size instead of heapBudget for device-local heaps. heapBudget
-            // pre-deducts the desktop compositor and other apps' current
-            // VRAM (e.g. ~3367 MiB on a 4096 MiB 3050 Ti), leaving usable
-            // VRAM on the table — the game can in practice use almost the
-            // full physical heap before VK_ERROR_OUT_OF_DEVICE_MEMORY
-            // fires. Integrated GPUs still need heapBudget since they
-            // share the system pool.
-            if (!IsIntegrated() && is_device_local) {
-                total_memory_budget += memory_props.memoryHeaps[i].size;
-            } else {
-                total_memory_budget += budget.heapBudget[i];
-            }
+            total_memory_budget += budget.heapBudget[i];
             continue;
         }
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
     if (!IsIntegrated()) {
-        // FIX(GR2FORK): no additional system reserve on discrete GPUs.
-        // VK_EXT_memory_budget already reports a dynamic heapBudget that
-        // accounts for the desktop compositor, other apps' current VRAM
-        // usage, and driver overhead — subtracting another min(budget/8,
-        // 1_GB) on top double-counts and eats 16-25% of usable VRAM on
-        // small cards (4 GB / 3050 Ti reported ~2.9 GB instead of ~3.3+).
-        // If actual allocations approach the limit the driver will return
-        // VK_ERROR_OUT_OF_DEVICE_MEMORY and the texture cache can react;
-        // we don't need a precautionary skim.
+        // We reserve some memory for the system.
+        const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
+        total_memory_budget -= system_memory;
         return;
     }
     // Leave at least 8 GB for the system on integrated GPUs.

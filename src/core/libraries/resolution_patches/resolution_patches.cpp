@@ -128,15 +128,6 @@ enum class Group : std::uint8_t {
          // the imm32 bytes to encode the scaled value. At 1080p+ the
          // patch is idempotent (multiplier clamped to 1.0). EXCLUDED
          // from `recommended` — opt in to test.
-    // ── v15 addition ────────────────────────────────────────────────
-    L1,  // Disable motion blur. Two `call <register-pass>` sites in
-         // the render-graph builder (0x0103e356 and 0x0103ea95) are
-         // replaced with 5-byte NOPs, so the motion-blur pass never
-         // gets added to the active draw list. Return values of both
-         // calls are discarded immediately after by a `mov eax, [rip
-         // + ...]` that overwrites the register, so killing the calls
-         // is safe w.r.t. dataflow — only the side effect (registering
-         // the pass) is removed. EXCLUDED from `recommended`. UNTESTED.
     Count
 };
 
@@ -813,55 +804,6 @@ constexpr std::array<InstrReplaceSite, 6> kInstrReplaceSites = {{
         // Replacement: mov ecx, 0x438; nop
         {0xB9, 0x38, 0x04, 0x00, 0x00, 0x90, 0x00, 0x00},
         "I1.H#2 (mov ecx, [rcx+0x92C4]) → lit 1080 — UI proj reader 2 (rbx+0x1b0)"},
-
-    // ── v15: L1 — disable motion blur ─────────────────────────────────
-    //
-    // The render-graph builder iterates through post-process passes and
-    // calls a "register-pass" function for each (Tonemap, Bloom,
-    // Antialias, SSAO, MotionBlur). All passes use the same template:
-    //
-    //     lea  rsi, [rip + pass_name_string]   ; e.g. "MotionBlur"
-    //     lea  rdx, [rip + per_pass_state]
-    //     call 0x10dfc70                       ; init-by-name
-    //     lea  rdi, [rip + per_pass_state]
-    //     call 0x13f55d0                       ; finalize init
-    //     mov  edi, dword ptr [rip + handle]   ; load pass handle
-    //     [optional: mov esi, <index>]          ; MotionBlur#1 only
-    //     call <register-pass-fn>              ; <-- THE PATCH TARGET
-    //     mov  eax, dword ptr [rip + ...]      ; overwrites eax
-    //
-    // MotionBlur is referenced from TWO sites in this builder:
-    //   #1: 0x0103e356  call 0x121b040   (special-slot register, esi=0x11)
-    //   #2: 0x0103ea95  call 0x121ae70   (standard register, no esi)
-    //
-    // Both calls' return values are DISCARDED — the next instruction is
-    // `mov eax, [rip + globals]` which unconditionally overwrites the
-    // call's eax result. So NOPing the call is safe w.r.t. dataflow.
-    // The only effect is removing the side effect (registering the
-    // pass with the active list), which is exactly what we want.
-    //
-    // RISK: if either register-pass function has REQUIRED side effects
-    // beyond pass-list insertion (refcounts, asserts, init state needed
-    // by later passes), NOP'ing could crash. The same `0x121ae70` is
-    // called by every other pass setup (Tonemap, Bloom, etc.) so it's
-    // a clean shared-function pointer — but those passes also have
-    // their own per-pass-state pointers passed as rdi, so NOP'ing for
-    // MotionBlur#2 only skips THIS instance, not the others. Should be
-    // safe in principle. UNTESTED at v15 ship time.
-    //
-    // EXCLUDED from `recommended`. Opt-in: "recommended,L1".
-    {0x0103e356, Group::L1, 5,
-        // Original: call 0x121b040 (E8 e5 cc 1d 00)
-        {0xE8, 0xE5, 0xCC, 0x1D, 0x00, 0x00, 0x00, 0x00},
-        // Replacement: 5x NOP
-        {0x90, 0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00},
-        "L1.MotionBlur#1 register-pass call → NOP (skip pass registration at slot 0x11)"},
-    {0x0103ea95, Group::L1, 5,
-        // Original: call 0x121ae70 (E8 d6 c3 1d 00)
-        {0xE8, 0xD6, 0xC3, 0x1D, 0x00, 0x00, 0x00, 0x00},
-        // Replacement: 5x NOP
-        {0x90, 0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00},
-        "L1.MotionBlur#2 register-pass call → NOP (skip standard pass registration)"},
 }};
 
 // ── Excluded / dead-end sites (DO NOT add to kResSites without re-RE) ──
@@ -1041,7 +983,6 @@ const char* GroupName(Group g) {
     case Group::I4: return "I4";
     case Group::J1: return "J1";
     case Group::K1: return "K1";
-    case Group::L1: return "L1";
     default:        return "?";
     }
 }
@@ -1084,7 +1025,6 @@ bool MatchGroupName(std::string_view tok, Group& out) {
     if (tok == "i4") { out = Group::I4; return true; }
     if (tok == "j1") { out = Group::J1; return true; }
     if (tok == "k1") { out = Group::K1; return true; }
-    if (tok == "l1") { out = Group::L1; return true; }
     return false;
 }
 
@@ -1150,26 +1090,22 @@ std::uint32_t ParseGroupMaskFromConfig(std::string_view raw) {
 }
 
 int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
-                              float aspect_ratio, bool disable_motion_blur) {
+                              float aspect_ratio) {
     if (eboot_base == 0) {
         LOG_ERROR(Core, "[GR2 Resolution] eboot_base is 0 — cannot patch");
         return 0;
     }
 
-    // Build the internal group mask from the two user-facing toggles.
-    // The patch-groups config knob was removed in v16: the resolution
-    // pipeline now ALWAYS applies kGroupMaskRecommended (the empirically-
-    // verified working set, see resolution_patches.h). Motion blur is
-    // controlled independently via the disable_motion_blur bool.
+    // Build the internal group mask. The patch-groups config knob was
+    // removed in v16: the resolution pipeline now ALWAYS applies
+    // kGroupMaskRecommended (the empirically-verified working set, see
+    // resolution_patches.h).
     std::uint32_t group_mask = 0;
     if (resolution != TargetResolution::Off) {
         group_mask |= kGroupMaskRecommended;
     }
-    if (disable_motion_blur) {
-        group_mask |= static_cast<std::uint32_t>(PatchGroupBit::L1);
-    }
     if (group_mask == 0) {
-        LOG_INFO(Core, "[GR2 Resolution] target=Off and disableMotionBlur=false; nothing to patch");
+        LOG_INFO(Core, "[GR2 Resolution] target=Off; nothing to patch");
         return 0;
     }
 
@@ -1245,10 +1181,10 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
     }
 
     LOG_INFO(Core,
-        "[GR2 Resolution] target={} aspect={:.4f} disableMotionBlur={} -> "
+        "[GR2 Resolution] target={} aspect={:.4f} -> "
         "final={}x{} mask=0x{:04x} — "
         "{} patched, {} already, {} mismatched, {} skipped (of {} total)",
-        TargetName(resolution), aspect_ratio, disable_motion_blur ? "true" : "false",
+        TargetName(resolution), aspect_ratio,
         final_sz.width, final_sz.height,
         group_mask, total_patched, total_already, total_mismatch, total_skipped,
         static_cast<int>(kResSites.size() + kInstrReplaceSites.size()));
