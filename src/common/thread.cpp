@@ -598,17 +598,90 @@ struct ReservedCoreDecision {
     u64 assembler_steal_from_guest;
 };
 
+// FIX(GR2FORK): hybrid-CPU awareness (Intel 12th/13th/14th gen Alder/Raptor/
+// Meteor/Arrow Lake; ARM big.LITTLE; Snapdragon X). Prior to this fix the
+// enumeration returned bare u64 masks sorted purely by lowest-bit-set, and
+// DecideReservedCores then did `cores.back()` to steal "the highest-numbered
+// physical core" for GpuComm. On a hybrid topology that's catastrophic
+// because the highest-numbered physical cores are the E-cores — exactly
+// the slowest, lowest-throughput cores in the system. Pinning the CPU-bound
+// GpuComm thread to an E-core capped emulator throughput at E-core IPC,
+// which is why disabling E-cores in BIOS was helping users instead of
+// hurting them: it forced the OS to schedule GpuComm onto a P-core.
+//
+// The fix is to capture the per-core efficiency class (Windows: the
+// PROCESSOR_RELATIONSHIP.EfficiencyClass field documented as "Higher
+// numerical values indicate higher performance, and 0 indicates the lowest
+// performance"; Linux: /sys/devices/system/cpu/cpuN/topology/core_type
+// returning "intel_atom"=0 or "intel_core"=1, available on hybrid Intel
+// kernels 5.18+) and re-sort:
+//
+//   primary key:   efficiency_class ASCENDING (so highest-EC at back)
+//   secondary key: lowest-bit-set ASCENDING  (preserves prior ordering
+//                  within a single efficiency tier — i.e. on non-hybrid
+//                  CPUs (every AMD chip, Intel <= 11th gen, 13th-gen
+//                  i3-13100 with no E-cores, etc.) the result is byte-
+//                  identical to the pre-fix behavior).
+//
+// Consumers then call cores.back() and get "highest-indexed P-core" on
+// hybrid hardware, "highest-indexed physical core" on uniform hardware.
+// The assembler-pin loop (rbegin → rend, take first non-overlapping)
+// naturally picks the second-highest P-core on hybrid, second-highest
+// physical core on uniform, with the same source code.
+struct CoreInfo {
+    u64 mask;
+    u8 efficiency_class;  // 0 = least performant (E-core), higher = P/Prime.
+};
+
+static bool CoreInfoLess(const CoreInfo& a, const CoreInfo& b) {
+    if (a.efficiency_class != b.efficiency_class) {
+        return a.efficiency_class < b.efficiency_class;
+    }
+    // Within a single efficiency tier, sort by lowest-set-bit ascending so
+    // .back() of that tier is the highest-indexed core. countr_zero(0) is
+    // UB per the standard, but mask is non-zero by enumeration filter.
+    return std::countr_zero(a.mask) < std::countr_zero(b.mask);
+}
+
 #if defined(__linux__)
-// Enumerate physical cores via /sys topology. Returns one mask per physical
-// core, in ascending order of lowest-bit-set (so .back() is the highest-
-// numbered physical core). Empty vector on /sys unavailability.
+// Read the efficiency class hint for a Linux CPU. Tries
+// /sys/devices/system/cpu/cpuN/topology/core_type (Intel hybrid, kernel
+// 5.18+) which contains the literal string "intel_atom" or "intel_core".
+// Returns -1 if no hybrid signal is available (uniform CPU, older kernel,
+// AMD host, ARM host without sysfs support, etc.) — the caller treats
+// "unknown" as efficiency_class=0, which is fine because on uniform hosts
+// ALL cores get the same class and the sort tiebreaker falls back to the
+// prior lowest-bit-set ordering.
+int ReadCoreTypeLinux(unsigned cpu) {
+    char path[160];
+    std::snprintf(path, sizeof(path),
+                  "/sys/devices/system/cpu/cpu%u/topology/core_type", cpu);
+    std::ifstream in(path);
+    if (!in.is_open()) return -1;
+    std::string s;
+    if (!std::getline(in, s)) return -1;
+    // Trim trailing whitespace/newline that getline doesn't strip.
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                          s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
+    }
+    if (s == "intel_atom") return 0;
+    if (s == "intel_core") return 1;
+    return -1;
+}
+
+// Enumerate physical cores via /sys topology. Returns CoreInfo per physical
+// core, sorted by (efficiency_class asc, lowest-bit-set asc) so .back() is
+// the highest-indexed core of the most performant efficiency class. Empty
+// vector on /sys unavailability.
 //
 // Walks CPUs 0..hw-1; for each CPU not yet seen, reads
 // /sys/devices/system/cpu/cpuN/topology/thread_siblings_list and pushes the
 // resulting mask. Marks every CPU in the siblings list as seen so we don't
-// push the same physical core twice.
-std::vector<u64> EnumeratePhysicalCoresLinux(unsigned hw) {
-    std::vector<u64> cores;
+// push the same physical core twice. Efficiency class is read from
+// core_type (Intel hybrid only); defaults to 0 on uniform CPUs.
+std::vector<CoreInfo> EnumeratePhysicalCoresLinux(unsigned hw) {
+    std::vector<CoreInfo> cores;
     if (hw == 0 || hw > 64) return cores;
     std::vector<bool> visited(hw, false);
     for (unsigned cpu = 0; cpu < hw; ++cpu) {
@@ -628,21 +701,26 @@ std::vector<u64> EnumeratePhysicalCoresLinux(unsigned hw) {
             // /sys unavailable for this CPU — treat as single-thread core.
             sibs = 1ULL << cpu;
         }
-        cores.push_back(sibs);
+        const int ec = ReadCoreTypeLinux(cpu);
+        const u8 efficiency = (ec < 0) ? 0 : static_cast<u8>(ec);
+        cores.push_back(CoreInfo{sibs, efficiency});
         for (unsigned c = 0; c < hw; ++c) {
             if (sibs & (1ULL << c)) visited[c] = true;
         }
     }
+    std::sort(cores.begin(), cores.end(), CoreInfoLess);
     return cores;
 }
 #endif
 
 #if defined(_WIN32)
 // Windows analogue: walk GetLogicalProcessorInformationEx with
-// RelationProcessorCore. Sort by lowest-bit-set so .back() is the highest-
-// numbered physical core, matching the Linux ordering.
-std::vector<u64> EnumeratePhysicalCoresWindows() {
-    std::vector<u64> cores;
+// RelationProcessorCore. EfficiencyClass is captured from each
+// PROCESSOR_RELATIONSHIP entry directly. Sort matches the Linux side
+// so .back() is the highest-indexed P-core on hybrid, highest-indexed
+// physical core on uniform.
+std::vector<CoreInfo> EnumeratePhysicalCoresWindows() {
+    std::vector<CoreInfo> cores;
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
     if (len == 0) return cores;
@@ -655,19 +733,15 @@ std::vector<u64> EnumeratePhysicalCoresWindows() {
     while (reinterpret_cast<std::byte*>(p) < buf.data() + len) {
         if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount > 0) {
             const u64 m = static_cast<u64>(p->Processor.GroupMask[0].Mask);
-            if (m != 0) cores.push_back(m);
+            if (m != 0) {
+                cores.push_back(CoreInfo{
+                    m, static_cast<u8>(p->Processor.EfficiencyClass)});
+            }
         }
         p = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
             reinterpret_cast<std::byte*>(p) + p->Size);
     }
-    std::sort(cores.begin(), cores.end(), [](u64 a, u64 b) {
-        // Sort by lowest set bit (i.e. by the lowest CPU index in the core).
-        // std::countr_zero is C++20, portable across clang-cl / MSVC / GCC,
-        // and avoids the <intrin.h> _BitScanForward64 vs __builtin_ctzll fork.
-        // Both args are non-zero by the filter above, so countr_zero is well-
-        // defined here (countr_zero(0) is undefined per the standard).
-        return std::countr_zero(a) < std::countr_zero(b);
-    });
+    std::sort(cores.begin(), cores.end(), CoreInfoLess);
     return cores;
 }
 #endif
@@ -687,58 +761,98 @@ ReservedCoreDecision DecideReservedCores() {
     // assembler decision below share one walk. /sys reads on Linux are
     // microseconds-scale; the function is called rarely (init paths +
     // SetAffinity calls) so the hoist is harmless.
-    std::vector<u64> cores;
+    //
+    // GR2FORK hybrid-CPU fix: cores is now sorted by (efficiency_class asc,
+    // lowest-bit-set asc), so cores.back() is the highest-indexed P-core
+    // on hybrid hardware (Intel 12th+ gen, ARM big.LITTLE, Snapdragon X)
+    // and the highest-indexed physical core on uniform hardware (every
+    // AMD chip, Intel <= 11th gen, etc.). The duplicate inline Phase 1
+    // enumeration that used to live here has been folded into a lookup
+    // against this same vector, so Phase 1's CPU-7 check also benefits
+    // from the efficiency-class signal.
+    std::vector<CoreInfo> cores;
 #ifdef _WIN32
     cores = EnumeratePhysicalCoresWindows();
 #elif defined(__linux__)
     cores = EnumeratePhysicalCoresLinux(hw);
 #endif
 
+    // Highest efficiency class observed. On uniform CPUs this is 0 for every
+    // core and the "is top tier?" check below collapses to "true for every
+    // core" — i.e. no behavior change on non-hybrid hardware. On hybrid the
+    // top tier is 1 for Intel Alder/Raptor/Meteor/Arrow Lake P-cores, and
+    // can be 2+ for Snapdragon X Prime cores (which we also want).
+    const u8 top_efficiency = cores.empty() ? 0 : cores.back().efficiency_class;
+
+    // Log the hybrid-CPU topology decision exactly once. This is the
+    // diagnostic that proves to a user staring at their log file whether
+    // the detection worked — the question Jun's original report ("the
+    // game is still not detecting P and E cores") had no way to answer.
+    //
+    // The cache is process-static so multiple DecideReservedCores calls
+    // (and there are many: every Pthread::SetAffinity goes through here)
+    // don't spam the log.
+    {
+        static std::once_flag log_once;
+        std::call_once(log_once, [&]() {
+            unsigned p_cores = 0, e_cores = 0;
+            u64 p_mask = 0, e_mask = 0;
+            for (const auto& ci : cores) {
+                if (ci.efficiency_class >= top_efficiency) {
+                    ++p_cores;
+                    p_mask |= ci.mask;
+                } else {
+                    ++e_cores;
+                    e_mask |= ci.mask;
+                }
+            }
+            if (e_cores > 0) {
+                LOG_INFO(Common,
+                         "CPU topology: hybrid detected, {} performant cores "
+                         "(mask=0x{:x}, efficiency_class={}), {} efficient cores "
+                         "(mask=0x{:x})",
+                         p_cores, p_mask, top_efficiency, e_cores, e_mask);
+            } else {
+                LOG_INFO(Common,
+                         "CPU topology: uniform, {} physical cores (mask=0x{:x})",
+                         p_cores, p_mask);
+            }
+        });
+    }
+
     // ----- Phase 1: is CPU 7's physical core naturally free? -----
     // On hosts with >= 8 physical cores (8c/16t Z1 Extreme, 8c/8t, 12c/24t,
     // 16c/32t...), CPU 7 sits on its own physical core that no guest mask
     // ever requests. Use it directly, no theft required.
+    //
+    // GR2FORK hybrid-CPU fix: ALSO require that CPU 7's physical core be in
+    // the top efficiency tier. Defensive against pathological topologies
+    // where Phase 1 would gleefully accept an E-core if it happened to be
+    // outside guest range. On every standard hybrid layout (Intel Alder/
+    // Raptor/Meteor/Arrow Lake, both HT-on and HT-off) CPU 7 is on a
+    // P-core, so this check just blesses what Phase 1 was already doing.
+    // On hypothetical future hybrid layouts where CPU 7 lands on an
+    // E-core, the check correctly rejects Phase 1 and falls through to
+    // Phase 2, which will then steal a P-core for GpuComm.
     u64 cpu7_phys = 0;
-#ifdef _WIN32
+    u8 cpu7_efficiency = 0;
     {
-        DWORD len = 0;
-        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-        if (len != 0) {
-            std::vector<std::byte> buf(len);
-            auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
-            if (GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
-                auto* p = base;
-                const u64 cpu7_bit = 1ULL << 7;
-                while (reinterpret_cast<std::byte*>(p) < buf.data() + len) {
-                    if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount > 0) {
-                        const u64 gm = static_cast<u64>(p->Processor.GroupMask[0].Mask);
-                        if (gm & cpu7_bit) {
-                            cpu7_phys = gm;
-                            break;
-                        }
-                    }
-                    p = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
-                        reinterpret_cast<std::byte*>(p) + p->Size);
-                }
+        const u64 cpu7_bit = 1ULL << 7;
+        for (const auto& ci : cores) {
+            if (ci.mask & cpu7_bit) {
+                cpu7_phys = ci.mask;
+                cpu7_efficiency = ci.efficiency_class;
+                break;
             }
         }
     }
-#elif defined(__linux__)
-    {
-        std::ifstream in("/sys/devices/system/cpu/cpu7/topology/thread_siblings_list");
-        if (in.is_open()) {
-            std::string line;
-            if (std::getline(in, line)) {
-                cpu7_phys = ParseCpuListLinux(line);
-            }
-        }
-    }
-#endif
 
     if (cpu7_phys != 0 && (cpu7_phys & (1ULL << 7)) != 0
-        && (cpu7_phys & GUEST_MASK) == 0) {
-        // CPU 7's physical core is entirely outside guest range. Tight pin
-        // available; full exclusion is sensible; no theft needed.
+        && (cpu7_phys & GUEST_MASK) == 0
+        && cpu7_efficiency >= top_efficiency) {
+        // CPU 7's physical core is entirely outside guest range AND it's a
+        // P-core (or, on uniform hardware, the only class there is). Tight
+        // pin available; full exclusion is sensible; no theft needed.
         result.mask = cpu7_phys;
         result.is_dedicated_physical_core = true;
         result.steal_from_guest = 0;
@@ -759,18 +873,29 @@ ReservedCoreDecision DecideReservedCores() {
     } else {
         // ----- Phase 2: enumerate physical cores and steal the highest -----
         // We get here on hosts where CPU 7's physical core overlaps the
-        // guest's claimed range — guest threads can land on it via SMT.
+        // guest's claimed range — guest threads can land on it via SMT —
+        // OR (post-hybrid-CPU fix) where CPU 7 happens to be on an E-core
+        // and we don't want to pin GpuComm there.
         // Examples:
         //
         //   * 6c/12t Zen 2/3 (Ryzen 5 3600/5600/7600): CPU 7 = SMT(CPU 1)
         //   * 6c/6t (no SMT, host CPUs 0..5):           cpu7_phys path missing
         //   * 4c/8t Steam Deck Aerith:                  CPU 7 = SMT(CPU 3)
+        //   * 8P+4E i7-12700K Windows HT-on:            CPU 7 = SMT(CPU 6)
+        //   * 8P+16E i9-13900K Windows HT-on:           CPU 7 = SMT(CPU 6)
         //
         // To give GpuComm a TRULY private physical core we steal the
         // highest-numbered one. The guest's affinity mask (0..6) gets that
         // core's bits stripped via Pthread::SetAffinity, so guest threads
         // can't land there.
-        const u64 highest = cores.back();
+        //
+        // GR2FORK hybrid-CPU fix: thanks to the new sort key, cores.back()
+        // is now the highest-indexed P-core (or Prime core on Snapdragon X)
+        // when running on a hybrid CPU. Pre-fix this used to return the
+        // highest-indexed E-core on Intel 12th+ gen, which was the entire
+        // reason GR2 ran terribly on Alder/Raptor/Meteor/Arrow Lake unless
+        // the user manually disabled E-cores in BIOS.
+        const u64 highest = cores.back().mask;
         if (highest == 0) {
             return result;
         }
@@ -807,6 +932,22 @@ ReservedCoreDecision DecideReservedCores() {
     //                                 rest = phys cores 0..3 (4 logical)
     //   * 4c/4t no-SMT:               hw < 6 early-return, no pin at all
     //
+    // Intel hybrid (post-fix), Windows topologies. P-cores fill the low
+    // logical-CPU indices, E-cores fill the high ones; GpuComm and the
+    // assembler always land on P-cores now:
+    //
+    //   * 8P+4E i7-12700K HT-on (12c/20t):   GpuComm={14,15} (P-core 7),
+    //                                        assembler={12,13} (P-core 6)
+    //   * 8P+16E i9-13900K HT-on (24c/32t):  GpuComm={14,15} (P-core 7),
+    //                                        assembler={12,13} (P-core 6)
+    //   * 6P+8E i5-13600K HT-on (14c/20t):   GpuComm={10,11} (P-core 5),
+    //                                        assembler={8,9}  (P-core 4)
+    //   * 6P+4E i5-12500H HT-on (10c/16t):   GpuComm={10,11} (P-core 5),
+    //                                        assembler={8,9}  (P-core 4)
+    //   * any hybrid HT-off:                 same logic, single-thread per
+    //                                        core, GpuComm/assembler get the
+    //                                        top two P-cores
+    //
     // Tradeoff on the smaller hosts (4c/8t, 6c/12t): the guest's 7 PS4-
     // logical cores' worth of work has to fit into 2 or 4 host physical
     // cores. That's tighter than upstream shadPS4 — upstream does no
@@ -819,8 +960,15 @@ ReservedCoreDecision DecideReservedCores() {
         // Walk physical cores from highest to lowest; pick the first that
         // doesn't overlap GpuComm's mask. This naturally selects the
         // second-highest physical core on every host topology.
+        //
+        // GR2FORK hybrid-CPU fix: thanks to the sort key, iterating from
+        // rbegin walks performant cores first. On Intel 12th+ gen hybrid
+        // this gives the assembler the second-highest P-core; only on
+        // pathological hosts with just one P-core would it fall through
+        // to an E-core (and even then an E-core pin is strictly better
+        // than no pin / contention with guest threads, so we accept it).
         for (auto it = cores.rbegin(); it != cores.rend(); ++it) {
-            const u64 c = *it;
+            const u64 c = it->mask;
             if (c == 0) continue;
             if ((c & result.mask) != 0) continue;  // overlaps GpuComm
             result.assembler_mask = c;
