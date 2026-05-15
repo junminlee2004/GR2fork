@@ -387,6 +387,37 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
         height = actual_h;
     }
 
+    // FIX(GR2FORK): Steam Deck / handheld native gyro & accelerometer support.
+    //
+    // When shadPS4 is launched through Steam (notably on Steam Deck, but also Legion Go,
+    // ROG Ally, and other handhelds running the Steam client), Steam's runtime injects
+    // SDL_GAMECONTROLLER_IGNORE_DEVICES / SDL_JOYSTICK_IGNORE_DEVICES into the process
+    // environment so SDL hides the underlying controller hardware (e.g. the Deck's
+    // 0x28de/0x1205 device) and the game only sees the Steam Virtual Gamepad. The virtual
+    // gamepad emulates an Xbox-style controller and does NOT expose gyro / accelerometer
+    // even on devices that physically have motion sensors.
+    //
+    // Forcing the ignore list to empty re-exposes the native controller. SDL then
+    // enumerates the underlying device including its motion sensors, and the existing
+    // gyro / accel handling (GameController::Gyro / GameController::Acceleration via the
+    // SDL_EVENT_GAMEPAD_SENSOR_UPDATE handler) just works -- no input mapping changes
+    // required by the user.
+    //
+    // Equivalent to adding "SDL_GAMECONTROLLER_IGNORE_DEVICES=0 %command%" to Steam launch
+    // options, but done internally so it always applies regardless of how the emulator
+    // was launched.
+    //
+    // CRITICAL DETAIL: plain SDL_SetHint (NORMAL priority) does NOT override a hint set
+    // via the environment by the parent process. SDL_HINT_OVERRIDE priority is required
+    // to clobber Steam's injected env var. Both the SDL2 (GAMECONTROLLER) and SDL3
+    // (JOYSTICK) hint names are set so the fix is robust across SDL versions and any
+    // future renames -- SDL reads whichever one matches its internal table.
+    //
+    // Must run BEFORE SDL_InitSubSystem(SDL_INIT_GAMEPAD) -- that's where SDL parses the
+    // ignore list and builds its device filter for gamepad enumeration.
+    SDL_SetHintWithPriority("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0", SDL_HINT_OVERRIDE);
+    SDL_SetHintWithPriority("SDL_JOYSTICK_IGNORE_DEVICES", "0", SDL_HINT_OVERRIDE);
+
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
     controller->SetEngine(std::make_unique<Input::SDLInputEngine>());
 
