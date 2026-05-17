@@ -12,7 +12,7 @@ join the GR2fork discord server (new) here for extended support. Anyone who want
 
 @ 1080p 30fps (LOCKED)
 
-CPU: Ryzen 5 5600X
+CPU: Ryzen 5 3600
 
 GPU: GTX 1650 4gb / RX 6400 4gb
 
