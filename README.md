@@ -37,7 +37,9 @@ XBOX ALLY X Z2 EXTREME
 LEGION GO Z1 EXTREME
 
 any 7840u cpu
+
 **Installation Instructions:**
+
 1. Download GR2fork_windows.zip
 
 2. extract it to whatever directory you want
