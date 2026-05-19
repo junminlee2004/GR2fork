@@ -22,7 +22,7 @@ SSD
 
 **Recommended Requirements:**
 
-CPU: i7 12700 / ryzen 5 7600
+CPU: i5 12600K / ryzen 5 5600x
 
 GPU: Any modern gpu stronger than the minimum requirements with >4gb vram
 
@@ -38,30 +38,22 @@ LEGION GO Z1 EXTREME
 
 any 7840u cpu
 **Installation Instructions:**
+1. Download GR2fork_windows.zip
 
-Download GR2fork_windows.zip
-extract it to whatever directory you want
-prepare your game dump and make sure it is downloaded to some folder on your pc. If you want to use the 1.11 patch, make sure the patch is copied into the base game's folder as it should be instead of having it in a separate folder. MAKE SURE YOUR GAME IS INSTALLED ON AN SSD
-add in your dumped sysmodules into GR2fork\user\sys_modules.
-open shadPS4QtLauncher.exe in GR2fork and add your Gravity Rush 2 game directory.
-add in the shadPS4gr2fork.exe to versions in the launcher emulator versions in the top right corner.
-set up configs. The input_config template file is in the root directory. DO NOT PRESS THE DELETE KEY IF USING KBM. DO NOT ENABLE READBACKS OR TOUCH THE DEBUG SECTION OF THE EMULATOR. Also please remember to enable shader cache by setting enable pipeline cache = true in the config.toml.
-Final note, do not be discouraged by crashing when going into a new area. Once you build up a good shader cache collection, crashes will dwindle
-**FAQ:**
+2. extract it to whatever directory you want
 
-Q: Is there currently any keyboard/mouse mapping for touchpad swipe (especially swipe down)? Or is this feature not implemented yet in this fork?
+3. prepare your game dump and make sure it is downloaded to some folder on your pc. If you want to use the 1.11 patch, make sure the patch is copied into the base game's folder as it should be instead of having it in a separate folder. MAKE SURE YOUR GAME IS INSTALLED ON AN SSD
 
-A: Yes, in fact this was one of the first things I coded into the emulator. The reason you dont see these options in the qtlauncher gui menu is that the mainline build has zero code to emulate touchpad swipes so there exists no gui buttons to support my new input code. As such, you will have to manually edit the default.ini config file in the input_config folder. On my PC, I have these 4 lines (you will have to add them too):
+4. add in your dumped sysmodules into GR2fork\user\sys_modules.
 
-touchpad_left = j
+5. open GR2Launcher.exe in GR2fork and add your Gravity Rush 2 game directory.
 
-touchpad_center = k
+6. open gui and set up configs
 
-touchpad_right = l
+7. IF YOU ARE USING AN INTEL CPU: disable the E threads through task manager, they are always the last ones
 
-touchpad_down = m
+8. Final note, do not be discouraged by crashing when going into a new area. Once you build up a good shader cache collection, crashes will dwindle
 
-so if I press J and then k that is swipe right. If I press k and then m it swipes down etc. Also for devices with a touchscreen, I made it so that the touchscreen can act as the touchpad.
 <h1 align="center">
   <br>
   <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
