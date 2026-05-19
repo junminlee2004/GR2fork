@@ -128,48 +128,6 @@ enum class Group : std::uint8_t {
          // the imm32 bytes to encode the scaled value. At 1080p+ the
          // patch is idempotent (multiplier clamped to 1.0). EXCLUDED
          // from `recommended` — opt in to test.
-    // ── v15 addition ────────────────────────────────────────────────
-    L1,  // Disable motion blur. Two `call <register-pass>` sites in
-         // the render-graph builder (0x0103e356 and 0x0103ea95) are
-         // replaced with 5-byte NOPs, so the motion-blur pass never
-         // gets added to the active draw list. Return values of both
-         // calls are discarded immediately after by a `mov eax, [rip
-         // + ...]` that overwrites the register, so killing the calls
-         // is safe w.r.t. dataflow — only the side effect (registering
-         // the pass) is removed. EXCLUDED from `recommended`. UNTESTED.
-    // ── v17 addition ────────────────────────────────────────────────
-    M1,  // PS4-Pro 4K-mode master enable. Four byte-level patches +
-         // a one-time BSS write that flip the game from FLAG=0
-         // (1080p path) to FLAG=1 (4K path). The flag at BSS VA
-         // 0x01b586c0 gates the swap-chain buffer attribute call
-         // (Display2DThin texSampler in renderdoc) — at FLAG=0 the
-         // game registers a 1920×1080 R8G8B8A8Srgb surface even when
-         // the 3D RT is at 4K, producing the upscaled-1080p output
-         // that the renderdoc capture revealed. With M1 active:
-         //   * writer_seta @ 0x00446852 always writes 1
-         //   * writer_zero @ 0x004466dd writes 1 instead of 0
-         //   * shift_x @ 0x0102b9a5 (shl eax,cl ; shl edx,cl) → 4xNOP
-         //   * shift_y @ 0x0102ba8e (shl eax,cl ; shl edx,cl) → 4xNOP
-         //   * (eboot_base + 0x01b586c0) BSS byte set to 1 at apply
-         // The two `shl` NOPs prevent double-amplification when B1
-         // (already at 4K) feeds dims that the flag-driven shift
-         // would otherwise multiply by 2. IN `recommended`. Gated by
-         // target_resolution ≥ R2160p inside ApplyGr2ResolutionPatches
-         // (stripped silently at lower-res targets — at <2160p, the
-         // cmovne-driven swap chain attribute would be 3840×2160
-         // while RTs are smaller).
-    // ── v17.2 addition ──────────────────────────────────────────────
-    N1,  // Real sceVideoOutSetBufferAttribute caller patch. Two BSS-
-         // load instructions at the call site (eboot VA 0x00446933 /
-         // 0x00446939) are rewritten to `mov reg, imm32` where the
-         // immediates encode target_W and target_H. See the v17.2 N1
-         // application block in ApplyGr2ResolutionPatches.
-    // ── v17.3 addition ──────────────────────────────────────────────
-    O1,  // Swap-chain buffer ALLOCATION size fix. Pairs with N1. Four
-         // imm16 patches at 0x00446825/29/2d/31 force the allocator
-         // wrapper to receive target_W / target_H regardless of the
-         // PS4-Pro cmova branch outcome. See the v17.3 O1 application
-         // block in ApplyGr2ResolutionPatches.
     Count
 };
 
@@ -819,7 +777,7 @@ struct InstrReplaceSite {
     const char*   label;
 };
 
-constexpr std::array<InstrReplaceSite, 10> kInstrReplaceSites = {{
+constexpr std::array<InstrReplaceSite, 6> kInstrReplaceSites = {{
     // Reader 1: in function reading [r14+0x10b0]->struct, stores proj vec at [rbx+0xf0]
     {0x01011306, Group::I1, 6,
         // Original: mov ecx, dword ptr [rax+0x92C0]
@@ -846,104 +804,6 @@ constexpr std::array<InstrReplaceSite, 10> kInstrReplaceSites = {{
         // Replacement: mov ecx, 0x438; nop
         {0xB9, 0x38, 0x04, 0x00, 0x00, 0x90, 0x00, 0x00},
         "I1.H#2 (mov ecx, [rcx+0x92C4]) → lit 1080 — UI proj reader 2 (rbx+0x1b0)"},
-
-    // ── v15: L1 — disable motion blur ─────────────────────────────────
-    //
-    // The render-graph builder iterates through post-process passes and
-    // calls a "register-pass" function for each (Tonemap, Bloom,
-    // Antialias, SSAO, MotionBlur). All passes use the same template:
-    //
-    //     lea  rsi, [rip + pass_name_string]   ; e.g. "MotionBlur"
-    //     lea  rdx, [rip + per_pass_state]
-    //     call 0x10dfc70                       ; init-by-name
-    //     lea  rdi, [rip + per_pass_state]
-    //     call 0x13f55d0                       ; finalize init
-    //     mov  edi, dword ptr [rip + handle]   ; load pass handle
-    //     [optional: mov esi, <index>]          ; MotionBlur#1 only
-    //     call <register-pass-fn>              ; <-- THE PATCH TARGET
-    //     mov  eax, dword ptr [rip + ...]      ; overwrites eax
-    //
-    // MotionBlur is referenced from TWO sites in this builder:
-    //   #1: 0x0103e356  call 0x121b040   (special-slot register, esi=0x11)
-    //   #2: 0x0103ea95  call 0x121ae70   (standard register, no esi)
-    //
-    // Both calls' return values are DISCARDED — the next instruction is
-    // `mov eax, [rip + globals]` which unconditionally overwrites the
-    // call's eax result. So NOPing the call is safe w.r.t. dataflow.
-    // The only effect is removing the side effect (registering the
-    // pass with the active list), which is exactly what we want.
-    //
-    // RISK: if either register-pass function has REQUIRED side effects
-    // beyond pass-list insertion (refcounts, asserts, init state needed
-    // by later passes), NOP'ing could crash. The same `0x121ae70` is
-    // called by every other pass setup (Tonemap, Bloom, etc.) so it's
-    // a clean shared-function pointer — but those passes also have
-    // their own per-pass-state pointers passed as rdi, so NOP'ing for
-    // MotionBlur#2 only skips THIS instance, not the others. Should be
-    // safe in principle. UNTESTED at v15 ship time.
-    //
-    // EXCLUDED from `recommended`. Opt-in: "recommended,L1".
-    {0x0103e356, Group::L1, 5,
-        // Original: call 0x121b040 (E8 e5 cc 1d 00)
-        {0xE8, 0xE5, 0xCC, 0x1D, 0x00, 0x00, 0x00, 0x00},
-        // Replacement: 5x NOP
-        {0x90, 0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00},
-        "L1.MotionBlur#1 register-pass call → NOP (skip pass registration at slot 0x11)"},
-    {0x0103ea95, Group::L1, 5,
-        // Original: call 0x121ae70 (E8 d6 c3 1d 00)
-        {0xE8, 0xD6, 0xC3, 0x1D, 0x00, 0x00, 0x00, 0x00},
-        // Replacement: 5x NOP
-        {0x90, 0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00},
-        "L1.MotionBlur#2 register-pass call → NOP (skip standard pass registration)"},
-
-    // ── v17: M1 — PS4-Pro 4K-mode master enable ───────────────────────
-    //
-    // The 4K-vs-1080p dispatch in GR2 is gated on a single BSS byte at
-    // VA 0x01b586c0. Two game-internal writers set this flag at
-    // startup (and on mode transitions); 18 readers consume it (one
-    // cmovne selector for the swap-chain buffer attribute, two shl-cl
-    // dim doublers, and 15 cmp-byte branch gates for 4K-mode-specific
-    // render state). shadPS4 emulates base PS4, so the runtime `seta`
-    // detection at 0x00446852 always writes 0 → all readers take the
-    // 1080p path. The renderdoc-evidenced 1920×1080 Display2DThin
-    // texSampler in the final compositing pass is the direct result
-    // of the FLAG=0 cmovne in the selector function at 0x00d9f9c0.
-    //
-    // M1 forces FLAG=1 (4K path) via four byte-level patches plus an
-    // apply-time BSS-byte write (see the M1 block inside the
-    // ApplyGr2ResolutionPatches function). The two `shl reg, cl`
-    // dim-doubling sites are NOP'd because B1 already drives the
-    // shared struct slot to the target dimension; without the NOPs
-    // the flag-driven shift would multiply B1's 4K values to 8K.
-    //
-    // GATED on target resolution >= R2160p (enforced inside the apply
-    // function). At lower targets, the selector's 4K-branch dims are
-    // hard-coded 3840/2160 and would force a 4K swap chain over
-    // smaller render targets.
-    {0x00446852, Group::M1, 7,
-        // Original: seta byte ptr [rip + 0x1711e67]  (writer_seta)
-        {0x0F, 0x97, 0x05, 0x67, 0x1E, 0x71, 0x01, 0x00},
-        // Replacement: mov byte ptr [rip + 0x1711e67], 1
-        {0xC6, 0x05, 0x67, 0x1E, 0x71, 0x01, 0x01, 0x00},
-        "M1.WRITER_SETA (seta byte FLAG) → mov FLAG, 1 — force PS4-Pro detection to always-true"},
-    {0x004466dd, Group::M1, 7,
-        // Original: mov byte ptr [rip + 0x1711fdc], 0  (writer_zero)
-        {0xC6, 0x05, 0xDC, 0x1F, 0x71, 0x01, 0x00, 0x00},
-        // Replacement: mov byte ptr [rip + 0x1711fdc], 1
-        {0xC6, 0x05, 0xDC, 0x1F, 0x71, 0x01, 0x01, 0x00},
-        "M1.WRITER_ZERO (mov FLAG, 0) → mov FLAG, 1 — keep flag set across the reset-path writer"},
-    {0x0102b9a5, Group::M1, 4,
-        // Original: shl eax, cl ; shl edx, cl (D3 E0 D3 E2)
-        {0xD3, 0xE0, 0xD3, 0xE2, 0x00, 0x00, 0x00, 0x00},
-        // Replacement: 4x NOP
-        {0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00, 0x00},
-        "M1.SHIFT_X (shl eax,cl; shl edx,cl @ init_x/cb3) → 4xNOP — prevent B1 4K-dim double-amplification"},
-    {0x0102ba8e, Group::M1, 4,
-        // Original: shl eax, cl ; shl edx, cl (D3 E0 D3 E2)
-        {0xD3, 0xE0, 0xD3, 0xE2, 0x00, 0x00, 0x00, 0x00},
-        // Replacement: 4x NOP
-        {0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00, 0x00},
-        "M1.SHIFT_Y (shl eax,cl; shl edx,cl @ init_y/cb4) → 4xNOP — prevent B1 4K-dim double-amplification"},
 }};
 
 // ── Excluded / dead-end sites (DO NOT add to kResSites without re-RE) ──
@@ -1123,10 +983,6 @@ const char* GroupName(Group g) {
     case Group::I4: return "I4";
     case Group::J1: return "J1";
     case Group::K1: return "K1";
-    case Group::L1: return "L1";
-    case Group::M1: return "M1";
-    case Group::N1: return "N1";
-    case Group::O1: return "O1";
     default:        return "?";
     }
 }
@@ -1169,10 +1025,6 @@ bool MatchGroupName(std::string_view tok, Group& out) {
     if (tok == "i4") { out = Group::I4; return true; }
     if (tok == "j1") { out = Group::J1; return true; }
     if (tok == "k1") { out = Group::K1; return true; }
-    if (tok == "l1") { out = Group::L1; return true; }
-    if (tok == "m1") { out = Group::M1; return true; }
-    if (tok == "n1") { out = Group::N1; return true; }
-    if (tok == "o1") { out = Group::O1; return true; }
     return false;
 }
 
@@ -1238,90 +1090,23 @@ std::uint32_t ParseGroupMaskFromConfig(std::string_view raw) {
 }
 
 int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
-                              float aspect_ratio, bool disable_motion_blur,
-                              std::string_view groups_config) {
+                              float aspect_ratio) {
     if (eboot_base == 0) {
         LOG_ERROR(Core, "[GR2 Resolution] eboot_base is 0 — cannot patch");
         return 0;
     }
 
-    // Build the internal group mask from the user-facing toggles.
-    //
-    // v17 BISECTION KNOB: groups_config (config.toml [GPU]
-    // resolutionPatchGroups, default "recommended") drives
-    // ParseGroupMaskFromConfig — preset names, individual group tokens
-    // (a1 .. m1), and ~/! negation prefixes:
-    //
-    //   "recommended"           default (M1 included at ≥2160p)
-    //   "recommended,~m1"       everything except M1 (4K bug reproducer)
-    //   "recommended,~b1,~d1"   everything except B1+D1
-    //   "m1"                    M1 alone, nothing else
-    //   "b1,d1,h1,h2,m1"        minimal 4K-target set
-    //   "all,~e1,~g1,~k1"       everything minus known-bad
-    //   "baseline"              v3 B1+D1 sanity preset
-    //   "none" / "" / "off"     disable the resolution-patch pipeline
-    //                           entirely (motion blur still gated by
-    //                           the disable_motion_blur bool)
-    //
-    // The chosen mask is logged with the parsed-from string so post-
-    // mortem bisection can match the log line against the config value.
+    // Build the internal group mask. The patch-groups config knob was
+    // removed in v16: the resolution pipeline now ALWAYS applies
+    // kGroupMaskRecommended (the empirically-verified working set, see
+    // resolution_patches.h).
     std::uint32_t group_mask = 0;
     if (resolution != TargetResolution::Off) {
-        const std::string cfg(groups_config);
-        const std::uint32_t parsed = ParseGroupMaskFromConfig(cfg);
-        if (cfg.empty() || cfg == "recommended" || cfg == "prod") {
-            // Hot path: don't spam the log when running on defaults.
-            group_mask |= (cfg.empty() ? kGroupMaskRecommended : parsed);
-        } else {
-            LOG_INFO(Core,
-                "[GR2 Resolution] resolutionPatchGroups='{}' parsed to "
-                "mask=0x{:07x} (kGroupMaskRecommended=0x{:07x})",
-                cfg, parsed, kGroupMaskRecommended);
-            group_mask |= parsed;
-        }
-    }
-    if (disable_motion_blur) {
-        group_mask |= static_cast<std::uint32_t>(PatchGroupBit::L1);
+        group_mask |= kGroupMaskRecommended;
     }
     if (group_mask == 0) {
-        LOG_INFO(Core, "[GR2 Resolution] target=Off and disableMotionBlur=false; nothing to patch");
+        LOG_INFO(Core, "[GR2 Resolution] target=Off; nothing to patch");
         return 0;
-    }
-
-    // ── v17: M1 target-resolution gate + apply-time BSS write ─────────
-    //
-    // M1 (PS4-Pro 4K-mode master enable) is in kGroupMaskRecommended,
-    // so it gets enabled whenever the resolution pipeline is active.
-    // It is ONLY meaningful at target_resolution ≥ R2160p: the cmovne
-    // 4K branch at the selector function (0x00d9f9c0) hard-codes
-    // 3840/2160 as the swap-chain buffer dims. Forcing the 4K branch
-    // at smaller targets would mismatch the swap chain attribute with
-    // the render targets. Strip M1 from the mask for lower-res targets
-    // with a clear log line, then perform the one-time BSS write at
-    // 0x01b586c0 before the per-site patch loop.
-    //
-    // The BSS write is belt-and-suspenders: the per-site patches
-    // include WRITER_SETA and WRITER_ZERO neutralizers that force the
-    // flag to 1 when the game's own writers run, but any reader that
-    // executes BEFORE the writers would otherwise see 0. Writing 1
-    // directly to BSS at apply-time (which runs before any game code
-    // per module.cpp) closes that window.
-    if ((group_mask & static_cast<std::uint32_t>(PatchGroupBit::M1)) != 0) {
-        if (static_cast<int>(resolution) < static_cast<int>(TargetResolution::R2160p)) {
-            LOG_INFO(Core,
-                "[GR2 Resolution] M1 requested but target={} (<2160p) — stripped "
-                "from mask (M1's hard-coded 4K-branch dims would mismatch sub-4K RTs)",
-                TargetName(resolution));
-            group_mask &= ~static_cast<std::uint32_t>(PatchGroupBit::M1);
-        } else {
-            constexpr std::uint32_t kBssFlagOffset = 0x01b586c0;
-            auto* flag_ptr = reinterpret_cast<std::uint8_t*>(eboot_base + kBssFlagOffset);
-            const std::uint8_t prev = *flag_ptr;
-            *flag_ptr = 0x01;
-            LOG_INFO(Core,
-                "[GR2 Resolution] M1: wrote BSS_FLAG[0x{:x}]=1 (was 0x{:02x}) — PS4-Pro 4K path enabled",
-                kBssFlagOffset, prev);
-        }
     }
 
     const Resolution final_sz = ComposeFinalImpl(resolution, aspect_ratio);
@@ -1387,171 +1172,6 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
         per_group_patched[static_cast<int>(s.group)]++;
     }
 
-    // ── v17.2: N1 — real sceVideoOutSetBufferAttribute caller patch ───
-    //
-    // The actual swap-chain buffer attribute call is at eboot VA
-    // 0x00446975, identified via return-address instrumentation in
-    // shadPS4's sceVideoOutSetBufferAttribute. The caller reads W/H
-    // from a BSS slot (packed W|H<<16) and pitch-encoding from another
-    // BSS slot. Neither slot has direct rip-rel writers in seg0; the
-    // game updates them via indirect pointer that static analysis
-    // can't trace, so apply-time BSS writes would be clobbered.
-    //
-    // Fix: patch the two BSS-LOAD instructions immediately preceding
-    // the call to load IMMEDIATES instead. Same-size replacements
-    // (6 / 7 bytes) so no length drift:
-    //
-    //   0x00446933 (6B):  8b 05 df a9 6e 01    mov eax, [rip+0x16ea9df]
-    //                  →  b8 ?? ?? ?? ?? 90    mov eax, pitch_enc; nop
-    //
-    //   0x00446939 (7B):  44 8b 0d 10 aa 6e 01 mov r9d, [rip+0x16eaa10]
-    //                  →  41 b9 ?? ?? ?? ?? 90 mov r9d, packed_wh; nop
-    //
-    // The downstream code at 0x0044695e..0x0044696b extracts:
-    //   pitch     = (eax & 0x7ff) * 8 + 8   →  set pitch_enc = (W-8)/8
-    //   r8d  = W  = r9w  (low 16 bits)
-    //   r9d  = H  = r9d >> 16 (high 16 bits)  →  packed_wh = W | (H<<16)
-    //
-    // Idempotent at 1080p target: encoded values match the game's
-    // runtime-computed defaults (pitch_enc=0xef, packed_wh=0x04380780).
-    if ((group_mask & static_cast<std::uint32_t>(PatchGroupBit::N1)) != 0) {
-        const std::uint32_t target_W = static_cast<std::uint32_t>(final_sz.width);
-        const std::uint32_t target_H = static_cast<std::uint32_t>(final_sz.height);
-        const std::uint32_t pitch_enc = (target_W >= 8) ? ((target_W - 8) / 8) : 0;
-        const std::uint32_t packed_wh = (target_W & 0xFFFFu) | ((target_H & 0xFFFFu) << 16);
-
-        struct N1Site {
-            std::uint32_t va_offset;
-            std::uint8_t  size;
-            std::uint8_t  expected[8];
-            std::uint8_t  rep_prefix[2];  // bytes before the imm32
-            std::uint8_t  rep_prefix_len;
-            std::uint8_t  rep_suffix;     // single byte after the imm32 (nop)
-            std::uint32_t imm32;
-            const char*   label;
-        };
-        const N1Site n1_sites[2] = {
-            // mov eax, [rip+0x16ea9df]  →  mov eax, pitch_enc ; nop
-            {0x00446933, 6,
-             {0x8B, 0x05, 0xDF, 0xA9, 0x6E, 0x01, 0, 0},
-             {0xB8, 0x00}, 1, 0x90, pitch_enc,
-             "N1.PITCH_ENC (mov eax, [rip+0x16ea9df]) → mov eax, imm32 ; nop"},
-            // mov r9d, [rip+0x16eaa10]  →  mov r9d, packed_wh ; nop
-            {0x00446939, 7,
-             {0x44, 0x8B, 0x0D, 0x10, 0xAA, 0x6E, 0x01, 0},
-             {0x41, 0xB9}, 2, 0x90, packed_wh,
-             "N1.PACKED_WH (mov r9d, [rip+0x16eaa10]) → mov r9d, imm32 ; nop"},
-        };
-
-        for (const auto& n : n1_sites) {
-            std::uint8_t* p = reinterpret_cast<std::uint8_t*>(eboot_base + n.va_offset);
-
-            // Build the replacement bytes inline.
-            std::uint8_t rep[8] = {0};
-            std::memcpy(rep, n.rep_prefix, n.rep_prefix_len);
-            std::memcpy(rep + n.rep_prefix_len, &n.imm32, 4);
-            rep[n.rep_prefix_len + 4] = n.rep_suffix;
-            // size = prefix + 4 + 1 (suffix nop) = 6 or 7
-
-            if (std::memcmp(p, rep, n.size) == 0) {
-                per_group_already[static_cast<int>(Group::N1)]++;
-                continue;
-            }
-            if (std::memcmp(p, n.expected, n.size) != 0) {
-                LOG_WARNING(Core,
-                    "[GR2 Resolution] {} @ vaddr 0x{:x}: unexpected bytes — NOT patched",
-                    n.label, n.va_offset);
-                per_group_mismatch[static_cast<int>(Group::N1)]++;
-                continue;
-            }
-            std::memcpy(p, rep, n.size);
-            LOG_INFO(Core,
-                "[GR2 Resolution] {} (imm32=0x{:08x}) @ vaddr 0x{:x} patched",
-                n.label, n.imm32, n.va_offset);
-            per_group_patched[static_cast<int>(Group::N1)]++;
-        }
-        LOG_INFO(Core,
-            "[GR2 Resolution] N1: pitch_enc=0x{:x} (= ({}-8)/8), packed_wh=0x{:08x} (W={} H={})",
-            pitch_enc, target_W, packed_wh, target_W, target_H);
-    }
-
-    // ── v17.3: O1 — swap-chain buffer ALLOCATION size fix ─────────────
-    //
-    // N1 alone makes shadPS4 think the swap chain is 4K-sized, but the
-    // game allocated 8 MB buffers (1080p-sized). TextureCache then walks
-    // off the buffer trying to upload 31.6 MB of texture data and crashes
-    // inside the NVIDIA driver.
-    //
-    // The buffer allocator wrapper at 0x1215570 takes (W, H) from edx/ecx,
-    // which were set by 4 `mov rXX, imm16` stores at 0x00446823 / 27 / 2b
-    // / 2f (then optionally cmova'd to 4K alternates if the game detected
-    // PS4 Pro mode). shadPS4 emulates base PS4 so cmova never takes and
-    // the allocator sees the 1080p defaults.
-    //
-    // O1 rewrites all 4 imm16 slots to (target_W, target_H) so both the
-    // default and the cmova-alt paths produce the same target dims,
-    // making the cmova effectively a no-op while keeping the surrounding
-    // logic intact. Each patch is 2 bytes at instr_va + 2.
-    //
-    // Layout of each instruction:
-    //   66 b8 ?? ??   mov ax, imm16
-    //                ^^^^^ imm16 = 2 bytes at instr+2
-    //
-    // Idempotent at 1080p target (imm16 values match the defaults).
-    if ((group_mask & static_cast<std::uint32_t>(PatchGroupBit::O1)) != 0) {
-        const std::uint16_t target_W = static_cast<std::uint16_t>(final_sz.width);
-        const std::uint16_t target_H = static_cast<std::uint16_t>(final_sz.height);
-
-        struct O1Site {
-            std::uint32_t instr_va;
-            std::uint8_t  instr_bytes[4];  // full 4-byte expected instruction
-            bool          is_height;       // true → patch with target_H, false → target_W
-            const char*   label;
-        };
-        const O1Site o1_sites[4] = {
-            {0x00446823, {0x66, 0xB8, 0x70, 0x08}, true,
-             "O1.H_ALT     (mov ax, 0x870 — cmova-alt H, PS4-Pro 4K branch)"},
-            {0x00446827, {0x66, 0xB9, 0x38, 0x04}, true,
-             "O1.H_DEFAULT (mov cx, 0x438 — default H, base-PS4 fall-through)"},
-            {0x0044682B, {0x66, 0xBE, 0x00, 0x0F}, false,
-             "O1.W_ALT     (mov si, 0xf00 — cmova-alt W, PS4-Pro 4K branch)"},
-            {0x0044682F, {0x66, 0xBA, 0x80, 0x07}, false,
-             "O1.W_DEFAULT (mov dx, 0x780 — default W, base-PS4 fall-through)"},
-        };
-
-        for (const auto& o : o1_sites) {
-            std::uint8_t* p = reinterpret_cast<std::uint8_t*>(eboot_base + o.instr_va);
-            const std::uint16_t target_val = o.is_height ? target_H : target_W;
-
-            // Build expected replacement: same opcode prefix, new imm16.
-            std::uint8_t expected_rep[4] = {o.instr_bytes[0], o.instr_bytes[1], 0, 0};
-            std::memcpy(expected_rep + 2, &target_val, 2);
-
-            if (std::memcmp(p, expected_rep, 4) == 0) {
-                per_group_already[static_cast<int>(Group::O1)]++;
-                continue;
-            }
-            // Check the original bytes (opcode+default imm16).
-            if (std::memcmp(p, o.instr_bytes, 4) != 0) {
-                LOG_WARNING(Core,
-                    "[GR2 Resolution] {} @ vaddr 0x{:x}: unexpected bytes — NOT patched",
-                    o.label, o.instr_va);
-                per_group_mismatch[static_cast<int>(Group::O1)]++;
-                continue;
-            }
-            // Patch ONLY the imm16 (last 2 bytes).
-            std::memcpy(p + 2, &target_val, 2);
-            LOG_INFO(Core,
-                "[GR2 Resolution] {} (imm16=0x{:04x}) @ vaddr 0x{:x} patched",
-                o.label, target_val, o.instr_va + 2);
-            per_group_patched[static_cast<int>(Group::O1)]++;
-        }
-        LOG_INFO(Core,
-            "[GR2 Resolution] O1: target_W=0x{:x} ({}) target_H=0x{:x} ({}) — "
-            "allocator wrapper @ 0x1215570 will receive target dims",
-            target_W, target_W, target_H, target_H);
-    }
-
     int total_patched = 0, total_already = 0, total_mismatch = 0, total_skipped = 0;
     for (int i = 0; i < static_cast<int>(Group::Count); i++) {
         total_patched  += per_group_patched[i];
@@ -1561,10 +1181,10 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
     }
 
     LOG_INFO(Core,
-        "[GR2 Resolution] target={} aspect={:.4f} disableMotionBlur={} -> "
+        "[GR2 Resolution] target={} aspect={:.4f} -> "
         "final={}x{} mask=0x{:04x} — "
         "{} patched, {} already, {} mismatched, {} skipped (of {} total)",
-        TargetName(resolution), aspect_ratio, disable_motion_blur ? "true" : "false",
+        TargetName(resolution), aspect_ratio,
         final_sz.width, final_sz.height,
         group_mask, total_patched, total_already, total_mismatch, total_skipped,
         static_cast<int>(kResSites.size() + kInstrReplaceSites.size()));
