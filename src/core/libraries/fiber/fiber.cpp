@@ -39,40 +39,7 @@ void PS4_SYSV_ABI _sceFiberCheckStackOverflow(OrbisFiberContext* ctx) {
     u64* stack_base = reinterpret_cast<u64*>(ctx->current_fiber->addr_context);
     u64 stack_size = ctx->current_fiber->size_context;
     if (stack_base && *stack_base != kFiberStackSignature) {
-        // GR2FORK: do NOT terminate the emulator on canary mismatch.
-        //
-        // The canary at addr_context sits at the lowest address of the fiber's
-        // allocation (x86_64 stacks grow downward, so it is the FIRST byte an
-        // overflowing callstack would clobber). Under shadPS4 HLE, every guest
-        // call into a Sce* function routes through host trampolines that
-        // consume meaningfully more host stack than native PS4 code would for
-        // the same logical operation (AvPlayer decode callbacks, GR2's
-        // BGFiberWorkerHigh job system, etc.). On small game-allocated fiber
-        // stacks the canary can be touched without any subsequent data
-        // corruption that would actually destabilise the title.
-        //
-        // Previously this path was an UNREACHABLE_MSG, which routed into the
-        // crash handler and killed the process. That is the wrong response for
-        // what is fundamentally a soft diagnostic. Log once per fiber (keyed
-        // on the OrbisFiber pointer, thread-local because each thread runs its
-        // own fiber chain), restore the canary so we do not keep re-firing,
-        // and continue. If a true overflow has corrupted memory beyond the
-        // canary the resulting symptom will surface elsewhere with more
-        // diagnostic value than a fiber.cpp UNREACHABLE.
-        static thread_local OrbisFiber* warned_fiber = nullptr;
-        if (warned_fiber != ctx->current_fiber) {
-            warned_fiber = ctx->current_fiber;
-            LOG_WARNING(Lib_Fiber,
-                        "Stack canary clobbered in fiber '{}' (size = 0x{:x}); "
-                        "HLE callback depth exceeded the guest-allocated fiber "
-                        "stack. Continuing; subsequent occurrences on this "
-                        "fiber are suppressed.",
-                        ctx->current_fiber->name, stack_size);
-        }
-        // Restore the canary in place so the per-call check stops tripping for
-        // this fiber. The actual stack content above addr_context is untouched
-        // by writing this single u64 back to its original value.
-        *stack_base = kFiberStackSignature;
+        UNREACHABLE_MSG("Stack overflow detected in fiber with size = 0x{:x}", stack_size);
     }
 }
 

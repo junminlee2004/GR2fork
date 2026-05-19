@@ -88,64 +88,13 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     const u64 page = device_addr >> CACHING_PAGEBITS;
-
-    // GR2FORK v3.0 FIX (read AV in MultiLevelPageTable<BufferCache::Traits>
-    // ::operator[] line 63, _Myfirst was 0x1110A130036120A):
-    //
-    // This function is the synchronous landing pad for guest read-faults
-    // (PageManager::GuestFaultSignalHandler -> Rasterizer::ReadMemory) AND
-    // for the on_flush callback of guest write-faults (BufferCache::
-    // InvalidateMemory -> MemoryTracker::InvalidateRegion -> ReadMemory).
-    // Either way it runs inside a Windows VEH / POSIX signal handler on
-    // whatever thread took the AV, with PageManager's handler registered
-    // at priority=0 (called BEFORE cpu_patches' priority=UINT32_MAX one).
-    //
-    // The previous body did
-    //     const BufferId buffer_id = page_table[page].buffer_id;
-    // and then never used the local — a dead read that nevertheless paid
-    // MultiLevelPageTable::operator[]'s side effect: a non-allocating L1
-    // hit followed by `if (!_Myfirst[l1_page]) ...` against the L1
-    // vector's header. The reported _Myfirst value (0x1110A130036120A) is
-    // non-canonical AND not 8-aligned, so it cannot be the result of any
-    // `_Myfirst + l1_page*8` arithmetic — the vector header itself is
-    // bad at the moment of access. Whatever produces that (heap overrun
-    // into BufferCache's tail, a stale rasterizer ptr reaching a re-used
-    // heap region, an ObjectPool reentry across threads racing through
-    // operator[]), we cannot SAFELY probe page_table from this thread:
-    // both operator[] AND find() dereference _Myfirst on line 1 of their
-    // bodies, so a defensive find() probe here would crash identically.
-    //
-    // The right answer is to not touch page_table from the signal-handler
-    // entry AT ALL. The SendCommand<true> lambda below already issues its
-    // own FindBuffer(device_addr, size) when it runs on the assembler
-    // thread — that's the correct context for any page_table interaction
-    // (it owns the rendering serialization, and a transient header
-    // inconsistency in this window will have cleared by the time the
-    // closure dequeues). We just gate the entry with stack-only checks.
-
-    // Guard A: page index inside the 40-bit guest address space.
-    // CACHING_NUMPAGES == 1 << 26. IsMapped should already filter this,
-    // but its TLS cache + interval lookup is non-trivial, so a stack-
-    // local bound on the raw addr is cheap insurance.
-    if (page >= CACHING_NUMPAGES) [[unlikely]] {
-        return;
-    }
-
-    // Guard B: rasterizer_ back-ref must be set before we hand work to
-    // PushPresenterRecord/WaitForAssembler. Set by Rasterizer's ctor body
-    // AFTER buffer_cache + bundle_assembler_ are alive; null during the
-    // window between PageManager construction (which registers the
-    // signal handler at the top of its ctor) and SetRasterizer(). A
-    // fault in that gap would null-deref through the lambda.
-    if (rasterizer_ == nullptr) [[unlikely]] {
-        return;
-    }
+    const BufferId buffer_id = page_table[page].buffer_id;
 
     // --- RYZEN 7840U / Z1 EXTREME OPTIMIZATION ---
     // Gravity Rush 2 Physics Hack
     // Forces small physics buffers (Havok data) to sync asynchronously.
     // This eliminates the heavy stuttering during gravity shifts and combat.
-    const bool likely_physics_stall = (size > 1024 && size < 24576);
+    bool likely_physics_stall = (size > 1024 && size < 24576);
     // ---------------------------------------------
 
     // Phase 1D-pre-F: the SendCommand<true> outer lambda runs on `gpu_id`

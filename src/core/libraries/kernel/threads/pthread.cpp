@@ -307,48 +307,15 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
     new_thread->native_thr = Core::NativeThread();
     int ret = new_thread->native_thr.Create(RunThread, new_thread, &new_thread->attr);
 
-    // GR2FORK: do NOT assert-and-die on host thread creation failure.
-    //
-    // On Windows, NativeThread::Create wraps NtCreateThread with a custom
-    // INITIAL_TEB and CONTEXT pointing at a guest-allocated stack. That
-    // creation pattern (custom TEB, non-image initial RIP) overlaps with the
-    // process-hollowing heuristics used by virtually every AV/EDR product and
-    // by Windows Defender Exploit Protection's dynamic-code policies; when any
-    // of those are hooking NtCreateThreadEx, the call returns
-    // STATUS_ACCESS_DENIED (0xC0000022 == -1073741790 as signed int32). The
-    // emulator hitting this assertion on the very first guest thread spawn
-    // means the user never sees a game frame and gets a bare crash dump
-    // instead of an actionable error.
-    //
-    // The correct POSIX response when the host cannot grant a new thread is
-    // EAGAIN; guest code expects to handle that. Unwind in reverse of what we
-    // just allocated and link'd, then return.
-    if (ret != 0) {
-        LOG_ERROR(Kernel_Pthread,
-                  "Native thread creation failed for '{}' (host error {} / 0x{:x}). "
-                  "Returning EAGAIN. On Windows, this is most commonly "
-                  "STATUS_ACCESS_DENIED (0xC0000022) from AV/EDR or Exploit "
-                  "Protection denying the custom-TEB NtCreateThread path; try "
-                  "adding the shadps4 folder to Defender exclusions, unblock the "
-                  "exe via Properties, and disable overlays (NVIDIA/Discord/MSI "
-                  "Afterburner/RTSS).",
-                  new_thread->name, ret, static_cast<u32>(ret));
-
-        // We have already: CreateStack'd, set state=Running, Link'd, and
-        // assigned (*thread) = new_thread. Reverse all of that. FreeStack is
-        // a no-op if the user supplied their own stack. Free destroys the
-        // Pthread and either recycles it onto the free list or releases it.
-        *thread = nullptr;
-        thread_state->Unlink(curthread, new_thread);
-        thread_state->FreeStack(&new_thread->attr);
-        thread_state->Free(curthread, new_thread);
-        return POSIX_EAGAIN;
-    }
+    ASSERT_MSG(ret == 0, "Failed to create thread with error {}", ret);
 
     if (attr != nullptr && *attr != nullptr && (*attr)->cpuset != nullptr) {
         new_thread->SetAffinity((*attr)->cpuset);
     }
-    return 0;
+    if (ret) {
+        *thread = nullptr;
+    }
+    return ret;
 }
 
 int PS4_SYSV_ABI posix_pthread_create(PthreadT* thread, const PthreadAttrT* attr,
