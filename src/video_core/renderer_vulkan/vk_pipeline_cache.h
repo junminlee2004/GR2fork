@@ -278,7 +278,7 @@ private:
     // this to a small value (e.g. 1ms-5ms) to catch fast compiles without the
     // 200ms-tier blocking. Do not raise back to 100ms+ without re-running the
     // spike-score A/B — the warmup and scene-transition spikes will return.
-    static constexpr std::chrono::milliseconds kInitialSyncBudget{5};
+    static constexpr std::chrono::milliseconds kInitialSyncBudget{200};
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
     static constexpr std::chrono::seconds      kPermaFailThreshold{30};
 

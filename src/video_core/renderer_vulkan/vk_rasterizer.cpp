@@ -19,9 +19,11 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <vector>
 #include <xxhash.h>
 
 #ifdef MemoryBarrier
@@ -1453,6 +1455,383 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // most shaders.
             if (desc.is_written && desc.is_formatted) [[unlikely]] {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+            }
+
+            // ============================================================
+            // FIX(GR2FORK grass-cbuf-override v8): two-table override of
+            // grass CS cbuffers with per-field BAKED DEFAULTS.
+            //
+            // v8 change from v7: each field can declare a baked default
+            // value via the default_str member. When the env var is
+            // unset (or empty), the baked default is parsed and applied
+            // as if the env var had been set to that value. When the
+            // env var IS set, it overrides the baked default. Fields
+            // with default_str=nullptr behave as before (no write unless
+            // env var is set).
+            //
+            // Currently baked defaults (applied with no env vars set):
+            //   GR2FORK_GRASS_CLIPMAXRANGE = 16
+            //   GR2FORK_GRASS_HEIGHTOFFSET = 0.00000000000000000000000000000000001
+            //   GR2FORK_GRASS_OFFSETCURVE  = 0.01
+            //   GR2FORK_GRASS_CLUSTERZSCALE= 99999999999999999
+            // To get the pure game default for any of these, set the env
+            // var explicitly to the original game value (e.g.
+            // GR2FORK_GRASS_CLIPMAXRANGE=28).
+            //
+            // Pipeline (from runtime + reflection analysis):
+            //   cs=0x83048c53 (BLADEGEN, 3 bindings) builds a per-patch
+            //     effector-affinity list (NOT visibility), terminated by
+            //     0xFFFFFFFF sentinel. Its buf_idx=0 is a 0x60-byte
+            //     read-only cbuffer.
+            //   cs=0xc282b105 (GATING, 9 bindings) reads that list,
+            //     applies effector forces per blade, and writes blade
+            //     output to b7. Its buf_idx=1 is the 0x150-byte cbuffer1.
+            //   cs=0x3f0a3c48 also gates/writes via the same cbuffer1.
+            //
+            // CBUF1 (cs=0xc282b105, cs=0x3f0a3c48) — 20 fields:
+            //   byte 0x100 u_f4ExtraForce.x  float GR2FORK_GRASS_EXTRAFORCE_X
+            //   byte 0x104 u_f4ExtraForce.y  float GR2FORK_GRASS_EXTRAFORCE_Y
+            //   byte 0x108 u_f4ExtraForce.z  float GR2FORK_GRASS_EXTRAFORCE_Z
+            //   byte 0x10c u_f4ExtraForce.w  float GR2FORK_GRASS_EXTRAFORCE_W
+            //   byte 0x110 u_ubVert          uint  GR2FORK_GRASS_UBVERT
+            //   byte 0x114 u_uGrassNumMax    uint  GR2FORK_GRASS_NUMMAX
+            //   byte 0x118 u_fClipMinRange   float GR2FORK_GRASS_CLIPMINRANGE
+            //   byte 0x11c u_fClipMaxRange   float GR2FORK_GRASS_CLIPMAXRANGE  [DEFAULT 16]
+            //   byte 0x120 uTopIndex         uint  GR2FORK_GRASS_TOPINDEX
+            //   byte 0x124 u_fCoherency      float GR2FORK_GRASS_COHERENCY
+            //   byte 0x128 u_fRangeMin       float GR2FORK_GRASS_RANGEMIN
+            //   byte 0x12c u_fRangeMax       float GR2FORK_GRASS_RANGEMAX
+            //   byte 0x130 u_fHeightOffset   float GR2FORK_GRASS_HEIGHTOFFSET  [DEFAULT 1e-35]
+            //   byte 0x134 u_fOffsetCurve    float GR2FORK_GRASS_OFFSETCURVE   [DEFAULT 0.01]
+            //   byte 0x138 u_fNormYLerp      float GR2FORK_GRASS_NORMYLERP
+            //   byte 0x13c u_fNormYLimitAng  float GR2FORK_GRASS_NORMYLIMITANG
+            //   byte 0x140 u_uEffectors      uint  GR2FORK_GRASS_EFFECTORS
+            //   byte 0x144 u_fDeltaTime      float GR2FORK_GRASS_DELTATIME
+            //   byte 0x148 u_fClusterZScale  float GR2FORK_GRASS_CLUSTERZSCALE [DEFAULT 1e17]
+            //   byte 0x14c u_fPadding1       float GR2FORK_GRASS_PADDING1
+            //
+            // BLADEGEN (cs=0x83048c53) — 24 floats, 0x60-byte cbuffer.
+            //   Diagnostic only; the per-effector cull in this shader
+            //   is dead code under default game state (loop bound is 0).
+            //   env vars: GR2FORK_GRASS_BLADEGEN_M00..M33 (16) and
+            //             GR2FORK_GRASS_BLADEGEN_P0..P7  (8), all float.
+            //
+            // Master kill switch:
+            //   GR2FORK_GRASS_CBUF_OVERRIDE_DISABLE=1 → hook does nothing,
+            //   no baked defaults applied either.
+            //
+            // Floats parsed via strtof; uints via strtoul base=0. Empty
+            // or unparseable env value treated as unset → falls through
+            // to the field's baked default_str (if any).
+            //
+            // Buffer ID:
+            //   CBUF1     = read-only Guest buffer, size == 0x150
+            //   BLADEGEN  = read-only Guest buffer, size == 0x60
+            // (Cannot use !is_storage — shadPS4 resource.h:44 forces all
+            // bindings to be Vulkan storage buffers.)
+            // ============================================================
+            {
+                struct GrassOverrideField {
+                    const char* env_name;
+                    const char* display_name;
+                    u32 byte_offset;
+                    bool is_uint;
+                    const char* default_str;
+                };
+                static constexpr GrassOverrideField kCbuf1Fields[] = {
+                    {"GR2FORK_GRASS_EXTRAFORCE_X", "u_f4ExtraForce.x",  0x100u, false, nullptr},
+                    {"GR2FORK_GRASS_EXTRAFORCE_Y", "u_f4ExtraForce.y",  0x104u, false, nullptr},
+                    {"GR2FORK_GRASS_EXTRAFORCE_Z", "u_f4ExtraForce.z",  0x108u, false, nullptr},
+                    {"GR2FORK_GRASS_EXTRAFORCE_W", "u_f4ExtraForce.w",  0x10cu, false, nullptr},
+                    {"GR2FORK_GRASS_UBVERT",       "u_ubVert",          0x110u, true,  nullptr},
+                    {"GR2FORK_GRASS_NUMMAX",       "u_uGrassNumMax",    0x114u, true,  nullptr},
+                    {"GR2FORK_GRASS_CLIPMINRANGE", "u_fClipMinRange",   0x118u, false, nullptr},
+                    {"GR2FORK_GRASS_CLIPMAXRANGE", "u_fClipMaxRange",   0x11cu, false, "16"},
+                    {"GR2FORK_GRASS_TOPINDEX",     "uTopIndex",         0x120u, true,  nullptr},
+                    {"GR2FORK_GRASS_COHERENCY",    "u_fCoherency",      0x124u, false, nullptr},
+                    {"GR2FORK_GRASS_RANGEMIN",     "u_fRangeMin",       0x128u, false, nullptr},
+                    {"GR2FORK_GRASS_RANGEMAX",     "u_fRangeMax",       0x12cu, false, nullptr},
+                    {"GR2FORK_GRASS_HEIGHTOFFSET", "u_fHeightOffset",   0x130u, false,
+                        "0.00000000000000000000000000000000001"},
+                    {"GR2FORK_GRASS_OFFSETCURVE",  "u_fOffsetCurve",    0x134u, false, "0.01"},
+                    {"GR2FORK_GRASS_NORMYLERP",    "u_fNormYLerp",      0x138u, false, nullptr},
+                    {"GR2FORK_GRASS_NORMYLIMITANG","u_fNormYLimitAng",  0x13cu, false, nullptr},
+                    {"GR2FORK_GRASS_EFFECTORS",    "u_uEffectors",      0x140u, true,  nullptr},
+                    {"GR2FORK_GRASS_DELTATIME",    "u_fDeltaTime",      0x144u, false, nullptr},
+                    {"GR2FORK_GRASS_CLUSTERZSCALE","u_fClusterZScale",  0x148u, false, "99999999999999999"},
+                    {"GR2FORK_GRASS_PADDING1",     "u_fPadding1",       0x14cu, false, nullptr},
+                };
+                static constexpr GrassOverrideField kBladegenFields[] = {
+                    {"GR2FORK_GRASS_BLADEGEN_M00", "bladegen.M00", 0x00u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M01", "bladegen.M01", 0x04u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M02", "bladegen.M02", 0x08u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M03", "bladegen.M03", 0x0cu, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M10", "bladegen.M10", 0x10u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M11", "bladegen.M11", 0x14u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M12", "bladegen.M12", 0x18u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M13", "bladegen.M13", 0x1cu, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M20", "bladegen.M20", 0x20u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M21", "bladegen.M21", 0x24u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M22", "bladegen.M22", 0x28u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M23", "bladegen.M23", 0x2cu, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M30", "bladegen.M30", 0x30u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M31", "bladegen.M31", 0x34u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M32", "bladegen.M32", 0x38u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_M33", "bladegen.M33", 0x3cu, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P0",  "bladegen.P0",  0x40u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P1",  "bladegen.P1",  0x44u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P2",  "bladegen.P2",  0x48u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P3",  "bladegen.P3",  0x4cu, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P4",  "bladegen.P4",  0x50u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P5",  "bladegen.P5",  0x54u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P6",  "bladegen.P6",  0x58u, false, nullptr},
+                    {"GR2FORK_GRASS_BLADEGEN_P7",  "bladegen.P7",  0x5cu, false, nullptr},
+                };
+                static constexpr size_t kNumCbuf1    =
+                    sizeof(kCbuf1Fields)    / sizeof(kCbuf1Fields[0]);
+                static constexpr size_t kNumBladegen =
+                    sizeof(kBladegenFields) / sizeof(kBladegenFields[0]);
+                static constexpr u32 kCbuf1RangeStart    = 0x100u;
+                static constexpr u32 kCbuf1RangeSize     = 0x50u;  // 0x150-0x100
+                static constexpr u32 kBladegenRangeStart = 0x00u;
+                static constexpr u32 kBladegenRangeSize  = 0x60u;
+
+                struct OverrideValue { bool has_value; u32 bits; };
+
+                static const auto parse_table =
+                    [](const GrassOverrideField* fields, size_t n) noexcept {
+                        std::vector<OverrideValue> out(n);
+                        for (size_t f_idx = 0; f_idx < n; ++f_idx) {
+                            out[f_idx].has_value = false;
+                            out[f_idx].bits = 0u;
+                            const char* env = std::getenv(fields[f_idx].env_name);
+                            const char* value_str =
+                                (env != nullptr && env[0] != '\0')
+                                    ? env
+                                    : fields[f_idx].default_str;
+                            if (value_str == nullptr) continue;
+                            char* end = nullptr;
+                            if (fields[f_idx].is_uint) {
+                                const unsigned long v =
+                                    std::strtoul(value_str, &end, 0);
+                                if (end != value_str) {
+                                    out[f_idx].has_value = true;
+                                    out[f_idx].bits = static_cast<u32>(v);
+                                }
+                            } else {
+                                const float v = std::strtof(value_str, &end);
+                                if (end != value_str) {
+                                    u32 bits;
+                                    std::memcpy(&bits, &v, sizeof(bits));
+                                    out[f_idx].has_value = true;
+                                    out[f_idx].bits = bits;
+                                }
+                            }
+                        }
+                        return out;
+                    };
+                static const std::vector<OverrideValue> s_cbuf1_values =
+                    parse_table(kCbuf1Fields, kNumCbuf1);
+                static const std::vector<OverrideValue> s_bladegen_values =
+                    parse_table(kBladegenFields, kNumBladegen);
+
+                static const s32 s_grass_cbuf_disable = []() noexcept -> s32 {
+                    const char* env =
+                        std::getenv("GR2FORK_GRASS_CBUF_OVERRIDE_DISABLE");
+                    return (env != nullptr && env[0] == '1' && env[1] == '\0')
+                               ? 1
+                               : 0;
+                }();
+
+                const u64 h = stage.pgm_hash;
+                const bool is_cbuf1_cs =
+                    (h == 0xc282b105ULL) || (h == 0x3f0a3c48ULL);
+                const bool is_bladegen_cs = (h == 0x83048c53ULL);
+                const bool is_any_grass = is_cbuf1_cs || is_bladegen_cs;
+
+                if (is_any_grass) [[unlikely]] {
+                    static std::atomic<bool> g_announced{false};
+                    if (!g_announced.exchange(true,
+                                              std::memory_order_relaxed)) {
+                        size_t active_cbuf1 = 0;
+                        for (size_t f_idx = 0; f_idx < kNumCbuf1; ++f_idx) {
+                            if (s_cbuf1_values[f_idx].has_value) {
+                                ++active_cbuf1;
+                            }
+                        }
+                        size_t active_bladegen = 0;
+                        for (size_t f_idx = 0; f_idx < kNumBladegen; ++f_idx) {
+                            if (s_bladegen_values[f_idx].has_value) {
+                                ++active_bladegen;
+                            }
+                        }
+                        LOG_INFO(
+                            Render_Vulkan,
+                            "[GR2FORK grass-cbuf-override v8] STARTUP "
+                            "disable={} cbuf1_active={}/{} bladegen_active="
+                            "{}/{} (master env "
+                            "GR2FORK_GRASS_CBUF_OVERRIDE_DISABLE=1 to kill; "
+                            "cbuf1 = c282b105/3f0a3c48 size==0x150; "
+                            "bladegen = 83048c53 size==0x60)",
+                            s_grass_cbuf_disable,
+                            active_cbuf1, kNumCbuf1,
+                            active_bladegen, kNumBladegen);
+                        auto log_table =
+                            [](const char* label,
+                               const GrassOverrideField* fields, size_t n,
+                               const std::vector<OverrideValue>& vals) {
+                                for (size_t f_idx = 0; f_idx < n; ++f_idx) {
+                                    if (vals[f_idx].has_value) {
+                                        if (fields[f_idx].is_uint) {
+                                            LOG_INFO(
+                                                Render_Vulkan,
+                                                "[GR2FORK grass-cbuf-override "
+                                                "v7]   {} byte 0x{:03x} {} "
+                                                "OVERRIDE={} (uint, env {})",
+                                                label,
+                                                fields[f_idx].byte_offset,
+                                                fields[f_idx].display_name,
+                                                vals[f_idx].bits,
+                                                fields[f_idx].env_name);
+                                        } else {
+                                            float f;
+                                            std::memcpy(&f, &vals[f_idx].bits,
+                                                        sizeof(f));
+                                            LOG_INFO(
+                                                Render_Vulkan,
+                                                "[GR2FORK grass-cbuf-override "
+                                                "v7]   {} byte 0x{:03x} {} "
+                                                "OVERRIDE={} (float, env {})",
+                                                label,
+                                                fields[f_idx].byte_offset,
+                                                fields[f_idx].display_name, f,
+                                                fields[f_idx].env_name);
+                                        }
+                                    } else {
+                                        LOG_INFO(
+                                            Render_Vulkan,
+                                            "[GR2FORK grass-cbuf-override v8] "
+                                            "  {} byte 0x{:03x} {} GAME (env "
+                                            "{} unset)",
+                                            label,
+                                            fields[f_idx].byte_offset,
+                                            fields[f_idx].display_name,
+                                            fields[f_idx].env_name);
+                                    }
+                                }
+                            };
+                        log_table("[CBUF1]   ", kCbuf1Fields, kNumCbuf1,
+                                  s_cbuf1_values);
+                        log_table("[BLADEGEN]", kBladegenFields, kNumBladegen,
+                                  s_bladegen_values);
+                    }
+                }
+
+                if (s_grass_cbuf_disable == 0) [[likely]] {
+                    auto apply_table =
+                        [&](const char* label,
+                            const GrassOverrideField* fields, size_t n,
+                            const std::vector<OverrideValue>& vals,
+                            u32 range_start, u32 range_sz) {
+                            size_t active = 0;
+                            for (size_t f_idx = 0; f_idx < n; ++f_idx) {
+                                if (vals[f_idx].has_value) {
+                                    ++active;
+                                }
+                            }
+                            if (active == 0u) return;
+                            const vk::DeviceSize range_off =
+                                static_cast<vk::DeviceSize>(offset_aligned) +
+                                static_cast<vk::DeviceSize>(adjust + range_start);
+                            const vk::DeviceSize range_size =
+                                static_cast<vk::DeviceSize>(range_sz);
+                            auto cmdbuf = scheduler.PrimaryCommandBuffer();
+                            const vk::Buffer vk_handle = vk_buffer->Handle();
+                            const vk::BufferMemoryBarrier2 pre{
+                                .srcStageMask =
+                                    vk::PipelineStageFlagBits2::eAllCommands,
+                                .srcAccessMask =
+                                    vk::AccessFlagBits2::eShaderRead |
+                                    vk::AccessFlagBits2::eUniformRead,
+                                .dstStageMask =
+                                    vk::PipelineStageFlagBits2::eTransfer,
+                                .dstAccessMask =
+                                    vk::AccessFlagBits2::eTransferWrite,
+                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .buffer = vk_handle,
+                                .offset = range_off,
+                                .size = range_size,
+                            };
+                            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                                .bufferMemoryBarrierCount = 1u,
+                                .pBufferMemoryBarriers = &pre,
+                            });
+                            for (size_t f_idx = 0; f_idx < n; ++f_idx) {
+                                if (!vals[f_idx].has_value) continue;
+                                const vk::DeviceSize wo =
+                                    static_cast<vk::DeviceSize>(offset_aligned) +
+                                    static_cast<vk::DeviceSize>(
+                                        adjust + fields[f_idx].byte_offset);
+                                cmdbuf.updateBuffer(vk_handle, wo, 4,
+                                                    &vals[f_idx].bits);
+                            }
+                            const vk::BufferMemoryBarrier2 post{
+                                .srcStageMask =
+                                    vk::PipelineStageFlagBits2::eTransfer,
+                                .srcAccessMask =
+                                    vk::AccessFlagBits2::eTransferWrite,
+                                .dstStageMask =
+                                    vk::PipelineStageFlagBits2::eComputeShader,
+                                .dstAccessMask =
+                                    vk::AccessFlagBits2::eShaderRead |
+                                    vk::AccessFlagBits2::eUniformRead,
+                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .buffer = vk_handle,
+                                .offset = range_off,
+                                .size = range_size,
+                            };
+                            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                                .bufferMemoryBarrierCount = 1u,
+                                .pBufferMemoryBarriers = &post,
+                            });
+                            static std::atomic<u32> g_logged_cbuf1{0};
+                            static std::atomic<u32> g_logged_bladegen{0};
+                            std::atomic<u32>& g_logged =
+                                (label[1] == 'C') ? g_logged_cbuf1
+                                                  : g_logged_bladegen;
+                            const u32 bit =
+                                (h == 0xc282b105ULL) ? 1u
+                                : (h == 0x3f0a3c48ULL) ? 2u
+                                : 4u;
+                            const u32 prev = g_logged.fetch_or(
+                                bit, std::memory_order_relaxed);
+                            if ((prev & bit) == 0) {
+                                LOG_INFO(
+                                    Render_Vulkan,
+                                    "[GR2FORK grass-cbuf-override v8] {} "
+                                    "cs={:#x} buf_idx={} sharp_idx={} "
+                                    "bufsz=0x{:x} wrote {} override(s) "
+                                    "to range [0x{:x}, 0x{:x})",
+                                    label, h, i, desc.sharp_idx,
+                                    static_cast<u32>(size), active,
+                                    range_start, range_start + range_sz);
+                            }
+                        };
+                    if (is_cbuf1_cs && !desc.is_written && !desc.IsSpecial() &&
+                        size == 0x150u) [[unlikely]] {
+                        apply_table("[CBUF1]   ", kCbuf1Fields, kNumCbuf1,
+                                    s_cbuf1_values, kCbuf1RangeStart,
+                                    kCbuf1RangeSize);
+                    } else if (is_bladegen_cs && !desc.is_written &&
+                               !desc.IsSpecial() && size == 0x60u)
+                        [[unlikely]] {
+                        apply_table("[BLADEGEN]", kBladegenFields,
+                                    kNumBladegen, s_bladegen_values,
+                                    kBladegenRangeStart, kBladegenRangeSize);
+                    }
+                }
             }
         }
 
