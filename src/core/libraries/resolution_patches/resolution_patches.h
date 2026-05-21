@@ -268,6 +268,300 @@ enum class PatchGroupBit : std::uint32_t {
                     // this module. Retained as an internal-only knob
                     // for any future re-export (e.g. an exposure-
                     // compensation config bool).
+    // ── v15 addition ────────────────────────────────────────────────
+    // ── v17 addition ────────────────────────────────────────────────
+    // ── v17.2 addition ──────────────────────────────────────────────
+    // ── v17.3 addition ──────────────────────────────────────────────
+    // ── v17.4 addition ──────────────────────────────────────────────
+    // ── v17.5 addition ──────────────────────────────────────────────
+    P3 = 1u << 30,  // **Screen-edge diamond vec4 array at 0x01488a00.**
+                    // A 6×vec4 = 96-byte rodata block loaded as
+                    // sequential `vmovaps xmm0, [rip+disp]` by the
+                    // function at fn ~0x00bc4b00. Layout:
+                    //
+                    //   vec4[0] = (   0,    0, 1, 0)   basis
+                    //   vec4[1] = (   0,    1, 0, 0)   basis
+                    //   vec4[2] = (1920,  540, 1, 0)   right-edge midpt
+                    //   vec4[3] = (   0,  540, 1, 0)   left-edge midpt
+                    //   vec4[4] = ( 960,    0, 1, 0)   top-edge midpt
+                    //   vec4[5] = ( 960, 1080, 1, 0)   bottom-edge midpt
+                    //
+                    // Forms a diamond inscribed in the 1080p frame-
+                    // buffer — used as a sample pattern by some
+                    // screen-space pass (vignette / edge sampling /
+                    // ring effect, exact purpose unconfirmed). At
+                    // non-1080p targets the diamond stays at 1080p
+                    // coordinates while the framebuffer is bigger or
+                    // smaller, breaking the pattern's intent.
+                    //
+                    // P3 patches the 6 resolution-dependent floats
+                    // with appropriate Kind values:
+                    //   * 0x01488a20  W_f      (1920 → target_W)
+                    //   * 0x01488a24  HalfH_f  (540  → target_H/2)
+                    //   * 0x01488a34  HalfH_f  (540  → target_H/2)
+                    //   * 0x01488a40  HalfW_f  (960  → target_W/2)
+                    //   * 0x01488a50  HalfW_f  (960  → target_W/2)
+                    //   * 0x01488a54  H_f      (1080 → target_H)
+                    //
+                    // The basis vec4[0]/[1] and the 1.0/0.0 padding
+                    // floats are LEFT UNTOUCHED. Idempotent at 1080p.
+                    // INCLUDED in `recommended`.
+    P2 = 1u << 29,  // **BSS_FLAG-indexed (1080p, 4K) mode table at
+                    // 0x014c7e60.** 8 floats laid out as two copies
+                    // of (W, W4K, H, H4K). Read by the function at
+                    // 0x00feeb8e via `vmovss [base + flag*4]` where
+                    // `flag` is the byte at 0x01b586c0 (the M1 flag),
+                    // and by a second consumer at 0x00fef0dd using
+                    // the duplicated copy at offset +0x10. Patching
+                    // all 8 entries to (target_W, target_H) makes
+                    // both readers see target dims regardless of
+                    // FLAG state — M1 becomes irrelevant for this
+                    // path. Tiny group (8 sites). INCLUDED in
+                    // `recommended`.
+    P1 = 1u << 28,  // **Viewport-center / half-dimension rodata
+                    // floats — the comic-scene "offset images" fix.**
+                    //
+                    // 150 individual float patches across 68 rodata
+                    // clusters, each storing (hW=960.0f, hH=540.0f)
+                    // — sometimes as a vec2 pair, sometimes as a
+                    // vec4 splat or vec6 packed form. Loaded via
+                    // `vaddss xmm, xmm, [rip+disp]` etc. and used
+                    // as the screen-center constants in NDC→screen
+                    // transforms:
+                    //
+                    //   screen_X = halfW + ndc_x * scale
+                    //   screen_Y = halfH - ndc_y * scale  (Y-flipped)
+                    //
+                    // Confirmed by disassembling cluster 0x014c2a48
+                    // (loader 0x012f4798): unambiguous viewport-
+                    // center math for a thumbnail-sized blit. The
+                    // per-draw scale (e.g. 100.0f for thumbnails)
+                    // is NOT touched — only the screen-center
+                    // constants. At non-1080p targets the hardcoded
+                    // (960, 540) places UI/2D sprites off-center
+                    // relative to the actual framebuffer; comic-
+                    // panel cutscenes are the most visible symptom.
+                    //
+                    // P1 scales every hW/hH float to
+                    // (target_W/2, target_H/2) using the existing
+                    // Kind::HalfW_f / Kind::HalfH_f encoders.
+                    // Idempotent at 1080p (960/540 unchanged).
+                    //
+                    // INCLUDED in `recommended` based on (a) high
+                    // confidence the symptom matches the math
+                    // pattern, (b) idempotency at native, and
+                    // (c) the per-cluster log lines surface any
+                    // mismatch immediately. If a regression
+                    // appears at non-1080p targets, opt out via
+                    // `resolutionPatchGroups = "recommended,~p1"`.
+    O1 = 1u << 27,  // **Swap-chain buffer ALLOCATION size fix.** Pairs
+                    // with N1 to make 4K actually work. N1 alone fixes
+                    // the buffer-attribute call (so videoout knows
+                    // the buffer is 4K), but the underlying memory
+                    // was allocated by the game as 8 MB per buffer
+                    // (1920×1080×4 ≈ 7.91 MB, page-aligned to 8 MB).
+                    // At 4K shadPS4's TextureCache::RefreshImage tries
+                    // to upload 31.6 MB from the 8 MB buffer, walking
+                    // past the end into adjacent direct-memory and
+                    // crashing inside nvoglv64 with SEH ACCESS_VIOLATION
+                    // (renderdoc shows the partial-read corruption as
+                    // mostly-black with colored noise blocks).
+                    //
+                    // The buffer allocator wrapper at 0x1215570 takes
+                    // (W, H) as args in (edx, ecx). The W/H come from
+                    // dx/cx set 4 instructions earlier as imm16 stores,
+                    // optionally cmova'd to the PS4-Pro 4K alternates:
+                    //
+                    //   0x00446823  66 b8 70 08  mov ax, 0x870  ; alt H
+                    //   0x00446827  66 b9 38 04  mov cx, 0x438  ; default H
+                    //   0x0044682b  66 be 00 0f  mov si, 0xf00  ; alt W
+                    //   0x0044682f  66 ba 80 07  mov dx, 0x780  ; default W
+                    //   ...
+                    //   0x0044684a  cmova dx, si  ; W <- alt if PS4-Pro
+                    //   0x0044684e  cmova cx, ax  ; H <- alt if PS4-Pro
+                    //
+                    // shadPS4 emulates base PS4 → the underlying cmp
+                    // resolves to equal → cmova NOT taken → defaults
+                    // (1920/1080) flow to the allocator. O1 rewrites
+                    // all 4 imm16 slots to target_W / target_H so
+                    // BOTH cmova branches give target dims regardless
+                    // of the comparison outcome.
+                    //
+                    // O1 is 4 × 2-byte imm16 patches at instr_va+2:
+                    //   * 0x00446825 (alt H)     → target_H
+                    //   * 0x00446829 (default H) → target_H
+                    //   * 0x0044682d (alt W)     → target_W
+                    //   * 0x00446831 (default W) → target_W
+                    //
+                    // Idempotent at 1080p target. PAIRED WITH N1 — at
+                    // 4K, N1 fixes the buffer-attr call to report
+                    // (3840,2160) to shadPS4, and O1 ensures the
+                    // backing memory is sized for that. Either one
+                    // alone is broken: N1 alone → OOB read crash;
+                    // O1 alone → 4K allocation but videoout still
+                    // told it's 1080p (original bug). INCLUDED in
+                    // `recommended` together with N1.
+    N1 = 1u << 26,  // **Real sceVideoOutSetBufferAttribute caller patch.**
+                    // The previous M1 hypothesis (4K-selector cmovne at
+                    // 0x00d9f9c0) was empirically falsified: even with
+                    // BSS_FLAG=1 + all M1 byte-patches active, the log
+                    // line `sceVideoOutSetBufferAttribute width=1920
+                    // height=1080` shows the swap chain never moved
+                    // (renderdoc Display2DThin stays 1080p).
+                    //
+                    // Return-address instrumentation in shadPS4's
+                    // sceVideoOutSetBufferAttribute pinned the real
+                    // caller at eboot VA 0x00446975 (the call right
+                    // before the recorded return address 0x0044697a).
+                    // That call is inside the SAME function as M1's
+                    // writer_seta (0x00446852), but in a DIFFERENT
+                    // code path further down — the M1 branch handles
+                    // some internal 4K-mode state, while the call at
+                    // 0x00446975 is the actual videoout import.
+                    //
+                    // Disassembly of the call setup:
+                    //   0x00446933  mov eax, [rip+0x16ea9df]
+                    //                 ; eax = BSS[0x01b31318] (pitch src)
+                    //   0x00446939  mov r9d, [rip+0x16eaa10]
+                    //                 ; r9d = BSS[0x01b31350] (packed W|H)
+                    //   0x00446948  mov esi, 0x80000000   ; pixelFormat
+                    //   0x0044694d  xor edx, edx          ; tilingMode=0
+                    //   0x0044694f  xor ecx, ecx          ; aspectRatio=0
+                    //   0x0044695e  and eax, 0x7ff        ; (BSS & 0x7ff)
+                    //   0x00446963  movzx r8d, r9w        ; r8d = W
+                    //   0x00446967  shr r9d, 0x10         ; r9d = H
+                    //   0x0044696b  lea eax, [rax*8 + 8]  ; pitch = N*8+8
+                    //   0x00446972  mov [rsp], eax        ; pitchInPixel
+                    //   0x00446975  call 0x13f7a00        ; ← PLT stub
+                    //
+                    // The two BSS slots (0x01b31318 and 0x01b31350) are
+                    // written by the game via indirect pointer (no
+                    // direct rip-rel writers exist in seg0). Patching
+                    // the BSS values at apply-time would be clobbered.
+                    //
+                    // N1 patches the two BSS-LOADS at 0x00446933 /
+                    // 0x00446939 to load IMMEDIATES instead, computed
+                    // from target resolution:
+                    //   pitch_enc = (target_W - 8) / 8
+                    //   packed_wh = target_W | (target_H << 16)
+                    //
+                    // Both replacements match the original instruction
+                    // size (6 / 7 bytes) so no length drift:
+                    //   8b 05 ?? ?? ?? ??   →  b8 ?? ?? ?? ?? 90
+                    //   44 8b 0d ?? ?? ?? ??→  41 b9 ?? ?? ?? ?? 90
+                    //
+                    // IDEMPOTENT at 1080p target (encoded values match
+                    // the game's runtime-computed defaults). INCLUDED
+                    // in `recommended` — works at any target resolution.
+    M1 = 1u << 25,  // **PS4-Pro 4K-mode master enable.** GR2 has a
+                    // complete 4K rendering path gated by a single
+                    // BSS byte at VA 0x01b586c0. The flag is set at
+                    // game startup by a `seta` instruction at
+                    // 0x00446852 that's the result of a runtime PS4-
+                    // Pro / display-config detection — on shadPS4
+                    // (which emulates base PS4) the comparison always
+                    // resolves to false → the byte stays 0 → all 18
+                    // readers of this flag take the 1080p code path,
+                    // including the SWAP-CHAIN buffer attribute
+                    // registration at the 4K-selector site
+                    // (0x00d9f9f9), which feeds the Display2DThin
+                    // buffer the present surface uses.
+                    //
+                    // RENDERDOC EVIDENCE: at 4K target, the main scene
+                    // RT renders at 3840×2160 (B1+H1 succeed) BUT the
+                    // final compositing/UI/color-grading pass reads
+                    // from a 1920×1080 R8G8B8A8Srgb Display2DThin
+                    // texSampler — this is the FLAG=0 swap-chain
+                    // buffer attribute. Setting FLAG=1 routes the
+                    // attribute call through the 4K branch
+                    // (3840×2160) and unlocks the rest of the 4K
+                    // codepath (16 reader sites that gate 4K-mode
+                    // render state on the flag).
+                    //
+                    // M1 applies four byte-level patches:
+                    //   * 0x00446852  seta byte FLAG → mov FLAG, 1
+                    //                 (the initial PS4-Pro detector
+                    //                 always writes 1 instead of the
+                    //                 emulated-false result)
+                    //   * 0x004466dd  mov FLAG, 0 → mov FLAG, 1
+                    //                 (a reset-path writer that
+                    //                 zeroes the flag in some game
+                    //                 mode transition — keep it 1)
+                    //   * 0x0102b9a5  shl eax,cl ; shl edx,cl → 4xNOP
+                    //   * 0x0102ba8e  shl eax,cl ; shl edx,cl → 4xNOP
+                    //                 Two `shl reg, cl` sites use the
+                    //                 flag as a SHIFT AMOUNT to double
+                    //                 the B1 struct dims (1920→3840,
+                    //                 1080→2160). With B1 already at
+                    //                 the 4K target, a non-zero shift
+                    //                 would DOUBLE-AMPLIFY to 7680 —
+                    //                 NOP them so B1's values pass
+                    //                 through unchanged.
+                    //
+                    // M1 also performs a one-time BSS write of byte=1
+                    // to (eboot_base + 0x01b586c0) at apply-time, so
+                    // any reader that runs BEFORE the patched writer
+                    // also sees the 4K flag.
+                    //
+                    // **GATED BY TARGET RESOLUTION.** M1 is only
+                    // applied when the target resolution is ≥ 2160p
+                    // (the 4K-branch dims at the selector are hard-
+                    // coded as 3840/2160 — H3 patches the 1080p
+                    // branch but not the 4K branch, so M1's cmovne
+                    // forces 4K regardless of target). At 1080p or
+                    // 1440p target, M1 would force the swap-chain
+                    // attribute to 3840×2160 while the actual render
+                    // targets are smaller — the videoout layer would
+                    // either reject the mismatch or upscale the
+                    // smaller render into a 4K buffer (defeating the
+                    // point). Gate enforced inside
+                    // ApplyGr2ResolutionPatches; the M1 bit can still
+                    // be in `groups` config — it's filtered for
+                    // lower-res targets with a logged note.
+                    //
+                    // INCLUDED in `recommended` — the apply function
+                    // gates M1 to target_resolution ≥ R2160p (stripped
+                    // silently at lower targets), so adding it to the
+                    // default mask is safe and gives 4K users the fix
+                    // out of the box. Verify with the M1 log line
+                    // in stderr: at 2160p target you should see
+                    // `M1: wrote BSS_FLAG[0x1b586c0]=1 (was 0x00)`
+                    // followed by 4 M1 patch lines.
+    L1 = 1u << 24,  // Disable motion blur by NOP'ing two `call
+                    // <register-pass>` instructions in the render-
+                    // graph builder. MotionBlur is registered from
+                    // two sites:
+                    //   0x0103e356  call 0x121b040 (special-slot)
+                    //   0x0103ea95  call 0x121ae70 (standard)
+                    // Both calls' return values are discarded by the
+                    // next instruction (`mov eax, [rip + ...]`), so
+                    // NOP'ing is safe w.r.t. dataflow — only the
+                    // side effect (registering the pass with the
+                    // active draw list) is removed.
+                    //
+                    // The "MotionBlur" string at 0x014fc61a sits in
+                    // the same rodata cluster as Tonemap, Bloom,
+                    // Antialias, SSAO — these are render-graph node
+                    // names passed to the pass-init function by name.
+                    // All other passes use only the standard register
+                    // call; MotionBlur is the only one with the extra
+                    // special-slot register, likely because it needs
+                    // a specific position in the draw order.
+                    //
+                    // RISK: untested at ship time. If either register
+                    // function has required side effects beyond list
+                    // insertion (refcounts, init state for later
+                    // passes), patching could crash. The shared
+                    // 0x121ae70 is called by Tonemap/Bloom/etc. from
+                    // their OWN sites — NOP'ing here only removes the
+                    // MotionBlur-specific call, not the function
+                    // pointer itself. Should be clean.
+                    //
+                    // EXCLUDED from `recommended`. v16: gated by the
+                    // `disableMotionBlur` config bool — wired through
+                    // ApplyGr2ResolutionPatches's `disable_motion_blur`
+                    // parameter. To turn off motion blur, set
+                    // `[GPU] disableMotionBlur = true` in config.toml.
 };
 
 // Recommended preset masks. Use these by name in the config string ("safe",
@@ -301,8 +595,8 @@ inline constexpr std::uint32_t kGroupMaskExt =
     static_cast<std::uint32_t>(PatchGroupBit::E1) |
     static_cast<std::uint32_t>(PatchGroupBit::G1);
 
-// "All" mask covers bits 0..23 (24 groups, A1..K1).
-inline constexpr std::uint32_t kGroupMaskAll = 0xFFFFFFu;  // bits 0..23
+// "All" mask covers bits 0..30 (31 groups, A1..P3).
+inline constexpr std::uint32_t kGroupMaskAll = 0x7FFFFFFFu;  // bits 0..30
 
 // ── v13 ─────────────────────────────────────────────────────────────────
 // `recommended` = `all` minus ten groups, ALL EMPIRICALLY DETERMINED.
@@ -342,6 +636,12 @@ inline constexpr std::uint32_t kGroupMaskAll = 0xFFFFFFu;  // bits 0..23
 //                 Patches three exposureIntensity = 2.0f sites to
 //                 scale by pixel-density ratio min(1.0, (H/1080)²):
 //                 540p → 0.5 (quarter of 1080p's 2.0).
+//   * L1        — v15 disable motion blur. Two NOP-call patches at
+//                 0x0103e356 and 0x0103ea95 in the render-graph
+//                 builder skip the MotionBlur pass registration.
+//                 Opt-in via "recommended,L1". Untested at v15 ship
+//                 time — risk if either register-pass function has
+//                 required side effects beyond list insertion.
 inline constexpr std::uint32_t kGroupMaskRecommended =
     kGroupMaskAll
     & ~static_cast<std::uint32_t>(PatchGroupBit::C2)
@@ -353,7 +653,20 @@ inline constexpr std::uint32_t kGroupMaskRecommended =
     & ~static_cast<std::uint32_t>(PatchGroupBit::I3)
     & ~static_cast<std::uint32_t>(PatchGroupBit::I4)
     & ~static_cast<std::uint32_t>(PatchGroupBit::J1)
-    & ~static_cast<std::uint32_t>(PatchGroupBit::K1);
+    & ~static_cast<std::uint32_t>(PatchGroupBit::K1)
+    & ~static_cast<std::uint32_t>(PatchGroupBit::L1)
+    & ~static_cast<std::uint32_t>(PatchGroupBit::M1);
+// v17.1 NOTE: M1 was empirically tested at 2160p and did NOT change the
+// sceVideoOutSetBufferAttribute dims — the swap chain registered at
+// 1920×1080 even with all four M1 byte-patches successful and the BSS
+// flag set. This means the call site at 0x00d9fa33 (call 0x1218370,
+// inside the flag-gated cmovne branch) is NOT the path that feeds
+// sceVideoOutSetBufferAttribute — that fn is an internal game registrar,
+// not the videoout import. M1 stays enumerable as an opt-in toggle for
+// future bisection (set `resolutionPatchGroups = "recommended,m1"` in
+// config.toml) but is excluded from the default mask. The real caller
+// of sceVideoOutSetBufferAttribute is currently being identified via a
+// return-address log added to video_out.cpp.
 
 // ── v7 bisection presets ────────────────────────────────────────────────
 // These exist to find which of the NEW-in-v5/v6 groups actually help vs
@@ -417,9 +730,9 @@ inline constexpr std::uint32_t kGroupMaskWithoutG1 =
 
 // Apply the GR2 resolution+aspect override. Internally patches the
 // `recommended` group set (the empirically-verified working subset —
-// see kGroupMaskRecommended above). Returns the number of sites
-// patched. Idempotent. Logs a warning per mismatched site (e.g. when
-// the eboot doesn't match v1.11).
+// see kGroupMaskRecommended above) and, optionally, the L1 motion-blur
+// disable patch. Returns the number of sites patched. Idempotent. Logs
+// a warning per mismatched site (e.g. when the eboot doesn't match v1.11).
 //
 // `eboot_base`           — should be MemoryPatcher::g_eboot_address.
 // `resolution`           — chosen vertical pixel density (Off skips
@@ -428,8 +741,21 @@ inline constexpr std::uint32_t kGroupMaskWithoutG1 =
 //                          AspectPatches::TargetAspectToRatio). Used to
 //                          compose the final (W, H); does NOT patch the
 //                          projection float (that's aspect_patches' job).
+// `disable_motion_blur`  — if true, also apply the L1 group (two NOP-
+//                          call patches that skip the MotionBlur pass
+//                          registration in the render-graph builder).
+//                          Independent of the resolution override; the
+//                          patches are applied even when `resolution`
+//                          is Off (so motion blur can be disabled at
+//                          native res too).
+// `groups_config`        — patch-group bisection string parsed by
+//                          ParseGroupMaskFromConfig. Empty / nullopt
+//                          defaults to kGroupMaskRecommended. Driven
+//                          from Config::getResolutionPatchGroups()
+//                          (config.toml [GPU] resolutionPatchGroups).
 int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
-                              float aspect_ratio);
+                              float aspect_ratio, bool disable_motion_blur,
+                              std::string_view groups_config);
 
 // Parse a config string into a TargetResolution. ("Off", "540p", "720p",
 // "900p", "1080p", "1440p", "2160p"/"4K", "4320p"/"8K", or "WxH" forms.)

@@ -21,49 +21,35 @@ namespace Libraries::Kernel {
 // watchdog's 15s critical threshold so we always catch near-hangs.
 static constexpr auto kTraceWaitThresholdMs = std::chrono::milliseconds(500);
 
-// FIX(GR2FORK): EventFlag race-guard window. Protects against the Havok
-// scheduler bug where one thread does:
-//     Worker:       Set(bit)
-//     Coordinator:  Clear(0)  ; wipes the bit
-//     Coordinator:  Wait(bit) ; never wakes — signal lost
-// We track per-bit set timestamps. On Wait entry, if the wait wants a bit
-// that was Set within this window but is no longer present in m_bits, we
-// re-inject it. A wait that successfully consumes a bit (via ClearMode)
-// clears the timestamp so legitimate "wait for NEXT signal" sequences are
-// unaffected.
-#ifndef GR2FORK_EF_RACE_WINDOW_MS
-#define GR2FORK_EF_RACE_WINDOW_MS 20
-#endif
-static constexpr auto kEfRaceGuardWindow =
-    std::chrono::milliseconds(GR2FORK_EF_RACE_WINDOW_MS);
-
-// FIX(GR2FORK): race-guard log throttling. The guard fires thousands of
-// times per long session — every fire previously emitted a LOG_WARNING,
-// which (a) flooded the log file, (b) cost real CPU time in formatting and
-// MPSCQueue enqueue, (c) made it impossible to spot anything else of
-// interest in the log. We now emit a summary periodically instead.
+// FIX(GR2FORK v3.1+): EventFlag race-guard REMOVED.
 //
-// Mechanics:
-//   - Every reinject increments g_ef_race_guard_fires (atomic, lock-free).
-//   - Every kEfRaceGuardLogIntervalMs window we emit ONE summary line:
-//     "[EF race-guard] N reinjects in last 5000ms". The first fire of a
-//     new window also includes the ef= and name= so we can find the
-//     hottest source if needed.
-//   - The very first fire of the entire process is logged in full so a
-//     user knows the guard is active.
-#ifndef GR2FORK_EF_RACE_LOG_INTERVAL_MS
-#define GR2FORK_EF_RACE_LOG_INTERVAL_MS 5000
-#endif
-static constexpr auto kEfRaceGuardLogInterval =
-    std::chrono::milliseconds(GR2FORK_EF_RACE_LOG_INTERVAL_MS);
-
-// Process-wide counters and last-emit timestamp. Atomics so we don't need
-// a global lock. The "first fire ever" flag uses memory_order_acq_rel so
-// the full-detail log only fires once.
-static std::atomic<uint64_t> g_ef_race_guard_fires_total{0};
-static std::atomic<uint64_t> g_ef_race_guard_fires_window{0};
-static std::atomic<int64_t>  g_ef_race_guard_last_log_ns{0};
-static std::atomic<bool>     g_ef_race_guard_first_seen{false};
+// The race-guard tracked per-bit Set timestamps and re-injected any wanted
+// bit on Wait-entry that had been Set within the prior 20ms but was no
+// longer present in m_bits. Targeted at a Havok-scheduler
+// `Set → Clear → Wait` race where the Coordinator's reset was thought to
+// be wiping a fresh worker signal.
+//
+// Why removed: false-positive prone. A legitimate
+// `setup → Clear(all) → start_workers → Wait(done)` sequence in which a
+// worker had Set the "done" bit within the previous 20ms (from an earlier
+// cycle) gets a spurious wakeup on the stale signal — the Coordinator's
+// Clear was intentional, the guard re-injects anyway, Wait returns
+// immediately for what it thinks is the new cycle's completion (actually
+// the previous cycle's residue). Coordinator proceeds, reads from
+// not-yet-updated state, propagates corruption. Symptom fits
+// "cycling-then-self-heal" — tight signal-clear-wait loops trip the false
+// positive, slack moments let the 20ms window expire and self-correct.
+//
+// Removed machinery: kEfRaceGuardWindow / kEfRaceGuardLogInterval, the
+// four g_ef_race_guard_* globals, the m_bit_set_at array, the StampBitsSet
+// / ClearBitsStamps / RaceGuardReinject methods, plus call sites in Wait
+// entry, the consumed-clear path, and Set.
+//
+// If the original Havok race was genuine, this re-introduces it; the
+// expected symptom would be a coordinator thread hanging on a wiped
+// signal — distinct from visual corruption. If hangs appear, the right
+// fix would be a thread-id or generation-counter check, not a wall-clock
+// window.
 
 
 constexpr int ORBIS_KERNEL_EVF_ATTR_TH_FIFO = 0x01;
@@ -98,14 +84,6 @@ public:
         // zero-cost while keeping the slow-path Record threshold logic
         // (kTraceWaitThresholdMs) and dump visibility intact.
         std::unique_lock lock{m_mutex};
-
-        // FIX(GR2FORK): race-guard. If bits this wait wants were Set within
-        // kEfRaceGuardWindow but are no longer present in m_bits (wiped by
-        // a racy Clear between the Set and this Wait), re-inject them.
-        // This targets the Havok scheduler's
-        //   Set(X) → Clear(0) → Wait(X)
-        // pattern where the coordinator's reset wipes a fresh worker signal.
-        (void)RaceGuardReinject(bits);
 
         uint32_t micros = 0;
         bool infinitely = true;
@@ -203,13 +181,9 @@ public:
         }
 
         if (clear_mode == ClearMode::All) {
-            // FIX(GR2FORK): consumed — clear all stamps so a later race-guard
-            // check doesn't incorrectly re-inject a stale signal.
             m_bits = 0;
-            m_bit_set_at.fill({});
         } else if (clear_mode == ClearMode::Bits) {
             m_bits &= ~bits;
-            ClearBitsStamps(bits);
         }
 
         // PERF(GR2FORK release_v2_3): same guard as above on the success
@@ -248,8 +222,6 @@ public:
 
         const u64 before = m_bits;
         m_bits |= bits;
-        // FIX(GR2FORK): stamp bits we just Set for race-guard purposes.
-        StampBitsSet(bits);
         const u32 waiters = static_cast<u32>(m_waiting_threads);
         m_cond_var.notify_all();
 
@@ -318,108 +290,6 @@ private:
     QueueMode m_queue_mode = QueueMode::Fifo;
     u64 m_bits = 0;
 
-    // FIX(GR2FORK): per-bit "last Set time" for race-guard re-injection.
-    // Default-constructed time_point has zero duration since epoch, which
-    // we use as the "never set" sentinel.
-    std::array<std::chrono::steady_clock::time_point, 64> m_bit_set_at{};
-
-    // Called under m_mutex. For each bit in `bits`, stamp now.
-    void StampBitsSet(u64 bits) {
-        const auto now = std::chrono::steady_clock::now();
-        while (bits != 0) {
-            const int i = std::countr_zero(bits);
-            m_bit_set_at[i] = now;
-            bits &= bits - 1;
-        }
-    }
-
-    // Called under m_mutex. For each bit in `bits`, mark "never set" so
-    // subsequent Wait entries will not try to re-inject this bit.
-    void ClearBitsStamps(u64 bits) {
-        while (bits != 0) {
-            const int i = std::countr_zero(bits);
-            m_bit_set_at[i] = {};
-            bits &= bits - 1;
-        }
-    }
-
-    // Called under m_mutex at Wait entry. If the wait wants a bit that was
-    // set recently but is no longer in m_bits (wiped by a racy Clear),
-    // re-inject it. Returns the mask of bits we re-injected.
-    u64 RaceGuardReinject(u64 wants) {
-        if (wants == 0) return 0;
-        const auto now = std::chrono::steady_clock::now();
-        u64 reinject = 0;
-        u64 missing = wants & ~m_bits;
-        while (missing != 0) {
-            const int i = std::countr_zero(missing);
-            const auto& when = m_bit_set_at[i];
-            if (when.time_since_epoch().count() != 0 &&
-                (now - when) < kEfRaceGuardWindow) {
-                reinject |= (1ULL << i);
-            }
-            missing &= missing - 1;
-        }
-        if (reinject != 0) {
-            m_bits |= reinject;
-            ClearBitsStamps(reinject);
-            m_cond_var.notify_all();
-
-            // FIX(GR2FORK): throttled logging. Increment counters; only
-            // emit a log line when the rate-limit window expires, or on
-            // the very first fire of the process so the user knows the
-            // guard is active.
-            const auto fires_total =
-                g_ef_race_guard_fires_total.fetch_add(1, std::memory_order_relaxed) + 1;
-            g_ef_race_guard_fires_window.fetch_add(1, std::memory_order_relaxed);
-
-            // First-fire-ever: full detail.
-            bool expected_first = false;
-            if (g_ef_race_guard_first_seen.compare_exchange_strong(
-                    expected_first, true, std::memory_order_acq_rel)) {
-                LOG_WARNING(Kernel_Event,
-                            "[EF race-guard] active. First reinject: ef={} "
-                            "name=\"{}\" bits={:#x}. Subsequent fires will "
-                            "be summarized every {}ms.",
-                            static_cast<const void*>(this), m_name, reinject,
-                            GR2FORK_EF_RACE_LOG_INTERVAL_MS);
-                g_ef_race_guard_last_log_ns.store(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        now.time_since_epoch()).count(),
-                    std::memory_order_relaxed);
-                return reinject;
-            }
-
-            // Periodic summary. Compare-and-swap on the timestamp ensures
-            // exactly one thread emits per window — others see their CAS
-            // fail and skip the log silently.
-            const auto now_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    now.time_since_epoch()).count();
-            const auto last_ns =
-                g_ef_race_guard_last_log_ns.load(std::memory_order_relaxed);
-            const auto interval_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                kEfRaceGuardLogInterval).count();
-            if (now_ns - last_ns >= interval_ns) {
-                int64_t expected_last = last_ns;
-                if (g_ef_race_guard_last_log_ns.compare_exchange_strong(
-                        expected_last, now_ns, std::memory_order_acq_rel)) {
-                    const auto window_count =
-                        g_ef_race_guard_fires_window.exchange(0, std::memory_order_relaxed);
-                    LOG_WARNING(Kernel_Event,
-                                "[EF race-guard] {} reinjects in last "
-                                "{}ms (total {}). Last: ef={} name=\"{}\" "
-                                "bits={:#x}",
-                                window_count,
-                                GR2FORK_EF_RACE_LOG_INTERVAL_MS,
-                                fires_total,
-                                static_cast<const void*>(this), m_name,
-                                reinject);
-                }
-            }
-        }
-        return reinject;
-    }
 };
 
 using OrbisKernelUseconds = u32;

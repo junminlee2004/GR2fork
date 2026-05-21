@@ -1126,6 +1126,163 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
 
+    // GR2FORK Fix A v7: SPIR-V-level patcher for the grass leader-write idiom.
+    //
+    // GR2's grass compute shaders (cs_0xc282b105 = gating CS, cs_0x3f0a3c48 =
+    // per-patch gen) end with a post-barrier "leader-write" pattern, where
+    // GCN does S_NOT_B64 s[106:107], s[0:1] then S_AND_SAVEEXEC_B64
+    // s[106:107], s[106:107]. shadPS4's IR translation produces
+    // OpLogicalAnd(GetExec, OpLogicalNot(GetThreadBitScalarReg(s106))), but
+    // both operands end up resolving to the SAME OpUndef bool (FlagTag SSA
+    // variables that were never written before the leader-write block).
+    // The resulting SPIR-V structure is OpLogicalAnd(%U, OpLogicalNot(%U)) -
+    // which is provably ALWAYS FALSE regardless of what %U is, so the
+    // leader-write block becomes unreachable and grass vertexCount stays 0.
+    //
+    // The fix here cannot change what %U resolves to (substitution doesn't
+    // help because both operands are the same %U). Instead, it REDIRECTS
+    // the consuming OpBranchConditional to use a different predicate that
+    // already exists in the shader: the entry-block's `lane == 0` check
+    // (OpLogicalNot(OpINotEqual(0, gl_LocalInvocationID.x))). This makes
+    // lane 0 write the result (matching the GCN's intent), and no other
+    // lanes race against it.
+    //
+    // History: an earlier attempt (Fix A v5/v6) tried to fix this at the
+    // SSA-rewrite level by substituting (scalar >> LaneId) & 1 for the
+    // UndefU1. That correctly removed the OpUndef bool from the output,
+    // but the LogicalAnd structure remained, and `chain AND NOT chain`
+    // is still always false. Reverted to this SPIR-V-level approach.
+    {
+        const u64 h = info.pgm_hash;
+        const bool is_grass_cs = (h == 0xc282b105ULL) ||
+                                 (h == 0x3f0a3c48ULL) ||
+                                 (h == 0x83048c53ULL);
+        if (is_grass_cs) [[unlikely]] {
+            const auto try_patch = [&](std::vector<u32>& code) -> bool {
+                if (code.size() < 5) return false;
+                // SPIR-V opcodes we care about
+                constexpr u32 kOpUndef = 1;
+                constexpr u32 kOpTypeBool = 20;
+                constexpr u32 kOpCompositeExtract = 81;
+                constexpr u32 kOpINotEqual = 171;
+                constexpr u32 kOpLogicalNot = 168;
+                constexpr u32 kOpLogicalAnd = 167;
+                constexpr u32 kOpBranchConditional = 250;
+
+                u32 bool_type_id = 0;
+                u32 undef_bool_id = 0;
+                u32 last_composite_extract_with_zero_idx = 0;
+                u32 lane_inotequal_id = 0;  // INotEqual involving the extract
+                u32 lane_eq_zero_id = 0;    // LogicalNot of the INotEqual
+                u32 lognot_undef_id = 0;
+                u32 logand_buggy_id = 0;
+                size_t branch_cond_word_pos = 0;
+
+                size_t i = 5;  // skip header
+                while (i < code.size()) {
+                    const u32 word = code[i];
+                    const u32 word_count = word >> 16;
+                    const u32 opcode = word & 0xFFFF;
+                    if (word_count == 0 || i + word_count > code.size()) break;
+
+                    switch (opcode) {
+                    case kOpTypeBool:
+                        if (word_count >= 2 && bool_type_id == 0) {
+                            bool_type_id = code[i + 1];
+                        }
+                        break;
+                    case kOpUndef:
+                        // word[1]=result_type, word[2]=result_id
+                        if (word_count >= 3 && undef_bool_id == 0 &&
+                            code[i + 1] == bool_type_id) {
+                            undef_bool_id = code[i + 2];
+                        }
+                        break;
+                    case kOpCompositeExtract:
+                        // word[1]=result_type, word[2]=result_id, word[3]=composite,
+                        // word[4..]=indices. We want the first one extracting index 0.
+                        // This will be the gl_LocalInvocationID.x extraction.
+                        if (word_count >= 5 && code[i + 4] == 0 &&
+                            last_composite_extract_with_zero_idx == 0) {
+                            last_composite_extract_with_zero_idx = code[i + 2];
+                        }
+                        break;
+                    case kOpINotEqual:
+                        // word[1]=result_type, word[2]=result_id, word[3]=op1, word[4]=op2.
+                        // Match any INotEqual where one operand is our extract result -
+                        // SPIR-V type rules guarantee the other is the corresponding
+                        // u32_zero constant we don't need to identify separately.
+                        if (word_count >= 5 && lane_inotequal_id == 0 &&
+                            last_composite_extract_with_zero_idx != 0 &&
+                            (code[i + 3] == last_composite_extract_with_zero_idx ||
+                             code[i + 4] == last_composite_extract_with_zero_idx)) {
+                            lane_inotequal_id = code[i + 2];
+                        }
+                        break;
+                    case kOpLogicalNot:
+                        // word[1]=result_type, word[2]=result_id, word[3]=operand
+                        if (word_count >= 4) {
+                            if (lane_eq_zero_id == 0 && lane_inotequal_id != 0 &&
+                                code[i + 3] == lane_inotequal_id) {
+                                lane_eq_zero_id = code[i + 2];
+                            }
+                            if (lognot_undef_id == 0 && undef_bool_id != 0 &&
+                                code[i + 3] == undef_bool_id) {
+                                lognot_undef_id = code[i + 2];
+                            }
+                        }
+                        break;
+                    case kOpLogicalAnd:
+                        if (word_count >= 5 && logand_buggy_id == 0 &&
+                            undef_bool_id != 0 && lognot_undef_id != 0) {
+                            const bool buggy_a = (code[i + 3] == undef_bool_id &&
+                                                  code[i + 4] == lognot_undef_id);
+                            const bool buggy_b = (code[i + 4] == undef_bool_id &&
+                                                  code[i + 3] == lognot_undef_id);
+                            if (buggy_a || buggy_b) {
+                                logand_buggy_id = code[i + 2];
+                            }
+                        }
+                        break;
+                    case kOpBranchConditional:
+                        // word[1]=cond, word[2]=true_label, word[3]=false_label
+                        if (word_count >= 4 && logand_buggy_id != 0 &&
+                            code[i + 1] == logand_buggy_id &&
+                            branch_cond_word_pos == 0) {
+                            branch_cond_word_pos = i + 1;
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                    i += word_count;
+                }
+
+                if (lane_eq_zero_id == 0 || branch_cond_word_pos == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "[GR2FORK Fix A v7] cs={:#x}: pattern not found "
+                                "(bool_type={} undef_bool={} extract={} "
+                                "inotequal={} lane_eq_zero={} lognot_undef={} "
+                                "logand_buggy={} branch_pos={})",
+                                h, bool_type_id, undef_bool_id,
+                                last_composite_extract_with_zero_idx,
+                                lane_inotequal_id, lane_eq_zero_id,
+                                lognot_undef_id, logand_buggy_id,
+                                branch_cond_word_pos);
+                    return false;
+                }
+                code[branch_cond_word_pos] = lane_eq_zero_id;
+                LOG_INFO(Render_Vulkan,
+                         "[GR2FORK Fix A v7] cs={:#x}: patched OpBranchConditional "
+                         "cond from %{} (LogicalAnd(undef, NOT undef)) to %{} "
+                         "(lane == 0)",
+                         h, logand_buggy_id, lane_eq_zero_id);
+                return true;
+            };
+            try_patch(spv);
+        }
+    }
+
     vk::ShaderModule module;
 
     auto patch = GetShaderPatch(info.pgm_hash, info.stage, perm_idx, "spv");

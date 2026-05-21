@@ -5,6 +5,7 @@
 #include "common/config.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/videoout/driver.h"
@@ -22,11 +23,19 @@ static std::unique_ptr<VideoOutDriver> driver;
 void PS4_SYSV_ABI sceVideoOutSetBufferAttribute(BufferAttribute* attribute, PixelFormat pixelFormat,
                                                 u32 tilingMode, u32 aspectRatio, u32 width,
                                                 u32 height, u32 pitchInPixel) {
+    // GR2-RE: log the caller VA so we can find the hardcoded 1920×1080 source.
+    // Subtract g_eboot_address to recover the eboot file VA (i.e., the offset
+    // that resolution_patches uses for patches).
+    void* ra = __builtin_return_address(0);
+    const std::uintptr_t ra_u = reinterpret_cast<std::uintptr_t>(ra);
+    const std::uintptr_t eboot_base = MemoryPatcher::g_eboot_address;
+    const std::int64_t ra_va =
+        (eboot_base != 0) ? static_cast<std::int64_t>(ra_u - eboot_base) : -1;
     LOG_INFO(Lib_VideoOut,
              "pixelFormat = {}, tilingMode = {}, aspectRatio = {}, width = {}, height = {}, "
-             "pitchInPixel = {}",
+             "pitchInPixel = {}  [caller_ra=0x{:x} eboot_va=0x{:x}]",
              GetPixelFormatString(pixelFormat), tilingMode, aspectRatio, width, height,
-             pitchInPixel);
+             pitchInPixel, ra_u, ra_va);
 
     std::memset(attribute, 0, sizeof(BufferAttribute));
     attribute->pixel_format = static_cast<PixelFormat>(pixelFormat);

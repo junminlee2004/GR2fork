@@ -281,7 +281,20 @@ struct fmt::formatter<Shader::Stage> {
         return ctx.begin();
     }
     auto format(const Shader::Stage stage, format_context& ctx) const {
+        // FIX(GR2FORK v3.2): bounds-check the names lookup. Previously
+        // `names[static_cast<size_t>(stage)]` would read out of bounds for
+        // any Stage value not in [0..6], and on Linux the resulting
+        // garbage pointer was occasionally null, which fmt rejects with
+        // `format_error: string pointer is null` — terminating the
+        // process. Symptom seen: crash on movie playback init
+        // (ep03_00200m) when a shader being compiled has a stage value
+        // outside the valid Stage enum range. Print the raw index in
+        // that case so the upstream source can be traced.
         constexpr static std::array names = {"fs", "vs", "gs", "es", "hs", "ls", "cs"};
-        return fmt::format_to(ctx.out(), "{}", names[static_cast<size_t>(stage)]);
+        const auto idx = static_cast<size_t>(stage);
+        if (idx < names.size()) {
+            return fmt::format_to(ctx.out(), "{}", names[idx]);
+        }
+        return fmt::format_to(ctx.out(), "??stage={}", idx);
     }
 };

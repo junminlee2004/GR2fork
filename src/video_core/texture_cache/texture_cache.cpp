@@ -445,7 +445,20 @@ bool TextureCache::ForceDownloadByAddress(VAddr address, u64 size) {
         .commandBufferCount = 1,
         .pCommandBuffers    = &photo_cmd_buf_,
     };
-    auto submit_result = queue.submit(submit_info, photo_fence_);
+    // FIX(GR2FORK queue-race): vkQueueSubmit requires external sync
+    // per VkQueue (Vulkan spec §3.6.3). The photo-capture path runs
+    // on a different thread from Scheduler::SubmitExecution and
+    // submits to the same graphics queue handle, producing
+    //   UNASSIGNED-Threading-MultipleThreads-Write
+    // hits in the validation layer. We share Scheduler::submit_mutex
+    // (already held by graphics, compute, and the swapchain Present
+    // fix). The lock is released before waitForFences so we do not
+    // block other queue operations during the fence wait.
+    vk::Result submit_result;
+    {
+        std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
+        submit_result = queue.submit(submit_info, photo_fence_);
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost,
                "[GR2Photo] Device lost during photo download submit");
     const auto wait_result = device.waitForFences(photo_fence_, VK_TRUE, UINT64_MAX);

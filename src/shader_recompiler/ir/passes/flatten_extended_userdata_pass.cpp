@@ -243,6 +243,20 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     Shader::Info& info = program.info;
     PassInfo pass_info;
 
+    // [GR2FORK angular-cull-diag] Per-shader counters for ReadConst processing.
+    // When directMemoryAccess=false (gr2fork standing constraint), EmitReadConst
+    // at backend/spirv/emit_spirv_context_get_set.cpp:61 IGNORES the runtime
+    // addr/offset arguments and only uses the immediate flatbuf_off_dw stored
+    // in the IR instruction's flags. That flag is populated below in
+    // VisitPointer's SetFlags<u32> calls — but ONLY for ReadConsts whose offset
+    // argument is an immediate constant. Non-immediate (dynamic) offsets hit
+    // the `continue` below, never get a flat_off_dw assigned, and stay at the
+    // default value 0 — so every dynamic lookup in the emitted shader loads
+    // flatbuffer dword 0. Strong candidate for the GR2 angular-cull symptom
+    // (grass/umbrellas/NPCs vanishing).
+    u32 readconst_total = 0;       // every ReadConst opcode encountered
+    u32 readconst_dynamic = 0;     // skipped because Arg(1) is non-immediate
+
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source
     boost::container::small_vector<IR::Inst*, 32> all_readconsts;
@@ -252,7 +266,9 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
         IR::Block* block = *r_it;
         for (IR::Inst& inst : *block) {
             if (inst.GetOpcode() == IR::Opcode::ReadConst) {
+                ++readconst_total;
                 if (!inst.Arg(1).IsImmediate()) {
+                    ++readconst_dynamic;
                     LOG_WARNING(Render_Recompiler, "ReadConst has non-immediate offset");
                     continue;
                 }
@@ -303,6 +319,21 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     }
 
     info.RefreshFlatBuf();
+
+    // [GR2FORK angular-cull-diag] Emit per-shader summary if any dynamic-offset
+    // ReadConsts were dropped. Logged once per shader at INFO level so it's
+    // visible in default builds (LOG_WARNING is per-instance and floods).
+    // Cross-reference the hash against the grass-args compute shaders
+    // (cs_0xc282b105, cs_0x3f0a3c48) and the affected VS programs from the
+    // v1-v5 diag dumps to confirm or reject the DMA-off hypothesis.
+    if (readconst_dynamic > 0) {
+        LOG_INFO(Render_Recompiler,
+                 "[GR2FORK angular-cull-diag] stage={} pgm_hash={:#x} "
+                 "readconst_total={} readconst_dynamic_dropped={} "
+                 "(dynamic offsets ignored by EmitReadConst under directMemoryAccess=false; "
+                 "those loads return flatbuffer dword 0)",
+                 info.stage, info.pgm_hash, readconst_total, readconst_dynamic);
+    }
 }
 
 } // namespace Shader::Optimization

@@ -5,9 +5,70 @@
 #include "core/libraries/avplayer/avplayer.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_impl.h"
+#include <mutex>
 #include "core/libraries/libs.h"
+#include "video_core/buffer_cache/stream_cache_epoch.h"
 
 namespace Libraries::AvPlayer {
+
+// FIX(GR2FORK v3.3): tutorial-priority serialization ("tutorial wins").
+//
+// In GR2 the tutorial info videos are uniquely 768×416 buffer-dim (native
+// 720×404 padded to pitch). When a tutorial video joins the AvPlayer mix
+// alongside any other concurrent stream (HUD overlay backdrop), shadPS4's
+// gpucomm + gpuassembler architecture cannot maintain bind-state isolation
+// between the two streams' draws within the same cmdbuf — produces green
+// chroma banding visible on both, instantly resolving the moment one
+// stream stops producing frames.
+//
+// Mechanism: on every successful GetVideoData, check if the frame
+// dimensions match the tutorial signature. If yes and no other handle is
+// currently the active tutorial, claim tutorial status. While any handle
+// is the active tutorial, suppress GetVideoData for all OTHER handles
+// (they return ret=0, which the game treats as normal decoder lag —
+// typically displays the last decoded frame frozen). When the tutorial
+// stops/closes, clear the designation and multi-stream play resumes.
+//
+// Other concurrent-stream scenarios (cutscene + HUD overlay) are left as
+// multi-stream and rely on the stream-cache epoch (below) to keep
+// buffer_cache coherent across the in-place UBO writes.
+namespace {
+
+constexpr u32 kTutorialWidth = 768;
+constexpr u32 kTutorialHeight = 416;
+
+std::mutex g_tutorial_mutex;
+AvPlayerHandle g_tutorial_handle = nullptr;
+
+bool IsTutorialDims(u32 w, u32 h) noexcept {
+    return w == kTutorialWidth && h == kTutorialHeight;
+}
+
+bool ShouldSuppress(AvPlayerHandle h) noexcept {
+    std::scoped_lock lock{g_tutorial_mutex};
+    return g_tutorial_handle != nullptr && g_tutorial_handle != h;
+}
+
+bool ObserveFrameAndDecide(AvPlayerHandle h, u32 w, u32 height) noexcept {
+    std::scoped_lock lock{g_tutorial_mutex};
+    if (g_tutorial_handle != nullptr && g_tutorial_handle != h) {
+        return false;
+    }
+    if (g_tutorial_handle == nullptr && IsTutorialDims(w, height)) {
+        g_tutorial_handle = h;
+    }
+    return true;
+}
+
+void ClearTutorialIfHandle(AvPlayerHandle h) noexcept {
+    std::scoped_lock lock{g_tutorial_mutex};
+    if (g_tutorial_handle == h) {
+        g_tutorial_handle = nullptr;
+    }
+}
+
+}  // anonymous namespace
+
 
 s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filename) {
     LOG_TRACE(Lib_AvPlayer, "filename = {}", filename);
@@ -37,6 +98,7 @@ s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    ClearTutorialIfHandle(handle);  // FIX(GR2FORK v3.3): tutorial-wins
     delete handle;
     return ORBIS_OK;
 }
@@ -87,7 +149,37 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoData(AvPlayerHandle handle, AvPlayerFrameIn
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    return handle->GetVideoData(*video_info);
+    // FIX(GR2FORK v3.3): tutorial-wins — early suppression.
+    if (ShouldSuppress(handle)) {
+        return false;
+    }
+    const bool got = handle->GetVideoData(*video_info);
+    if (got) {
+        // FIX(GR2FORK v3.3): observe-and-decide. Race protection if
+        // tutorial designated on another handle between early-out and now.
+        if (!ObserveFrameAndDecide(handle, video_info->details.video.width,
+                                   video_info->details.video.height)) {
+            return false;
+        }
+        // FIX(GR2FORK v3.3): bump buffer_cache stream-cache epoch only
+        // on tutorial-sized frames. The within-frame in-place UBO update
+        // pattern that Path D mishandles is specific to the tutorial
+        // scenario where the game switches between backdrop and tutorial
+        // UBOs (same VAddr, same tick, different content) during the
+        // brief init window before tutorial-wins suppression kicks in.
+        // Gating the bump on tutorial dimensions means in-game TV scenes
+        // (Jirga Para Lhao etc.), which have many concurrent AvPlayer
+        // instances but no within-frame UBO collisions, retain full
+        // Path D performance — they don't cause cache thrashing.
+        // Cutscenes outside the tutorial path stay on natural per-tick
+        // Path D behavior; if they ever exhibit cycling we'd address
+        // by extending the predicate, not by flooding the epoch.
+        if (IsTutorialDims(video_info->details.video.width,
+                           video_info->details.video.height)) {
+            VideoCore::BumpStreamCacheEpoch();
+        }
+    }
+    return got;
 }
 
 bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
@@ -96,7 +188,23 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    return handle->GetVideoData(*video_info);
+    // FIX(GR2FORK v3.3): tutorial-wins — early suppression.
+    if (ShouldSuppress(handle)) {
+        return false;
+    }
+    const bool got = handle->GetVideoData(*video_info);
+    if (got) {
+        // FIX(GR2FORK v3.3): see GetVideoData above.
+        if (!ObserveFrameAndDecide(handle, video_info->details.video.width,
+                                   video_info->details.video.height)) {
+            return false;
+        }
+        if (IsTutorialDims(video_info->details.video.width,
+                           video_info->details.video.height)) {
+            VideoCore::BumpStreamCacheEpoch();
+        }
+    }
+    return got;
 }
 
 AvPlayerHandle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
@@ -232,6 +340,7 @@ s32 PS4_SYSV_ABI sceAvPlayerStop(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    ClearTutorialIfHandle(handle);  // FIX(GR2FORK v3.3): tutorial-wins
     return handle->Stop();
 }
 

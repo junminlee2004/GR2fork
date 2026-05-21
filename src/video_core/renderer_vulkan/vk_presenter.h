@@ -100,6 +100,26 @@ public:
     /// a device-lost at vk_presenter.cpp:770 during newspaper comic cutscenes
     /// because Stop() lands while the GPU still has in-flight draws sampling
     /// the decoded NV12 frame.
+    ///
+    /// NOTE(GR2FORK queue-race): the Khronos validation layer flags this as
+    /// UNASSIGNED-Threading-MultipleThreads-Write because vkDeviceWaitIdle
+    /// is equivalent to vkQueueWaitIdle on every queue (Vulkan §3.6.3) and
+    /// AvPlayerSource::Stop runs on a guest thread that doesn't hold
+    /// Scheduler::submit_mutex. Two race-free alternatives were tried and
+    /// both regressed performance:
+    ///   v1: wrap waitIdle in Scheduler::submit_mutex — held the lock for
+    ///       the full drain, stalling the renderer at every AvPlayer Stop.
+    ///       GR2 cycles Stop rapidly during comic panels, producing
+    ///       visible per-transition stutter.
+    ///   v2: snapshot scheduler ticks under brief lock, then wait via
+    ///       timeline semaphores (vkWaitSemaphores — device op, not queue
+    ///       op). Eliminated per-transition stutter but degraded overall
+    ///       steady-state performance, likely because Stop() fires often
+    ///       enough that the per-call drain cost accumulates.
+    /// On RADV/Mesa with the Z1 Extreme this race does not produce real
+    /// driver corruption (no DEVICE_LOST observed across thousands of
+    /// validation-on intents). Accept the per-spec race in exchange for
+    /// the perf baseline.
     void WaitIdle() {
         (void)instance.GetDevice().waitIdle();
     }

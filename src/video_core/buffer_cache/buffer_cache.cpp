@@ -10,6 +10,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/stream_cache_epoch.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 // Phase 1D-pre-F: needs full Rasterizer type for PushPresenterRecord template
 // instantiation in BufferCache::ReadMemory.
@@ -20,6 +21,13 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace VideoCore {
+
+// Stream-cache invalidation epoch. Declared in stream_cache_epoch.h.
+// Bumped by external producers of in-place UBO updates (notably
+// libSceAvPlayer's GetVideoData entries). Read on every stream-cache
+// hit. See header comment for full mechanics.
+std::atomic<u32> g_stream_cache_epoch{0};
+
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
@@ -88,13 +96,64 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     const u64 page = device_addr >> CACHING_PAGEBITS;
-    const BufferId buffer_id = page_table[page].buffer_id;
+
+    // GR2FORK v3.0 FIX (read AV in MultiLevelPageTable<BufferCache::Traits>
+    // ::operator[] line 63, _Myfirst was 0x1110A130036120A):
+    //
+    // This function is the synchronous landing pad for guest read-faults
+    // (PageManager::GuestFaultSignalHandler -> Rasterizer::ReadMemory) AND
+    // for the on_flush callback of guest write-faults (BufferCache::
+    // InvalidateMemory -> MemoryTracker::InvalidateRegion -> ReadMemory).
+    // Either way it runs inside a Windows VEH / POSIX signal handler on
+    // whatever thread took the AV, with PageManager's handler registered
+    // at priority=0 (called BEFORE cpu_patches' priority=UINT32_MAX one).
+    //
+    // The previous body did
+    //     const BufferId buffer_id = page_table[page].buffer_id;
+    // and then never used the local — a dead read that nevertheless paid
+    // MultiLevelPageTable::operator[]'s side effect: a non-allocating L1
+    // hit followed by `if (!_Myfirst[l1_page]) ...` against the L1
+    // vector's header. The reported _Myfirst value (0x1110A130036120A) is
+    // non-canonical AND not 8-aligned, so it cannot be the result of any
+    // `_Myfirst + l1_page*8` arithmetic — the vector header itself is
+    // bad at the moment of access. Whatever produces that (heap overrun
+    // into BufferCache's tail, a stale rasterizer ptr reaching a re-used
+    // heap region, an ObjectPool reentry across threads racing through
+    // operator[]), we cannot SAFELY probe page_table from this thread:
+    // both operator[] AND find() dereference _Myfirst on line 1 of their
+    // bodies, so a defensive find() probe here would crash identically.
+    //
+    // The right answer is to not touch page_table from the signal-handler
+    // entry AT ALL. The SendCommand<true> lambda below already issues its
+    // own FindBuffer(device_addr, size) when it runs on the assembler
+    // thread — that's the correct context for any page_table interaction
+    // (it owns the rendering serialization, and a transient header
+    // inconsistency in this window will have cleared by the time the
+    // closure dequeues). We just gate the entry with stack-only checks.
+
+    // Guard A: page index inside the 40-bit guest address space.
+    // CACHING_NUMPAGES == 1 << 26. IsMapped should already filter this,
+    // but its TLS cache + interval lookup is non-trivial, so a stack-
+    // local bound on the raw addr is cheap insurance.
+    if (page >= CACHING_NUMPAGES) [[unlikely]] {
+        return;
+    }
+
+    // Guard B: rasterizer_ back-ref must be set before we hand work to
+    // PushPresenterRecord/WaitForAssembler. Set by Rasterizer's ctor body
+    // AFTER buffer_cache + bundle_assembler_ are alive; null during the
+    // window between PageManager construction (which registers the
+    // signal handler at the top of its ctor) and SetRasterizer(). A
+    // fault in that gap would null-deref through the lambda.
+    if (rasterizer_ == nullptr) [[unlikely]] {
+        return;
+    }
 
     // --- RYZEN 7840U / Z1 EXTREME OPTIMIZATION ---
     // Gravity Rush 2 Physics Hack
     // Forces small physics buffers (Havok data) to sync asynchronously.
     // This eliminates the heavy stuttering during gravity shifts and combat.
-    bool likely_physics_stall = (size > 1024 && size < 24576);
+    const bool likely_physics_stall = (size > 1024 && size < 24576);
     // ---------------------------------------------
 
     // Phase 1D-pre-F: the SendCommand<true> outer lambda runs on `gpu_id`
@@ -677,23 +736,36 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         // log_if_due lambda firing every 200K calls. Strip before
         // shipping.
         // ----------------------------------------------------------------
+        // Path D + epoch entry layout. Adds 4 bytes for the stream-cache
+        // epoch captured at insert time, plus 4 bytes padding to keep the
+        // entry naturally aligned. On hit we compare entry.epoch against
+        // the current g_stream_cache_epoch; mismatch forces re-Copy.
+        // This restores Path D's correctness for in-place UBO updates
+        // (notably video compositor UBOs) while keeping Path D's perf
+        // for the dominant rolling-allocator gameplay traffic.
         struct StreamCopyCacheEntry {
             VAddr addr;                // 8 bytes (0 = invalid sentinel)
             u64 tick;                  // 8 bytes
             vk::CommandBuffer cmdbuf;  // 8 bytes (single VkCommandBuffer pointer)
             u32 offset;                // 4 bytes (UboStreamBufferSize=64MB fits in u32)
             u32 size;                  // 4 bytes
+            u32 epoch;                 // 4 bytes (stream-cache epoch at insert)
+            u32 _pad;                  // 4 bytes alignment padding
         };
-        static_assert(sizeof(StreamCopyCacheEntry) == 32,
-                      "StreamCopyCacheEntry must be 32 bytes (two per cache line)");
+        static_assert(sizeof(StreamCopyCacheEntry) == 40,
+                      "StreamCopyCacheEntry must be 40 bytes (Path D + epoch layout)");
 
         constexpr size_t kStreamCacheSets = 4096;
         constexpr size_t kStreamCacheWays = 2;
         struct alignas(64) StreamCopyCacheSet {
             StreamCopyCacheEntry ways[kStreamCacheWays];
         };
-        static_assert(sizeof(StreamCopyCacheSet) == 64,
-                      "StreamCopyCacheSet must occupy exactly one cache line");
+        // 2 × 40 = 80 bytes, padded to 128 by alignas(64). Each set
+        // occupies 2 cache lines. Cache footprint: 4096 × 128 = 512 KB
+        // per thread (was 256 KB pre-epoch). Fits comfortably in
+        // Z1 Extreme's 1 MB L2 per core.
+        static_assert(sizeof(StreamCopyCacheSet) == 128,
+                      "StreamCopyCacheSet must be 128 bytes (Path D + epoch layout)");
 
         struct StreamCopyCache {
             std::array<StreamCopyCacheSet, kStreamCacheSets> sets{};
@@ -717,6 +789,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 
         const auto cmdbuf = scheduler.PrimaryCommandBuffer();
         const u64 tick = scheduler.CurrentTick();
+        // Path D-epoch: load the current stream-cache epoch once. Relaxed
+        // is sufficient — we need a value that's eventually consistent
+        // with bumpers on other threads, no synchronization with other
+        // state. On x86 this lowers to a plain mov.
+        const u32 cur_epoch =
+            g_stream_cache_epoch.load(std::memory_order_relaxed);
 
         // splittable64-style mix (from v1.32 Fix 1). `size * 0x9e37…`
         // folds size into all 64 bits before XORing into addr, so
@@ -739,10 +817,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         // device_addr ≠ 0 implies a populated entry).
         StreamCopyCacheEntry* hit = nullptr;
         if (set.ways[0].addr == device_addr && set.ways[0].size == size &&
-            set.ways[0].cmdbuf == cmdbuf && set.ways[0].tick == tick) [[likely]] {
+            set.ways[0].cmdbuf == cmdbuf && set.ways[0].tick == tick &&
+            set.ways[0].epoch == cur_epoch) [[likely]] {
             hit = &set.ways[0];
         } else if (set.ways[1].addr == device_addr && set.ways[1].size == size &&
-                   set.ways[1].cmdbuf == cmdbuf && set.ways[1].tick == tick) {
+                   set.ways[1].cmdbuf == cmdbuf && set.ways[1].tick == tick &&
+                   set.ways[1].epoch == cur_epoch) {
             hit = &set.ways[1];
         }
 
@@ -760,6 +840,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             // the v1.35 hit_dirty path preserved verbatim.
             const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
             hit->offset = static_cast<u32>(offset);
+            hit->epoch = cur_epoch;  // Path D-epoch: refresh on re-Copy.
             return {&stream_buffer, offset};
         }
 
@@ -776,6 +857,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         victim.cmdbuf = cmdbuf;
         victim.offset = static_cast<u32>(offset);
         victim.size = size;
+        victim.epoch = cur_epoch;  // Path D-epoch: stamp at insert time.
         cache.lru[set_idx] = static_cast<u8>(victim_way ^ 1u);
 
         // PERF(GR2FORK v1.32 Fix 2 → REVERTED in v1.34, see path-D notes

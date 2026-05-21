@@ -19,6 +19,7 @@
 #include <array>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -1454,6 +1455,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (desc.is_written && desc.is_formatted) [[unlikely]] {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
             }
+
         }
 
         const u32 dst_binding = binding.unified++;
