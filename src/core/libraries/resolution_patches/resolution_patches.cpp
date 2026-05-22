@@ -128,6 +128,19 @@ enum class Group : std::uint8_t {
          // the imm32 bytes to encode the scaled value. At 1080p+ the
          // patch is idempotent (multiplier clamped to 1.0). EXCLUDED
          // from `recommended` — opt in to test.
+    // ── v15 group (formerly L1) EXCISED — slot RESERVED ─────────────
+    // CRITICAL: GroupBit(g) == (1u << ordinal(g)), and that ordinal MUST
+    // stay equal to the explicit shift in PatchGroupBit (resolution_patches.h).
+    // PatchGroupBit deliberately keeps bit 24 vacant (K1 = 1<<23, M1 = 1<<25)
+    // to preserve stable, persistable bitmask values across the removal of the
+    // old v15 render-pass-option group. If this enum simply skipped from K1 to
+    // M1, every group from M1 onward would shift down one bit and silently
+    // desync from PatchGroupBit / kGroupMaskAll / kGroupMaskRecommended — which
+    // is exactly the bug that forced M1's 4K-flag patches on via the orphaned
+    // always-set bit 24 and crashed 4K in the shader recompiler. Keep this
+    // placeholder so ordinal(M1) == 25. It has no patch sites, so it never
+    // applies, indexes a counter slot, or prints in the per-group log.
+    L1_reserved,
     // ── v17 addition ────────────────────────────────────────────────
     M1,  // PS4-Pro 4K-mode master enable. Four byte-level patches +
          // a one-time BSS write that flip the game from FLAG=0
@@ -1336,6 +1349,7 @@ const char* GroupName(Group g) {
     case Group::I4: return "I4";
     case Group::J1: return "J1";
     case Group::K1: return "K1";
+    case Group::L1_reserved: return "L1(reserved)";
     case Group::M1: return "M1";
     case Group::N1: return "N1";
     case Group::O1: return "O1";
