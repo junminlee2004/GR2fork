@@ -1498,18 +1498,16 @@ std::uint32_t ParseGroupMaskFromConfig(std::string_view raw,
 // uses this augmented mask as the baseline for the "recommended" preset,
 // then applies user negations on top.
 constexpr std::uint32_t kTextScalingExtras_AboveDesign =
-      static_cast<std::uint32_t>(PatchGroupBit::C2)
-    | static_cast<std::uint32_t>(PatchGroupBit::C3)
-    | static_cast<std::uint32_t>(PatchGroupBit::I1)
+    // C2/C3 intentionally excluded from recommended entirely (per request).
+      static_cast<std::uint32_t>(PatchGroupBit::I1)
     | static_cast<std::uint32_t>(PatchGroupBit::I2)
     | static_cast<std::uint32_t>(PatchGroupBit::I3)
     | static_cast<std::uint32_t>(PatchGroupBit::I4)
     | static_cast<std::uint32_t>(PatchGroupBit::E1);
 
 constexpr std::uint32_t kTextScalingExtras_BelowDesign =
-      static_cast<std::uint32_t>(PatchGroupBit::C2)
-    | static_cast<std::uint32_t>(PatchGroupBit::C3)
-    | static_cast<std::uint32_t>(PatchGroupBit::I1)
+    // C2/C3 intentionally excluded from recommended entirely (per request).
+      static_cast<std::uint32_t>(PatchGroupBit::I1)
     | static_cast<std::uint32_t>(PatchGroupBit::I2)
     | static_cast<std::uint32_t>(PatchGroupBit::I3)
     | static_cast<std::uint32_t>(PatchGroupBit::I4);

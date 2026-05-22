@@ -603,8 +603,10 @@ inline constexpr std::uint32_t kGroupMaskAll = 0x7FFFFFFFu;  // bits 0..30
 //                 540p → 0.5 (quarter of 1080p's 2.0).
 inline constexpr std::uint32_t kGroupMaskRecommended =
     kGroupMaskAll
+    & ~static_cast<std::uint32_t>(PatchGroupBit::C1)
     & ~static_cast<std::uint32_t>(PatchGroupBit::C2)
     & ~static_cast<std::uint32_t>(PatchGroupBit::C3)
+    & ~static_cast<std::uint32_t>(PatchGroupBit::P1)
     & ~static_cast<std::uint32_t>(PatchGroupBit::E1)
     & ~static_cast<std::uint32_t>(PatchGroupBit::G1)
     & ~static_cast<std::uint32_t>(PatchGroupBit::I1)
