@@ -37,6 +37,11 @@ class TextureCache;
 class MemoryTracker;
 class PageManager;
 
+// GR2FORK fix: holds the resolved vertex-input descriptors cached across cmdbuf
+// rotations. Defined in buffer_cache.cpp so this header need not pull in the
+// heavy vk_graphics_pipeline.h (VertexInputs / vk vertex-input types).
+struct VbbResolveCache;
+
 class BufferCache {
 public:
     static constexpr u32 CACHING_PAGEBITS = 14;
@@ -254,8 +259,36 @@ private:
     // context regs in the stamp; buffer sharps are SH regs in the stamp).
     // Returning here saves ~0.76% of GpuComm time spent in
     // GetVertexInputs + dual hash loops.
+    // GR2FORK: BindVertexBuffers dispatches to one of these based on
+    // Config::accurateVertexBufferCacheEnabled() (force-enabled for Gravity Rush
+    // Remastered in emulator.cpp). Fixed = cmdbuf-rotation-aware + resolve-cache
+    // path; Legacy = verbatim upstream behavior (no tick guard, no resolve cache).
+    void BindVertexBuffersFixed(const Vulkan::GraphicsPipeline& pipeline,
+                                const AmdGpu::LiverpoolRegsSnapshot& regs);
+    void BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeline,
+                                 const AmdGpu::LiverpoolRegsSnapshot& regs);
+
     const Vulkan::GraphicsPipeline* last_vbb_pipeline_{};
     u64 last_vbb_stamp_{};
+
+    // GR2FORK fix (cmdbuf-rotation correctness + perf): setVertexInputEXT +
+    // bindVertexBuffers are per-PRIMARY-cmdbuf dynamic state, but every skip
+    // above keys on pipeline/stamp/bind_sig/input_sig which all persist across
+    // cmdbuf rotations. Without a cmdbuf-aware guard the FIRST bind of a freshly
+    // rotated cmdbuf was skipped -> undefined vertex-input state -> black mesh
+    // (correct silhouette), intermittent.
+    //   - last_vbb_tick_ records the primary-cmdbuf tick of the last emit so the
+    //     skips become cmdbuf-aware (CurrentTick advances on every rotation, the
+    //     same signal the index-buffer skip uses).
+    //   - vbb_resolve_ caches the resolved descriptors (attributes/bindings/guest
+    //     buffers). They depend ONLY on the pipeline (immutable fetch_shader) and
+    //     stamp-tracked regs, so on a rotation with unchanged pipeline+stamp we
+    //     reuse them and skip the GetVertexInputs walk + dual hash loops. NO host
+    //     buffer handles/offsets are cached, so ObtainBuffer still runs every
+    //     cmdbuf (stream offsets / buffer handles / content sync stay correct).
+    u64 last_vbb_tick_{};
+    bool last_vbb_resolve_valid_{false};
+    std::unique_ptr<VbbResolveCache> vbb_resolve_;
 
     // OPT(v18): Index buffer bind deduplication.
     // Skip redundant vkCmdBindIndexBuffer when the same buffer/offset/type is already bound.

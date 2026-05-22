@@ -247,7 +247,14 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline,
     // PERF(GR2FORK v1.15): Hint the rt_cache hit path. Render targets change
     // on render-pass switches, not within a pass — so consecutive draws
     // overwhelmingly hit this branch. The slow path falls through naturally.
-    if (rt_cache_.valid && rt_cache_.hash == rt_hash) [[likely]] {
+    //
+    // FIX(GR2FORK): rt_cache_ hashes content (addresses + extents), not the
+    // resolved ImageId. TextureCache image-recreate at the same VAddr leaves
+    // a stale image_id behind the matching hash -> shadow flicker. Gated by
+    // Config::accurateRenderTargetCacheEnabled() (default false). Hard-forced
+    // true on GR Remastered SKUs in emulator.cpp.
+    const bool rt_cache_active = !Config::accurateRenderTargetCacheEnabled();
+    if (rt_cache_active && rt_cache_.valid && rt_cache_.hash == rt_hash) [[likely]] {
         // Fast path: render targets unchanged. Reuse cached image_ids.
         // Must still add to bound_images and re-mark is_target (cleared by ResetBindings).
         for (s32 cb = 0; cb < num_cbs; ++cb) {

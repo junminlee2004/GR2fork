@@ -10,6 +10,8 @@
 #include <fmt/xchar.h>
 #include <hwinfo/hwinfo.h>
 
+#include <algorithm>
+#include <array>
 #include "common/config.h"
 #include "common/crash_handler.h"
 #include "common/debug.h"
@@ -295,6 +297,28 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     if (param_sfo_exists) {
         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
+
+        // HARD OVERRIDE for Gravity Rush Remastered (all known SKUs).
+        // rt_cache_ in PrepareRenderState hashes render-target content but not
+        // ImageId identity. When TextureCache invalidates / recreates an image
+        // at the same VAddr, rt_hash still matches the prior call and the
+        // cache returns a stale image_id -> draw goes into the wrong / freed
+        // image (visible as shadow flicker on this title). Force the accurate
+        // path on regardless of user config.
+        static constexpr std::array<std::string_view, 7> gr_remastered_ids = {
+            "CUSA01112", "CUSA01113", "CUSA01130",
+            "PCJS50008", "CUSA02318", "CUSA02443", "CUSA04246",
+        };
+        if (std::find(gr_remastered_ids.begin(), gr_remastered_ids.end(), id) !=
+            gr_remastered_ids.end()) {
+            LOG_INFO(Loader,
+                     "Gravity Rush Remastered ({}) detected -> forcing "
+                     "accurateRenderTargetCache + accurateVertexBufferCache on for "
+                     "this session.",
+                     id);
+            Config::setAccurateRenderTargetCacheEnabled(true);
+            Config::setAccurateVertexBufferCacheEnabled(true);
+        }
         LOG_INFO(Loader, "Fw: {:#x} App Version: {}", fw_version, app_version);
         LOG_INFO(Loader, "Compiled SDK version: {:#x}", sdk_version);
         LOG_INFO(Loader, "PSVR Supported: {}", (bool)psf_attributes.support_ps_vr.Value());

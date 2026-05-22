@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include "common/alignment.h"
+#include "common/config.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
@@ -21,6 +22,20 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace VideoCore {
+
+// GR2FORK fix: resolved vertex-input descriptors cached across cmdbuf rotations.
+// These derive purely from the pipeline (immutable fetch_shader) + stamp-tracked
+// regs (step rates, buffer sharps), so when pipeline+stamp are unchanged they are
+// byte-identical to a fresh GetVertexInputs walk and can be reused, skipping that
+// walk + the dual hash loops. No host buffer handles/offsets are stored here, so
+// ObtainBuffer is still re-run each cmdbuf for correct stream offsets / handles /
+// content sync. Defined here (not the header) to avoid pulling vk_graphics_pipeline.h
+// into buffer_cache.h.
+struct VbbResolveCache {
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
+};
 
 // Stream-cache invalidation epoch. Declared in stream_cache_epoch.h.
 // Bumped by external producers of in-place UBO updates (notably
@@ -82,6 +97,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     critical_gc_memory = static_cast<u64>(
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
+    vbb_resolve_ = std::make_unique<VbbResolveCache>();
 }
 
 BufferCache::~BufferCache() = default;
@@ -245,6 +261,20 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
 
 void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                                     const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    // GR2FORK: the cmdbuf-rotation-aware vertex bind path (correctness +
+    // resolve-cache perf) is gated by config and force-enabled only for
+    // Gravity Rush Remastered (emulator.cpp). For every other title (e.g.
+    // GR2) the flag is off by default and the verbatim upstream path runs,
+    // so behavior is unchanged there.
+    if (Config::accurateVertexBufferCacheEnabled()) {
+        BindVertexBuffersFixed(pipeline, regs);
+    } else {
+        BindVertexBuffersLegacy(pipeline, regs);
+    }
+}
+
+void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeline,
+                                          const AmdGpu::LiverpoolRegsSnapshot& regs) {
     // PERF(GR2): Stamp ultra-fast skip.
     //
     // When pipeline pointer + gfx-pipeline stamp are unchanged since the last
@@ -337,6 +367,235 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
     last_vbb_pipeline_ = &pipeline;
     last_vbb_stamp_ = cur_stamp;
 
+
+    if (bindings.empty()) {
+        // If there are no bindings, there is nothing further to do.
+        return;
+    }
+
+    // PERF(GR2 v16): Fast path for the common single-active-buffer case.
+    // GR2 draws typically bind 1-2 vertex buffers. When there's only one non-empty
+    // buffer, skip the sort + merge + find_if entirely (saves ~0.3% of GpuComm).
+    Vulkan::VertexInputs<vk::Buffer> host_buffers;
+    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
+    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
+    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
+    const auto null_buffer =
+        instance.IsNullDescriptorSupported() ? VK_NULL_HANDLE : GetBuffer(NULL_BUFFER_ID).Handle();
+
+    // Count non-empty buffers to decide which path to take.
+    u32 non_empty_count = 0;
+    for (const auto& buffer : guest_buffers) {
+        non_empty_count += (buffer.GetSize() > 0) ? 1 : 0;
+    }
+
+    if (non_empty_count <= 1) {
+        // Single-buffer fast path: no sort/merge needed.
+        // Just obtain the one buffer directly and map all guest buffers to it.
+        vk::Buffer single_vk_buffer{};
+        u64 single_offset = 0;
+        VAddr single_base = 0;
+        VAddr single_end = 0;
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0 && !single_vk_buffer) {
+                const u64 size = memory->ClampRangeSize(buffer.base_address, buffer.GetSize());
+                const auto [obtained, offset] = ObtainBuffer(buffer.base_address, size, false);
+                single_vk_buffer = obtained->buffer;
+                single_offset = offset;
+                single_base = buffer.base_address;
+                single_end = buffer.base_address + buffer.GetSize();
+            }
+        }
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0) {
+                host_buffers.emplace_back(single_vk_buffer);
+                host_offsets.push_back(single_offset + buffer.base_address - single_base);
+            } else {
+                host_buffers.emplace_back(null_buffer);
+                host_offsets.push_back(0);
+            }
+            host_sizes.push_back(buffer.GetSize());
+            host_strides.push_back(buffer.GetStride());
+        }
+    } else {
+        // Multi-buffer path: sort, merge, then map.
+        struct BufferRange {
+            VAddr base_address;
+            VAddr end_address;
+            vk::Buffer vk_buffer;
+            u64 offset;
+
+            [[nodiscard]] size_t GetSize() const {
+                return end_address - base_address;
+            }
+        };
+
+        Vulkan::VertexInputs<BufferRange> ranges{};
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0) {
+                ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+            }
+        }
+
+        // Merge connecting ranges together
+        Vulkan::VertexInputs<BufferRange> ranges_merged{};
+        std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) {
+            return lhv.base_address < rhv.base_address;
+        });
+        ranges_merged.emplace_back(ranges[0]);
+        for (auto range : ranges) {
+            auto& prev_range = ranges_merged.back();
+            if (prev_range.end_address < range.base_address) {
+                ranges_merged.emplace_back(range);
+            } else {
+                prev_range.end_address = std::max(prev_range.end_address, range.end_address);
+            }
+        }
+
+        // Map buffers for merged ranges
+        for (auto& range : ranges_merged) {
+            const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+            const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+            range.vk_buffer = buffer->buffer;
+            range.offset = offset;
+        }
+
+        for (const auto& buffer : guest_buffers) {
+            if (buffer.GetSize() > 0) {
+                const auto host_buffer_info =
+                    std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
+                        return buffer.base_address >= range.base_address &&
+                               buffer.base_address < range.end_address;
+                    });
+                ASSERT(host_buffer_info != ranges_merged.cend());
+                host_buffers.emplace_back(host_buffer_info->vk_buffer);
+                host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+                                       host_buffer_info->base_address);
+            } else {
+                host_buffers.emplace_back(null_buffer);
+                host_offsets.push_back(0);
+            }
+            host_sizes.push_back(buffer.GetSize());
+            host_strides.push_back(buffer.GetStride());
+        }
+    }
+
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+    const auto num_buffers = guest_buffers.size();
+    if (instance.IsVertexInputDynamicState()) {
+        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+    } else {
+        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
+                                  host_sizes.data(), host_strides.data());
+    }
+}
+
+void BufferCache::BindVertexBuffersFixed(const Vulkan::GraphicsPipeline& pipeline,
+                                         const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    // Phase 1D-pre-C: stamp from snapshot, not `liverpool->GetGfxPipelineStamp()`.
+    const u64 cur_stamp = regs.gfx_pipeline_stamp;
+    const u64 vbb_tick = scheduler.CurrentTick();
+
+    // (A) Ultra-fast skip: same pipeline + stamp AND same primary cmdbuf (tick).
+    //     The cmdbuf already carries this exact vertex state, so skip the
+    //     GetVertexInputs walk + dual hash loops + driver bind calls entirely.
+    //     The `vbb_tick` term is the correctness fix: pipeline/stamp/bind_sig all
+    //     persist across cmdbuf rotations, so without it the FIRST bind into a
+    //     freshly-rotated cmdbuf was skipped -> undefined vertex-input state ->
+    //     black mesh (correct silhouette), intermittent.
+    if (last_vbb_pipeline_ == &pipeline && last_vbb_stamp_ == cur_stamp &&
+        last_vertex_bind_sig_valid && vbb_tick == last_vbb_tick_) [[likely]] {
+        return;
+    }
+
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
+
+    // (B) Cross-cmdbuf cheap re-emit: pipeline + stamp unchanged but the cmdbuf
+    //     rotated (vbb_tick differs). The resolved vertex-input descriptors and
+    //     guest buffer sharps derive ONLY from the pipeline (immutable
+    //     fetch_shader) and stamp-tracked regs (step rates = context regs;
+    //     buffer sharps = SH regs), so they are byte-identical to the cached
+    //     resolve. Reuse it and skip the GetVertexInputs walk + both hash loops.
+    //     ObtainBuffer + both driver calls are still issued below, so stream
+    //     offsets / buffer handles / content sync are correct for the new cmdbuf
+    //     (no buffer state is cached across cmdbufs).
+    const bool reuse_resolve = last_vbb_resolve_valid_ && last_vbb_pipeline_ == &pipeline &&
+                               last_vbb_stamp_ == cur_stamp;
+    if (reuse_resolve) {
+        attributes = vbb_resolve_->attributes;
+        bindings = vbb_resolve_->bindings;
+        guest_buffers = vbb_resolve_->guest_buffers;
+    } else {
+        // (C) Full resolve: pipeline or stamp changed (or first call this run).
+        pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                                 regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+        auto mix = [](u64& h, u64 v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+
+        u64 input_sig = 0xcbf29ce484222325ULL; // arbitrary non-zero seed
+        mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
+        mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
+        mix(input_sig, static_cast<u64>(instance.IsVertexInputDynamicState() ? 1 : 0));
+        mix(input_sig, reinterpret_cast<u64>(&pipeline));
+
+        for (const auto& b : bindings) {
+            mix(input_sig, (static_cast<u64>(b.binding) << 32) | static_cast<u64>(b.stride));
+            mix(input_sig, static_cast<u64>(static_cast<u32>(b.inputRate)));
+        }
+        for (const auto& a : attributes) {
+            mix(input_sig, (static_cast<u64>(a.location) << 32) | static_cast<u64>(a.binding));
+            mix(input_sig, (static_cast<u64>(static_cast<u32>(a.format)) << 32) | static_cast<u64>(a.offset));
+        }
+        for (const auto& d : divisors) {
+            mix(input_sig, (static_cast<u64>(d.binding) << 32) | static_cast<u64>(d.divisor));
+        }
+
+        // Full bind signature includes guest buffers (addresses/sizes/strides).
+        u64 bind_sig = input_sig;
+        for (const auto& gb : guest_buffers) {
+            mix(bind_sig, static_cast<u64>(gb.base_address));
+            mix(bind_sig, static_cast<u64>(gb.GetSize()));
+            mix(bind_sig, static_cast<u64>(gb.GetStride()));
+        }
+
+        // Within THIS cmdbuf, an identical resolved bind is already recorded ->
+        // nothing to do. tick-gated so it never elides the first bind of a freshly
+        // rotated cmdbuf (that path must fall through and re-emit).
+        if (last_vertex_bind_sig_valid && bind_sig == last_vertex_bind_sig &&
+            vbb_tick == last_vbb_tick_) {
+            last_vbb_pipeline_ = &pipeline;
+            last_vbb_stamp_ = cur_stamp;
+            return;
+        }
+
+        last_vertex_input_sig = input_sig;
+        last_vertex_input_sig_valid = true;
+        last_vertex_bind_sig = bind_sig;
+        last_vertex_bind_sig_valid = true;
+
+        // Cache the resolved descriptors for cross-cmdbuf reuse (path B above).
+        vbb_resolve_->attributes = attributes;
+        vbb_resolve_->bindings = bindings;
+        vbb_resolve_->guest_buffers = guest_buffers;
+        last_vbb_resolve_valid_ = true;
+    }
+
+    // Publish skip keys + the cmdbuf this bind state is being recorded into.
+    last_vbb_pipeline_ = &pipeline;
+    last_vbb_stamp_ = cur_stamp;
+    last_vbb_tick_ = vbb_tick;
+
+    // setVertexInputEXT is per-cmdbuf dynamic state; (re-)emit it whenever we
+    // reach the emit path (the first bind for this state in this cmdbuf). Within
+    // a cmdbuf, repeats are absorbed by skip (A) above.
+    if (instance.IsVertexInputDynamicState()) {
+        const auto setvi_cmdbuf = scheduler.PrimaryCommandBuffer();
+        setvi_cmdbuf.setVertexInputEXT(bindings, attributes);
+    }
 
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.

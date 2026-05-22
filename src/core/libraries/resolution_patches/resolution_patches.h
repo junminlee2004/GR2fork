@@ -527,41 +527,6 @@ enum class PatchGroupBit : std::uint32_t {
                     // in stderr: at 2160p target you should see
                     // `M1: wrote BSS_FLAG[0x1b586c0]=1 (was 0x00)`
                     // followed by 4 M1 patch lines.
-    L1 = 1u << 24,  // Disable motion blur by NOP'ing two `call
-                    // <register-pass>` instructions in the render-
-                    // graph builder. MotionBlur is registered from
-                    // two sites:
-                    //   0x0103e356  call 0x121b040 (special-slot)
-                    //   0x0103ea95  call 0x121ae70 (standard)
-                    // Both calls' return values are discarded by the
-                    // next instruction (`mov eax, [rip + ...]`), so
-                    // NOP'ing is safe w.r.t. dataflow — only the
-                    // side effect (registering the pass with the
-                    // active draw list) is removed.
-                    //
-                    // The "MotionBlur" string at 0x014fc61a sits in
-                    // the same rodata cluster as Tonemap, Bloom,
-                    // Antialias, SSAO — these are render-graph node
-                    // names passed to the pass-init function by name.
-                    // All other passes use only the standard register
-                    // call; MotionBlur is the only one with the extra
-                    // special-slot register, likely because it needs
-                    // a specific position in the draw order.
-                    //
-                    // RISK: untested at ship time. If either register
-                    // function has required side effects beyond list
-                    // insertion (refcounts, init state for later
-                    // passes), patching could crash. The shared
-                    // 0x121ae70 is called by Tonemap/Bloom/etc. from
-                    // their OWN sites — NOP'ing here only removes the
-                    // MotionBlur-specific call, not the function
-                    // pointer itself. Should be clean.
-                    //
-                    // EXCLUDED from `recommended`. v16: gated by the
-                    // `disableMotionBlur` config bool — wired through
-                    // ApplyGr2ResolutionPatches's `disable_motion_blur`
-                    // parameter. To turn off motion blur, set
-                    // `[GPU] disableMotionBlur = true` in config.toml.
 };
 
 // Recommended preset masks. Use these by name in the config string ("safe",
@@ -636,12 +601,6 @@ inline constexpr std::uint32_t kGroupMaskAll = 0x7FFFFFFFu;  // bits 0..30
 //                 Patches three exposureIntensity = 2.0f sites to
 //                 scale by pixel-density ratio min(1.0, (H/1080)²):
 //                 540p → 0.5 (quarter of 1080p's 2.0).
-//   * L1        — v15 disable motion blur. Two NOP-call patches at
-//                 0x0103e356 and 0x0103ea95 in the render-graph
-//                 builder skip the MotionBlur pass registration.
-//                 Opt-in via "recommended,L1". Untested at v15 ship
-//                 time — risk if either register-pass function has
-//                 required side effects beyond list insertion.
 inline constexpr std::uint32_t kGroupMaskRecommended =
     kGroupMaskAll
     & ~static_cast<std::uint32_t>(PatchGroupBit::C2)
@@ -654,7 +613,6 @@ inline constexpr std::uint32_t kGroupMaskRecommended =
     & ~static_cast<std::uint32_t>(PatchGroupBit::I4)
     & ~static_cast<std::uint32_t>(PatchGroupBit::J1)
     & ~static_cast<std::uint32_t>(PatchGroupBit::K1)
-    & ~static_cast<std::uint32_t>(PatchGroupBit::L1)
     & ~static_cast<std::uint32_t>(PatchGroupBit::M1);
 // v17.1 NOTE: M1 was empirically tested at 2160p and did NOT change the
 // sceVideoOutSetBufferAttribute dims — the swap chain registered at
@@ -730,9 +688,9 @@ inline constexpr std::uint32_t kGroupMaskWithoutG1 =
 
 // Apply the GR2 resolution+aspect override. Internally patches the
 // `recommended` group set (the empirically-verified working subset —
-// see kGroupMaskRecommended above) and, optionally, the L1 motion-blur
-// disable patch. Returns the number of sites patched. Idempotent. Logs
-// a warning per mismatched site (e.g. when the eboot doesn't match v1.11).
+// see kGroupMaskRecommended above). Returns the number of sites patched.
+// Idempotent. Logs a warning per mismatched site (e.g. when the eboot
+// doesn't match v1.11).
 //
 // `eboot_base`           — should be MemoryPatcher::g_eboot_address.
 // `resolution`           — chosen vertical pixel density (Off skips
@@ -741,20 +699,13 @@ inline constexpr std::uint32_t kGroupMaskWithoutG1 =
 //                          AspectPatches::TargetAspectToRatio). Used to
 //                          compose the final (W, H); does NOT patch the
 //                          projection float (that's aspect_patches' job).
-// `disable_motion_blur`  — if true, also apply the L1 group (two NOP-
-//                          call patches that skip the MotionBlur pass
-//                          registration in the render-graph builder).
-//                          Independent of the resolution override; the
-//                          patches are applied even when `resolution`
-//                          is Off (so motion blur can be disabled at
-//                          native res too).
 // `groups_config`        — patch-group bisection string parsed by
 //                          ParseGroupMaskFromConfig. Empty / nullopt
 //                          defaults to kGroupMaskRecommended. Driven
 //                          from Config::getResolutionPatchGroups()
 //                          (config.toml [GPU] resolutionPatchGroups).
 int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
-                              float aspect_ratio, bool disable_motion_blur,
+                              float aspect_ratio,
                               std::string_view groups_config);
 
 // Parse a config string into a TargetResolution. ("Off", "540p", "720p",

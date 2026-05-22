@@ -143,22 +143,24 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
 
-    // FIX(GR2FORK): per-user-request, threshold and cap both at 2048.
-    // Previous policy (> 2048 → 1) was destroying legitimate large array
-    // textures and effects went missing over time as more textures aged
-    // into that range. The 4096 cap was rejected — it could produce values
-    // above the device's maxImageArrayLayers (commonly 2048) and fail
-    // vkCreateImage. 2048 is the standard Vulkan minimum-spec ceiling for
-    // maxImageArrayLayers, so clamping there is creatable on essentially
-    // all target hardware. Caveat: the AMD T# field is 13 bits (up to
-    // 8191), so values in (2048, 8191] still get a wrong-but-creatable
-    // layer count; if those exist they render wrong rather than missing
-    // — watch this warning.
+    // FIX(GR2FORK): threshold 2048, tripped T# collapses to 1 layer.
+    // This is the permissive-threshold / hard-collapse policy: anything in
+    // (1024, 2048] passes through UNTOUCHED (treated as possibly-legit large
+    // array textures), and only layer counts >2048 — which exceed the Vulkan
+    // minimum-spec maxImageArrayLayers ceiling and cannot be created anyway —
+    // are treated as corrupt and collapsed to a single layer. Collapsing to 1
+    // (rather than to 2048) yields the smallest possible allocation, so a
+    // garbage descriptor can never feed the ErrorOutOfDeviceMemory path in
+    // Image::Image (observed origin: a 4609-layer gallery T# OOM'ing on a
+    // 4 GiB device). Trade-off vs the 1024-threshold variants: more T#s slip
+    // through unclamped here, so if a value in (1024, 2048] is itself garbage
+    // it will still attempt a large allocation; only the clearly-impossible
+    // (>2048) cases are made cheap. The AMD T# field is 13 bits (up to 8191).
     if (resources.layers > 2048u) [[unlikely]] {
         LOG_WARNING(Render_Vulkan,
-                    "T# layer count {} exceeds 2048 cap, clamping to 2048",
+                    "T# layer count {} exceeds 2048 cap, collapsing to 1",
                     resources.layers);
-        resources.layers = 2048;
+        resources.layers = 1;
     }
 
     UpdateSize();
@@ -172,8 +174,9 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
 void ImageInfo::UpdateSize() {
     // NOTE: layer-count fixup for garbage T#s previously lived here at
     // threshold 512 and clobbered ColorBuffer/DepthBuffer/null paths too.
-    // It now lives in the AmdGpu::Image ctor (threshold 2048) and the
-    // primary bail is in vk_rasterizer.cpp BindTextures.
+    // The single authoritative cap now lives above in this ctor (threshold
+    // 1024, OOM-driven) and the orthogonal block/macro-tile garbage bail is
+    // in vk_rasterizer.cpp BindTextures.
 
     // PERF(GR2 v8): Compute signature with packed 64-bit words instead of 13 separate hash steps.
     // This reduces ALU from 13 multiply+xor chains to 4.

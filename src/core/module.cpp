@@ -258,12 +258,6 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             //     "2160p"/"4K" | "2880p"/"5K" | "3456p"/"6K" | "4032p"/"7K" |
             //     "4320p"/"8K"
             //
-            // [GPU] disableMotionBlur (bool, default false)
-            //     When true, the MotionBlur post-process pass is skipped
-            //     by NOPing two pass-registration calls in the render-
-            //     graph builder. Independent of resolutionOverride — can
-            //     be toggled at native resolution too.
-            //
             // [GPU] resolutionPatchGroups (string, default "recommended")
             //     Bisection knob for the patch-group pipeline. Supports
             //     preset names ("recommended", "safe", "all", "baseline",
@@ -278,7 +272,6 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 Libraries::ResolutionPatches::ParseResolutionFromConfig(
                     Config::getResolutionOverride()),
                 Libraries::AspectPatches::TargetAspectToRatio(_gr2_aspect_target),
-                Config::getDisableMotionBlur(),
                 Config::getResolutionPatchGroups());
         }
     }

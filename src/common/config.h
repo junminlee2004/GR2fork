@@ -99,6 +99,10 @@ bool isBeginRenderingCacheEnabled();
 void setBeginRenderingCacheEnabled(bool enable, bool is_game_specific = false);
 bool isPipelineUdHashLruEnabled();
 void setPipelineUdHashLruEnabled(bool enable, bool is_game_specific = false);
+bool accurateRenderTargetCacheEnabled();
+void setAccurateRenderTargetCacheEnabled(bool enable, bool is_game_specific = false);
+bool accurateVertexBufferCacheEnabled();
+void setAccurateVertexBufferCacheEnabled(bool enable, bool is_game_specific = false);
 bool getEnableDiscordRPC();
 void setEnableDiscordRPC(bool enable);
 bool isRdocEnabled();
@@ -163,12 +167,6 @@ void setAspectRatioOverride(const std::string& value, bool is_game_specific = fa
 std::string getResolutionOverride();
 void setResolutionOverride(const std::string& value, bool is_game_specific = false);
 
-// GR2 (CUSA04943) motion-blur disable toggle. When true, the motion-blur
-// post-process pass is skipped at game load by NOPing the two pass-
-// registration calls in the render-graph builder. Default: false.
-bool getDisableMotionBlur();
-void setDisableMotionBlur(bool value, bool is_game_specific = false);
-
 // GR2 (CUSA04943) resolution-patch group selector. Bisection knob for
 // the resolution_patches.cpp pipeline. Default: "recommended" (the
 // empirically-verified working set, currently A1+A2+A3+A4+B1+C1+D1+F1+
@@ -196,96 +194,6 @@ void setDisableMotionBlur(bool value, bool is_game_specific = false);
 std::string getResolutionPatchGroups();
 void setResolutionPatchGroups(const std::string& value, bool is_game_specific = false);
 
-// =============================================================================
-// GR2 granular render-pass disable toggles.
-//
-// GR2's renderer dispatches every named pass through a uniform per-frame
-// template; each toggle below independently neutralises one pass (or two, for
-// passes with both low-watermark and high-watermark dispatch sites) by
-// rewriting its skip-flag load to `mov al, 1` so the immediately following
-// `test al, al; jne SKIP` always branches past the pass body.
-//
-// All default false. Each toggle is independent — combine freely. Critical
-// passes (Tonemap, Composite, Resolve, LightPass, opaque/Lambert, skypass,
-// G2_BG_*, etc.) are intentionally not exposed because disabling them would
-// black-screen the game.
-// =============================================================================
-
-// --- Shadow group ---
-// ShadowCast0/1/2 are the three cascade shadow-map renders (near/mid/far).
-// The far cascade (Cast2) typically carries the most shadow-caster draws
-// because its frustum covers the most world space, so disableShadowCast2
-// alone is the highest-payoff/lowest-visible-impact starting toggle.
-// ShadowTrace is the screen-space pass that samples the cascades into the
-// shadow mask consumed by opaque shading; disable it together with all
-// three casts for a clean shadow-free look.
-bool getDisableShadowCast0();
-void setDisableShadowCast0(bool value, bool is_game_specific = false);
-bool getDisableShadowCast1();
-void setDisableShadowCast1(bool value, bool is_game_specific = false);
-bool getDisableShadowCast2();
-void setDisableShadowCast2(bool value, bool is_game_specific = false);
-bool getDisableShadowTrace();
-void setDisableShadowTrace(bool value, bool is_game_specific = false);
-
-// --- Lighting / shading group ---
-// SSAO: screen-space ambient occlusion. Soft contact darkening; cheap to lose
-// visually, modest per-pixel cost saved.
-// IBL: image-based lighting. Diffuse/specular environment lighting; the world
-// gets a flatter look without it.
-// Contour: cel-shading outlines. GR2's signature comic-book line work runs
-// here — disabling makes characters look "modern PBR" rather than cel-shaded.
-// Visually drastic; only enable if you don't care about the art style.
-// SelfTranslucent: character self-translucency (subsurface scattering on
-// skin/cloth). Modest fragment cost; characters look slightly more opaque.
-bool getDisableSSAO();
-void setDisableSSAO(bool value, bool is_game_specific = false);
-bool getDisableIBL();
-void setDisableIBL(bool value, bool is_game_specific = false);
-bool getDisableContour();
-void setDisableContour(bool value, bool is_game_specific = false);
-bool getDisableSelfTranslucent();
-void setDisableSelfTranslucent(bool value, bool is_game_specific = false);
-
-// --- Post-process group ---
-// Bloom: bright-pixel glow/halation post-process pyramid.
-// Antialias: post-process AA (FXAA-ish); edges get crawlier without it.
-// Effector: impact / screen-distortion effects (hit flashes, gravity-slip
-// rings, etc.). Tied to gameplay feedback — disable with care.
-bool getDisableBloom();
-void setDisableBloom(bool value, bool is_game_specific = false);
-bool getDisableAntialias();
-void setDisableAntialias(bool value, bool is_game_specific = false);
-bool getDisableEffector();
-void setDisableEffector(bool value, bool is_game_specific = false);
-
-// --- Fog group ---
-// FogRender: main per-pixel fog application pass.
-// FogCloud: cloud-layer fog contribution.
-// FogDist: distance / global-distance fog.
-// FogCast: volumetric fog "casting" (god-ray-ish) pass.
-// On the floating cities, fog stacks add up; disabling individual fog
-// passes can make the world look "clean" but lose atmosphere.
-bool getDisableFogRender();
-void setDisableFogRender(bool value, bool is_game_specific = false);
-bool getDisableFogCloud();
-void setDisableFogCloud(bool value, bool is_game_specific = false);
-bool getDisableFogDist();
-void setDisableFogDist(bool value, bool is_game_specific = false);
-bool getDisableFogCast();
-void setDisableFogCast(bool value, bool is_game_specific = false);
-
-// --- Particle group ---
-// ParticleCompute: particle simulation kernel. Disabling stops particle
-// motion / spawning entirely — effectively "no particles" mode. Huge
-// savings if a scene is particle-heavy, but VFX cues vanish.
-// ParticleDistortion: heat-haze / refractive distortion particles (patches
-// both the LW and HW dispatch sites). Particularly expensive because each
-// dispatch forces a backup-color-buffer copy; cheapest particles to lose.
-bool getDisableParticleCompute();
-void setDisableParticleCompute(bool value, bool is_game_specific = false);
-bool getDisableParticleDistortion();
-void setDisableParticleDistortion(bool value, bool is_game_specific = false);
 bool getIsConnectedToNetwork();
 void setConnectedToNetwork(bool enable, bool is_game_specific = false);
 void setUserName(const std::string& name, bool is_game_specific = false);
