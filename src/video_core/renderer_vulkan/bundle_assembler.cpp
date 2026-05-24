@@ -53,10 +53,19 @@ BundleAssembler::~BundleAssembler() {
 
 u32 BundleAssembler::Push(DrawIntent intent) {
     // Stage 1: capture the reg snapshot and stamp the intent before publish.
+    // Tier-1 split: route to the graphics or compute snapshot pool by intent
+    // type. Draw* take a graphics snapshot (cs_program omitted); Dispatch*
+    // take a compute snapshot (minimal audited set). snapshot_idx is the slot
+    // index within whichever pool was used — ProcessOne releases from the same
+    // pool, keyed off the same intent type.
     if (IntentUsesSnapshot(intent.type)) {
-        intent.snapshot_idx = liverpool_->CaptureSnapshot();
-        // Y-1 telemetry: snapshot pool HWM after capture.
-        Rasterizer::BumpSnapshotPoolHwm(liverpool_->SnapshotPoolInFlight());
+        if (IntentUsesComputeSnapshot(intent.type)) {
+            intent.snapshot_idx = liverpool_->CaptureComputeSnapshot();
+            Rasterizer::BumpSnapshotPoolHwm(liverpool_->ComputeSnapshotPoolInFlight());
+        } else {
+            intent.snapshot_idx = liverpool_->CaptureGfxSnapshot();
+            Rasterizer::BumpSnapshotPoolHwm(liverpool_->GfxSnapshotPoolInFlight());
+        }
     } else {
         intent.snapshot_idx = kNoSnapshot;
     }
@@ -245,7 +254,14 @@ void BundleAssembler::ProcessOne(const DrawIntent& intent) {
     }
 
     if (intent.snapshot_idx != kNoSnapshot) {
-        liverpool_->ReleaseSnapshot(intent.snapshot_idx);
+        // Tier-1 split: release from the same pool the intent captured into.
+        // Per-pool FIFO holds because the assembler processes intents in PM4
+        // order, so each pool's releases occur in its own capture order.
+        if (IntentUsesComputeSnapshot(intent.type)) {
+            liverpool_->ReleaseComputeSnapshot(intent.snapshot_idx);
+        } else {
+            liverpool_->ReleaseGfxSnapshot(intent.snapshot_idx);
+        }
     }
 }
 

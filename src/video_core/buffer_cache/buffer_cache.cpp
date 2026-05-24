@@ -1046,14 +1046,25 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return !e || e[0] != '0';
         }();
 
+        // GR2FORK: stream-cache epoch disable switch. When the [GPU]
+        // config key `disableStreamCacheEpoch` is true, epoch invalidation
+        // is turned off entirely — `cur_epoch` is pinned to 0, inserts
+        // stamp epoch=0, and every `entry.epoch == cur_epoch` test becomes
+        // `0 == 0` (always passes). This reverts Path D to its pre-epoch
+        // form (four-tuple identity only). The avplayer BumpStreamCacheEpoch
+        // calls still increment the global atomic but it is never read, so
+        // they become inert. Read once per thread, like kTrustIntraCmdbuf.
+        static const bool kEpochDisabled = Config::disableStreamCacheEpoch();
+
         const auto cmdbuf = scheduler.PrimaryCommandBuffer();
         const u64 tick = scheduler.CurrentTick();
         // Path D-epoch: load the current stream-cache epoch once. Relaxed
         // is sufficient — we need a value that's eventually consistent
         // with bumpers on other threads, no synchronization with other
-        // state. On x86 this lowers to a plain mov.
+        // state. On x86 this lowers to a plain mov. When epoch invalidation
+        // is disabled via config, pin to 0 so every comparison passes.
         const u32 cur_epoch =
-            g_stream_cache_epoch.load(std::memory_order_relaxed);
+            kEpochDisabled ? 0u : g_stream_cache_epoch.load(std::memory_order_relaxed);
 
         // splittable64-style mix (from v1.32 Fix 1). `size * 0x9e37…`
         // folds size into all 64 bits before XORing into addr, so

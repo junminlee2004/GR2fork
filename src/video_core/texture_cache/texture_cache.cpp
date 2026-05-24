@@ -445,20 +445,7 @@ bool TextureCache::ForceDownloadByAddress(VAddr address, u64 size) {
         .commandBufferCount = 1,
         .pCommandBuffers    = &photo_cmd_buf_,
     };
-    // FIX(GR2FORK queue-race): vkQueueSubmit requires external sync
-    // per VkQueue (Vulkan spec §3.6.3). The photo-capture path runs
-    // on a different thread from Scheduler::SubmitExecution and
-    // submits to the same graphics queue handle, producing
-    //   UNASSIGNED-Threading-MultipleThreads-Write
-    // hits in the validation layer. We share Scheduler::submit_mutex
-    // (already held by graphics, compute, and the swapchain Present
-    // fix). The lock is released before waitForFences so we do not
-    // block other queue operations during the fence wait.
-    vk::Result submit_result;
-    {
-        std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
-        submit_result = queue.submit(submit_info, photo_fence_);
-    }
+    const auto submit_result = queue.submit(submit_info, photo_fence_);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost,
                "[GR2Photo] Device lost during photo download submit");
     const auto wait_result = device.waitForFences(photo_fence_, VK_TRUE, UINT64_MAX);
@@ -1799,41 +1786,43 @@ void TextureCache::RunGarbageCollector() {
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
     const auto clean_up = [&](ImageId image_id) {
+        auto& image = slot_images[image_id];
+
+        // HARD RULE (GR2FORK): unrecoverable GPU-only content is NEVER
+        // GC-evicted — not under pressure, and not under critical/aggressive
+        // GC. SafeToDownload() == (GpuModified && !Dirty) means the image's
+        // live contents exist ONLY in VRAM: there is no guest-memory copy and
+        // no buffer-cache copy to rebuild it from. Freeing it loses the pixels
+        // permanently — effects/particles vanish until the producing pass
+        // re-runs, which for one-shot spawns may not happen until the title is
+        // restarted. (This was the silent, VRAM-budget-dependent effect-loss
+        // bug: on a low-VRAM GPU the collector was permanently `pressured`, so
+        // the old `download && !pressured` guard never engaged and these
+        // surfaces got freed with no writeback.)
+        //
+        // We refuse eviction here BEFORE spending the deletion budget, so the
+        // collector keeps scanning past protected surfaces and reclaims the
+        // recoverable (re-uploadable) textures below them in the LRU instead.
+        //
+        // If protecting this set ever pushes us past the VRAM budget, that is
+        // surfaced as a LOUD, fully-logged crash at the allocation site
+        // (UniqueImage::Create, VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT →
+        // VK_ERROR_OUT_OF_DEVICE_MEMORY) — never a silent corruption of the
+        // frame. Trading a possible logged OOM for never dropping
+        // irrecoverable content is the intended contract.
+        if (image.SafeToDownload()) {
+            return false;
+        }
+
         if (num_deletions == 0) {
             return true;
         }
         --num_deletions;
-        auto& image = slot_images[image_id];
-        const bool download = image.SafeToDownload();
-        const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
-            return false;
-        }
-        if (download && !pressured) {
-            return false;
-        }
-        // FIX(GR2FORK): GC-time download disabled. Even with the per-property
-        // guards in DownloadImageMemory (null backing, MSAA, 3D, depth+stencil,
-        // zero-size), some image still slips through and crashes the NVIDIA
-        // driver inside vkCmdCopyImageToBuffer with a read at offset 0x108.
-        // The crash signature is identical across rounds and reproduces
-        // reliably during pipeline-compile bursts (shader storms on zone load).
-        //
-        // The download writeback only matters when guest CPU code is going to
-        // *read* what the GPU wrote — primarily photo mode (which has its own
-        // synchronous path via ForceDownloadByAddress) and a handful of
-        // GR2-internal cases. For GC-time eviction, the data being "lost"
-        // would have been overwritten by the next draw anyway in the vast
-        // majority of cases. Trading occasional stale guest-memory reads
-        // for not-crashing is the right tradeoff right now.
-        //
-        // To re-enable for diagnosis: define GR2FORK_GC_DOWNLOAD_ENABLE.
-#ifdef GR2FORK_GC_DOWNLOAD_ENABLE
-        if (download) {
-            DownloadImageMemory(image_id);
-        }
-#endif
+
+        // Only recoverable images reach here (SafeToDownload() == false), so
+        // there is nothing that needs writing back before the free. The former
+        // GC-time download path (GR2FORK_GC_DOWNLOAD_ENABLE) is moot now that
+        // the unrecoverable set is never freed at GC time.
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {

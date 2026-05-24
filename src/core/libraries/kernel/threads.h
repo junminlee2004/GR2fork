@@ -5,6 +5,7 @@
 
 #include <functional>
 #include "common/polyfill_thread.h"
+#include "common/types.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
 namespace Core::Loader {
@@ -14,6 +15,8 @@ class SymbolsResolver;
 namespace Libraries::Kernel {
 
 int PS4_SYSV_ABI posix_pthread_attr_init(PthreadAttrT* attr);
+
+int PS4_SYSV_ABI posix_pthread_attr_setstacksize(PthreadAttrT* attr, size_t stacksize);
 
 int PS4_SYSV_ABI posix_pthread_attr_destroy(PthreadAttrT* attr);
 
@@ -61,6 +64,29 @@ public:
         this->func = std::move(func);
         PthreadAttrT attr{};
         posix_pthread_attr_init(&attr);
+        // FIX(GR2FORK): widen the stack for these emulator-internal worker
+        // threads. The default attr uses ThrStackDefault (1 MiB, the guest
+        // default), but every thread launched through this wrapper runs HOST
+        // C++ HLE on that same stack — and several of them (the AvPlayer
+        // controller/demuxer/decoder threads in particular) re-enter GUEST
+        // code via Core::ExecuteGuest for event callbacks. GR2's opening-movie
+        // AvPlayer callback drives a deep guest chain (video manager -> job
+        // system -> sceFiberSwitch) on top of ExecuteGuest's own 12 KB
+        // ClearStack alloca and the heavier-than-native host trampoline
+        // frames. On 1 MiB that overflows the controller thread's stack: RSP
+        // runs past the live fiber structures and smashes them (observed as a
+        // corrupt current_fiber with a garbage name and an impossible
+        // size_context=0x90 in _sceFiberCheckStackOverflow), then the process
+        // dies via fastfail with no clean crash line — the log just ends. The
+        // canary handler only reports this after the fact; it cannot prevent
+        // the overflow. 8 MiB matches a typical host thread stack and gives the
+        // HLE+guest-callback chain ample room.
+        //
+        // This is a one-time, per-thread reservation made at creation (the
+        // stack allocator mmaps it; pages commit on demand), so it costs
+        // nothing per frame and does not affect FPS.
+        static constexpr size_t kInternalThreadStackSize = 8_MB;
+        posix_pthread_attr_setstacksize(&attr, kInternalThreadStackSize);
         posix_pthread_create(&thread, &attr, HOST_CALL(RunWrapper), this);
         posix_pthread_attr_destroy(&attr);
     }

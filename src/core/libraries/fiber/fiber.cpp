@@ -36,11 +36,35 @@ extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
 }
 
 void PS4_SYSV_ABI _sceFiberCheckStackOverflow(OrbisFiberContext* ctx) {
-    u64* stack_base = reinterpret_cast<u64*>(ctx->current_fiber->addr_context);
-    u64 stack_size = ctx->current_fiber->size_context;
-    if (stack_base && *stack_base != kFiberStackSignature) {
-        // GR2FORK: do NOT terminate the emulator on canary mismatch.
-        //
+    OrbisFiber* fiber = ctx ? ctx->current_fiber : nullptr;
+
+    // GR2FORK: validate the fiber before trusting any field on it. If a
+    // genuine overflow has already occurred (e.g. an HLE callback chain ran
+    // past the bottom of an undersized worker-thread stack), the OrbisFiber /
+    // OrbisFiberContext sitting in adjacent memory may itself be smashed. We
+    // have seen exactly that: a corrupt current_fiber surfacing here with a
+    // garbage name and an impossible size_context (0x90, far below
+    // ORBIS_FIBER_CONTEXT_MINIMUM_SIZE). In that state addr_context is also
+    // garbage, so the canary "restore" below would be a wild write through a
+    // bad pointer — turning a detectable corruption into silent heap damage
+    // and an unlogged fastfail. Bail out on any structural inconsistency
+    // (bad magics, sub-minimum size) and leave the diagnosis to whatever
+    // crash handling fires next, which carries more signal than a stray
+    // write here. The real prevention for the overflow lives at the thread
+    // stack-size level (see Kernel::Thread::Run); this check only stops us
+    // from making a bad situation worse.
+    if (!fiber || fiber->magic_start != kFiberSignature0 ||
+        fiber->magic_end != kFiberSignature1) {
+        return;
+    }
+
+    u64* stack_base = reinterpret_cast<u64*>(fiber->addr_context);
+    u64 stack_size = fiber->size_context;
+    if (!stack_base || stack_size < ORBIS_FIBER_CONTEXT_MINIMUM_SIZE) {
+        return;
+    }
+
+    if (*stack_base != kFiberStackSignature) {
         // The canary at addr_context sits at the lowest address of the fiber's
         // allocation (x86_64 stacks grow downward, so it is the FIRST byte an
         // overflowing callstack would clobber). Under shadPS4 HLE, every guest
@@ -56,18 +80,16 @@ void PS4_SYSV_ABI _sceFiberCheckStackOverflow(OrbisFiberContext* ctx) {
         // what is fundamentally a soft diagnostic. Log once per fiber (keyed
         // on the OrbisFiber pointer, thread-local because each thread runs its
         // own fiber chain), restore the canary so we do not keep re-firing,
-        // and continue. If a true overflow has corrupted memory beyond the
-        // canary the resulting symptom will surface elsewhere with more
-        // diagnostic value than a fiber.cpp UNREACHABLE.
+        // and continue.
         static thread_local OrbisFiber* warned_fiber = nullptr;
-        if (warned_fiber != ctx->current_fiber) {
-            warned_fiber = ctx->current_fiber;
+        if (warned_fiber != fiber) {
+            warned_fiber = fiber;
             LOG_WARNING(Lib_Fiber,
                         "Stack canary clobbered in fiber '{}' (size = 0x{:x}); "
                         "HLE callback depth exceeded the guest-allocated fiber "
                         "stack. Continuing; subsequent occurrences on this "
                         "fiber are suppressed.",
-                        ctx->current_fiber->name, stack_size);
+                        fiber->name, stack_size);
         }
         // Restore the canary in place so the per-call check stops tripping for
         // this fiber. The actual stack content above addr_context is untouched

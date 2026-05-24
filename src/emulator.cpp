@@ -256,7 +256,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     LOG_INFO(Loader, "Starting gr2fork (shadps4 v{} base)", Common::g_version);
     LOG_INFO(Loader, "Fork: Gravity Rush 2 focus");
-    LOG_INFO(Loader, "Build: v3.3");
+    LOG_INFO(Loader, "Build: v3.4");
 
     const bool has_game_config = std::filesystem::exists(
         Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"));
@@ -309,16 +309,22 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
             "CUSA01112", "CUSA01113", "CUSA01130",
             "PCJS50008", "CUSA02318", "CUSA02443", "CUSA04246",
         };
-        if (std::find(gr_remastered_ids.begin(), gr_remastered_ids.end(), id) !=
-            gr_remastered_ids.end()) {
+        const bool is_gr_remastered =
+            std::find(gr_remastered_ids.begin(), gr_remastered_ids.end(), id) !=
+            gr_remastered_ids.end();
+        if (is_gr_remastered) {
             LOG_INFO(Loader,
                      "Gravity Rush Remastered ({}) detected -> forcing "
                      "accurateRenderTargetCache + accurateVertexBufferCache on for "
                      "this session.",
                      id);
-            Config::setAccurateRenderTargetCacheEnabled(true);
-            Config::setAccurateVertexBufferCacheEnabled(true);
         }
+        // Symmetric policy from a single source of truth: ON for Remastered,
+        // and hard-forced OFF for every OTHER title (overriding global config,
+        // per-game TOML, and the GUI). These are Remastered-only correctness
+        // shims; a stray saved 'true' under another game would otherwise enable
+        // the stale-image_id render-target path it never wanted.
+        Config::setGameSpecificCacheToggles(is_gr_remastered);
         LOG_INFO(Loader, "Fw: {:#x} App Version: {}", fw_version, app_version);
         LOG_INFO(Loader, "Compiled SDK version: {:#x}", sdk_version);
         LOG_INFO(Loader, "PSVR Supported: {}", (bool)psf_attributes.support_ps_vr.Value());
@@ -369,19 +375,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // own release tag. Format: "Junmin Lee GR2FORK v1.0 (v0.13.0) | <game>".
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.3 (v{}) | {}", Common::g_version,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.4 (v{}) | {}", Common::g_version,
                                        game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.3 {}/(v{}) | {}", remote_host,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.4 {}/(v{}) | {}", remote_host,
                                        Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.3 (v{}) {} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.4 (v{}) {} {} | {}",
                                        Common::g_version, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.3 (v{}) {}/{} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.4 (v{}) {}/{} {} | {}",
                                        Common::g_version, remote_host, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         }

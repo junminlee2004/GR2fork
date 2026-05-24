@@ -12,8 +12,8 @@ using Sirit::Id;
 constexpr u32 SPIRV_VERSION_1_5 = 0x00010500;
 
 struct QuadRectListEmitter : public Sirit::Module {
-    explicit QuadRectListEmitter(const FragmentRuntimeInfo& fs_info_, u32 vs_output_mask_)
-        : Sirit::Module{SPIRV_VERSION_1_5}, fs_info{fs_info_}, vs_output_mask{vs_output_mask_} {
+    explicit QuadRectListEmitter(const FragmentRuntimeInfo& fs_info_)
+        : Sirit::Module{SPIRV_VERSION_1_5}, fs_info{fs_info_} {
         void_id = TypeVoid();
         bool_id = TypeBool();
         float_id = TypeFloat(32);
@@ -117,25 +117,6 @@ struct QuadRectListEmitter : public Sirit::Module {
 
         // Set attributes
         for (int i = 0; i < inputs.size(); i++) {
-            // GR2FORK aux-TCS grass fix (v3.3): when the upstream VS doesn't
-            // write the Param at fs_info.inputs[i].param_index, DefineInputs
-            // left `inputs_valid[i] = false` and did NOT declare a Vulkan
-            // Input variable at that Location. Reading from inputs[i] would
-            // be UB (default-constructed Sirit::Id has value 0, which is the
-            // OpTypeVoid id in our module). Skip the load and write a zero
-            // vec4 to the corresponding Output instead. The AuxTCS→AuxTES→FS
-            // chain stays structurally valid downstream because all Outputs
-            // matching FS-expected Locations are still declared; FS samples
-            // zero where the VS had nothing to contribute, matching the
-            // implicit-undefined semantics of vanilla VS→FS on the same
-            // input topology (which already produces zero/undef there).
-            if (!inputs_valid[i]) {
-                const Id zero_f{Constant(float_id, 0.0f)};
-                const Id zero4{
-                    ConstantComposite(vec4_id, zero_f, zero_f, zero_f, zero_f)};
-                OpStore(OpAccessChain(output_vec4, outputs[i], invocation_id), zero4);
-                continue;
-            }
             // vec4 in_paramN3 = interpolate(bary_coord, in_paramN[0], in_paramN[1], in_paramN[2]);
             const Id v0{OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[i], Int(0)))};
             const Id v1{OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[i], Int(1)))};
@@ -181,16 +162,6 @@ struct QuadRectListEmitter : public Sirit::Module {
         OpStore(OpAccessChain(output_vec4, gl_out, invocation_id, Int(0)), in_position);
 
         for (int i = 0; i < inputs.size(); i++) {
-            // GR2FORK aux-TCS grass fix (v3.3): same VS-output-mask handling
-            // as in EmitRectListTCS. Skip the load for unwritten Locations
-            // and write zero to the corresponding Output.
-            if (!inputs_valid[i]) {
-                const Id zero_f{Constant(float_id, 0.0f)};
-                const Id zero4{
-                    ConstantComposite(vec4_id, zero_f, zero_f, zero_f, zero_f)};
-                OpStore(OpAccessChain(output_vec4, outputs[i], invocation_id), zero4);
-                continue;
-            }
             // out_paramN[gl_InvocationID] = in_paramN[gl_InvocationID];
             const Id in_param{OpLoad(vec4_id, OpAccessChain(input_vec4, inputs[i], index))};
             OpStore(OpAccessChain(output_vec4, outputs[i], invocation_id), in_param);
@@ -306,40 +277,12 @@ private:
         gl_in = AddInput(gl_per_vertex_array);
         const Id float_arr{TypeArray(vec4_id, Int(32))};
         inputs.reserve(fs_info.num_inputs);
-        inputs_valid.reserve(fs_info.num_inputs);
         for (int i = 0; i < fs_info.num_inputs; i++) {
             const auto& input = fs_info.inputs[i];
             if (input.IsDefault()) {
                 continue;
             }
-            // GR2FORK aux-TCS grass fix (v3.3): only declare a TCS Input
-            // variable for this Location if the upstream VS actually writes
-            // to the corresponding Param. Otherwise VUID-RuntimeSpirv-
-            // OpEntryPoint-08743 fires (TCS Input at Location N has no
-            // matching VS Output) and RADV rejects the pipeline. The
-            // PassthroughTES path (vs_output_mask unused there) always
-            // declares all Inputs — its upstream is the AuxTCS, which we
-            // always populate on every FS-expected Location.
-            //
-            // param_index is u8 so values 0..255 are possible; guard the
-            // shift to avoid UB on the (very rare) param_index >= 32 case.
-            // For TCS, treat such out-of-mask params as "VS doesn't write"
-            // (safer: skip the Input, write zero downstream — matches the
-            // observed missing-output behavior). For TES, the mask is
-            // unused and we always declare.
-            const bool tes_path =
-                model == spv::ExecutionModel::TessellationEvaluation;
-            const u32 pidx = static_cast<u32>(input.param_index);
-            const bool vs_writes_param =
-                tes_path ||
-                (pidx < 32u && ((vs_output_mask >> pidx) & 1u) != 0);
-            if (!vs_writes_param) {
-                inputs.emplace_back();           // sentinel: no Vulkan Input declared
-                inputs_valid.push_back(false);
-                continue;
-            }
             inputs.emplace_back(AddInput(float_arr));
-            inputs_valid.push_back(true);
             Decorate(inputs.back(), spv::Decoration::Location, input.param_index);
         }
     }
@@ -372,21 +315,12 @@ private:
         Id gl_invocation_id;
     };
     std::vector<Id> inputs;
-    // GR2FORK aux-TCS grass fix (v3.3): parallel to `inputs`, marks which
-    // slots have a real Vulkan Input declared (true) vs. were skipped because
-    // the VS doesn't write that Location (false → write zero to outputs[i]).
-    std::vector<bool> inputs_valid;
     std::vector<Id> outputs;
     std::vector<Id> interfaces;
-    // GR2FORK aux-TCS grass fix (v3.3): bit i set iff upstream VS writes
-    // Param_i. Used by DefineInputs (TCS only); PassthroughTES leaves this
-    // at the default 0xFFFFFFFF and declares all FS-expected Inputs.
-    u32 vs_output_mask;
 };
 
-std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, const FragmentRuntimeInfo& fs_info,
-                                        u32 vs_output_mask) {
-    QuadRectListEmitter ctx{fs_info, vs_output_mask};
+std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, const FragmentRuntimeInfo& fs_info) {
+    QuadRectListEmitter ctx{fs_info};
     switch (type) {
     case AuxShaderType::RectListTCS:
         ctx.EmitRectListTCS();

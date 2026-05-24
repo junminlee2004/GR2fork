@@ -98,6 +98,32 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkImage unsafe_image{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
                                      &allocation, nullptr);
+    if (result != VK_SUCCESS) [[unlikely]] {
+        // GR2FORK: this is the designated VRAM-exhaustion failure point. The
+        // alloc uses VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT, so VMA REFUSES to
+        // over-commit and returns VK_ERROR_OUT_OF_DEVICE_MEMORY rather than
+        // silently spilling — and because the texture-cache GC never evicts
+        // unrecoverable GPU-only content, running out here is a real,
+        // expected-possible outcome of that contract. Record it LOUDLY with
+        // full context. The ASSERT_MSG below traps via assert_fail_impl(),
+        // which calls Common::Log::Stop() (drains + flushes every backend) and
+        // fflush(stdout) BEFORE the int3 — so this line is guaranteed on disk.
+        // An OOM must never present as a context-free silent crash.
+        const auto& ext = image_ci.extent;
+        const u64 depth = ext.depth ? ext.depth : 1u;
+        const u64 approx_texels =
+            u64{ext.width} * u64{ext.height} * depth * u64{image_ci.arrayLayers};
+        LOG_CRITICAL(Render_Vulkan,
+                     "[GR2FORK OOM] vmaCreateImage FAILED ({}): {}x{}x{} layers={} mips={} "
+                     "samples={} format={} usage={} (~{} texels). "
+                     "WITHIN_BUDGET refused the allocation -> device memory is exhausted. "
+                     "This is the never-evict-unrecoverable-GPU-content tradeoff hitting its "
+                     "limit; crashing LOUDLY (NOT silently) so it is on the record.",
+                     vk::to_string(vk::Result{result}), ext.width, ext.height, ext.depth,
+                     image_ci.arrayLayers, image_ci.mipLevels,
+                     vk::to_string(image_ci.samples), vk::to_string(image_ci.format),
+                     vk::to_string(image_ci.usage), approx_texels);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};

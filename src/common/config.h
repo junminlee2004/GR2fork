@@ -69,6 +69,8 @@ bool readbackLinearImages();
 void setReadbackLinearImages(bool enable, bool is_game_specific = false);
 bool directMemoryAccess();
 void setDirectMemoryAccess(bool enable, bool is_game_specific = false);
+bool disableStreamCacheEpoch();
+void setDisableStreamCacheEpoch(bool enable, bool is_game_specific = false);
 bool dumpShaders();
 void setDumpShaders(bool enable, bool is_game_specific = false);
 u32 vblankFreq();
@@ -103,6 +105,11 @@ bool accurateRenderTargetCacheEnabled();
 void setAccurateRenderTargetCacheEnabled(bool enable, bool is_game_specific = false);
 bool accurateVertexBufferCacheEnabled();
 void setAccurateVertexBufferCacheEnabled(bool enable, bool is_game_specific = false);
+// GR2FORK: enforce the two GR-Remastered-only cache shims as a single policy:
+// ON for Remastered, hard-forced OFF for every other title. Pass the
+// authoritative Remastered-SKU result from emulator.cpp; call once at startup
+// after per-game config load.
+void setGameSpecificCacheToggles(bool is_gr_remastered);
 bool getEnableDiscordRPC();
 void setEnableDiscordRPC(bool enable);
 bool isRdocEnabled();

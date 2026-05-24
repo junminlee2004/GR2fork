@@ -144,8 +144,23 @@ public:
     // `liverpool->ClearDynamicDirty()` (vk_pipeline_cache.cpp:543 and
     // vk_rasterizer.cpp:2723) were the only cleared sites; with Phase C
     // those calls are removed, and PM4 now owns the clear at capture time.
-    [[nodiscard]] u16 CaptureSnapshot() noexcept {
-        const u16 idx = snapshot_pool_.Capture(
+    // Tier-1 split: two snapshot pools with independent SPSC ring cursors.
+    // Draw* intents capture into the graphics pool (cs_program omitted);
+    // Dispatch* intents capture into the compute pool (minimal audited set).
+    // Independent pools mean draws and dispatches don't share a ring head/tail
+    // and don't false-share each other's slots.
+    [[nodiscard]] u16 CaptureGfxSnapshot() noexcept {
+        const u16 idx = gfx_snapshot_pool_.CaptureGfx(
+            regs,
+            gfx_pipeline_stamp.load(std::memory_order_relaxed),
+            gfx_key_dirty_, dynamic_dirty_,
+            last_cb_extent, last_db_extent);
+        gfx_key_dirty_ = false;
+        dynamic_dirty_ = false;
+        return idx;
+    }
+    [[nodiscard]] u16 CaptureComputeSnapshot() noexcept {
+        const u16 idx = compute_snapshot_pool_.CaptureCompute(
             regs, mapped_queues[curr_qid].cs_state,
             gfx_pipeline_stamp.load(std::memory_order_relaxed),
             gfx_key_dirty_, dynamic_dirty_,
@@ -155,20 +170,29 @@ public:
         return idx;
     }
 
-    // Const view of a previously-captured snapshot. Index must be one returned
-    // by CaptureSnapshot() and not yet released.
-    [[nodiscard]] const LiverpoolRegsSnapshot& GetSnapshot(u16 idx) const noexcept {
-        return snapshot_pool_.Slot(idx);
+    // Const views of a previously-captured snapshot. Index must be one returned
+    // by the matching CaptureXSnapshot() and not yet released.
+    [[nodiscard]] const LiverpoolRegsSnapshot& GetGfxSnapshot(u16 idx) const noexcept {
+        return gfx_snapshot_pool_.Slot(idx);
+    }
+    [[nodiscard]] const LiverpoolRegsSnapshot& GetComputeSnapshot(u16 idx) const noexcept {
+        return compute_snapshot_pool_.Slot(idx);
     }
 
-    // Release a snapshot slot back to the pool. Single-consumer FIFO.
-    void ReleaseSnapshot(u16 idx) noexcept {
-        snapshot_pool_.Release(idx);
+    // Release a snapshot slot back to its pool. Single-consumer FIFO per pool.
+    void ReleaseGfxSnapshot(u16 idx) noexcept {
+        gfx_snapshot_pool_.Release(idx);
+    }
+    void ReleaseComputeSnapshot(u16 idx) noexcept {
+        compute_snapshot_pool_.Release(idx);
     }
 
-    // Y-1 telemetry: live in-flight count for HWM tracking.
-    [[nodiscard]] u32 SnapshotPoolInFlight() const noexcept {
-        return snapshot_pool_.InFlight();
+    // Y-1 telemetry: live in-flight counts for HWM tracking.
+    [[nodiscard]] u32 GfxSnapshotPoolInFlight() const noexcept {
+        return gfx_snapshot_pool_.InFlight();
+    }
+    [[nodiscard]] u32 ComputeSnapshotPoolInFlight() const noexcept {
+        return compute_snapshot_pool_.InFlight();
     }
 
     template <bool wait_done = false>
@@ -432,7 +456,8 @@ private:
 
     // Versioned per-draw reg snapshot pool. INERT in Turn 1 — the pool is
     // constructed but no captures occur until Stage 1 wiring lands in Turn 2.
-    LiverpoolRegsSnapshotPool snapshot_pool_{};
+    LiverpoolRegsSnapshotPool gfx_snapshot_pool_{};
+    LiverpoolRegsSnapshotPool compute_snapshot_pool_{};
 };
 
 } // namespace AmdGpu

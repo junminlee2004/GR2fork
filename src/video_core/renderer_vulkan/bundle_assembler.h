@@ -156,6 +156,14 @@ private:
         return false;
     }
 
+    // Tier-1 split: among snapshot-using intents, which take a COMPUTE snapshot
+    // (captured into Liverpool's compute pool) vs. a GRAPHICS snapshot. Dispatch
+    // / DispatchIndirect are the compute consumers; all Draw* are graphics.
+    // Precondition: only meaningful when IntentUsesSnapshot(t) is true.
+    [[nodiscard]] static constexpr bool IntentUsesComputeSnapshot(DrawIntent::Type t) noexcept {
+        return t == DrawIntent::Type::Dispatch || t == DrawIntent::Type::DispatchIndirect;
+    }
+
     Rasterizer& rasterizer_;
     AmdGpu::Liverpool* liverpool_;
 

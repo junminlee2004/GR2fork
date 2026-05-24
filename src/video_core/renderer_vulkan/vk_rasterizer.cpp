@@ -418,7 +418,7 @@ void Rasterizer::DoDrawFromIntent(const DrawIntent& intent) {
         scheduler.PopPendingOperations();
     }
 
-    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetGfxSnapshot(intent.snapshot_idx);
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(regs);
     // PERF(GR2FORK v1.21): pipeline is null only on cache failure / unsupported
     // shader stage combinations — an error path. Steady-state draws have a
@@ -537,7 +537,7 @@ void Rasterizer::DoDrawIndirectFromIntent(const DrawIntent& intent) {
 
     RENDERER_TRACE;
 
-    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetGfxSnapshot(intent.snapshot_idx);
 
     scheduler.PopPendingOperations();
 
@@ -646,7 +646,7 @@ void Rasterizer::DoDispatchDirectFromIntent(const DrawIntent& intent) {
 
     scheduler.PopPendingOperations();
 
-    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetComputeSnapshot(intent.snapshot_idx);
     const auto& cs_program = regs.cs_program;
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(regs);
     // PERF(GR2FORK v1.26): null pipeline is a cache failure / unsupported
@@ -707,7 +707,7 @@ void Rasterizer::DoDispatchIndirectFromIntent(const DrawIntent& intent) {
 
     scheduler.PopPendingOperations();
 
-    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetComputeSnapshot(intent.snapshot_idx);
     (void)regs.cs_program; // captured but unread for indirect dispatch (dims live in the indirect buffer)
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(regs);
     // PERF(GR2FORK v1.26): mirrors DispatchDirect — null pipeline /
