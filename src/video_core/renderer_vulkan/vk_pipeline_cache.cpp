@@ -593,9 +593,32 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
 
         auto pending = LaunchAsyncPipelineCompile(graphics_key, pipeline_hash);
 
-        // Synchronous fast-path wait. Most compiles complete in <50ms; waiting
-        // kInitialSyncBudget catches them without triggering frame-skip.
-        if (pending->future.wait_for(kInitialSyncBudget) == std::future_status::ready) {
+        // GR2FORK: photo-capture budget, detected from regs BEFORE any skip.
+        // The free-camera capture renders to a 1024x1024 LINEAR color target
+        // (the same RT TextureCache hands to ForceDownloadByAddress). The draw
+        // path returns on a null pipeline before BeginRendering ever binds the
+        // RT, so an RT-bind gate can't arm in time for the first, cold capture —
+        // we must recognize the photo target here, at the compile decision, from
+        // the bound color buffer. For a photo target we wait long enough to
+        // finish even a COLD compile (~2.5s) so the capture render never skips
+        // and the very first photo is never black. Gameplay targets are tiled /
+        // not 1024^2, so they keep kGameplaySyncBudget (0ms) — full fps.
+        bool photo_target = false;
+        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col_buf = regs.color_buffers[cb];
+            if (!col_buf) {
+                continue;
+            }
+            const auto& hint = regs.last_cb_extent[cb];
+            const u32 w = hint.Valid() ? hint.width : col_buf.Pitch();
+            const u32 h = hint.Valid() ? hint.height : col_buf.Height();
+            if (w == 1024 && h == 1024 && !col_buf.IsTiled()) {
+                photo_target = true;
+                break;
+            }
+        }
+        const auto sync_budget = photo_target ? kPhotoSyncBudget : kGameplaySyncBudget;
+        if (pending->future.wait_for(sync_budget) == std::future_status::ready) {
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {
                 pipeline = pending->future.get();

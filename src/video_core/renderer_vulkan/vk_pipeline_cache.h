@@ -263,22 +263,38 @@ private:
     //   scene cluster at frame ~492: ~433ms ≈ 2 × 200ms (2 pipelines serialized)
     //   200ms ceiling spikes at frame ~493: exactly the budget
     //
-    // Set to 0: pipeline compile is fully async on first encounter. wait_for(0)
-    // still returns ready for compiles that finished synchronously (rare, e.g.
-    // serialized cache hits), so those proceed normally. Anything not yet ready
-    // gets stashed in pending_graphics_pipelines and the draw is skipped this
-    // frame; subsequent frames poll non-blockingly via TryFinalizePending and
-    // install the pipeline once compile completes (typically 1-3 frames later).
+    // GR2FORK photo-mode-gated budget (replaces the single kInitialSyncBudget):
     //
-    // Visual cost: brief gap (1-3 frames @ 30fps cap = 33-100ms) on the very
-    // first appearance of each new pipeline. The same skip-this-draw fallback
-    // path already exists today for compiles that exceed 200ms.
+    //   kGameplaySyncBudget = 0  — normal play. Compile is fully async on first
+    //     encounter. wait_for(0) still returns ready for compiles that already
+    //     finished (rare, serialized cache hits) so those proceed; anything not
+    //     ready is stashed in pending_graphics_pipelines and the draw is skipped
+    //     this frame, then installed a few frames later via TryFinalizePending.
+    //     Zero blocking on the assembler thread — this is what removes the
+    //     steady few-fps regression that a non-zero budget caused.
     //
-    // If visual artifacts during scene transitions are too noticeable, raise
-    // this to a small value (e.g. 1ms-5ms) to catch fast compiles without the
-    // 200ms-tier blocking. Do not raise back to 100ms+ without re-running the
-    // spike-score A/B — the warmup and scene-transition spikes will return.
-    static constexpr std::chrono::milliseconds kInitialSyncBudget{15};
+    //   kPhotoSyncBudget = 10s — a photo capture render is in progress, i.e. the
+    //     bound color target is the 1024x1024 LINEAR photo RT (detected from regs
+    //     at the wait site). A skipped draw is unacceptable here: the photo RT is
+    //     copied out verbatim, so a draw skipped for a not-yet-ready pipeline
+    //     yields a blank/black capture. The photo-render pipelines are large and,
+    //     COLD (first capture of a session / empty disk cache), take ~2.5s to
+    //     compile — far beyond the old 15ms, which is exactly why the first
+    //     capture was black. We block long enough to finish even a cold compile
+    //     so the capture render never skips. A capture is rare, user-initiated,
+    //     and non-realtime, so a one-time multi-second stall while a cold photo
+    //     pipeline compiles is the acceptable price of a perfect capture; warm
+    //     captures (pipeline already on disk) don't stall at all.
+    //
+    // The wait site in GetGraphicsPipeline selects between these per-compile by
+    // detecting the photo color target from regs (1024x1024 linear) — done there,
+    // not via an RT-bind gate, because the draw path returns on a null pipeline
+    // before BeginRendering binds the RT, so an RT-bind gate can't arm in time
+    // for the first cold capture. Do not raise kGameplaySyncBudget above 0
+    // without re-running the spike-score A/B — the warmup/scene-transition spikes
+    // and the gameplay fps regression both return with any non-zero value.
+    static constexpr std::chrono::milliseconds kGameplaySyncBudget{0};
+    static constexpr std::chrono::milliseconds kPhotoSyncBudget{10000}; // cold photo-pipeline compile is ~2.5s; must exceed it so the capture never skips
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
     static constexpr std::chrono::seconds      kPermaFailThreshold{30};
 

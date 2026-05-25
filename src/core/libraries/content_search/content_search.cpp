@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "common/logging/log.h"
+#include "common/elf_info.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
@@ -27,75 +28,6 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/content_search/content_search.h"
 #include "core/libraries/screenshot_service/screenshot_service.h"
-
-// FIX(GR2FORK): Silent-crash fix for the gallery-state monitor thread.
-// The monitor at GalleryStateMonitorLoop does raw `*reinterpret_cast<u64*>(...)`
-// dereferences of guest memory at 30Hz. On Linux this works because the
-// emulator's SIGSEGV handler catches page-fault reads and the process-wide
-// signal infrastructure masks them. On Windows, an AV in a detached std::thread
-// that wasn't covered by a vectored exception handler takes down the whole
-// process — STATUS_ACCESS_VIOLATION, no log, no dialog. That matches exactly
-// the GR2 CUSA03694 RTX 3050 Ti "silent crash after 40-70 minutes at the
-// guide-hand scene" symptom: the user's game-state transition invalidates
-// the PhotoMode root pointer, the monitor's pointer-chain read faults, and
-// the process dies silently. All three submitted crash logs had the monitor
-// running and zero Vulkan errors.
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
-
-namespace {
-// Safe guest-memory readers. Return false if the page isn't readable (on
-// Windows) or — worst case — if an AV fires mid-read. On Linux, delegates
-// to the existing raw read since the shadPS4 SIGSEGV handler covers it.
-#ifdef _WIN32
-static bool IsCommittedReadable(const void* p, size_t n) noexcept {
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    const DWORD prot = mbi.Protect & 0xFF;
-    if (prot == 0 || prot == PAGE_NOACCESS) return false;
-    const auto* end = reinterpret_cast<const unsigned char*>(p) + n;
-    const auto* region_end =
-        reinterpret_cast<const unsigned char*>(mbi.BaseAddress) + mbi.RegionSize;
-    return end <= region_end;
-}
-
-// Defined out-of-line so __try/__except works under /EHsc. Non-inline; must
-// not contain C++ objects with non-trivial destructors.
-static bool SafeRead64(const u64* p, u64& out) noexcept {
-    if (!IsCommittedReadable(p, sizeof(u64))) return false;
-    __try {
-        out = *p;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-static bool SafeRead32(const u32* p, u32& out) noexcept {
-    if (!IsCommittedReadable(p, sizeof(u32))) return false;
-    __try {
-        out = *p;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-#else
-static bool SafeRead64(const u64* p, u64& out) noexcept {
-    out = *p;
-    return true;
-}
-static bool SafeRead32(const u32* p, u32& out) noexcept {
-    out = *p;
-    return true;
-}
-#endif
-} // namespace
 
 namespace Libraries::ContentSearch {
 
@@ -373,101 +305,6 @@ std::string GetLastSavedContentId() {
 
 // HLE API
 
-// ─── Gallery visibility background monitor ─────────────────────────────
-// A dedicated 30Hz thread polls the game's photo-mode state object and
-// logs ENTER/EXIT transitions. Decoupled from pad, GPU, and all other
-// subsystems — runs as long as the emulator process does.
-//
-//   root  = *(u64*)(eboot_base + 0x1AA3E78)   [BSS PHOTO_MODE_ROOT]
-//   obj   = *(u64*)(root + 8)                 if root sane
-//   state = *(u32*)(obj  + 0x178)             if obj  sane
-//   visible = (state == 2)
-//
-// Thread is started lazily on the first sceContentSearchInit call,
-// idempotent, and detached (OS reaps on process exit).
-static std::atomic<bool> g_gallery_monitor_started{false};
-
-static void GalleryStateMonitorLoop() {
-    Common::SetCurrentThreadName("shadPS4:GalleryStateMonitor");
-    auto ptr_ok = [](u64 v) -> bool {
-        return v > 0x100000ULL && v < 0x800000000000ULL;
-    };
-    bool was_visible = false;
-
-    // Poll period 33ms (~30 Hz). Negligible CPU: three pointer loads and
-    // a compare per tick. Sub-33ms worst-case edge-detection latency.
-    constexpr auto kPeriod = std::chrono::milliseconds(33);
-
-    // FIX(GR2FORK): circuit-breaker for pathological Windows faults. If the
-    // monitor fails to read guest memory consistently (e.g. layout drift or
-    // a game-state transition we don't understand), stop polling rather
-    // than spin on failed reads at 30Hz forever. The monitor is a
-    // best-effort logger, not a correctness requirement.
-    constexpr u32 kMaxConsecutiveFaults = 300; // ~10 seconds at 30Hz
-    u32 consecutive_faults = 0;
-    bool monitor_disabled = false;
-
-    while (true) {
-        if (monitor_disabled) {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
-            continue;
-        }
-        const uintptr_t base = MemoryPatcher::g_eboot_address;
-        if (base != 0) {
-            bool now_visible = false;
-            bool read_ok = true;
-            u64 root = 0;
-            // FIX(GR2FORK): was `root = *reinterpret_cast<u64*>(base + 0x1AA3E78);`.
-            // Unsafe on Windows — a guest-memory AV here silently terminates
-            // the whole emulator process (STATUS_ACCESS_VIOLATION in a detached
-            // std::thread). Use SEH-protected read.
-            if (!SafeRead64(reinterpret_cast<const u64*>(base + 0x1AA3E78), root)) {
-                read_ok = false;
-            } else if (ptr_ok(root)) {
-                u64 obj = 0;
-                if (!SafeRead64(reinterpret_cast<const u64*>(root + 8), obj)) {
-                    read_ok = false;
-                } else if (ptr_ok(obj)) {
-                    u32 state = 0;
-                    if (!SafeRead32(reinterpret_cast<const u32*>(obj + 0x178), state)) {
-                        read_ok = false;
-                    } else {
-                        now_visible = (state == 2);
-                    }
-                }
-            }
-            if (read_ok) {
-                consecutive_faults = 0;
-            } else if (++consecutive_faults >= kMaxConsecutiveFaults) {
-                LOG_WARNING(Core,
-                            "[Gallery] monitor disabled — {} consecutive guest-memory "
-                            "faults at BSS 0x{:X} / offsets +0x8 / +0x178. "
-                            "Game-state probe is stale. Gallery ENTER/EXIT logging is off.",
-                            consecutive_faults, 0x1AA3E78);
-                monitor_disabled = true;
-                continue;
-            }
-            if (read_ok && now_visible != was_visible) {
-                LOG_INFO(Core, "[Gallery] {}",
-                         now_visible ? "ENTERED film-album"
-                                     : "EXITED film-album");
-                was_visible = now_visible;
-            }
-        }
-        std::this_thread::sleep_for(kPeriod);
-    }
-}
-
-static void StartGalleryStateMonitor() {
-    bool expected = false;
-    if (g_gallery_monitor_started.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel)) {
-        std::thread(GalleryStateMonitorLoop).detach();
-        LOG_INFO(Core,
-                 "[Gallery] background state monitor started (30 Hz poll)");
-    }
-}
-
 int PS4_SYSV_ABI sceContentSearchInit(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7,
                                       u64 a8) {
     // Apply the View+Mark gate NOPs so Cross and Square work on HLE photos.
@@ -478,10 +315,6 @@ int PS4_SYSV_ABI sceContentSearchInit(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
             Libraries::ScreenshotService::ApplyViewMarkPatches(base);
         }
     }
-
-    // Start the background gallery-state monitor (idempotent — first call
-    // only). Runs as long as the process does; decoupled from pad/GPU.
-    StartGalleryStateMonitor();
 
     MountScreenshotDir();
     {
