@@ -150,12 +150,12 @@ GraphicsPipeline::GraphicsPipeline(
     // GR2FORK: Gravity Rush Remastered (CUSA01130) wind/speed-line over-intensity fix.
     // The wind fragment shader (fs 0xc1338b35) draws a premultiplied-alpha effect into the HDR
     // target whose colour comes out far too intense in emulation, producing near-solid white
-    // streaks instead of the subtle PS4 effect. We scale its colour contribution to 3% via a
-    // constant blend factor (result.rgb = src.rgb*0.03 + dst.rgb*(1-srcA)), which matches the
+    // streaks instead of the subtle PS4 effect. We scale its colour contribution to 5% via a
+    // constant blend factor (result.rgb = src.rgb*0.05 + dst.rgb*(1-srcA)), which matches the
     // intended look without altering the game's data. Gated to GRR's serial so GR2 (CUSA04943)
     // and every other title in the fork are completely unaffected.
     static constexpr u64 kWindPsHash = 0xc1338b35;
-    static constexpr float kWindFadeAmt = 0.03f;
+    static constexpr float kWindFadeAmt = 0.05f;
     static const bool is_gr_remastered = Common::ElfInfo::Instance().GameSerial() == "CUSA01130";
     u64 fs_pgm_hash = 0;
     for (const Shader::Info* s : stages) {
