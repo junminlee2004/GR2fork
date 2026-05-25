@@ -43,7 +43,7 @@ static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType 
 static constexpr spv::ExecutionMode GetOutputPrimitiveType(AmdGpu::GsOutputPrimitiveType type) {
     switch (type) {
     case AmdGpu::GsOutputPrimitiveType::PointList:
-        return spv::ExecutionMode::OutputVertices;
+        return spv::ExecutionMode::OutputPoints;
     case AmdGpu::GsOutputPrimitiveType::LineStrip:
         return spv::ExecutionMode::OutputLineStrip;
     case AmdGpu::GsOutputPrimitiveType::TriangleStrip:
