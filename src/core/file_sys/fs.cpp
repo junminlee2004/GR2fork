@@ -64,21 +64,36 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
         *is_read_only = mount->read_only;
     }
 
-    // Nothing to do if getting the mount itself.
     const auto corrected_path_sanitized = RemoveTrailingSlashes(corrected_path);
-    if (corrected_path_sanitized == mount->mount) {
-        return mount->host_path;
-    }
 
-    // Remove device (e.g /app0) from path to retrieve relative path.
-    const auto rel_path = std::string_view{corrected_path}.substr(mount->mount.size() + 1);
-    std::filesystem::path host_path = mount->host_path / rel_path;
+    // Base host path for this mount.
+    std::filesystem::path host_path = mount->host_path;
+
+    // Update/patch folder is either mount + "-UPDATE" or mount + "-patch".
     std::filesystem::path patch_path = mount->host_path;
     patch_path += "-UPDATE";
     if (!std::filesystem::exists(patch_path)) {
         patch_path = mount->host_path;
         patch_path += "-patch";
     }
+
+    // If we're just retrieving the mount itself, return the patch root when a patch
+    // applies, so that iterating the mount root (e.g. /app0) can see update content
+    // and not only the base game. Previously this branch unconditionally returned the
+    // base path, ignoring force_base_path; that made IterateDirectory resolve both its
+    // base and patch lookups to the same base path, so top-level files added or
+    // replaced by a game update were never iterated.
+    if (corrected_path_sanitized == mount->mount) {
+        if ((corrected_path.starts_with("/app0") || corrected_path.starts_with("/hostapp")) &&
+            !force_base_path && !ignore_game_patches && std::filesystem::exists(patch_path)) {
+            return patch_path;
+        }
+        return host_path;
+    }
+
+    // Remove device (e.g /app0) from path to retrieve relative path.
+    const auto rel_path = std::string_view{corrected_path}.substr(mount->mount.size() + 1);
+    host_path /= rel_path;
     patch_path /= rel_path;
 
     if ((corrected_path.starts_with("/app0") || corrected_path.starts_with("/hostapp")) &&

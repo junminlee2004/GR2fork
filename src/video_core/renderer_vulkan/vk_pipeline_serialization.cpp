@@ -401,6 +401,14 @@ void PipelineCache::WarmUp(const std::function<void(u32 loaded, u32 total)>& tic
     }
 
     Storage::DataBase::Instance().FinishPreload();
+
+    // POST-WARMUP STARTUP WINDOW: record the finish time BEFORE releasing
+    // warmup_complete_ so GetGraphicsPipeline's acquire-load sees a valid
+    // time_point (C++ happens-before from release → acquire).
+    warmup_complete_time_ = std::chrono::steady_clock::now();
+    warmup_complete_.store(true, std::memory_order_release);
+    LOG_INFO(Render, "Pipeline warmup done — holding {}ms sync budget for {}s",
+             kPostWarmupSyncBudget.count(), kPostWarmupWindow.count());
 }
 
 void PipelineCache::Sync() {

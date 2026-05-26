@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -295,6 +296,15 @@ private:
     // and the gameplay fps regression both return with any non-zero value.
     static constexpr std::chrono::milliseconds kGameplaySyncBudget{0};
     static constexpr std::chrono::milliseconds kPhotoSyncBudget{10000}; // cold photo-pipeline compile is ~2.5s; must exceed it so the capture never skips
+    // POST-WARMUP STARTUP WINDOW (GR2FORK): for kPostWarmupWindow seconds after
+    // WarmUp() finishes, hold a 10s sync budget so pipelines encountered during
+    // the first scene load block long enough to finish rather than being stashed
+    // as async-pending. This prevents a wave of skipped draws (and a visible
+    // frame-skip / geometry-pop) immediately after the loading screen clears.
+    // After the window expires the budget reverts to kGameplaySyncBudget (0ms)
+    // and the normal fully-async path resumes — zero fps impact at steady state.
+    static constexpr std::chrono::milliseconds kPostWarmupSyncBudget{10000};
+    static constexpr std::chrono::seconds      kPostWarmupWindow{5};
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
     static constexpr std::chrono::seconds      kPermaFailThreshold{30};
 
@@ -333,6 +343,12 @@ private:
     GraphicsPipelineKey prev_graphics_key_{};  // Key-level dedup: skip map lookup when unchanged
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // POST-WARMUP STARTUP WINDOW: set by WarmUp() on completion. The time_point
+    // is written before the atomic flag is released, so reading it after an
+    // acquire-load of warmup_complete_ is safe by C++ happens-before.
+    std::atomic<bool> warmup_complete_{false};
+    std::chrono::steady_clock::time_point warmup_complete_time_{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

@@ -617,7 +617,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
                 break;
             }
         }
-        const auto sync_budget = photo_target ? kPhotoSyncBudget : kGameplaySyncBudget;
+        // POST-WARMUP STARTUP WINDOW: for kPostWarmupWindow seconds after WarmUp()
+        // finishes, use kPostWarmupSyncBudget (10s) so pipelines encountered during
+        // the first scene load (after the loading screen clears) block long enough
+        // to finish compiling rather than being stashed as async-pending. This
+        // prevents the geometry-pop / skipped-draw wave that otherwise shows up in
+        // the first few seconds of gameplay. Once the window expires we revert to
+        // kGameplaySyncBudget (0ms) and the fully-async path resumes.
+        const bool in_warmup_window =
+            warmup_complete_.load(std::memory_order_acquire) &&
+            (std::chrono::steady_clock::now() - warmup_complete_time_) < kPostWarmupWindow;
+        const auto sync_budget = photo_target       ? kPhotoSyncBudget
+                                 : in_warmup_window ? kPostWarmupSyncBudget
+                                                    : kGameplaySyncBudget;
         if (pending->future.wait_for(sync_budget) == std::future_status::ready) {
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {

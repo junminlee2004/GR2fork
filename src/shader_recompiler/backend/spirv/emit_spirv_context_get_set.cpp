@@ -3,6 +3,8 @@
 
 #include "common/assert.h"
 #include "common/config.h"
+#include "common/elf_info.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_bounds.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -12,10 +14,98 @@
 
 #include <magic_enum/magic_enum.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <optional>
+#include <unordered_map>
+
 namespace Shader::Backend::SPIRV {
 
 using PointerType = EmitContext::PointerType;
 using PointerSize = EmitContext::PointerSize;
+
+// [GR2FORK] Gravity Rush Remastered's final composite shader (fs 0x9a4b146c) multiplies the whole
+// image by an overall exposure/scale it reads from constant-buffer #0 dword 0. In gr2fork that
+// value arrives at ~0.40, which darkens the entire frame versus PS4. We scale that one constant as
+// the shader loads it (see EmitReadConstBuffer). A multiplier — not a fixed value — is used so the
+// game's own dynamic/auto-exposure is preserved and only the overall level is corrected.
+// 0.40 * 2.5 == 1.0, i.e. this default removes the dimming entirely. Tune to taste (like the wind
+// fade constant): lower it toward 1.0 if it ends up too bright.
+static constexpr f32 kGrrExposureBoost = 1.0f;
+static constexpr u64 kGrrCompositePgmHash = 0x9a4b146cull;
+
+// [GR2FORK] Bloom intensity. RenderDoc + the composite's decompiled SPIR-V confirm the bloom
+// texture (fs_img16, the 480x270 blur) is multiplied per-channel by CB#0 dwords 8/9/10 and then
+// added to the scene; dword 11 is an extra depth-gated bloom boost (applied where depth > 0.5).
+// Scaling 8/9/10 together scales overall bloom while preserving its tint. 1.0 == stock.
+static constexpr f32 kGrrBloomScale = 1.3f;
+
+// [GR2FORK] Highlight shaping in the composite's tonemap (extended Reinhard:
+//   _274 = (1 + L*data[15]) / (1 + L), with a highlight rolloff _301 = data[12] + brightness).
+// kGrrHighlightLift scales dword 15 (the white-point term): >1 makes bright object cores read
+// hotter, scaling with luma so mid-tones barely move. kGrrHighlightRolloff scales dword 12 (the
+// rolloff denominator): >1 compresses the very brightest pixels harder, reining in things that
+// blow out (fountain spec, 3D UI markers) without dimming mid-bright emitters. Tune the two
+// together: lift up for glow, rolloff up to stop the hottest pixels clipping. Both 1.0 == stock.
+static constexpr f32 kGrrHighlightLift = 16.0f;    // dword 15
+static constexpr f32 kGrrHighlightRolloff = 1.0f; // dword 12
+
+// Permanent (dword -> multiplier) table baked into every build. Entries at 1.0 are no-ops.
+static constexpr std::array<std::pair<u32, f32>, 6> kGrrPermanentScales{{
+    {0u, kGrrExposureBoost},
+    {8u, kGrrBloomScale},
+    {9u, kGrrBloomScale},
+    {10u, kGrrBloomScale},
+    {12u, kGrrHighlightRolloff},
+    {15u, kGrrHighlightLift},
+}};
+
+// [GR2FORK] Live tuning via FOUR independent env vars (read once at first shader compile; the
+// composite must be re-emitted, so clear/disable the shader+pipeline cache between runs or env
+// changes won't take effect). Each var is a single float multiplier; unset == use the baked
+// constant above (1.0 by default == stock). Each overrides only its own dword(s):
+//   GR2_EXPOSURE=<f>   -> overall exposure        (CB#0 dword 0)
+//   GR2_BLOOM=<f>      -> bloom intensity          (CB#0 dwords 8/9/10, applied together)
+//   GR2_EMISSION=<f>   -> highlight/white-point    (CB#0 dword 15, the tonemap white-point term)
+//   GR2_ROLLOFF=<f>    -> highlight rolloff        (CB#0 dword 12, compress hottest pixels)
+// Example: GR2_EXPOSURE=1.8 GR2_BLOOM=1.0 GR2_EMISSION=1.0 GR2_ROLLOFF=2.0
+//
+// WHICH KNOB DOES WHAT (this is the whole game here):
+// The composite tonemap is extended Reinhard: out = L * (1 + L*data[15]) / (1 + L). data[15]
+// (EMISSION) is a WHITE-POINT term -- it scales with L, so it lifts bright pixels hard and leaves
+// dark/mid pixels almost untouched. Cranking EMISSION to brighten a dark scene is the wrong lever:
+// it blows the fountain / orbs / 3D UI markers to flat white while Kat and the shadows never move,
+// which raises contrast (the opposite of the soft, hazy, shadow-lifted PS4 dusk look).
+// To brighten the WHOLE image -- including Kat and the shadows -- use GR2_EXPOSURE (dword 0), a
+// LINEAR pre-tonemap gain on (scene + bloom): out scales ~linearly for small L, so it lifts darks.
+// Then use GR2_ROLLOFF (dword 12) to compress the now-hotter highlights so the fountain/markers
+// stop clipping. Practical recipe to match PS4: EMISSION back to ~1.0, EXPOSURE up to lift the
+// scene + Kat, ROLLOFF up to rein in the brightest pixels. Lift/rolloff balance, not emission alone.
+static const std::unordered_map<u32, f32> kGrrEnvScales = [] {
+    std::unordered_map<u32, f32> m;
+    const auto read_f32 = [](const char* name) -> std::optional<f32> {
+        if (const char* e = std::getenv(name)) {
+            return static_cast<f32>(std::strtod(e, nullptr));
+        }
+        return std::nullopt;
+    };
+    if (const auto v = read_f32("GR2_EXPOSURE")) {
+        m[0u] = *v; // exposure -> dword 0
+    }
+    if (const auto v = read_f32("GR2_BLOOM")) {
+        m[8u] = *v; // bloom -> dwords 8/9/10 (per channel, scaled equally)
+        m[9u] = *v;
+        m[10u] = *v;
+    }
+    if (const auto v = read_f32("GR2_EMISSION")) {
+        m[15u] = *v; // highlight/white-point lift -> dword 15
+    }
+    if (const auto v = read_f32("GR2_ROLLOFF")) {
+        m[12u] = *v; // highlight rolloff -> dword 12 (compress hottest pixels: fountain, orbs, markers)
+    }
+    return m;
+}();
 
 static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribute attr) {
     if (IR::IsParam(attr)) {
@@ -71,13 +161,65 @@ Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
 }
 
 Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
+    // [GR2FORK] Detect GRR's composite (fs 0x9a4b146c) reading floats from constant-buffer #0. The
+    // match is made on the original, pre-offset index: S_BUFFER_LOAD_DWORD builds the index as
+    // IAdd(dword_offset, i), which constant-folds to ConstU32(k) for dword k, so an exact-constant
+    // index plus the composite's program hash uniquely identifies a given parameter load. Dword 0
+    // is the overall exposure (scaled by kGrrExposureBoost). Other dwords (bloom intensity, grade
+    // matrix, tonemap params) are discovered/tuned via the GR2_CB0_* env vars. If nothing matches,
+    // the read is left untouched (safe no-op).
+    // [GR2FORK] All composite-shader patching runs only for Gravity Rush Remastered.
+    // Function-local static so ElfInfo is queried on first shader compile, not at
+    // program startup before the game serial is known.
+    static const bool kIsGravityRushRemastered = [] {
+        static constexpr std::array<std::string_view, 12> kGrrSerials = {
+            "CUSA01112", "CUSA01113", "CUSA01113P", "CUSA01130",
+            "CUSA02318", "CUSA00546", "CUSA02443",  "CUSA04246",
+            "PCJS50004", "PCJS50008", "PCJS66015",  "PCJS66029",
+        };
+        const auto serial = Common::ElfInfo::Instance().GameSerial();
+        return std::find(kGrrSerials.begin(), kGrrSerials.end(), serial) != kGrrSerials.end();
+    }();
+    const bool is_composite_cb0 =
+        kIsGravityRushRemastered && ctx.info.pgm_hash == kGrrCompositePgmHash && handle == 0;
+
+    // Decide whether this dword load should be scaled, and by how much. The permanent table
+    // (exposure / bloom / highlight knobs) applies first; an env entry for the same dword overrides
+    // it for live tuning. Entries of 1.0 are skipped so they emit nothing.
+    f32 scale = 1.0f;
+    bool do_scale = false;
+    if (is_composite_cb0) {
+        for (const auto& [d, f] : kGrrPermanentScales) {
+            if (f != 1.0f && index.value == ctx.ConstU32(d).value) {
+                scale = f;
+                do_scale = true;
+                break;
+            }
+        }
+        for (const auto& [d, f] : kGrrEnvScales) {
+            if (index.value == ctx.ConstU32(d).value) {
+                scale = f; // env override wins (live tuning)
+                do_scale = true;
+                break;
+            }
+        }
+    }
+
     const auto& buffer = ctx.buffers[handle];
     if (const Id offset = buffer.Offset(PointerSize::B32); Sirit::ValidId(offset)) {
         index = ctx.OpIAdd(ctx.U32[1], index, offset);
     }
     const auto [id, pointer_type] = buffer.Alias(PointerType::U32);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index)};
-    const Id result{ctx.OpLoad(ctx.U32[1], ptr)};
+    Id result{ctx.OpLoad(ctx.U32[1], ptr)};
+
+    if (do_scale) {
+        // The constant is a raw float stored as a dword; bitcast, scale, bitcast back.
+        const Id as_f32 = ctx.OpBitcast(ctx.F32[1], result);
+        const Id scaled = ctx.OpFMul(ctx.F32[1], as_f32, ctx.ConstF32(scale));
+        result = ctx.OpBitcast(ctx.U32[1], scaled);
+    }
+
     if (const Id size = buffer.Size(PointerSize::B32); Sirit::ValidId(size)) {
         const Id in_bounds = ctx.OpULessThan(ctx.U1[1], index, size);
         return ctx.OpSelect(ctx.U32[1], in_bounds, result, ctx.u32_zero_value);

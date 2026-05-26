@@ -156,7 +156,15 @@ GraphicsPipeline::GraphicsPipeline(
     // and every other title in the fork are completely unaffected.
     static constexpr u64 kWindPsHash = 0xc1338b35;
     static constexpr float kWindFadeAmt = 0.05f;
-    static const bool is_gr_remastered = Common::ElfInfo::Instance().GameSerial() == "CUSA01130";
+    static constexpr std::array<std::string_view, 12> kGrrSerials = {
+        "CUSA01112", "CUSA01113", "CUSA01113P", "CUSA01130",
+        "CUSA02318", "CUSA00546", "CUSA02443",  "CUSA04246",
+        "PCJS50004", "PCJS50008", "PCJS66015",  "PCJS66029",
+    };
+    static const bool is_gr_remastered = [&] {
+        const auto serial = Common::ElfInfo::Instance().GameSerial();
+        return std::find(kGrrSerials.begin(), kGrrSerials.end(), serial) != kGrrSerials.end();
+    }();
     u64 fs_pgm_hash = 0;
     for (const Shader::Info* s : stages) {
         if (s != nullptr && s->l_stage == Shader::LogicalStage::Fragment) {

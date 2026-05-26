@@ -256,7 +256,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     LOG_INFO(Loader, "Starting gr2fork (shadps4 v{} base)", Common::g_version);
     LOG_INFO(Loader, "Fork: Gravity Rush 2 focus");
-    LOG_INFO(Loader, "Build: v3.4");
+    LOG_INFO(Loader, "Build: v3.5");
 
     const bool has_game_config = std::filesystem::exists(
         Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"));
@@ -305,9 +305,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         // cache returns a stale image_id -> draw goes into the wrong / freed
         // image (visible as shadow flicker on this title). Force the accurate
         // path on regardless of user config.
-        static constexpr std::array<std::string_view, 7> gr_remastered_ids = {
-            "CUSA01112", "CUSA01113", "CUSA01130",
-            "PCJS50008", "CUSA02318", "CUSA02443", "CUSA04246",
+        static constexpr std::array<std::string_view, 12> gr_remastered_ids = {
+            "CUSA01112", "CUSA01113", "CUSA01113P", "CUSA01130",
+            "CUSA02318", "CUSA00546", "CUSA02443",  "CUSA04246",
+            "PCJS50004", "PCJS50008", "PCJS66015",  "PCJS66029",
         };
         const bool is_gr_remastered =
             std::find(gr_remastered_ids.begin(), gr_remastered_ids.end(), id) !=
@@ -375,19 +376,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // own release tag. Format: "Junmin Lee GR2FORK v1.0 (v0.13.0) | <game>".
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.4 (v{}) | {}", Common::g_version,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.5 (v{}) | {}", Common::g_version,
                                        game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.4 {}/(v{}) | {}", remote_host,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.5 {}/(v{}) | {}", remote_host,
                                        Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.4 (v{}) {} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.5 (v{}) {} {} | {}",
                                        Common::g_version, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.4 (v{}) {}/{} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.5 (v{}) {}/{} {} | {}",
                                        Common::g_version, remote_host, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         }
