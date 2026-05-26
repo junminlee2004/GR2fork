@@ -44,7 +44,7 @@ public:
     // HANDOFF §9: PM4-parser → assembler queue depth = 256 slots. The first
     // queue is deepest because PM4 packets can burst (CE writes hundreds of
     // regs between draws).
-    static constexpr u32 kQueueSize = 256;
+    static constexpr u32 kQueueSize = 512;
     static_assert((kQueueSize & (kQueueSize - 1)) == 0,
                   "kQueueSize must be a power of two");
 
