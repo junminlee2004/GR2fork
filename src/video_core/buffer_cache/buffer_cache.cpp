@@ -1006,29 +1006,21 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                       "StreamCopyCacheEntry must be 32 bytes (Path D four-tuple layout)");
 
         constexpr size_t kStreamCacheSets = 4096;
-        // GR2FORK cache-audit: ObtainBuf_Stream misses measured 92.6% Collision
-        // (both ways held other live buffers) at 2-way — i.e. conflict misses,
-        // the textbook associativity-limited case. Bumped 2 -> 4 ways: doubles
-        // capacity AND attacks the conflict directly. 4-way at 4096 sets stays
-        // L2-resident (768 KB), unlike widening to 8192 sets (1 MB = whole L2),
-        // so the ~46% existing hits don't turn into L2-miss probes.
-        constexpr size_t kStreamCacheWays = 4;
+        constexpr size_t kStreamCacheWays = 2;
         struct alignas(64) StreamCopyCacheSet {
             StreamCopyCacheEntry ways[kStreamCacheWays];
         };
-        // 4 × 32 = 128 bytes, exactly two cache lines under alignas(64).
-        // Cache footprint: 4096 × 128 = 512 KB per thread. Well within
-        // Z1 Extreme's 1 MB L2 per core.
-        static_assert(sizeof(StreamCopyCacheSet) == 128,
-                      "StreamCopyCacheSet must be 128 bytes (Path D four-tuple, 4-way)");
+        // 2 × 32 = 64 bytes, exactly one cache line under alignas(64).
+        // Cache footprint: 4096 × 64 = 256 KB per thread. Comfortably within
+        // Z1 Extreme's 1 MB L2 per core. (The v3.6 4-way associativity bump
+        // was reverted; the 32-byte four-tuple entry is from the epoch removal.)
+        static_assert(sizeof(StreamCopyCacheSet) == 64,
+                      "StreamCopyCacheSet must be 64 bytes (Path D four-tuple, 2-way)");
 
         struct StreamCopyCache {
             std::array<StreamCopyCacheSet, kStreamCacheSets> sets{};
-            // Per-set round-robin (FIFO) victim pointer, 0..kStreamCacheWays-1.
-            // At 4-way a true LRU needs recency ordering across 4 entries;
-            // round-robin is cheaper and, for a conflict-thrashing working set,
-            // performs within noise of LRU. The associativity bump (2->4) is the
-            // win; eviction policy is second-order here.
+            // 1-bit pseudo-LRU per set: index of the way to evict next.
+            // Stored separately to keep the set itself at one cache line.
             std::array<u8, kStreamCacheSets> lru{};
         };
         static thread_local std::unique_ptr<StreamCopyCache> cache_storage;
@@ -1061,21 +1053,22 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         const size_t set_idx = key & (kStreamCacheSets - 1);
         StreamCopyCacheSet& set = cache.sets[set_idx];
 
-        // Probe all ways. way 0 is the common hit in steady state; the scan
-        // is a tight loop over kStreamCacheWays (4) entries within the set.
-        // The `addr == device_addr` check folds in the invalid-sentinel test
+        // Probe both ways. way 0 is hit in the dominant case; way 1 only
+        // matters when way 0 was evicted by a colliding key. The
+        // `addr == device_addr` check folds in the invalid-sentinel test
         // (device_addr ≠ 0, so addr == device_addr implies a populated entry).
         StreamCopyCacheEntry* hit = nullptr;
-        for (u32 w = 0; w < kStreamCacheWays; ++w) {
-            StreamCopyCacheEntry& e = set.ways[w];
-            if (e.addr == device_addr && e.size == size && e.cmdbuf == cmdbuf &&
-                e.tick == tick) {
-                hit = &e;
-                break;
-            }
+        if (set.ways[0].addr == device_addr && set.ways[0].size == size &&
+            set.ways[0].cmdbuf == cmdbuf && set.ways[0].tick == tick) [[likely]] {
+            hit = &set.ways[0];
+        } else if (set.ways[1].addr == device_addr && set.ways[1].size == size &&
+                   set.ways[1].cmdbuf == cmdbuf && set.ways[1].tick == tick) {
+            hit = &set.ways[1];
         }
 
         if (hit) [[likely]] {
+            // 1-bit LRU update: the OTHER way is the next eviction target.
+            cache.lru[set_idx] = static_cast<u8>(hit == &set.ways[0] ? 1u : 0u);
             // Path D: skip the sticky-dirty check by default. v1.35
             // behavior is restored when kTrustIntraCmdbuf is false.
             if (kTrustIntraCmdbuf || !IsRegionCpuModified(device_addr, size)) [[likely]] {
@@ -1090,18 +1083,18 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return {&stream_buffer, offset};
         }
 
-        // Miss in all ways. Copy fresh and insert into the round-robin victim.
-        // cache.lru[set_idx] names the next victim way (0..kStreamCacheWays-1)
-        // and advances by one on each insert (FIFO).
+        // Miss in both ways. Copy fresh and insert into the LRU way.
+        // cache.lru[set_idx] names the next victim; after the insert it
+        // flips to the other way so that way evicts next.
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        const u8 victim_way = cache.lru[set_idx] & (kStreamCacheWays - 1u);
+        const u8 victim_way = cache.lru[set_idx] & 1u;
         StreamCopyCacheEntry& victim = set.ways[victim_way];
         victim.addr = device_addr;
         victim.tick = tick;
         victim.cmdbuf = cmdbuf;
         victim.offset = static_cast<u32>(offset);
         victim.size = size;
-        cache.lru[set_idx] = static_cast<u8>((victim_way + 1u) & (kStreamCacheWays - 1u));
+        cache.lru[set_idx] = static_cast<u8>(victim_way ^ 1u);
 
         // PERF(GR2FORK v1.32 Fix 2 → REVERTED in v1.34, see path-D notes
         // above): UnmarkRegionAsCpuModified() here would clear the

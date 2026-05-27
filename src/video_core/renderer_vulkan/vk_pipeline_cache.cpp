@@ -529,41 +529,25 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
     // load of `liverpool->gfx_pipeline_stamp` plus a plain bool read of
     // `liverpool->gfx_key_dirty_` could disagree with the regs we
     // captured for THIS intent.
-    // =========================================================================
-    // REMOVED DEAD SKIP CACHES — do not re-add. (cache-audit, 62M draws)
-    //
-    // Two early-return skip caches used to sit here:
-    //
-    //   1. gfx-stamp skip:  if (stamp == last_gfx_stamp && last_gfx_pipeline)
-    //                           return last_gfx_pipeline;
-    //   2. key-clean skip:  if (!regs.gfx_key_dirty && last_gfx_pipeline)
-    //                           return last_gfx_pipeline;
-    //
-    // Both measured 0.00% hit (literally zero hits in 62,000,000 draws). They
-    // are NOT optimizations — they were pure per-draw overhead, and the
-    // `last_gfx_stamp` member they fed has been deleted with them.
-    //
-    // WHY THEY CAN NEVER HIT, AND WHY YOU MUST NOT TRY TO "FIX" THEM:
-    //   GR2 rewrites user_data SGPRs every draw (per-draw constants + sharp
-    //   pointers). Each such write goes through PM4 SetShReg -> MarkGfxKeyDirty,
-    //   which sets gfx_key_dirty_ AND bumps gfx_pipeline_stamp. So the stamp
-    //   bumps and gfx_key_dirty is set on EVERY draw -> both predicates above
-    //   are always false.
-    //
-    //   That per-draw bump is LOAD-BEARING, not a bug. GR2 reuses the same
-    //   shader (PGM address) against different sharps that require different
-    //   module SPECIALIZATIONS (image type / dst_select / srgb / array-ness /
-    //   fetch-shader layout — see the v17 stable-shortcut removal note in
-    //   GetProgram below). Serving last_gfx_pipeline when user_data changed
-    //   would serve a stale, wrong-specialized module -> green/garbled
-    //   corruption. This was already shipped and reverted once (v17).
-    //
-    //   Do NOT make the stamp ignore user_data to wake these. Do NOT re-add a
-    //   pointer/stamp shortcut. The ONLY correct dedup is the KeyMemcmp below,
-    //   which REBUILDS the key (its stage_hashes fold in perm_idx, the
-    //   specialization index) and byte-compares — that one genuinely works
-    //   (~82-86% hit) because it reflects the resolved module, not raw regs.
-    // =========================================================================
+    const u64 stamp = regs.gfx_pipeline_stamp;
+    // PERF(GR2FORK v1.15): The gfx-stamp early-out is the dominant exit —
+    // consecutive draws share a pipeline and the stamp only bumps on register
+    // writes that affect pipeline state. The metrics + the FilterDraw same-
+    // pipeline cache directly track this rate. Hint it.
+    if (stamp == last_gfx_stamp && last_gfx_pipeline) [[likely]] {
+        return last_gfx_pipeline;
+    }
+    // Level 2: stamp bumped but only dynamic-state regs changed (viewport, scissor, etc.)
+    // Skip the entire RefreshGraphicsKey rebuild — pipeline key cannot have changed.
+    // PERF(GR2FORK v1.23): once we've passed the v1.15 stamp-equal early
+    // exit, the next-most-common case is dynamic-state-only changes
+    // (viewport scrolls, scissor moves, blend constants) — those bump the
+    // stamp but don't dirty the key. Hint as the dominant exit among the
+    // post-stamp-mismatch cases.
+    if (!regs.gfx_key_dirty && last_gfx_pipeline) [[likely]] {
+        last_gfx_stamp = stamp;
+        return last_gfx_pipeline;
+    }
     // Phase 1D-pre-C: the prior `liverpool->ClearGfxKeyDirty()` call here
     // is gone — PM4 cleared the live `gfx_key_dirty_` flag inside
     // `Liverpool::CaptureSnapshot()` under sole-writer ownership. The
@@ -577,6 +561,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
     if (last_gfx_pipeline &&
         std::memcmp(&graphics_key, &prev_graphics_key_,
                     offsetof(GraphicsPipelineKey, cached_hash_)) == 0) {
+        last_gfx_stamp = stamp;
         return last_gfx_pipeline;
     }
 
@@ -689,6 +674,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
         return nullptr;
     }
 
+    last_gfx_stamp = stamp;
     last_gfx_pipeline = it->second.get();
     std::memcpy(&prev_graphics_key_, &graphics_key, sizeof(GraphicsPipelineKey));
     return last_gfx_pipeline;
@@ -1309,34 +1295,6 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         ud_hash ^= ri_bind_hash + 0x9e3779b97f4a7c15ULL + (ud_hash << 6) + (ud_hash >> 2);
 
-        // =====================================================================
-        // DEAD SKIP CACHES — RETAINED BUT NEAR-INERT. DO NOT "FIX" THEM.
-        //
-        // The two ud_hash-keyed module caches below (last_result and
-        // ud_hash_lru) measured 0.27% and 0.85% hit over ~100M GetProgram
-        // calls. They are effectively dead, NOT working optimizations.
-        //
-        // WHY THEY MISS, AND WHY IT IS NOT FIXABLE CHEAPLY:
-        //   ud_hash is a hash of raw user_data (SGPR pointer values), which GR2
-        //   rewrites every draw. So ud_hash churns every call -> the caches
-        //   miss almost always. The MODULE that the slow path then resolves is
-        //   usually the SAME (the key memcmp in GetGraphicsPipeline hits ~85%),
-        //   but you cannot detect "same module" cheaply: the module depends on
-        //   the SHARP CONTENTS (format/type/etc.), which live in guest memory
-        //   behind those pointers. A cheap key (the pointers) churns; the only
-        //   stable key (the sharp contents) requires reading the sharps, which
-        //   IS the cost. This circularity is fundamental.
-        //
-        //   DO NOT try to wake these by keying on a "stable subset" of
-        //   user_data or by reusing the last module when user_data changed —
-        //   that is the v17 stable-shortcut trap (same shader, different sharps,
-        //   different required specialization -> wrong module -> corruption).
-        //   Already shipped and reverted once. The correct, working dedup is
-        //   the rebuild+memcmp in GetGraphicsPipeline, not anything here.
-        //
-        //   Retained in place (rather than excising ~78 woven references from
-        //   this correctness-critical resolver) but they are not optimizations.
-        // =====================================================================
         // PERF(GR2FORK v1.15): When user_data is stable across consecutive
         // calls (the dominant case in steady state — same shader bound, same
         // resource layout), this branch returns the cached module without

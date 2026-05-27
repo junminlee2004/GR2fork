@@ -377,22 +377,22 @@ private:
     // Cross-call cache to skip repeated FindImageWithView lock/page-table scans for stable descriptors.
     // PERF(GR2FORK v1.44): key now folds in the texture VA so different
     // textures bound to the same shader binding get distinct slots.
-    // PERF(GR2FORK cache-audit): 16384 was TESTED and REVERTED to 4096. The 4×
-    // bump did collapse the conflict (pkey 20.68%->7.40%, FindImageWithView
-    // fires 25.58%->12.03%, hits 74%->88%) — so the miss WAS real conflict, not
-    // compulsory. BUT bindtex cyc/stage stayed flat (~1940->~2061) and avg_cyc
-    // nudged UP: the pcache only caches image_id resolution, while the bulk of
-    // bindtex (per-iteration view lookup + descriptor construction) is NOT
-    // gated by it. Hit-rate win, zero cost win, +480 KB & worse locality.
-    // Keep 4096. (One-line re-bump to 16384 if a future fps read ever favors it.)
     std::array<PersistentFindImageCacheEntry, 4096> find_image_pcache_{};
 
-    // PERF(GR2FORK v1.43 + cache-audit): the BindTextures intra-call caches are
-    // gone. find_image_cache_(_stamp_) was culled in v1.43 (0 hits); the texture
-    // view cache (find_texture_cache_ / _stamp_, bind_textures_epoch_,
-    // FindTextureCacheEntry, the epoch counter) was culled in the cache-audit —
-    // 0.00% hit over 38,839 lookups on the mip-fallback path. The one caller now
-    // goes straight to texture_cache.FindTexture (behavior-identical at runtime).
+    // PERF(GR2 v17): Epoch-based validity for BindTextures caches.
+    // Instead of zero-initializing 640+ bytes of stamp arrays on the stack every BindTextures call,
+    // use a monotonically increasing epoch counter. Entries are valid iff their stamp matches the
+    // current epoch. This eliminates the per-call memset overhead.
+    u32 bind_textures_epoch_{};
+    // PERF(GR2FORK v1.43): find_image_cache_stamp_ removed alongside the
+    // intra-call cache. find_texture_cache_stamp_ remains for FindTextureCached.
+    std::array<u32, 128> find_texture_cache_stamp_{}; // was local u8[128] zeroed every call
+    struct FindTextureCacheEntry {
+        VideoCore::ImageId image_id{};
+        VideoCore::TextureCache::BindingType type{};
+        VideoCore::ImageView* view{};
+    };
+    std::array<FindTextureCacheEntry, 128> find_texture_cache_{};
 
     // =========================================================================
     // Render target identity cache

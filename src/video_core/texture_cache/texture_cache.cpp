@@ -821,13 +821,21 @@ bool TextureCache::ValidateCachedFindImage(const ImageDesc& desc, ImageId image_
         return {GetNullImage(info.pixel_format), -1, -1};
     }
 
-    // PERF(GR2FORK): the per-thread "ptr_hot" MRU (keyed on the ImageDesc*
-    // pointer) was removed. Cache-metrics measured it at 2.9% hit across 62M
-    // image lookups: the Rasterizer rebuilds its descriptor array each draw, so
-    // &desc almost never recurs. The content-keyed hot_cache below caught
-    // everything it did (65% hit) and is a strict superset, so ptr_hot only
-    // added per-call validation overhead (two entries × image deref + field
-    // compares) on the ~97% of calls that missed it.
+    // OPT(v8/v4): Tiny per-thread hot cache for perfect-match lookups.
+    // GR2 repeatedly queries the same image descriptors; avoid scanning page candidates.
+    struct PtrHotEntry {
+        const ImageDesc* desc_ptr{};
+        ImageId id{};
+        VAddr guest_address{};
+        u32 guest_size{};
+        Extent3D size{};
+        AmdGpu::ImageType type{};
+        vk::Format pixel_format{};
+        bool exact{};
+        bool valid{false};
+    };
+    thread_local PtrHotEntry ptr_hot0{};
+    thread_local PtrHotEntry ptr_hot1{};
 
     auto fast_hot_hash = [&](const ImageInfo& ii, bool exact) noexcept -> u64 {
         // PERF(v4): direct-mapped cache only needs a cheap mixer (we fully validate on hit).
@@ -873,21 +881,57 @@ bool TextureCache::ValidateCachedFindImage(const ImageDesc& desc, ImageId image_
         return *hot_slot_ptr;
     };
 
-    // ARCH-2: Lock-free fast path for the hot_cache lookup.
+    // ARCH-2: Lock-free fast path for ptr_hot and hot_cache lookups.
     //
-    // hot_cache only reads thread_local data + pool-stable Image fields.
+    // ptr_hot and hot_cache only read thread_local data + pool-stable Image fields.
     // On x86 (TSO), aligned reads of fundamental types from stable memory are safe
     // without locks. Stale reads cause a cache miss and fall through to the locked path.
-    // This eliminates shared_lock acquisition for the bulk of lookups.
+    // This eliminates shared_lock acquisition for ~80-90% of lookups.
     const u64 now_tick = scheduler.CurrentTick();
     static constexpr u64 kTouchIntervalTicks = 65536;
     ImageId fast_image_id{};
     bool fast_needs_touch = false;
     {
-        // NO lock here — hot_cache is lock-free safe
+        // NO lock here — ptr_hot and hot_cache are lock-free safe
+
+        auto try_ptr_hot = [&](const PtrHotEntry& e) -> bool {
+            if (!e.valid || e.desc_ptr != &desc || e.exact != exact_fmt) {
+                return false;
+            }
+            if (!slot_images.is_allocated(e.id)) {
+                return false;
+            }
+            auto& cache_image = slot_images[e.id];
+            if (!(cache_image.flags & ImageFlagBits::Registered)) {
+                return false;
+            }
+            if (cache_image.info.guest_address != e.guest_address ||
+                cache_image.info.guest_size != e.guest_size ||
+                cache_image.info.size != e.size ||
+                cache_image.info.type != e.type ||
+                cache_image.info.pixel_format != e.pixel_format) {
+                return false;
+                }
+                if (cache_image.info.guest_address != info.guest_address ||
+                    cache_image.info.guest_size != info.guest_size ||
+                    cache_image.info.size != info.size ||
+                    !IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+                    (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1}) ||
+                    (exact_fmt && info.pixel_format != cache_image.info.pixel_format)) {
+                    return false;
+                    }
+                    fast_image_id = e.id;
+                fast_needs_touch = (now_tick - cache_image.tick_accessed_last) > kTouchIntervalTicks;
+                return true;
+        };
+
+        // Zero-hash pointer MRU fast path (very common with Rasterizer's descriptor cache).
+        if (!try_ptr_hot(ptr_hot0)) {
+            (void)try_ptr_hot(ptr_hot1);
+        }
 
         // Hot-cache check (O(1) in common case). Lock-free safe.
-        {
+        if (!fast_image_id) {
             HotEntry& hot_slot = ensure_hot_slot();
             if (hot_slot.valid && hot_slot.key == hot_key) {
                 const auto cache_id = hot_slot.id;
@@ -955,6 +999,16 @@ bool TextureCache::ValidateCachedFindImage(const ImageDesc& desc, ImageId image_
         hot_slot.key = hot_key;
         hot_slot.id = fast_image_id;
         hot_slot.valid = true;
+        ptr_hot1 = ptr_hot0;
+        ptr_hot0 = PtrHotEntry{.desc_ptr = &desc,
+            .id = fast_image_id,
+            .guest_address = info.guest_address,
+            .guest_size = info.guest_size,
+            .size = info.size,
+            .type = info.type,
+            .pixel_format = info.pixel_format,
+            .exact = exact_fmt,
+            .valid = true};
             return {fast_image_id, -1, -1};
     }
 
@@ -970,6 +1024,16 @@ bool TextureCache::ValidateCachedFindImage(const ImageDesc& desc, ImageId image_
             hot_slot.key = hot_key;
             hot_slot.id = fast_image_id;
             hot_slot.valid = true;
+            ptr_hot1 = ptr_hot0;
+            ptr_hot0 = PtrHotEntry{.desc_ptr = &desc,
+                .id = fast_image_id,
+                .guest_address = info.guest_address,
+                .guest_size = info.guest_size,
+                .size = info.size,
+                .type = info.type,
+                .pixel_format = info.pixel_format,
+                .exact = exact_fmt,
+                .valid = true};
                 return {fast_image_id, -1, -1};
         }
         // If it got invalidated between locks, fall through to the original slow path.
@@ -1068,6 +1132,18 @@ bool TextureCache::ValidateCachedFindImage(const ImageDesc& desc, ImageId image_
     hot_slot.key = hot_key;
     hot_slot.id = image_id;
     hot_slot.valid = true;
+    if (view_mip < 0 && view_slice < 0) {
+        ptr_hot1 = ptr_hot0;
+        ptr_hot0 = PtrHotEntry{.desc_ptr = &desc,
+            .id = image_id,
+            .guest_address = info.guest_address,
+            .guest_size = info.guest_size,
+            .size = info.size,
+            .type = info.type,
+            .pixel_format = info.pixel_format,
+            .exact = exact_fmt,
+            .valid = true};
+    }
 
     return {image_id, view_mip, view_slice};
 
