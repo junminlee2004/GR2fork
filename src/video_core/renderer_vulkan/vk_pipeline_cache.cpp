@@ -173,14 +173,15 @@ namespace {
 
 // One-shot computation of the initial sync budget. See the
 // GetInitialSyncBudget() comment block in vk_pipeline_cache.h for policy.
+// The two budget values are PipelineCache::kNormalSyncBudget and
+// PipelineCache::kLongSyncBudget (header) — tune there, not here.
 [[nodiscard]] std::chrono::milliseconds DetectInitialSyncBudget() {
     const bool low_intel = IsLowEndIntelCpu();
     const unsigned hw = std::thread::hardware_concurrency();
     const bool low_threads = (hw != 0u && hw <= 4u);
     const bool use_long = low_intel || low_threads;
-    const auto budget = use_long
-                            ? std::chrono::milliseconds{1000}
-                            : std::chrono::milliseconds{200};
+    const auto budget = use_long ? PipelineCache::kLongSyncBudget
+                                 : PipelineCache::kNormalSyncBudget;
     LOG_INFO(Render_Vulkan,
              "[GR2FORK sync-budget] hw_threads={} low_end_intel={} "
              "low_thread_count={} -> kInitialSyncBudget={}ms",
