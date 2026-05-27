@@ -503,7 +503,19 @@ bool isRdocEnabled() {
 }
 
 bool isPipelineCacheEnabled() {
-    return pipelineCacheEnable.get();
+    // GR2FORK: pipeline cache is FORCED OFF for every game, regardless of
+    // what is in the global config.toml or any per-game config. This runs
+    // before warmup (and every subsequent call) because all consumers go
+    // through this getter. The underlying ConfigEntry value is left alone
+    // so save round-trips don't clobber the user's saved preference.
+    [[maybe_unused]] static const bool logged_once = [] {
+        LOG_INFO(Config,
+                 "GR2FORK: pipelineCacheEnable FORCED OFF "
+                 "(config.toml value ignored, was {})",
+                 pipelineCacheEnable.get() ? "true" : "false");
+        return true;
+    }();
+    return false;
 }
 
 bool isPipelineCacheArchived() {

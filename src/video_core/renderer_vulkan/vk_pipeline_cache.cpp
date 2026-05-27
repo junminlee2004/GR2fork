@@ -595,44 +595,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
 
         auto pending = LaunchAsyncPipelineCompile(graphics_key, pipeline_hash);
 
-        // GR2FORK: photo-capture budget, detected from regs BEFORE any skip.
-        // The free-camera capture renders to a 1024x1024 LINEAR color target
-        // (the same RT TextureCache hands to ForceDownloadByAddress). The draw
-        // path returns on a null pipeline before BeginRendering ever binds the
-        // RT, so an RT-bind gate can't arm in time for the first, cold capture —
-        // we must recognize the photo target here, at the compile decision, from
-        // the bound color buffer. For a photo target we wait long enough to
-        // finish even a COLD compile (~2.5s) so the capture render never skips
-        // and the very first photo is never black. Gameplay targets are tiled /
-        // not 1024^2, so they keep kGameplaySyncBudget (0ms) — full fps.
-        bool photo_target = false;
-        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
-            const auto& col_buf = regs.color_buffers[cb];
-            if (!col_buf) {
-                continue;
-            }
-            const auto& hint = regs.last_cb_extent[cb];
-            const u32 w = hint.Valid() ? hint.width : col_buf.Pitch();
-            const u32 h = hint.Valid() ? hint.height : col_buf.Height();
-            if (w == 1024 && h == 1024 && !col_buf.IsTiled()) {
-                photo_target = true;
-                break;
-            }
-        }
-        // POST-WARMUP STARTUP WINDOW: for kPostWarmupWindow seconds after WarmUp()
-        // finishes, use kPostWarmupSyncBudget (10s) so pipelines encountered during
-        // the first scene load (after the loading screen clears) block long enough
-        // to finish compiling rather than being stashed as async-pending. This
-        // prevents the geometry-pop / skipped-draw wave that otherwise shows up in
-        // the first few seconds of gameplay. Once the window expires we revert to
-        // kGameplaySyncBudget (0ms) and the fully-async path resumes.
-        const bool in_warmup_window =
-            warmup_complete_.load(std::memory_order_acquire) &&
-            (std::chrono::steady_clock::now() - warmup_complete_time_) < kPostWarmupWindow;
-        const auto sync_budget = photo_target       ? kPhotoSyncBudget
-                                 : in_warmup_window ? kPostWarmupSyncBudget
-                                                    : kGameplaySyncBudget;
-        if (pending->future.wait_for(sync_budget) == std::future_status::ready) {
+        // Synchronous fast-path wait. Most compiles complete in <50ms; waiting
+        // kInitialSyncBudget catches them without triggering frame-skip.
+        if (pending->future.wait_for(kInitialSyncBudget) == std::future_status::ready) {
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {
                 pipeline = pending->future.get();
