@@ -20,6 +20,11 @@
 namespace Shader::Backend::SPIRV {
 namespace {
 
+// GR2FORK v3.1 (grass fix companion): GCN GS can be fed strip-form
+// adjacency primitives in addition to the list forms. AdjLineStrip and
+// AdjTriangleStrip carry the same per-primitive vertex count as their
+// list cousins so the SPIR-V InputLinesAdjacency / InputTrianglesAdjacency
+// execution mode is the correct mapping in both cases.
 static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType type) {
     switch (type) {
     case AmdGpu::PrimitiveType::PointList:
@@ -32,18 +37,28 @@ static constexpr spv::ExecutionMode GetInputPrimitiveType(AmdGpu::PrimitiveType 
     case AmdGpu::PrimitiveType::RectList:
         return spv::ExecutionMode::Triangles;
     case AmdGpu::PrimitiveType::AdjTriangleList:
+    case AmdGpu::PrimitiveType::AdjTriangleStrip:
         return spv::ExecutionMode::InputTrianglesAdjacency;
     case AmdGpu::PrimitiveType::AdjLineList:
+    case AmdGpu::PrimitiveType::AdjLineStrip:
         return spv::ExecutionMode::InputLinesAdjacency;
     default:
         UNREACHABLE_MSG("Unknown input primitive type {}", u32(type));
     }
 }
 
+// GR2FORK v3.1 (grass fix): GsOutputPrimitiveType::PointList previously
+// mapped to spv::ExecutionMode::OutputVertices, which is the per-shader
+// max-vertex-count execution mode and REQUIRES an integer literal operand.
+// Used as a primitive type it produces malformed SPIR-V — the validator
+// either rejects the module (pipeline create fails silently) or the driver
+// folds the GS into a no-op. OutputPoints is the correct primitive-output
+// execution mode. The (unused) duplicate at frontend/translate/emit_spirv.cpp
+// already had OutputPoints; this canonical backend copy did not.
 static constexpr spv::ExecutionMode GetOutputPrimitiveType(AmdGpu::GsOutputPrimitiveType type) {
     switch (type) {
     case AmdGpu::GsOutputPrimitiveType::PointList:
-        return spv::ExecutionMode::OutputVertices;
+        return spv::ExecutionMode::OutputPoints;
     case AmdGpu::GsOutputPrimitiveType::LineStrip:
         return spv::ExecutionMode::OutputLineStrip;
     case AmdGpu::GsOutputPrimitiveType::TriangleStrip:

@@ -14,6 +14,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/thread.h"
+#include "common/arch.h"
 #include "core/debug_state.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
@@ -27,9 +28,166 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+// GR2FORK sync-budget detection: CPUID intrinsics for IsLowEndIntelCpu().
+// Pulled in only on x86_64 hosts; ARM/other archs short-circuit the check
+// to false and never touch these headers.
+#ifdef ARCH_X86_64
+#  ifdef _MSC_VER
+#    include <intrin.h>
+#  else
+#    include <cpuid.h>
+#  endif
+#endif
+
 namespace Vulkan {
 
 namespace {
+
+// =========================================================================
+// GR2FORK sync-budget CPU detection.
+// =========================================================================
+// Identifies "weak" Intel hosts where a 200ms shader-compile sync budget
+// isn't enough to absorb a cold-compile burst, so the skipped-draw fallback
+// triggers on nearly every miss and reproduces the same infinite-loading
+// failure the 200ms floor was added to prevent. On those hosts we raise the
+// budget to 1000ms; everywhere else the 200ms default stays.
+//
+// "Weak" is two independent conditions, either of which trips the long path:
+//   (1) Intel Core CPU older than 7th-generation Kaby Lake (Nehalem through
+//       Skylake client) — and Atom Silvermont→Goldmont+ which are
+//       perma-low-end regardless of generation marketing. Detected by CPUID
+//       leaf 1 DisplayFamily/DisplayModel. Skylake-X server (model 0x55) is
+//       intentionally excluded — many-core, doesn't need the long budget.
+//   (2) std::thread::hardware_concurrency() ≤ 4, independent of vendor.
+//       Covers slow AMD APUs, Atom-class boxes, constrained VMs, etc.
+//
+// IsLowEndIntelCpu() is fail-safe to false: AMD, ARM, non-x86, CPUID
+// failures, unknown models — all return false and use the 200ms default.
+
+#ifdef ARCH_X86_64
+// Thin wrapper over __cpuid / __get_cpuid that returns false on failure.
+[[nodiscard]] bool QueryCpuid(u32 leaf, u32& eax, u32& ebx, u32& ecx, u32& edx) {
+#  ifdef _MSC_VER
+    int regs[4]{};
+    __cpuid(regs, static_cast<int>(leaf));
+    eax = static_cast<u32>(regs[0]);
+    ebx = static_cast<u32>(regs[1]);
+    ecx = static_cast<u32>(regs[2]);
+    edx = static_cast<u32>(regs[3]);
+    return true;
+#  else
+    // __get_cpuid returns 0 if the requested leaf exceeds the CPU's maximum
+    // supported leaf for that range. Treat that as "can't determine" → false.
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid(leaf, &a, &b, &c, &d) == 0) {
+        return false;
+    }
+    eax = a; ebx = b; ecx = c; edx = d;
+    return true;
+#  endif
+}
+#endif // ARCH_X86_64
+
+[[nodiscard]] bool IsLowEndIntelCpu() {
+#ifndef ARCH_X86_64
+    return false; // ARM64 etc. — not classified here.
+#else
+    u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
+
+    // Leaf 0: vendor string in ebx/edx/ecx, max basic leaf in eax.
+    if (!QueryCpuid(0u, eax, ebx, ecx, edx)) {
+        return false;
+    }
+    // "GenuineIntel" packed little-endian: ebx="Genu", edx="ineI", ecx="ntel".
+    constexpr u32 kIntelEbx = 0x756E6547u; // "Genu"
+    constexpr u32 kIntelEdx = 0x49656E69u; // "ineI"
+    constexpr u32 kIntelEcx = 0x6C65746Eu; // "ntel"
+    if (ebx != kIntelEbx || edx != kIntelEdx || ecx != kIntelEcx) {
+        return false; // Not Intel — AMD, Hygon, VIA, hypervisor mask, etc.
+    }
+    if (eax < 1u) {
+        return false; // No leaf 1 support — implausibly ancient, fail-safe.
+    }
+
+    // Leaf 1: family/model/stepping in eax (Intel SDM Vol.2A §3.2.5).
+    //   base_family = (eax >> 8)  & 0x0F
+    //   base_model  = (eax >> 4)  & 0x0F
+    //   ext_family  = (eax >> 20) & 0xFF
+    //   ext_model   = (eax >> 16) & 0x0F
+    // Family 6 and 0xF use the extended fields; everywhere else uses base.
+    if (!QueryCpuid(1u, eax, ebx, ecx, edx)) {
+        return false;
+    }
+    const u32 base_family = (eax >> 8)  & 0x0Fu;
+    const u32 base_model  = (eax >> 4)  & 0x0Fu;
+    const u32 ext_family  = (eax >> 20) & 0xFFu;
+    const u32 ext_model   = (eax >> 16) & 0x0Fu;
+    const u32 family = (base_family == 0x0Fu) ? (base_family + ext_family)
+                                              : base_family;
+    const u32 model  = (base_family == 0x06u || base_family == 0x0Fu)
+                           ? (base_model | (ext_model << 4))
+                           : base_model;
+
+    if (family != 0x06u) {
+        // Pre-P6 (e.g. P4 NetBurst on family 0xF) or some exotic Intel.
+        // Effectively dead — family 6 has been Intel's only consumer family
+        // for ~two decades. Treat as not-low-end (fail-safe).
+        return false;
+    }
+
+    // Pre-7th-gen Core microarchitectures (Nehalem through Skylake client)
+    // and Atom-class chips (Silvermont/Airmont/Goldmont/Goldmont+).
+    // Skylake-X server (0x55) is intentionally excluded — many-core, doesn't
+    // need the long budget.
+    switch (model) {
+    // Nehalem / Westmere (1st-gen Core)
+    case 0x1A: case 0x1E: case 0x1F: case 0x25:
+    case 0x2C: case 0x2E: case 0x2F:
+    // Sandy Bridge (2nd-gen Core)
+    case 0x2A: case 0x2D:
+    // Ivy Bridge (3rd-gen Core)
+    case 0x3A: case 0x3E:
+    // Haswell (4th-gen Core)
+    case 0x3C: case 0x3F: case 0x45: case 0x46:
+    // Broadwell (5th-gen Core)
+    case 0x3D: case 0x47: case 0x4F: case 0x56:
+    // Skylake client (6th-gen Core) — Skylake-X 0x55 deliberately omitted
+    case 0x4E: case 0x5E:
+    // Atom Silvermont (Bay Trail / Avoton / Rangeley)
+    case 0x37: case 0x4A: case 0x4D: case 0x5A: case 0x5D:
+    // Atom Airmont (Cherry Trail / Braswell)
+    case 0x4C:
+    // Atom Goldmont (Apollo Lake / Denverton)
+    case 0x5C: case 0x5F:
+    // Atom Goldmont Plus (Gemini Lake)
+    case 0x7A:
+        return true;
+    default:
+        // Kaby Lake (8E/9E) and everything after — including Coffee Lake,
+        // Comet Lake, Ice Lake, Tiger Lake, Rocket Lake, Alder Lake,
+        // Raptor Lake, Meteor Lake, Arrow Lake. All "not low-end".
+        return false;
+    }
+#endif // ARCH_X86_64
+}
+
+// One-shot computation of the initial sync budget. See the
+// GetInitialSyncBudget() comment block in vk_pipeline_cache.h for policy.
+[[nodiscard]] std::chrono::milliseconds DetectInitialSyncBudget() {
+    const bool low_intel = IsLowEndIntelCpu();
+    const unsigned hw = std::thread::hardware_concurrency();
+    const bool low_threads = (hw != 0u && hw <= 4u);
+    const bool use_long = low_intel || low_threads;
+    const auto budget = use_long
+                            ? std::chrono::milliseconds{1000}
+                            : std::chrono::milliseconds{200};
+    LOG_INFO(Render_Vulkan,
+             "[GR2FORK sync-budget] hw_threads={} low_end_intel={} "
+             "low_thread_count={} -> kInitialSyncBudget={}ms",
+             hw, low_intel, low_threads,
+             static_cast<long long>(budget.count()));
+    return budget;
+}
 
 // =========================================================================
 // OPT(GR2 v78): Pipeline compile graveyard.
@@ -61,6 +219,16 @@ PipelineCompileGraveyard& Graveyard() {
 }
 
 } // namespace
+
+// GR2FORK sync-budget runtime detection. One-shot: the function-local static
+// is initialized on first call (thread-safe under C++11 "magic statics") and
+// returned by reference thereafter, so the CPUID query and the LOG_INFO
+// announce happen exactly once per process. See DetectInitialSyncBudget()
+// and IsLowEndIntelCpu() in the anonymous namespace above for the policy.
+std::chrono::milliseconds PipelineCache::GetInitialSyncBudget() {
+    static const std::chrono::milliseconds budget = DetectInitialSyncBudget();
+    return budget;
+}
 
 using Shader::LogicalStage;
 using Shader::Output;
@@ -596,8 +764,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
         auto pending = LaunchAsyncPipelineCompile(graphics_key, pipeline_hash);
 
         // Synchronous fast-path wait. Most compiles complete in <50ms; waiting
-        // kInitialSyncBudget catches them without triggering frame-skip.
-        if (pending->future.wait_for(kInitialSyncBudget) == std::future_status::ready) {
+        // GetInitialSyncBudget() catches them without triggering frame-skip.
+        // The budget is 200ms by default and 1000ms on weak hosts (pre-7th-gen
+        // Intel or hardware_concurrency <= 4) — see the declaration comment
+        // in vk_pipeline_cache.h.
+        if (pending->future.wait_for(GetInitialSyncBudget()) == std::future_status::ready) {
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {
                 pipeline = pending->future.get();
@@ -1159,6 +1330,163 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
+
+    // GR2FORK Fix A v7: SPIR-V-level patcher for the grass leader-write idiom.
+    //
+    // GR2's grass compute shaders (cs_0xc282b105 = gating CS, cs_0x3f0a3c48 =
+    // per-patch gen) end with a post-barrier "leader-write" pattern, where
+    // GCN does S_NOT_B64 s[106:107], s[0:1] then S_AND_SAVEEXEC_B64
+    // s[106:107], s[106:107]. shadPS4's IR translation produces
+    // OpLogicalAnd(GetExec, OpLogicalNot(GetThreadBitScalarReg(s106))), but
+    // both operands end up resolving to the SAME OpUndef bool (FlagTag SSA
+    // variables that were never written before the leader-write block).
+    // The resulting SPIR-V structure is OpLogicalAnd(%U, OpLogicalNot(%U)) -
+    // which is provably ALWAYS FALSE regardless of what %U is, so the
+    // leader-write block becomes unreachable and grass vertexCount stays 0.
+    //
+    // The fix here cannot change what %U resolves to (substitution doesn't
+    // help because both operands are the same %U). Instead, it REDIRECTS
+    // the consuming OpBranchConditional to use a different predicate that
+    // already exists in the shader: the entry-block's `lane == 0` check
+    // (OpLogicalNot(OpINotEqual(0, gl_LocalInvocationID.x))). This makes
+    // lane 0 write the result (matching the GCN's intent), and no other
+    // lanes race against it.
+    //
+    // History: an earlier attempt (Fix A v5/v6) tried to fix this at the
+    // SSA-rewrite level by substituting (scalar >> LaneId) & 1 for the
+    // UndefU1. That correctly removed the OpUndef bool from the output,
+    // but the LogicalAnd structure remained, and `chain AND NOT chain`
+    // is still always false. Reverted to this SPIR-V-level approach.
+    {
+        const u64 h = info.pgm_hash;
+        const bool is_grass_cs = (h == 0xc282b105ULL) ||
+                                 (h == 0x3f0a3c48ULL) ||
+                                 (h == 0x83048c53ULL);
+        if (is_grass_cs) [[unlikely]] {
+            const auto try_patch = [&](std::vector<u32>& code) -> bool {
+                if (code.size() < 5) return false;
+                // SPIR-V opcodes we care about
+                constexpr u32 kOpUndef = 1;
+                constexpr u32 kOpTypeBool = 20;
+                constexpr u32 kOpCompositeExtract = 81;
+                constexpr u32 kOpINotEqual = 171;
+                constexpr u32 kOpLogicalNot = 168;
+                constexpr u32 kOpLogicalAnd = 167;
+                constexpr u32 kOpBranchConditional = 250;
+
+                u32 bool_type_id = 0;
+                u32 undef_bool_id = 0;
+                u32 last_composite_extract_with_zero_idx = 0;
+                u32 lane_inotequal_id = 0;  // INotEqual involving the extract
+                u32 lane_eq_zero_id = 0;    // LogicalNot of the INotEqual
+                u32 lognot_undef_id = 0;
+                u32 logand_buggy_id = 0;
+                size_t branch_cond_word_pos = 0;
+
+                size_t i = 5;  // skip header
+                while (i < code.size()) {
+                    const u32 word = code[i];
+                    const u32 word_count = word >> 16;
+                    const u32 opcode = word & 0xFFFF;
+                    if (word_count == 0 || i + word_count > code.size()) break;
+
+                    switch (opcode) {
+                    case kOpTypeBool:
+                        if (word_count >= 2 && bool_type_id == 0) {
+                            bool_type_id = code[i + 1];
+                        }
+                        break;
+                    case kOpUndef:
+                        // word[1]=result_type, word[2]=result_id
+                        if (word_count >= 3 && undef_bool_id == 0 &&
+                            code[i + 1] == bool_type_id) {
+                            undef_bool_id = code[i + 2];
+                        }
+                        break;
+                    case kOpCompositeExtract:
+                        // word[1]=result_type, word[2]=result_id, word[3]=composite,
+                        // word[4..]=indices. We want the first one extracting index 0.
+                        // This will be the gl_LocalInvocationID.x extraction.
+                        if (word_count >= 5 && code[i + 4] == 0 &&
+                            last_composite_extract_with_zero_idx == 0) {
+                            last_composite_extract_with_zero_idx = code[i + 2];
+                        }
+                        break;
+                    case kOpINotEqual:
+                        // word[1]=result_type, word[2]=result_id, word[3]=op1, word[4]=op2.
+                        // Match any INotEqual where one operand is our extract result -
+                        // SPIR-V type rules guarantee the other is the corresponding
+                        // u32_zero constant we don't need to identify separately.
+                        if (word_count >= 5 && lane_inotequal_id == 0 &&
+                            last_composite_extract_with_zero_idx != 0 &&
+                            (code[i + 3] == last_composite_extract_with_zero_idx ||
+                             code[i + 4] == last_composite_extract_with_zero_idx)) {
+                            lane_inotequal_id = code[i + 2];
+                        }
+                        break;
+                    case kOpLogicalNot:
+                        // word[1]=result_type, word[2]=result_id, word[3]=operand
+                        if (word_count >= 4) {
+                            if (lane_eq_zero_id == 0 && lane_inotequal_id != 0 &&
+                                code[i + 3] == lane_inotequal_id) {
+                                lane_eq_zero_id = code[i + 2];
+                            }
+                            if (lognot_undef_id == 0 && undef_bool_id != 0 &&
+                                code[i + 3] == undef_bool_id) {
+                                lognot_undef_id = code[i + 2];
+                            }
+                        }
+                        break;
+                    case kOpLogicalAnd:
+                        if (word_count >= 5 && logand_buggy_id == 0 &&
+                            undef_bool_id != 0 && lognot_undef_id != 0) {
+                            const bool buggy_a = (code[i + 3] == undef_bool_id &&
+                                                  code[i + 4] == lognot_undef_id);
+                            const bool buggy_b = (code[i + 4] == undef_bool_id &&
+                                                  code[i + 3] == lognot_undef_id);
+                            if (buggy_a || buggy_b) {
+                                logand_buggy_id = code[i + 2];
+                            }
+                        }
+                        break;
+                    case kOpBranchConditional:
+                        // word[1]=cond, word[2]=true_label, word[3]=false_label
+                        if (word_count >= 4 && logand_buggy_id != 0 &&
+                            code[i + 1] == logand_buggy_id &&
+                            branch_cond_word_pos == 0) {
+                            branch_cond_word_pos = i + 1;
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                    i += word_count;
+                }
+
+                if (lane_eq_zero_id == 0 || branch_cond_word_pos == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "[GR2FORK Fix A v7] cs={:#x}: pattern not found "
+                                "(bool_type={} undef_bool={} extract={} "
+                                "inotequal={} lane_eq_zero={} lognot_undef={} "
+                                "logand_buggy={} branch_pos={})",
+                                h, bool_type_id, undef_bool_id,
+                                last_composite_extract_with_zero_idx,
+                                lane_inotequal_id, lane_eq_zero_id,
+                                lognot_undef_id, logand_buggy_id,
+                                branch_cond_word_pos);
+                    return false;
+                }
+                code[branch_cond_word_pos] = lane_eq_zero_id;
+                LOG_INFO(Render_Vulkan,
+                         "[GR2FORK Fix A v7] cs={:#x}: patched OpBranchConditional "
+                         "cond from %{} (LogicalAnd(undef, NOT undef)) to %{} "
+                         "(lane == 0)",
+                         h, logand_buggy_id, lane_eq_zero_id);
+                return true;
+            };
+            try_patch(spv);
+        }
+    }
 
     vk::ShaderModule module;
 

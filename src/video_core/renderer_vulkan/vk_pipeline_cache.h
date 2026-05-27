@@ -256,14 +256,41 @@ private:
     //
     // GR2FORK: reverted from the photo-mode-gated split back to v3.0's single
     // sync-budget constant. The wait site blocks the GpuComm thread for up to
-    // kInitialSyncBudget on first encounter of a new pipeline; if the compile
-    // finishes in that window the pipeline is installed inline, otherwise the
-    // future is stashed in pending_graphics_pipelines and the draw is skipped
-    // (TryFinalizePending polls non-blockingly on subsequent frames). Value
-    // chosen at 200ms — catches the vast majority of normal compiles inline
-    // without an excessively long worst-case stall. If spike-score regressions
-    // return, lower; if too many skipped-draw artifacts appear, raise.
-    static constexpr std::chrono::milliseconds kInitialSyncBudget{200};
+    // GetInitialSyncBudget() on first encounter of a new pipeline; if the
+    // compile finishes in that window the pipeline is installed inline,
+    // otherwise the future is stashed in pending_graphics_pipelines and the
+    // draw is skipped (TryFinalizePending polls non-blockingly on subsequent
+    // frames).
+    //
+    // ⚠ DO NOT LOWER the 200ms default. Empirically confirmed (see chat
+    //   "Infinite loading and shader cache issues", 2026-05-25): the v3.4 split
+    //   that put kGameplaySyncBudget at 0ms produced infinite loading screens —
+    //   transiently relieved by clearing the shader cache, recurring after a
+    //   few minutes of play. The skipped-draw fallback that fires when a
+    //   compile exceeds the budget interacts badly with the game's loading
+    //   flow when the budget is so small that nearly every cold compile
+    //   triggers it. 200ms catches the vast majority of compiles inline.
+    //   If artifacts appear, RAISE — never lower.
+    //
+    // GR2FORK runtime-tuned: GetInitialSyncBudget() returns 1000ms instead of
+    // the 200ms default on CPUs where 200ms isn't enough to absorb a cold
+    // compile burst — specifically (a) low-end Intel parts pre-7th-generation
+    // Core (Nehalem through Skylake client, plus the Atom Silvermont→Goldmont+
+    // line) detected by CPUID, and (b) any host where
+    // std::thread::hardware_concurrency() returns ≤ 4 (independent of vendor,
+    // covers slow AMD APUs / Atom-class boxes / VMs with constrained core
+    // pinning). On those hosts the 200ms budget triggered the skipped-draw
+    // path on nearly every cold compile, reproducing the same infinite-loading
+    // failure mode the 200ms floor was introduced to fix. 1000ms catches the
+    // vast majority of cold compiles inline on the slow hosts while still
+    // bounding worst-case GpuComm stalls. Detection is one-shot at first call
+    // (function-local static, thread-safe), so no per-frame CPUID cost.
+    //
+    // Skylake-X server (model 0x55) is intentionally NOT classified as
+    // low-end despite being Skylake-era — it has many more cores and doesn't
+    // need the long budget. The check is fail-safe: on AMD, on ARM, or on
+    // any CPUID failure GetInitialSyncBudget() returns the 200ms default.
+    [[nodiscard]] static std::chrono::milliseconds GetInitialSyncBudget();
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
     static constexpr std::chrono::seconds      kPermaFailThreshold{30};
 
