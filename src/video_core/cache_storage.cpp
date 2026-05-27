@@ -51,6 +51,20 @@ namespace Storage {
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
 
+    // PERF(GR2FORK): keep the pipeline-cache disk/compression worker OFF the two
+    // hot cores. It does real CPU work during compile bursts (MZ_BEST_COMPRESSION
+    // on each blob, not just lazy I/O), and it inherits the init thread's all-CPU
+    // affinity — so without this it can land on the GpuComm core
+    // (GetReservedCoreMask) or the GpuAsse core (GetGpuAssemblerCoreMask) right
+    // when those are busiest. Pinned ONCE here (it's a persistent worker, unlike
+    // the per-spawn compile fence). SetCurrentThreadAffinityMask clips to the real
+    // host CPU count, so ~forbidden is safe on any topology. On small-core hosts
+    // that reserve nothing (both masks 0) we skip — there are no hot cores to dodge.
+    if (const u64 forbidden =
+            Common::GetReservedCoreMask() | Common::GetGpuAssemblerCoreMask()) {
+        Common::SetCurrentThreadAffinityMask(~forbidden);
+    }
+
     while (!stoken.stop_requested()) {
         std::packaged_task<void()> request{};
         {

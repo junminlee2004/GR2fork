@@ -323,6 +323,13 @@ bool AvPlayerState::IsActive() {
            m_current_state != AvState::EndOfFile && m_up_source->IsActive();
 }
 
+void AvPlayerState::FlushFrozenFrames() {
+    std::shared_lock lock(m_source_mutex);
+    if (m_up_source != nullptr) {
+        m_up_source->FlushFrozenFrames();
+    }
+}
+
 u64 AvPlayerState::CurrentTime() {
     std::shared_lock lock(m_source_mutex);
     if (m_up_source == nullptr) {

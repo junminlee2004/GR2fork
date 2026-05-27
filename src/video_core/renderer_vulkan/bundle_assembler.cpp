@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <thread>
+#include <immintrin.h> // _mm_prefetch (one-iteration-ahead snapshot warming)
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -53,19 +55,10 @@ BundleAssembler::~BundleAssembler() {
 
 u32 BundleAssembler::Push(DrawIntent intent) {
     // Stage 1: capture the reg snapshot and stamp the intent before publish.
-    // Tier-1 split: route to the graphics or compute snapshot pool by intent
-    // type. Draw* take a graphics snapshot (cs_program omitted); Dispatch*
-    // take a compute snapshot (minimal audited set). snapshot_idx is the slot
-    // index within whichever pool was used — ProcessOne releases from the same
-    // pool, keyed off the same intent type.
     if (IntentUsesSnapshot(intent.type)) {
-        if (IntentUsesComputeSnapshot(intent.type)) {
-            intent.snapshot_idx = liverpool_->CaptureComputeSnapshot();
-            Rasterizer::BumpSnapshotPoolHwm(liverpool_->ComputeSnapshotPoolInFlight());
-        } else {
-            intent.snapshot_idx = liverpool_->CaptureGfxSnapshot();
-            Rasterizer::BumpSnapshotPoolHwm(liverpool_->GfxSnapshotPoolInFlight());
-        }
+        intent.snapshot_idx = liverpool_->CaptureSnapshot();
+        // Y-1 telemetry: snapshot pool HWM after capture.
+        Rasterizer::BumpSnapshotPoolHwm(liverpool_->SnapshotPoolInFlight());
     } else {
         intent.snapshot_idx = kNoSnapshot;
     }
@@ -148,6 +141,40 @@ void BundleAssembler::DrainLoop(std::stop_token stop) noexcept {
         wake_counter_.notify_all();
     }};
 
+    // PERF(GR2FORK Y-4): one-iteration-ahead snapshot prefetch.
+    //
+    // Every Rasterizer constituent the draw path runs (GetGraphicsPipeline,
+    // RefreshGraphicsKey + the per-stage GetProgram calls, BindResources,
+    // BeginRendering, BindVertexBuffers, MakeUserData) reads from
+    // `LiverpoolRegsSnapshot`. That snapshot is *written by GpuComm* (its own
+    // physical core) and *read here by the assembler* (a different physical
+    // core). The assembler's first touch of each snapshot cache line is
+    // therefore a shared-L3 / cross-core transfer (~40 cyc on Zen 4), and a
+    // single draw reads many scattered fields of it — paid fresh every draw,
+    // and a likely source of the scattered cold-read stalls in the trace.
+    //
+    // Because the assembler is the sole consumer and processes intents in FIFO
+    // order, it knows the NEXT intent before it finishes the current one. We
+    // warm the next intent's snapshot into this core's private L2 (HINT_T1, so
+    // it survives the current ProcessOne's own memory traffic — T0/L1 would
+    // likely be evicted before use) while the current draw executes. The
+    // shader-program block sits at the head of the struct and is read first by
+    // RefreshGraphicsKey/GetProgram on the expensive key-rebuild path, so we
+    // warm the head; the HW prefetcher extends from there.
+    //
+    // Safety: _mm_prefetch is a pure hint — a stale/garbage address is a
+    // no-op (no fault), and we only peek a slot the producer has published
+    // (t+1 != h, so head has advanced past it with release ordering). No
+    // scheduling/queue/wait behavior changes. Kill switch:
+    // GR2FORK_ASSEMBLER_PREFETCH=0.
+    static const bool prefetch_enabled = []() noexcept {
+        const char* e = std::getenv("GR2FORK_ASSEMBLER_PREFETCH");
+        return !e || e[0] != '0';
+    }();
+    // Bytes of the next snapshot to warm. 512 B = 8 lines covers the six
+    // ShaderProgram members at the struct head (the key-rebuild read set).
+    constexpr u32 kSnapshotPrefetchBytes = 512;
+
     while (!stop.stop_requested()) {
         u32 t = tail_.load(std::memory_order_relaxed);
         u32 h = head_.load(std::memory_order_acquire);
@@ -162,6 +189,18 @@ void BundleAssembler::DrainLoop(std::stop_token stop) noexcept {
                 wake_counter_.wait(w, std::memory_order_acquire);
             }
             continue;
+        }
+        // Warm the NEXT intent's snapshot (if one is already published) into
+        // L2 while we process the current intent below.
+        if (prefetch_enabled && (t + 1) != h) [[likely]] {
+            const DrawIntent& next = queue_[(t + 1) & (kQueueSize - 1)];
+            if (next.snapshot_idx != kNoSnapshot) {
+                const auto& snap = liverpool_->GetSnapshot(next.snapshot_idx);
+                const char* p = reinterpret_cast<const char*>(&snap);
+                for (u32 off = 0; off < kSnapshotPrefetchBytes; off += 64) {
+                    _mm_prefetch(p + off, _MM_HINT_T1);
+                }
+            }
         }
         // Copy the intent out by value before advancing tail. Under
         // async the producer may rewrite the slot once tail moves past
@@ -254,14 +293,7 @@ void BundleAssembler::ProcessOne(const DrawIntent& intent) {
     }
 
     if (intent.snapshot_idx != kNoSnapshot) {
-        // Tier-1 split: release from the same pool the intent captured into.
-        // Per-pool FIFO holds because the assembler processes intents in PM4
-        // order, so each pool's releases occur in its own capture order.
-        if (IntentUsesComputeSnapshot(intent.type)) {
-            liverpool_->ReleaseComputeSnapshot(intent.snapshot_idx);
-        } else {
-            liverpool_->ReleaseGfxSnapshot(intent.snapshot_idx);
-        }
+        liverpool_->ReleaseSnapshot(intent.snapshot_idx);
     }
 }
 

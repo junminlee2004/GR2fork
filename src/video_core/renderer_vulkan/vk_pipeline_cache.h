@@ -335,8 +335,10 @@ private:
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    // Fast path: if only shader user data changes, the graphics pipeline key does not.
-    u64 last_gfx_stamp{};
+    // NOTE: the `last_gfx_stamp` member was removed — it fed the gfx-stamp /
+    // key-clean skip caches in GetGraphicsPipeline, both of which measured
+    // 0.00% hit and could never hit (user_data churns the stamp every draw).
+    // See the "REMOVED DEAD SKIP CACHES" tombstone in GetGraphicsPipeline.
     const GraphicsPipeline* last_gfx_pipeline{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};

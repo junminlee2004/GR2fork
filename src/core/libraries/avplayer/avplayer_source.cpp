@@ -413,6 +413,35 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
         return false;
     }
 
+    // FIX(GR2FORK v5): drop any frames left over from a previous loop
+    // generation before applying the timestamp-based selection below.
+    // A frame decoded from a pre-seek packet carries an end-of-clip
+    // timestamp; after the loop reset zeroed the playback clock the
+    // "not yet due" test (head.timestamp > now) would pin it at the head
+    // forever, backing up the queue until the decoder runs out of free
+    // buffers and parks permanently -> the silent loop hang. Recycling
+    // stale-epoch frames here keeps the head fresh and the buffers
+    // circulating.
+    {
+        const u64 epoch = m_loop_epoch.load(std::memory_order_acquire);
+        while (true) {
+            bool head_stale = false;
+            if (!m_video_frames.TryPeek(
+                    [&](const Frame& f) { head_stale = f.epoch < epoch; })) {
+                break; // queue empty
+            }
+            if (!head_stale) {
+                break;
+            }
+            auto stale = m_video_frames.Pop();
+            if (!stale.has_value()) {
+                break;
+            }
+            m_video_buffers.Push(std::move(stale->buffer));
+            m_video_buffers_cv.Notify();
+        }
+    }
+
     // FIX(GR2FORK v4): peek-then-decide via TryPeek (atomic under the
     // queue's mutex) instead of unlocked Size() + Front(). Previously
     // the game thread took a raw reference to m_video_frames.front()
@@ -504,9 +533,27 @@ bool AvPlayerSource::GetAudioData(AvPlayerFrameInfo& audio_info) {
     // TOCTOU — if the demuxer drained m_audio_frames between the size
     // check and the Pop (which happens on loop reset), Pop() returns
     // nullopt and the subsequent frame->info.timestamp dereference was UB.
-    auto frame = m_audio_frames.Pop();
-    if (!frame.has_value()) {
-        return false;
+    //
+    // FIX(GR2FORK v5): skip frames from an older loop generation. Their
+    // end-of-clip timestamps would otherwise be written into
+    // m_last_audio_ts and stall the audio-synced video selection in
+    // GetVideoData (head.timestamp > audio_ts forever).
+    std::optional<Frame> frame;
+    {
+        const u64 epoch = m_loop_epoch.load(std::memory_order_acquire);
+        while (true) {
+            auto popped = m_audio_frames.Pop();
+            if (!popped.has_value()) {
+                return false;
+            }
+            if (popped->epoch < epoch) {
+                m_audio_buffers.Push(std::move(popped->buffer));
+                m_audio_buffers_cv.Notify();
+                continue;
+            }
+            frame = std::move(popped);
+            break;
+        }
     }
     m_last_audio_ts = frame->info.timestamp;
 
@@ -533,6 +580,25 @@ u64 AvPlayerSource::CurrentTime() {
 bool AvPlayerSource::IsActive() {
     return !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
            m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
+}
+
+void AvPlayerSource::FlushFrozenFrames() {
+    // Recycle the decoded backlog back to the buffer pools. While suppressed,
+    // the consumer stopped draining m_video_frames/m_audio_frames, so the
+    // buffer pool emptied and the decoder threads are likely parked on the
+    // *_buffers_cv. Returning the frames frees buffers and the Notify wakes the
+    // decoders, which then resume from the current decode position; the
+    // consumer's existing stale-timestamp skip handles catch-up. The queues are
+    // atomic and the decoders may run concurrently — Pop/Push interleave safely,
+    // so no extra locking is needed.
+    while (auto old = m_video_frames.Pop()) {
+        m_video_buffers.Push(std::move(old->buffer));
+    }
+    m_video_buffers_cv.Notify();
+    while (auto old = m_audio_frames.Pop()) {
+        m_audio_buffers.Push(std::move(old->buffer));
+    }
+    m_audio_buffers_cv.Notify();
 }
 
 void AvPlayerSource::ReleaseAVPacket(AVPacket* packet) {
@@ -594,6 +660,7 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
                 if (m_is_looping) {
                     LOG_INFO(Lib_AvPlayer, "EOF reached in demuxer. Looping the source...");
                     m_state.OnWarning(ORBIS_AVPLAYER_ERROR_WAR_LOOPING_BACK);
+
                     avio_seek(m_avformat_context->pb, 0, SEEK_SET);
                     if (m_video_stream_index.has_value()) {
                         const auto index = m_video_stream_index.value();
@@ -614,6 +681,30 @@ void AvPlayerSource::DemuxerThread(std::stop_token stop) {
                     m_start_time = std::chrono::high_resolution_clock::now();
                     m_pause_duration = {};
                     m_last_audio_ts.reset();
+
+                    // FIX(GR2FORK v5): discard packets that were queued from
+                    // before the seek. The loop reset previously drained only
+                    // the decoded-frame queues; any pre-seek packets still
+                    // sitting in the packet queues would be decoded into the
+                    // new generation's stream with end-of-clip timestamps.
+                    // Dropping them here means the decoders only ever see
+                    // post-seek packets, so the bulk of stale frames are never
+                    // produced in the first place (the epoch stamp covers the
+                    // single in-flight straggler).
+                    while (m_video_packets.Pop()) {
+                    }
+                    while (m_audio_packets.Pop()) {
+                    }
+
+                    // FIX(GR2FORK v5): open the new loop generation now, after
+                    // the stale packets are gone. Any frame still in flight
+                    // inside a decoder thread (already received, not yet pushed
+                    // to m_video_frames) came from a packet popped under the
+                    // old epoch and is therefore stamped older than this; the
+                    // consumer recycles it instead of pinning it at the head
+                    // of the queue with its end-of-clip timestamp. Packets
+                    // pushed from here on (post-seek) carry the new epoch.
+                    m_loop_epoch.fetch_add(1, std::memory_order_acq_rel);
 
                     // FIX(GR2FORK v4): while-pop pattern; Size()-then-Pop()
                     // was a TOCTOU race against the game thread's
@@ -737,7 +828,7 @@ static void CopyNV12Data(u8* dst, const AVFrame& src) {
     }
 }
 
-Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame) {
+Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame, u64 epoch) {
     ASSERT(frame.format == AV_PIX_FMT_NV12);
 
     const u32 content_w = u32(frame.width);
@@ -784,6 +875,7 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
                             },
                     },
             },
+        .epoch = epoch,
     };
 }
 
@@ -801,6 +893,11 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
         if (!packet.has_value()) {
             continue;
         }
+
+        // FIX(GR2FORK v5): sample the loop generation for this packet.
+        // Frames produced from it inherit this epoch so the consumer can
+        // discard any straggler decoded across a loop-back seek.
+        const u64 pkt_epoch = m_loop_epoch.load(std::memory_order_acquire);
 
         // FIX(GR2FORK v4): lock codec context for the FFmpeg call —
         // the demuxer thread may be calling avcodec_flush_buffers on
@@ -851,9 +948,11 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
                 }
                 if (up_frame->format != AV_PIX_FMT_NV12) {
                     const auto nv12_frame = ConvertVideoFrame(*up_frame);
-                    m_video_frames.Push(PrepareVideoFrame(std::move(buffer.value()), *nv12_frame));
+                    m_video_frames.Push(
+                        PrepareVideoFrame(std::move(buffer.value()), *nv12_frame, pkt_epoch));
                 } else {
-                    m_video_frames.Push(PrepareVideoFrame(std::move(buffer.value()), *up_frame));
+                    m_video_frames.Push(
+                        PrepareVideoFrame(std::move(buffer.value()), *up_frame, pkt_epoch));
                 }
                 m_video_frames_cv.Notify();
             }
@@ -889,7 +988,7 @@ AvPlayerSource::AVFramePtr AvPlayerSource::ConvertAudioFrame(const AVFrame& fram
     return pcm16_frame;
 }
 
-Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame) {
+Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame, u64 epoch) {
     ASSERT(frame.format == AV_SAMPLE_FMT_S16);
     ASSERT(frame.nb_samples <= 1024);
 
@@ -920,6 +1019,7 @@ Frame AvPlayerSource::PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame
                             },
                     },
             },
+        .epoch = epoch,
     };
 }
 
@@ -937,6 +1037,9 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
         if (!packet.has_value()) {
             continue;
         }
+        // FIX(GR2FORK v5): sample the loop generation for this packet —
+        // see the video decoder thread for rationale.
+        const u64 pkt_epoch = m_loop_epoch.load(std::memory_order_acquire);
         // FIX(GR2FORK v4): lock codec context — same rationale as
         // video decoder thread above.
         int res;
@@ -985,9 +1088,11 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
                 }
                 if (up_frame->format != AV_SAMPLE_FMT_S16) {
                     const auto pcm16_frame = ConvertAudioFrame(*up_frame);
-                    m_audio_frames.Push(PrepareAudioFrame(std::move(buffer.value()), *pcm16_frame));
+                    m_audio_frames.Push(
+                        PrepareAudioFrame(std::move(buffer.value()), *pcm16_frame, pkt_epoch));
                 } else {
-                    m_audio_frames.Push(PrepareAudioFrame(std::move(buffer.value()), *up_frame));
+                    m_audio_frames.Push(
+                        PrepareAudioFrame(std::move(buffer.value()), *up_frame, pkt_epoch));
                 }
                 m_audio_frames_cv.Notify();
             }

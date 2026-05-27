@@ -418,7 +418,7 @@ void Rasterizer::DoDrawFromIntent(const DrawIntent& intent) {
         scheduler.PopPendingOperations();
     }
 
-    const auto& regs = liverpool->GetGfxSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(regs);
     // PERF(GR2FORK v1.21): pipeline is null only on cache failure / unsupported
     // shader stage combinations — an error path. Steady-state draws have a
@@ -537,7 +537,7 @@ void Rasterizer::DoDrawIndirectFromIntent(const DrawIntent& intent) {
 
     RENDERER_TRACE;
 
-    const auto& regs = liverpool->GetGfxSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
 
     scheduler.PopPendingOperations();
 
@@ -646,7 +646,7 @@ void Rasterizer::DoDispatchDirectFromIntent(const DrawIntent& intent) {
 
     scheduler.PopPendingOperations();
 
-    const auto& regs = liverpool->GetComputeSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
     const auto& cs_program = regs.cs_program;
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(regs);
     // PERF(GR2FORK v1.26): null pipeline is a cache failure / unsupported
@@ -707,7 +707,7 @@ void Rasterizer::DoDispatchIndirectFromIntent(const DrawIntent& intent) {
 
     scheduler.PopPendingOperations();
 
-    const auto& regs = liverpool->GetComputeSnapshot(intent.snapshot_idx);
+    const auto& regs = liverpool->GetSnapshot(intent.snapshot_idx);
     (void)regs.cs_program; // captured but unread for indirect dispatch (dims live in the indirect buffer)
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(regs);
     // PERF(GR2FORK v1.26): mirrors DispatchDirect — null pipeline /
@@ -900,6 +900,25 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
 
     if (pipeline_uses_push) [[unlikely]] {
         tick = scheduler.CurrentTick();
+        // =====================================================================
+        // DEAD SKIP CACHE — RETAINED BUT INERT. DO NOT "WAKE" IT. (cache-audit)
+        //
+        // The binding_skip_cache_ below (stamp-replay + identical-bindings
+        // PushUd-only) measured 0.00% and 0.03% hit over ~64M draws. It keys on
+        // gfx_pipeline_stamp + a per-stage user_data memcmp, both of which
+        // change every draw in GR2 (user_data churn). It is not an
+        // optimization; it is per-draw overhead (the verification memcmp + the
+        // push_data bookkeeping run on the way to the slow path almost always).
+        //
+        // It CANNOT be woken: the replay reuses cached push_data (which embeds
+        // user_data), so it is only valid when user_data is unchanged — and
+        // user_data changes every draw. Making it "hit" by ignoring user_data
+        // would replay stale push constants -> wrong shader inputs. Same family
+        // of trap as the GetProgram/GfxPipe stamp caches (see their tombstones).
+        //
+        // Retained in place (rather than excising ~24 woven references from
+        // this hot bind path) but INERT. Do not assume it helps.
+        // =====================================================================
         // Phase 1D-pre-C: read pipeline stamp from the snapshot rather
         // than `liverpool->GetGfxPipelineStamp()`. The binding skip cache
         // wants the stamp value AT the consuming intent, which is exactly
@@ -982,7 +1001,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
             return true;
         }
     }
-
     // Full binding path.
     // GpuComm v4 instrumentation: time the descriptor-construction work that
     // Candidate A would move to a worker thread (per-stage BindBuffers +
@@ -1526,75 +1544,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         return k;
     };
 
-    // PERF(GR2 v17): Epoch-based validity — avoids zeroing 640+ bytes of stamp arrays per call.
-    const u32 epoch = ++bind_textures_epoch_;
-    // Handle epoch wrap (extremely unlikely, ~every 4 billion BindTextures calls)
-    if (epoch == 0) {
-        bind_textures_epoch_ = 1;
-        // find_image_cache_stamp_ removed; find_texture_cache_stamp_ still
-        // active for the FindTextureCached lambda below.
-        find_texture_cache_stamp_.fill(0);
-    }
-
-    // OPT(v15): De-dup FindTexture() within this BindTextures() call.
-    // GR2 frequently binds the same {image_id,type,view_info} multiple times across stages.
-    // FindTexture() takes a lock (UpdateImage) and does view lookup, so avoiding duplicates
-    // reduces GpuComm overhead (rwlock + Image::FindView + barriers).
-    auto& find_texture_cache = find_texture_cache_;
-    auto& find_texture_cache_stamp = find_texture_cache_stamp_;
-    auto hash_view_info = [](const VideoCore::ImageViewInfo& v) noexcept -> u64 {
-        // PERF(GR2 v8): Pack fields into 2-3 mix calls instead of 11.
-        // This saves ~8 multiply+xor cycles per image binding in the hot path.
-        auto mix = [](u64 h, u64 x) noexcept {
-            h ^= x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-            return h;
-        };
-        u64 h = 0x84222325cbf29ce4ULL;
-        // Pack type(8) + format(8) + level(8) + layer(8) + levels(8) + layers(8) + storage(1) = fits in 64 bits
-        const u64 packed0 =
-            (static_cast<u64>(static_cast<u32>(v.type))) |
-            (static_cast<u64>(static_cast<u32>(v.format)) << 8) |
-            (static_cast<u64>(v.range.base.level) << 16) |
-            (static_cast<u64>(v.range.base.layer) << 24) |
-            (static_cast<u64>(v.range.extent.levels) << 32) |
-            (static_cast<u64>(v.range.extent.layers) << 40) |
-            (static_cast<u64>(v.is_storage ? 1u : 0u) << 48);
-        h = mix(h, packed0);
-        // Pack swizzle components into one u64
-        const u64 packed1 =
-            (static_cast<u64>(v.mapping.r)) |
-            (static_cast<u64>(v.mapping.g) << 8) |
-            (static_cast<u64>(v.mapping.b) << 16) |
-            (static_cast<u64>(v.mapping.a) << 24);
-        h = mix(h, packed1);
-        return h;
-    };
-
-    auto FindTextureCached = [&](VideoCore::ImageId image_id,
-                                 VideoCore::TextureCache::BindingType type,
-                                 const VideoCore::ImageViewInfo& view_info) -> VideoCore::ImageView& {
-                                     const u64 k = (static_cast<u64>(image_id.index) * 0x9e3779b97f4a7c15ULL) ^
-                                     (static_cast<u64>(static_cast<u32>(type)) << 48) ^
-                                     hash_view_info(view_info);
-                                     const u32 slot = static_cast<u32>(k) & (find_texture_cache_stamp.size() - 1);
-                                     auto& e = find_texture_cache[slot];
-                                     // PERF(GR2FORK v1.23): in steady state
-                                     // (consecutive same-shader draws binding
-                                     // the same images) this cache hits on
-                                     // most calls. Hint the warmed-cache
-                                     // return.
-                                     if (find_texture_cache_stamp[slot] == epoch &&
-                                         e.image_id == image_id &&
-                                         e.type == type &&
-                                         e.view &&
-                                         e.view->info == view_info) [[likely]] {
-                                         return *e.view;
-                                         }
-                                         auto& v = texture_cache.FindTexture(image_id, type, view_info);
-                                     e = FindTextureCacheEntry{image_id, type, &v};
-                                     find_texture_cache_stamp[slot] = epoch;
-                                     return v;
-                                 };
+    // PERF(GR2FORK cache-audit): FindTextureCached (find_texture_cache_) CULLED.
+    // It was an epoch-gated intra-call dedup of texture_cache.FindTexture, used
+    // only on the mip-fallback array path. Measurement showed 0.00% hit over
+    // 38,839 lookups (vs ~9.6M image iterations) — GR2 never rebinds the same
+    // {image_id,type,view_info} twice within one call there, exactly like the
+    // find_image_cache culled in v1.43. Every call already fell through to
+    // FindTexture, so calling it directly at the one use site is behavior-
+    // identical at runtime and drops a never-hitting cache check + struct write.
+    // Removed with it: bind_textures_epoch_, find_texture_cache_(_stamp_),
+    // FindTextureCacheEntry, hash_view_info (all dead once the lambda is gone).
 
                                  for (const auto& image_res : stage.images) {
                                      auto tsharp = image_res.GetSharp(stage);
@@ -1873,7 +1832,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 VideoCore::ImageView* view_ptr = nullptr;
                 if (is_storage) {
                     // Keep the original FindTexture() path for storage images (it tags GpuModified + readback).
-                    auto& image_view = FindTextureCached(b.image_id, base_desc->type, mip_view_info);
+                    auto& image_view = texture_cache.FindTexture(b.image_id, base_desc->type, mip_view_info);
                     view_ptr = &image_view;
                 } else {
                     // Sampled images: UpdateImage once per ImageId, then find view without re-taking the lock.
@@ -2028,6 +1987,29 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
     // Gated on Config::isBeginRenderingCacheEnabled() — on by default; set
     // beginRenderingCacheEnable=false in [Vulkan] to disable if shadow flicker
     // or other rendering artifacts return.
+    // =========================================================================
+    // DEAD SKIP CACHE — RETAINED BUT INERT. DO NOT "WAKE" IT. (cache-audit)
+    //
+    // The BeginRendering br_cache below keys its hit on gfx_pipeline_stamp and
+    // measures 0.00% hit — it never fires, because gfx_pipeline_stamp bumps
+    // every draw on user_data SH writes (see the tombstone in
+    // PipelineCache::GetGraphicsPipeline). As-is it is pure per-draw overhead
+    // (the populate at the bottom still runs).
+    //
+    // DO NOT try to wake it with an attachment-scoped stamp. That experiment
+    // was done (a dedicated `render_state_stamp` that bumped only on CB/DB
+    // context writes): it took the hit rate from 0% to ~68% with NO graphical
+    // glitches — and was STILL a net fps REGRESSION. The per-attachment
+    // dynamic re-checks here (IsMetaCleared + texture_cache.GetImage + layout
+    // per attachment) plus the producer-side stamp machinery cost more than
+    // the FindRenderTarget/FindDepthTarget work a hit skips. Measured,
+    // confirmed, reverted. This is the canonical "hit-rate is not fps" case.
+    //
+    // Leaving the cache structurally intact (rather than excising 33 woven
+    // references from this correctness-critical attachment-setup path) — but
+    // it is INERT and not an optimization. If you want it gone, excise it as a
+    // dedicated, separately-validated pass; do not assume it helps.
+    // =========================================================================
     const bool br_cache_enabled = Config::isBeginRenderingCacheEnabled();
     if (br_cache_enabled) {
         // Phase 1D-pre-C: read pipeline stamp from the snapshot.
@@ -2321,8 +2303,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
             br_cache_.cb_count = state.num_color_attachments;
             br_cache_.attachment_feedback_loop = attachment_feedback_loop;
             br_cache_.pipeline = pipeline;
-            // Phase 1D-pre-C: stamp from snapshot; matches the same value
-            // the fast-path comparison above used.
+            // Phase 1D-pre-C: stamp from snapshot; matches the fast-path compare.
             br_cache_.stamp = regs.gfx_pipeline_stamp;
             br_cache_.tick = scheduler.CurrentTick();
 

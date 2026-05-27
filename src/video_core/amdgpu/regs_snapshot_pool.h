@@ -51,29 +51,20 @@ public:
     LiverpoolRegsSnapshotPool(LiverpoolRegsSnapshotPool&&) = delete;
     LiverpoolRegsSnapshotPool& operator=(LiverpoolRegsSnapshotPool&&) = delete;
 
-    // Tier-1 split: two capture entry points, one per snapshot flavor. Both
-    // share the same SPSC ring mechanics (single-producer reservation, yield
-    // on full, release-publish); they differ only in which subset of fields
-    // they write into the reserved slot.
+    // Capture every audited field from `regs` plus the queue's compute
+    // program (`cs_state`) into the next free slot and return its index.
+    // Spins (yield) if the pool is full waiting for the consumer to call
+    // Release(). Single-producer.
     //
-    // CaptureGfx: every audited field a Draw consumer reads, EXCLUDING the
-    // 320-byte cs_program (no graphics consumer reads it). For Draw /
-    // DrawIndexed / DrawIndirect / DrawIndexedIndirect intents.
-    u16 CaptureGfx(const Regs& regs,
-                   u64 gfx_pipeline_stamp, bool gfx_key_dirty,
-                   bool dynamic_dirty,
-                   const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_extent,
-                   CbDbExtent last_db_extent) noexcept;
-
-    // CaptureCompute: the minimal audited compute read-set (cs_program +
-    // viewport_control + viewports[0] + pre-C hot fields), rest zeroed. For
-    // Dispatch / DispatchIndirect intents. `cs_state` is the queue's compute
-    // program (`mapped_queues[curr_qid].cs_state`).
-    u16 CaptureCompute(const Regs& regs, const ComputeProgram& cs_state,
-                       u64 gfx_pipeline_stamp, bool gfx_key_dirty,
-                       bool dynamic_dirty,
-                       const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_extent,
-                       CbDbExtent last_db_extent) noexcept;
+    // Phase 1D-pre-C: also forwards five PM4-side fields that live on
+    // Liverpool (not on Regs) — `gfx_pipeline_stamp`, `gfx_key_dirty`,
+    // `dynamic_dirty`, `last_cb_extent[]`, `last_db_extent` — so the
+    // data plane can read them from the snapshot instead of racing PM4.
+    u16 Capture(const Regs& regs, const ComputeProgram& cs_state,
+                u64 gfx_pipeline_stamp, bool gfx_key_dirty,
+                bool dynamic_dirty,
+                const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_extent,
+                CbDbExtent last_db_extent) noexcept;
 
     // Const view of the snapshot at `idx`. Index must be one previously
     // returned by Capture() and not yet released. The returned reference is
@@ -99,13 +90,6 @@ public:
     }
 
 private:
-    // Shared single-producer reservation: spin-yield until a slot is free,
-    // then return the (un-published) head index. Caller writes the slot and
-    // publishes via PublishHead(). Splitting reserve from publish lets the
-    // two capture flavors share the backpressure logic without duplicating it.
-    [[nodiscard]] u32 ReserveHead() noexcept;
-    void PublishHead(u32 my_head) noexcept;
-
     // Storage. Aligned to a cache line so adjacent slots don't false-share
     // when consumer reads slot N while producer writes slot N+1.
     alignas(64) std::array<LiverpoolRegsSnapshot, kNumSlots> slots_;

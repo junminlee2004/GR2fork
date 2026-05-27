@@ -35,6 +35,8 @@ public:
     bool GetVideoData(AvPlayerFrameInfo& video_info);
     bool GetVideoData(AvPlayerFrameInfoEx& video_info);
     bool IsActive();
+    // FIX(GR2FORK v6.3): flush frozen streams (post-suppression recovery).
+    void FlushStreams();
     u64 CurrentTime();
     s32 Stop();
     bool SetLooping(bool is_looping);

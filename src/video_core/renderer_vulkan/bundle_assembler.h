@@ -44,7 +44,7 @@ public:
     // HANDOFF §9: PM4-parser → assembler queue depth = 256 slots. The first
     // queue is deepest because PM4 packets can burst (CE writes hundreds of
     // regs between draws).
-    static constexpr u32 kQueueSize = 512;
+    static constexpr u32 kQueueSize = 256;
     static_assert((kQueueSize & (kQueueSize - 1)) == 0,
                   "kQueueSize must be a power of two");
 
@@ -154,14 +154,6 @@ private:
             return false;
         }
         return false;
-    }
-
-    // Tier-1 split: among snapshot-using intents, which take a COMPUTE snapshot
-    // (captured into Liverpool's compute pool) vs. a GRAPHICS snapshot. Dispatch
-    // / DispatchIndirect are the compute consumers; all Draw* are graphics.
-    // Precondition: only meaningful when IntentUsesSnapshot(t) is true.
-    [[nodiscard]] static constexpr bool IntentUsesComputeSnapshot(DrawIntent::Type t) noexcept {
-        return t == DrawIntent::Type::Dispatch || t == DrawIntent::Type::DispatchIndirect;
     }
 
     Rasterizer& rasterizer_;

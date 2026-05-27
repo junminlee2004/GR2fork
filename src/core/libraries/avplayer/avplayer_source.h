@@ -105,6 +105,15 @@ private:
 struct Frame {
     GuestBuffer buffer;
     AvPlayerFrameInfoEx info;
+    // FIX(GR2FORK v5): loop-epoch stamp. Frames decoded from packets that
+    // were dequeued before a loop-back seek carry a stale (end-of-clip)
+    // timestamp. After the seek resets the playback clock to ~0, the
+    // consumer's "frame not yet due" logic treats such a frame as far in
+    // the future and refuses to ever pop it, wedging the head of
+    // m_video_frames and eventually starving the decoder of buffers ->
+    // silent loop hang. The epoch lets the consumer discard any frame
+    // produced under an older loop generation. See m_loop_epoch.
+    u64 epoch{};
 };
 
 class EventCV {
@@ -159,6 +168,14 @@ public:
     u64 CurrentTime();
     bool IsActive();
 
+    // FIX(GR2FORK v6.3): recycle every decoded-but-unconsumed frame back to the
+    // buffer pool and wake the decoders. Used when this stream comes out of
+    // tutorial-wins suppression: while suppressed it was frozen and its decoder
+    // is likely parked with the buffer pool drained into the frame queue. This
+    // unwedges it immediately so a previously-suppressed video resumes cleanly
+    // instead of sitting frozen and blocking the game's streaming queue.
+    void FlushFrozenFrames();
+
 private:
     static void ReleaseAVPacket(AVPacket* packet);
     static void ReleaseAVFrame(AVFrame* frame);
@@ -183,8 +200,8 @@ private:
     AVFramePtr ConvertAudioFrame(const AVFrame& frame);
     AVFramePtr ConvertVideoFrame(const AVFrame& frame);
 
-    Frame PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame);
-    Frame PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame);
+    Frame PrepareAudioFrame(GuestBuffer buffer, const AVFrame& frame, u64 epoch);
+    Frame PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame, u64 epoch);
 
     AvPlayerStateCallback& m_state;
     bool m_use_vdec2 = false;
@@ -196,6 +213,12 @@ private:
     std::atomic_bool m_is_paused = false;
     std::atomic_bool m_is_eof = false;
     std::atomic_bool m_first_video_delivered = false;
+
+    // FIX(GR2FORK v5): monotonically increasing loop generation. Bumped by
+    // the demuxer on every loop-back seek. Decoder threads sample it when
+    // they dequeue a packet and stamp the resulting frame(s); GetVideoData/
+    // GetAudioData discard frames whose epoch is older than this value.
+    std::atomic<u64> m_loop_epoch = 0;
 
     std::unique_ptr<IDataStreamer> m_up_data_streamer;
 

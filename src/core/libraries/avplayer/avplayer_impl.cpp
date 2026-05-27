@@ -204,6 +204,12 @@ bool AvPlayer::IsActive() {
     return m_state->IsActive();
 }
 
+void AvPlayer::FlushStreams() {
+    if (m_state != nullptr) {
+        m_state->FlushFrozenFrames();
+    }
+}
+
 u64 AvPlayer::CurrentTime() {
     if (m_state == nullptr) {
         return 0;

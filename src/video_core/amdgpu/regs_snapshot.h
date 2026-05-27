@@ -163,36 +163,31 @@ struct LiverpoolRegsSnapshot {
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent;
     CbDbExtent last_db_extent;
 
-    // === API: graphics capture — every audited field a Draw consumer reads. ===
+    // === API: capture every audited field from a live Regs. ===
     // Intentionally a member function (not a free function) so the captured
     // field set is co-located with the struct definition. Adding/removing a
-    // field touches both the struct and CaptureGfxFrom in one place.
+    // field touches both the struct and CaptureFrom in one place.
     //
     // Inline by design: the snapshot strategy is header-only on the capture
     // side. The pool's .cpp keeps the storage; the per-field copy lives here
     // so the struct definition and its capture path are auditable as one unit.
     //
-    // Tier-1 split (graphics/compute snapshots): this graphics path deliberately
-    // OMITS `cs_program`. Audit (see CaptureComputeFrom below) confirms the Draw
-    // / DrawIndexed / DrawIndirect / DrawIndexedIndirect consumer chain never
-    // reads `cs_program` — the only reads are compute-gated (RefreshComputeKey,
-    // BuildRuntimeInfo's Stage::Compute branch, the IsCompute* meta helpers, and
-    // BindBuffers's SharedMemory/LDS branch, which is marked "graphics draws
-    // never reach this branch"). Skipping the 320-byte ComputeProgram copy here
-    // is the per-draw write saving — and since draws never read cs_program, the
-    // slot's stale cs_program bytes are inert on the graphics path.
+    // 2B-1: also captures the compute program from the queue's cs_state so
+    // dispatch-path consumers (PipelineCache::GetComputePipeline,
+    // BindBuffers's SharedMemory branch, IsCompute*) can read from the
+    // snapshot uniformly with graphics consumers.
     //
     // Phase 1D-pre-C: also captures `gfx_pipeline_stamp`, `gfx_key_dirty`,
     // `dynamic_dirty`, `last_cb_extent[]`, and `last_db_extent` — five
     // PM4-side fields that live on Liverpool (not on Regs). The producer
-    // (Liverpool::CaptureGfxSnapshot) reads-and-clears the two dirty bits
+    // (Liverpool::CaptureSnapshot) reads-and-clears the two dirty bits
     // outside this method as part of its sole-writer-ownership protocol;
     // here we just copy the values it passes in.
-    void CaptureGfxFrom(const Regs& regs,
-                        u64 gfx_pipeline_stamp_in, bool gfx_key_dirty_in,
-                        bool dynamic_dirty_in,
-                        const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_in,
-                        CbDbExtent last_db_in) noexcept {
+    void CaptureFrom(const Regs& regs, const ComputeProgram& cs_state,
+                     u64 gfx_pipeline_stamp_in, bool gfx_key_dirty_in,
+                     bool dynamic_dirty_in,
+                     const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_in,
+                     CbDbExtent last_db_in) noexcept {
         // Shader programs
         ps_program = regs.ps_program;
         vs_program = regs.vs_program;
@@ -286,74 +281,16 @@ struct LiverpoolRegsSnapshot {
         vgt_instance_step_rate_0 = regs.vgt_instance_step_rate_0;
         vgt_instance_step_rate_1 = regs.vgt_instance_step_rate_1;
 
-        // Tier-1 split: cs_program is NOT captured on the graphics path.
-        // Whatever stale ComputeProgram bytes occupy this slot are inert here
-        // because no Draw consumer reads cs_program (see method doc above).
+        // Compute program (separate state, owned by the queue's cs_state slot,
+        // not by Regs).
+        cs_program = cs_state;
 
         // Phase 1D-pre-C: hot-path Liverpool state. These come from the
         // Liverpool object's own members (not from Regs). The producer
         // reads them from the live Liverpool and passes them in as args;
         // `gfx_key_dirty_in` / `dynamic_dirty_in` are the values BEFORE
-        // Liverpool::CaptureGfxSnapshot clears them (so the snapshot reflects
+        // Liverpool::CaptureSnapshot clears them (so the snapshot reflects
         // "what the assembler would have observed had it read live").
-        gfx_pipeline_stamp = gfx_pipeline_stamp_in;
-        gfx_key_dirty = gfx_key_dirty_in;
-        dynamic_dirty = dynamic_dirty_in;
-        last_cb_extent = last_cb_in;
-        last_db_extent = last_db_in;
-    }
-
-    // === API: compute capture — the minimal audited set a Dispatch reads. ===
-    //
-    // Tier-1 split: a Dispatch / DispatchIndirect consumer touches only a tiny
-    // subset of the snapshot. The full audited compute read-set is:
-    //
-    //   * `cs_program`               — DoDispatch*FromIntent (dims), GetComputePipeline
-    //                                  → RefreshComputeKey → GetProgram →
-    //                                  BuildRuntimeInfo(Stage::Compute), the three
-    //                                  IsCompute* meta helpers, and BindBuffers's
-    //                                  SharedMemory/LDS branch.
-    //   * `viewport_control`         — MakeUserData (runs inside BindResources on the
-    //   * `viewports[0]`               dispatch path too); the four push-constant
-    //                                  viewport floats are derived from these. A
-    //                                  compute shader's push range generally excludes
-    //                                  them, but capturing the two fields keeps
-    //                                  push_data BIT-IDENTICAL to the pre-split path,
-    //                                  so this is correctness-preserving, not a guess.
-    //
-    // Everything else is zero-initialized via `*this = {}` FIRST. This is the
-    // deliberate safety property of the split: if a future code change adds a
-    // `regs.<field>` read on the compute path that this audit didn't cover, it
-    // reads a DETERMINISTIC ZERO rather than stale ring-slot garbage — a clean,
-    // reproducible wrong value instead of nondeterministic corruption. The memset
-    // is a streaming store (no source read) and is cheaper than the old full
-    // per-field copy from live Regs; the consumer also reads back far fewer lines.
-    //
-    // NOTE: this does not shrink sizeof(LiverpoolRegsSnapshot) (the type is shared
-    // with the graphics pool so consumer signatures are unchanged). The compute
-    // win is reduced write traffic + smaller consumer read-set, not a smaller
-    // struct. A dedicated compact compute-snapshot type would cut the 156 KB pool
-    // footprint further but requires threading a new type through the pipeline
-    // cache + bind path — deferred as a follow-up.
-    void CaptureComputeFrom(const Regs& regs, const ComputeProgram& cs_state,
-                            u64 gfx_pipeline_stamp_in, bool gfx_key_dirty_in,
-                            bool dynamic_dirty_in,
-                            const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& last_cb_in,
-                            CbDbExtent last_db_in) noexcept {
-        // Zero the whole slot first so every un-captured field is a determinate 0.
-        *this = LiverpoolRegsSnapshot{};
-
-        // Compute program — the primary payload of a dispatch snapshot.
-        cs_program = cs_state;
-
-        // MakeUserData reads these on the dispatch path; capture verbatim so the
-        // derived push-constant viewport transform is unchanged from pre-split.
-        viewport_control = regs.viewport_control;
-        viewports[0] = regs.viewports[0];
-
-        // Phase 1D-pre-C hot-path Liverpool state (cheap; preserved for parity
-        // with the graphics snapshot's contract even though the compute pipeline
-        // cache path keys off cs_program rather than the gfx pipeline stamp).
         gfx_pipeline_stamp = gfx_pipeline_stamp_in;
         gfx_key_dirty = gfx_key_dirty_in;
         dynamic_dirty = dynamic_dirty_in;

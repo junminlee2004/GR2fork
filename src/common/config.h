@@ -69,8 +69,6 @@ bool readbackLinearImages();
 void setReadbackLinearImages(bool enable, bool is_game_specific = false);
 bool directMemoryAccess();
 void setDirectMemoryAccess(bool enable, bool is_game_specific = false);
-bool disableStreamCacheEpoch();
-void setDisableStreamCacheEpoch(bool enable, bool is_game_specific = false);
 bool dumpShaders();
 void setDumpShaders(bool enable, bool is_game_specific = false);
 u32 vblankFreq();

@@ -5,65 +5,150 @@
 #include "core/libraries/avplayer/avplayer.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_impl.h"
-#include <mutex>
 #include "core/libraries/libs.h"
-#include "video_core/buffer_cache/stream_cache_epoch.h"
+#include <array>
+#include <mutex>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
 
 namespace Libraries::AvPlayer {
 
-// FIX(GR2FORK v3.3): tutorial-priority serialization ("tutorial wins").
+// FIX(GR2FORK v6 / v6.3): tutorial-wins serialization — filename-identified,
+// with frozen-stream flush on release.
 //
-// In GR2 the tutorial info videos are uniquely 768×416 buffer-dim (native
-// 720×404 padded to pitch). When a tutorial video joins the AvPlayer mix
-// alongside any other concurrent stream (HUD overlay backdrop), shadPS4's
-// gpucomm + gpuassembler architecture cannot maintain bind-state isolation
-// between the two streams' draws within the same cmdbuf — produces green
-// chroma banding visible on both, instantly resolving the moment one
-// stream stops producing frames.
+// Tutorial overlays collide with a concurrent background video in the
+// GpuComm/assembler split (shared bind-state in one cmdbuf), which can't be
+// fixed without collapsing the threaded architecture. So while a tutorial is
+// live we serialize: it becomes the only stream that receives frames, others
+// are suppressed (frozen). The v6 stall-watchdog (avplayer_source.cpp) keeps a
+// suppressed stream's decoder from wedging.
 //
-// Mechanism: on every successful GetVideoData, check if the frame
-// dimensions match the tutorial signature. If yes and no other handle is
-// currently the active tutorial, claim tutorial status. While any handle
-// is the active tutorial, suppress GetVideoData for all OTHER handles
-// (they return ret=0, which the game treats as normal decoder lag —
-// typically displays the last decoded frame frozen). When the tutorial
-// stops/closes, clear the designation and multi-stream play resumes.
+// v6.3 changes two things:
+//   1. Identification is by source FILENAME, not the 768x416 frame size. The
+//      size matched any like-sized cutscene/preview and would wrongly suppress
+//      legitimate streams; the twelve info/ tutorial files are matched exactly.
+//   2. When the active tutorial ends and no tutorial remains, every other live
+//      stream (all of which were suppressed/frozen) is flushed immediately, so
+//      a frozen video can't sit dead and stall GR2's streaming queue into an
+//      infinite load.
 //
-// Other concurrent-stream scenarios (cutscene + HUD overlay) are left as
-// multi-stream and rely on the stream-cache epoch (below) to keep
-// buffer_cache coherent across the in-place UBO writes.
+// The gate is otherwise the corrected v6 form: decide suppression BEFORE
+// consuming (never discard a consumed frame), and drop only the first racing
+// frame of a freshly-claimed tutorial.
 namespace {
 
-constexpr u32 kTutorialWidth = 768;
-constexpr u32 kTutorialHeight = 416;
+// The GR2 tutorial info videos, by exact source filename. These twelve files
+// (under the game's info/ folder) ARE the tutorial overlays; matching the
+// source path against them is definitive.
+constexpr std::array<std::string_view, 12> kTutorialVideoFiles{{
+    "ep02_info_02.mp4", "ep02_info_04.mp4", "ep02_info_05.mp4", "ep02_info_06.mp4",
+    "ep02_info_07.mp4", "ep02_info_08.mp4", "ep02_info_09.mp4", "ep02_info_13.mp4",
+    "ep03_info_02_01.mp4", "ep03_info_03_01.mp4", "ep03_info_04_01.mp4", "ep03_info_06_01.mp4",
+}};
 
-std::mutex g_tutorial_mutex;
-AvPlayerHandle g_tutorial_handle = nullptr;
-
-bool IsTutorialDims(u32 w, u32 h) noexcept {
-    return w == kTutorialWidth && h == kTutorialHeight;
+bool IsTutorialFilename(std::string_view path) noexcept {
+    // Substring match handles full paths, e.g. /app0/.../info/ep03_info_06_01.mp4.
+    for (const auto name : kTutorialVideoFiles) {
+        if (path.find(name) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
+std::mutex g_tutorial_mutex;
+AvPlayerHandle g_tutorial_handle = nullptr; // currently-active (suppressing) tutorial
+bool g_tutorial_primed = false;             // first-frame drop done for the active tutorial
+
+// Handles whose current source is one of the tutorial files above.
+std::unordered_set<AvPlayerHandle> g_tutorial_sources;
+// Every live handle (Init..Close), so suppression release can flush the others.
+std::unordered_set<AvPlayerHandle> g_live_handles;
+
+void RegisterLiveHandle(AvPlayerHandle h) {
+    std::scoped_lock lock{g_tutorial_mutex};
+    g_live_handles.insert(h);
+}
+
+// Mark/unmark a handle's source as a tutorial from its filename. A handle being
+// repurposed for a non-tutorial source loses tutorial status.
+void SetTutorialSource(AvPlayerHandle h, bool is_tutorial) {
+    std::scoped_lock lock{g_tutorial_mutex};
+    if (is_tutorial) {
+        g_tutorial_sources.insert(h);
+    } else {
+        g_tutorial_sources.erase(h);
+    }
+}
+
+// Suppress every handle except the one currently designated the tutorial.
 bool ShouldSuppress(AvPlayerHandle h) noexcept {
     std::scoped_lock lock{g_tutorial_mutex};
     return g_tutorial_handle != nullptr && g_tutorial_handle != h;
 }
 
-bool ObserveFrameAndDecide(AvPlayerHandle h, u32 w, u32 height) noexcept {
+// Claim tutorial status when a confirmed tutorial-source handle delivers a
+// frame, and decide whether THIS frame must be dropped.
+//
+// FIX(GR2FORK v6.1/6.2): the very first tutorial frame races its own
+// invalidation — Path D still holds a stale UBO copy and the texture cache a
+// stale image at the shared VAddr from the prior stream, so frame 1 presents
+// corrupt; by the next frame the tick key has turned over and the cache
+// re-copies clean. So drop the first frame after claiming and present from the
+// second. FIX(GR2FORK v6.3): the claim requires the handle's source to be a
+// known tutorial file (set at AddSource), so a like-sized clip can never be
+// mistaken for the tutorial. Returns true if this (first) frame is withheld.
+bool ClaimAndShouldDropFirstFrame(AvPlayerHandle h) noexcept {
     std::scoped_lock lock{g_tutorial_mutex};
-    if (g_tutorial_handle != nullptr && g_tutorial_handle != h) {
+    if (!g_tutorial_sources.contains(h)) {
         return false;
     }
-    if (g_tutorial_handle == nullptr && IsTutorialDims(w, height)) {
+    if (g_tutorial_handle == nullptr) {
         g_tutorial_handle = h;
+        g_tutorial_primed = false;
     }
-    return true;
+    if (g_tutorial_handle == h && !g_tutorial_primed) {
+        g_tutorial_primed = true; // every subsequent frame is delivered
+        return true;              // withhold this first (racing) frame
+    }
+    return false;
 }
 
-void ClearTutorialIfHandle(AvPlayerHandle h) noexcept {
+// Release the active-tutorial designation if this handle holds it, and return
+// the OTHER live handles to flush. When the active tutorial ends, every other
+// stream was suppressed (frozen) by it; flushing them lets them resume at once
+// rather than sitting wedged and stalling the streaming queue (the infinite-
+// load failure). The caller flushes the returned handles AFTER releasing the
+// lock, since FlushStreams reaches into the source layer.
+std::vector<AvPlayerHandle> ClearTutorialAndCollectFlush(AvPlayerHandle h) {
+    std::vector<AvPlayerHandle> to_flush;
     std::scoped_lock lock{g_tutorial_mutex};
     if (g_tutorial_handle == h) {
         g_tutorial_handle = nullptr;
+        g_tutorial_primed = false;
+        for (auto live : g_live_handles) {
+            if (live != h) {
+                to_flush.push_back(live);
+            }
+        }
+    }
+    return to_flush;
+}
+
+// Drop a handle from both registries (on Close).
+void ForgetHandle(AvPlayerHandle h) {
+    std::scoped_lock lock{g_tutorial_mutex};
+    g_tutorial_sources.erase(h);
+    g_live_handles.erase(h);
+}
+
+// Release tutorial designation held by `h` (if any) and flush the streams that
+// were suppressed by it. Safe to call on any lifecycle exit; a no-op when `h`
+// wasn't the active tutorial.
+void ReleaseTutorialAndFlush(AvPlayerHandle h) {
+    for (auto fh : ClearTutorialAndCollectFlush(h)) {
+        fh->FlushStreams();
     }
 }
 
@@ -75,6 +160,11 @@ s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filenam
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    // FIX(GR2FORK v6/v6.3): handle reuse releases any prior designation (and
+    // flushes the streams it was suppressing), then re-evaluate this handle's
+    // tutorial status from the new source filename.
+    ReleaseTutorialAndFlush(handle);
+    SetTutorialSource(handle, filename != nullptr && IsTutorialFilename(filename));
     return handle->AddSource(filename);
 }
 
@@ -84,7 +174,9 @@ s32 PS4_SYSV_ABI sceAvPlayerAddSourceEx(AvPlayerHandle handle, AvPlayerUriType u
     if (handle == nullptr || uri_type != AvPlayerUriType::Source) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6): handle reuse
     const auto path = std::string_view(source_details->uri.name, source_details->uri.length);
+    SetTutorialSource(handle, IsTutorialFilename(path));  // FIX(GR2FORK v6.3)
     return handle->AddSourceEx(path, source_details->source_type);
 }
 
@@ -98,7 +190,8 @@ s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    ClearTutorialIfHandle(handle);  // FIX(GR2FORK v3.3): tutorial-wins
+    ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6/v6.3): release + flush frozen others
+    ForgetHandle(handle);             // drop from live/tutorial-source registries
     delete handle;
     return ORBIS_OK;
 }
@@ -149,36 +242,25 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoData(AvPlayerHandle handle, AvPlayerFrameIn
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    // FIX(GR2FORK v3.3): tutorial-wins — early suppression.
+    // FIX(GR2FORK v6): tutorial-wins — decide suppression BEFORE consuming, so
+    // we never pop a frame we then throw away. A suppressed handle returns
+    // without touching its queue; its decoder keeps running and the v6
+    // watchdog prevents it from wedging.
     if (ShouldSuppress(handle)) {
         return false;
     }
     const bool got = handle->GetVideoData(*video_info);
     if (got) {
-        // FIX(GR2FORK v3.3): observe-and-decide. Race protection if
-        // tutorial designated on another handle between early-out and now.
-        if (!ObserveFrameAndDecide(handle, video_info->details.video.width,
-                                   video_info->details.video.height)) {
-            return false;
-        }
-        // FIX(GR2FORK v3.3): bump buffer_cache stream-cache epoch only
-        // on tutorial-sized frames. The within-frame in-place UBO update
-        // pattern that Path D mishandles is specific to the tutorial
-        // scenario where the game switches between backdrop and tutorial
-        // UBOs (same VAddr, same tick, different content) during the
-        // brief init window before tutorial-wins suppression kicks in.
-        // Gating the bump on tutorial dimensions means in-game TV scenes
-        // (Jirga Para Lhao etc.), which have many concurrent AvPlayer
-        // instances but no within-frame UBO collisions, retain full
-        // Path D performance — they don't cause cache thrashing.
-        // Cutscenes outside the tutorial path stay on natural per-tick
-        // Path D behavior; if they ever exhibit cycling we'd address
-        // by extending the predicate, not by flooding the epoch.
-        if (IsTutorialDims(video_info->details.video.width,
-                           video_info->details.video.height)) {
-            VideoCore::BumpStreamCacheEpoch();
+        // FIX(GR2FORK v6.3): claim/first-frame-drop keyed on the handle's
+        // tutorial-source identity (set from the filename at AddSource), not
+        // the frame size. ClaimAndShouldDropFirstFrame is a no-op for any
+        // non-tutorial handle.
+        if (ClaimAndShouldDropFirstFrame(handle)) {
+            return false; // withhold the first (racing) frame; deliver from #2
         }
     }
+    // Always deliver a consumed frame (never discard) — that was the v3.3 race.
+    // The single first-frame drop above is a deliberate, bounded exception.
     return got;
 }
 
@@ -188,20 +270,17 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    // FIX(GR2FORK v3.3): tutorial-wins — early suppression.
+    // FIX(GR2FORK v6): see sceAvPlayerGetVideoData — suppress before consume,
+    // drop the first (racing) tutorial frame, never discard a consumed frame.
     if (ShouldSuppress(handle)) {
         return false;
     }
     const bool got = handle->GetVideoData(*video_info);
     if (got) {
-        // FIX(GR2FORK v3.3): see GetVideoData above.
-        if (!ObserveFrameAndDecide(handle, video_info->details.video.width,
-                                   video_info->details.video.height)) {
+        // FIX(GR2FORK v6.3): see sceAvPlayerGetVideoData — claim by source
+        // identity, drop only the first racing frame.
+        if (ClaimAndShouldDropFirstFrame(handle)) {
             return false;
-        }
-        if (IsTutorialDims(video_info->details.video.width,
-                           video_info->details.video.height)) {
-            VideoCore::BumpStreamCacheEpoch();
         }
     }
     return got;
@@ -221,7 +300,9 @@ AvPlayerHandle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
         return nullptr;
     }
 
-    return new AvPlayer(*data);
+    auto* handle = new AvPlayer(*data);
+    RegisterLiveHandle(handle);  // FIX(GR2FORK v6.3): track for suppression-release flush
+    return handle;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* p_data, AvPlayerHandle* p_player) {
@@ -246,7 +327,9 @@ s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* p_data, AvPlayerHan
     data.num_output_video_framebuffers = p_data->num_output_video_framebuffers;
     data.auto_start = p_data->auto_start;
 
-    *p_player = new AvPlayer(data);
+    auto* handle = new AvPlayer(data);
+    RegisterLiveHandle(handle);  // FIX(GR2FORK v6.3): track for suppression-release flush
+    *p_player = handle;
     return ORBIS_OK;
 }
 
@@ -271,6 +354,7 @@ s32 PS4_SYSV_ABI sceAvPlayerPause(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6/v6.3): paused tutorial unfreezes + flushes others
     return handle->Pause();
 }
 
@@ -340,7 +424,7 @@ s32 PS4_SYSV_ABI sceAvPlayerStop(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    ClearTutorialIfHandle(handle);  // FIX(GR2FORK v3.3): tutorial-wins
+    ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6/v6.3): tutorial stop flushes frozen others
     return handle->Stop();
 }
 

@@ -35,6 +35,9 @@ public:
     bool GetVideoData(AvPlayerFrameInfo& video_info);
     bool GetVideoData(AvPlayerFrameInfoEx& video_info);
     bool IsActive();
+    // FIX(GR2FORK v6.3): forward a frozen-stream flush to the source. See
+    // AvPlayerSource::FlushFrozenFrames.
+    void FlushFrozenFrames();
     u64 CurrentTime();
     bool SetLooping(bool is_looping);
 

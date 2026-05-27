@@ -171,12 +171,6 @@ static ConfigEntry<bool> shouldCopyGPUBuffers(false);
 static ConfigEntry<bool> readbacksEnabled(false);
 static ConfigEntry<bool> readbackLinearImagesEnabled(false);
 static ConfigEntry<bool> directMemoryAccessEnabled(false);
-// GR2FORK: when true, disables the BufferCache stream-cache epoch
-// invalidation entirely (reverts ObtainBuffer Path D to its pre-epoch
-// behavior — four-tuple identity only, no generation check). Default
-// false keeps epoch invalidation on, which is the correct behavior for
-// in-place UBO updates (video compositor). Diagnostic/perf-isolation knob.
-static ConfigEntry<bool> streamCacheEpochDisabled(false);
 static ConfigEntry<bool> shouldDumpShaders(false);
 static ConfigEntry<bool> shouldPatchShaders(false);
 static ConfigEntry<u32> vblankFrequency(60);
@@ -496,10 +490,6 @@ bool directMemoryAccess() {
     return directMemoryAccessEnabled.get();
 }
 
-bool disableStreamCacheEpoch() {
-    return streamCacheEpochDisabled.get();
-}
-
 bool dumpShaders() {
     return shouldDumpShaders.get();
 }
@@ -723,10 +713,6 @@ void setReadbackLinearImages(bool enable, bool is_game_specific) {
 
 void setDirectMemoryAccess(bool enable, bool is_game_specific) {
     directMemoryAccessEnabled.set(enable, is_game_specific);
-}
-
-void setDisableStreamCacheEpoch(bool enable, bool is_game_specific) {
-    streamCacheEpochDisabled.set(enable, is_game_specific);
 }
 
 void setDumpShaders(bool enable, bool is_game_specific) {
@@ -1097,7 +1083,6 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         readbacksEnabled.setFromToml(gpu, "readbacks", is_game_specific);
         readbackLinearImagesEnabled.setFromToml(gpu, "readbackLinearImages", is_game_specific);
         directMemoryAccessEnabled.setFromToml(gpu, "directMemoryAccess", is_game_specific);
-        streamCacheEpochDisabled.setFromToml(gpu, "disableStreamCacheEpoch", is_game_specific);
         shouldDumpShaders.setFromToml(gpu, "dumpShaders", is_game_specific);
         shouldPatchShaders.setFromToml(gpu, "patchShaders", is_game_specific);
         vblankFrequency.setFromToml(gpu, "vblankFrequency", is_game_specific);
@@ -1297,8 +1282,6 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     resolutionOverride.setTomlValue(data, "GPU", "resolutionOverride", is_game_specific);
     resolutionPatchGroups.setTomlValue(data, "GPU", "resolutionPatchGroups", is_game_specific);
     directMemoryAccessEnabled.setTomlValue(data, "GPU", "directMemoryAccess", is_game_specific);
-    streamCacheEpochDisabled.setTomlValue(data, "GPU", "disableStreamCacheEpoch",
-                                          is_game_specific);
 
     gpuId.setTomlValue(data, "Vulkan", "gpuId", is_game_specific);
     vkValidation.setTomlValue(data, "Vulkan", "validation", is_game_specific);
