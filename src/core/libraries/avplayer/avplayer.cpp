@@ -38,16 +38,6 @@ namespace Libraries::AvPlayer {
 // frame of a freshly-claimed tutorial.
 namespace {
 
-// GR2FORK: master switch for the tutorial-wins serialization described above.
-// DISABLED. With this false, no AvPlayer stream is ever suppressed/frozen and
-// no first frame is ever dropped — every concurrent stream receives frames
-// normally (stock shadPS4 behavior). The filename/handle bookkeeping below is
-// still compiled and called but is inert at runtime: because the claim path is
-// gated off, g_tutorial_handle is never set, so ShouldSuppress() is always
-// false and ClearTutorialAndCollectFlush() never collects anyone to flush.
-// Flip to true to restore the full v6.3 tutorial-wins behavior.
-constexpr bool kTutorialWinsEnabled = false;
-
 // The GR2 tutorial info videos, by exact source filename. These twelve files
 // (under the game's info/ folder) ARE the tutorial overlays; matching the
 // source path against them is definitive.
@@ -94,13 +84,8 @@ void SetTutorialSource(AvPlayerHandle h, bool is_tutorial) {
 
 // Suppress every handle except the one currently designated the tutorial.
 bool ShouldSuppress(AvPlayerHandle h) noexcept {
-    if constexpr (kTutorialWinsEnabled) {
-        std::scoped_lock lock{g_tutorial_mutex};
-        return g_tutorial_handle != nullptr && g_tutorial_handle != h;
-    } else {
-        (void)h;
-        return false; // tutorial-wins disabled: never suppress any stream
-    }
+    std::scoped_lock lock{g_tutorial_mutex};
+    return g_tutorial_handle != nullptr && g_tutorial_handle != h;
 }
 
 // Claim tutorial status when a confirmed tutorial-source handle delivers a
@@ -115,24 +100,19 @@ bool ShouldSuppress(AvPlayerHandle h) noexcept {
 // known tutorial file (set at AddSource), so a like-sized clip can never be
 // mistaken for the tutorial. Returns true if this (first) frame is withheld.
 bool ClaimAndShouldDropFirstFrame(AvPlayerHandle h) noexcept {
-    if constexpr (kTutorialWinsEnabled) {
-        std::scoped_lock lock{g_tutorial_mutex};
-        if (!g_tutorial_sources.contains(h)) {
-            return false;
-        }
-        if (g_tutorial_handle == nullptr) {
-            g_tutorial_handle = h;
-            g_tutorial_primed = false;
-        }
-        if (g_tutorial_handle == h && !g_tutorial_primed) {
-            g_tutorial_primed = true; // every subsequent frame is delivered
-            return true;              // withhold this first (racing) frame
-        }
+    std::scoped_lock lock{g_tutorial_mutex};
+    if (!g_tutorial_sources.contains(h)) {
         return false;
-    } else {
-        (void)h;
-        return false; // tutorial-wins disabled: never claim, never drop a frame
     }
+    if (g_tutorial_handle == nullptr) {
+        g_tutorial_handle = h;
+        g_tutorial_primed = false;
+    }
+    if (g_tutorial_handle == h && !g_tutorial_primed) {
+        g_tutorial_primed = true; // every subsequent frame is delivered
+        return true;              // withhold this first (racing) frame
+    }
+    return false;
 }
 
 // Release the active-tutorial designation if this handle holds it, and return
