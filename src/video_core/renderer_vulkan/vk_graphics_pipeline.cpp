@@ -245,35 +245,7 @@ GraphicsPipeline::GraphicsPipeline(
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
-            // GR2FORK aux-TCS grass fix (v3.3): compute the bitmask of Params
-            // that the upstream VS actually writes, so EmitAuxilaryTessShader
-            // can skip declaring TCS Inputs at Locations the VS doesn't
-            // output. Without this, the aux TCS declares Inputs based on
-            // fs_info.inputs[i].param_index (what the FS wants to read) and
-            // VUID-RuntimeSpirv-OpEntryPoint-08743 fires whenever the VS's
-            // output set is a strict subset of the FS's expected inputs —
-            // the failure mode observed in GR2 for the grass-area
-            // rect_list/quad_list draws (pipeline rejected by RADV, draw
-            // silently dropped, geometry invisible).
-            u32 vs_output_mask = 0;
-            if (const auto* vs_info_ptr = infos[u32(Shader::LogicalStage::Vertex)]) {
-                for (u32 i = 0; i < Shader::IR::NumParams; ++i) {
-                    if (vs_info_ptr->stores.GetAny(
-                            static_cast<Shader::IR::Attribute>(
-                                static_cast<u32>(Shader::IR::Attribute::Param0) + i))) {
-                        vs_output_mask |= (1u << i);
-                    }
-                }
-            } else {
-                // No VS Info available (shouldn't happen for a real draw, but
-                // be defensive): fall back to "VS writes all params" so we
-                // preserve pre-fix behavior on this code path. RADV will
-                // still reject pipelines with genuine interface mismatches —
-                // we just stop introducing NEW ones.
-                vs_output_mask = 0xFFFFFFFFu;
-            }
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                type, fs_info, vs_output_mask);
+            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,

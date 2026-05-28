@@ -18,18 +18,7 @@ enum class AuxShaderType : u32 {
     PassthroughTES,
 };
 
-// GR2FORK aux-TCS grass fix (v3.3):
-// `vs_output_mask` is a bitmask where bit i = 1 iff the upstream VS writes to
-// Param_i (i.e. info.stores.GetAny(IR::Attribute::Param0 + i) is true). The
-// auxiliary TCS uses it to skip declaring Input variables for Locations the
-// VS doesn't actually output — otherwise VUID-RuntimeSpirv-OpEntryPoint-08743
-// fires (TCS declared Input at Location N but previous stage has no Output
-// declared there) and RADV rejects the pipeline, silently dropping the draw.
-// Only TCS aux types consume the mask; PassthroughTES ignores it (TES inputs
-// come from the AuxTCS Outputs, which are still fully declared on all
-// FS-expected Locations).
 [[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type,
-                                                      const FragmentRuntimeInfo& fs_info,
-                                                      u32 vs_output_mask = 0xFFFFFFFFu);
+                                                      const FragmentRuntimeInfo& fs_info);
 
 } // namespace Shader::Backend::SPIRV

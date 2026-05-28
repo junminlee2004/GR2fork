@@ -312,8 +312,8 @@ private:
     // a future reader is meant to read. Everything else in this block
     // stays private.
 public:
-    static constexpr std::chrono::milliseconds kNormalSyncBudget{400};
-    static constexpr std::chrono::milliseconds kLongSyncBudget{1000};
+    static constexpr std::chrono::milliseconds kNormalSyncBudget{2000};
+    static constexpr std::chrono::milliseconds kLongSyncBudget{10000};
 
 private:
     [[nodiscard]] static std::chrono::milliseconds GetInitialSyncBudget();
