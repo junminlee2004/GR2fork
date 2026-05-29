@@ -247,7 +247,36 @@ private:
         // PipelineCache::infos/runtime_infos/modules — those cache members are
         // overwritten on the next RefreshGraphicsStages, so the async task
         // cannot rely on them. Copy once at launch.
-        std::array<const Shader::Info*, MaxShaderStages> infos_copy{};
+        //
+        // RACE FIX: the Shader::Info pointers serve two masters with different
+        // lifetime/mutability needs, so they are split:
+        //
+        //   live_infos     — the program-owned Shader::Info pointers for THIS
+        //                    draw. The finished GraphicsPipeline stores these in
+        //                    Pipeline::stages and reads them per-draw in
+        //                    BindResources, so they MUST stay live: the
+        //                    GpuAssembler refreshes their flattened_ud_buf on
+        //                    every draw (GetProgram -> RefreshFlatBuf), on its
+        //                    own thread.
+        //
+        //   info_snapshot  — immutable per-launch DEEP COPIES of those Infos.
+        //                    The (fenced) compile worker builds the descriptor-
+        //                    set layout from these: BuildDescSetLayout reads
+        //                    flattened_ud_buf via GetSharp to choose storage-vs-
+        //                    uniform. Copying the Info also deep-copies its
+        //                    flattened_ud_buf vector — the exact buffer
+        //                    RefreshFlatBuf() reallocates. So when a budget-
+        //                    skipped draw recurs next frame and the GpuAssembler
+        //                    re-runs RefreshFlatBuf on the LIVE Info, it cannot
+        //                    realloc/tear the buffer this worker is mid-read on.
+        //                    That tear was the wedge: a torn sharp -> wrong
+        //                    descriptor type in the layout -> RADV DEVICE_LOST.
+        //
+        //   snapshot_infos — pointers into info_snapshot in the ctor's span
+        //                    shape (nullptr for absent stages).
+        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+        std::array<std::optional<Shader::Info>, MaxShaderStages> info_snapshot{};
+        std::array<const Shader::Info*, MaxShaderStages> snapshot_infos{};
         std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos_copy{};
         std::array<vk::ShaderModule, MaxShaderStages> modules_copy{};
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_copy{};
@@ -258,7 +287,7 @@ private:
     // Thresholds for the async-compile + driver-hang watchdog.
     //
     // GR2FORK: the synchronous sync-budget is now user-tunable via the [GPU]
-    // gameplaySyncBudgetMs config key (default 2000; surfaced as a slider in
+    // gameplaySyncBudgetMs config key (default 10000; surfaced as a slider in
     // the Qt launcher, range 0..50000 ms). It is read fresh from Config at the
     // wait site in GetGraphicsPipeline — a cold-compile-only ([[unlikely]])
     // path, so the per-read cost is irrelevant and there is no hot-path
@@ -268,15 +297,23 @@ private:
     // future is stashed in pending_graphics_pipelines and the draw is skipped
     // (TryFinalizePending polls non-blockingly on subsequent frames).
     //
-    // DO NOT set the budget near zero. Empirically confirmed (see chat
-    //   "Infinite loading and shader cache issues", 2026-05-25): a near-zero
-    //   gameplay budget produced infinite loading screens, because the
-    //   skipped-draw fallback that fires when a compile exceeds the budget
-    //   interacts badly with the game's loading flow when the budget is so
-    //   small that nearly every cold compile triggers it. 2000ms (the default)
-    //   catches the vast majority of cold compiles inline. If artifacts
-    //   appear, RAISE the budget -- never lower it. The 0 end of the slider is
-    //   exposed for diagnostics only.
+    // A low budget is now SAFE. The "near-zero budget -> infinite loading"
+    //   symptom (see chat "Infinite loading and shader cache issues",
+    //   2026-05-25) was NOT inherent to skipping — it was a data race the skip
+    //   path exposed: the fenced compile worker read the live Shader::Info
+    //   (flattened_ud_buf, via GetSharp in BuildDescSetLayout) while the
+    //   GpuAssembler re-ran RefreshFlatBuf() on it for the same draw recurring
+    //   next frame, reallocating the buffer mid-read -> torn sharp -> wrong
+    //   descriptor type -> RADV DEVICE_LOST / wedged load. That is fixed at the
+    //   source: the worker now builds the layout from an immutable per-launch
+    //   Info snapshot (see PendingGraphicsPipeline::info_snapshot), so skips can
+    //   no longer corrupt a compile. A LOW budget is therefore preferred for
+    //   throughput: it lets the GpuAssembler skip-and-backfill (stash the future,
+    //   keep draining draws) instead of blocking on the future, keeping its
+    //   dedicated core at full utilization. The only cost of a skip is brief
+    //   pop-in (1-3 frames) on a pipeline's first appearance, never corruption.
+    //   Default stays 10000ms (catches most cold compiles inline, zero pop-in);
+    //   lower it via the slider if you want the assembler kept busy during loads.
     //
     // kHangLogThreshold / kPermaFailThreshold stay compile-time constants: they
     // govern the non-blocking escalation inside TryFinalizePending, not the

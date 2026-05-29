@@ -172,6 +172,12 @@ void setIsMotionControlsEnabled(bool use, bool is_game_specific = false);
 // Auto-enabled by the launcher's Steam Deck preset.
 bool getGyroSwapYawRoll();
 void setGyroSwapYawRoll(bool enable, bool is_game_specific = false);
+// gr2fork: optional gyro yaw inversion. Negates the yaw (horizontal) component
+// of the motion data so tilt/motion aiming turns the opposite way. Applied to
+// the resolved yaw channel, so it is independent of (and composes with) the
+// yaw/roll swap above. Auto-enabled by the launcher's Steam Deck preset.
+bool getGyroInvertYaw();
+void setGyroInvertYaw(bool enable, bool is_game_specific = false);
 std::string getDefaultControllerID();
 void setDefaultControllerID(std::string id);
 bool getBackgroundControllerInput();
@@ -187,7 +193,7 @@ void setRcasAttenuation(int value, bool is_game_specific = false);
 // GR2FORK: pipeline-compile synchronous-wait budget, in milliseconds. On first
 // encounter of a new graphics pipeline, the GpuComm thread blocks up to this
 // long for the async compile to finish inline before falling back to skipping
-// the draw. Default 2000. Lives in the [GPU] section; user-tunable via the Qt
+// the draw. Default 10000. Lives in the [GPU] section; user-tunable via the Qt
 // launcher slider (0..50000 ms). See vk_pipeline_cache for the wait site and
 // the "do not set near zero" rationale.
 int getGameplaySyncBudgetMs();

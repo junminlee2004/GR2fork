@@ -623,7 +623,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
             ++num_new_pipelines;
             if (Config::collectShadersForDebug()) {
                 for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                    if (pending->infos_copy[stage]) {
+                    if (pending->live_infos[stage]) {
                         auto& m = pending->modules_copy[stage];
                         module_related_pipelines[m].emplace_back(graphics_key);
                     }
@@ -706,7 +706,7 @@ bool PipelineCache::TryFinalizePending(PendingGraphicsPipeline& pending,
     ++num_new_pipelines;
     if (Config::collectShadersForDebug()) {
         for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-            if (pending.infos_copy[stage]) {
+            if (pending.live_infos[stage]) {
                 auto& m = pending.modules_copy[stage];
                 module_related_pipelines[m].emplace_back(key);
             }
@@ -729,7 +729,22 @@ PipelineCache::LaunchAsyncPipelineCompile(const GraphicsPipelineKey& key, u64 pi
     // Deep-copy stage data. The PipelineCache::infos/runtime_infos/modules
     // members are span-targets and get overwritten by the next RefreshGraphicsStages.
     // The async task must not alias them.
-    pending->infos_copy = infos;
+    //
+    // RACE FIX: snapshot each Shader::Info into pending->info_snapshot (an
+    // immutable per-launch deep copy) and keep the live pointers separately in
+    // pending->live_infos. The compile worker reads the SNAPSHOT for descriptor-
+    // layout construction (race-free: copying the Info deep-copies its
+    // flattened_ud_buf, the vector RefreshFlatBuf() reallocates), then the
+    // finished pipeline is repointed at live_infos for per-draw BindResources.
+    pending->live_infos = infos;
+    for (size_t i = 0; i < MaxShaderStages; ++i) {
+        if (infos[i]) {
+            pending->info_snapshot[i].emplace(*infos[i]);
+            pending->snapshot_infos[i] = &*pending->info_snapshot[i];
+        } else {
+            pending->snapshot_infos[i] = nullptr;
+        }
+    }
     pending->runtime_infos_copy = runtime_infos;
     pending->modules_copy = modules;
     pending->fetch_shader_copy = fetch_shader;
@@ -786,17 +801,28 @@ PipelineCache::LaunchAsyncPipelineCompile(const GraphicsPipelineKey& key, u64 pi
                 Common::SetCurrentThreadAffinityMask(compile_affinity_mask);
             }
             // Spans over the pending-owned copies — stable for the async task's lifetime.
-            std::span<const Shader::Info*, MaxShaderStages> infos_span{raw->infos_copy};
+            // RACE FIX: build from the IMMUTABLE snapshot (snapshot_infos), NOT the
+            // live program Infos. BuildDescSetLayout reads flattened_ud_buf via
+            // GetSharp; a concurrent GetProgram->RefreshFlatBuf() on the live Info
+            // (a budget-skipped draw recurring next frame) would otherwise realloc
+            // that buffer under this read on the fenced compile core.
+            std::span<const Shader::Info*, MaxShaderStages> infos_span{raw->snapshot_infos};
             std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_span{
                 raw->runtime_infos_copy};
             std::span<const vk::ShaderModule> modules_span{raw->modules_copy};
             // Note: GraphicsPipeline ctor ASSERTs on driver-return failure, which
             // kills the process. We can't soften that; it's only the hang case
             // (no return at all) that this whole mechanism addresses.
-            return std::make_unique<GraphicsPipeline>(
+            auto pipeline = std::make_unique<GraphicsPipeline>(
                 *instance_ptr, *scheduler_ptr, *desc_heap_ptr, *profile_ptr, key_copy,
                 cache_handle, infos_span, runtime_span, raw->fetch_shader_copy, modules_span,
                 raw->sdata, false);
+            // The ctor copied the snapshot pointers into Pipeline::stages and read
+            // them only for layout construction. Repoint stages at the LIVE Infos:
+            // per-draw BindResources reads stages and needs the live,
+            // per-draw-refreshed flattened_ud_buf. The snapshot is dead after this.
+            pipeline->RebindInfoStages(raw->live_infos);
+            return pipeline;
         });
     return pending;
 }

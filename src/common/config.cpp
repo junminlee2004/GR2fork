@@ -153,6 +153,7 @@ static ConfigEntry<bool> useSpecialPad(false);
 static ConfigEntry<int> specialPadClass(1);
 static ConfigEntry<bool> isMotionControlsEnabled(true);
 static ConfigEntry<bool> gyroSwapYawRoll(false);
+static ConfigEntry<bool> gyroInvertYaw(false);
 static ConfigEntry<bool> useUnifiedInputConfig(true);
 static ConfigEntry<string> defaultControllerID("");
 static ConfigEntry<bool> backgroundControllerInput(false);
@@ -183,8 +184,8 @@ static ConfigEntry<bool> fsrEnabled(false);
 static ConfigEntry<bool> rcasEnabled(true);
 static ConfigEntry<int> rcasAttenuation(250);
 // GR2FORK: pipeline-compile sync-wait budget in ms (see config.h). Default
-// 2000; user-tunable from the Qt launcher.
-static ConfigEntry<int> gameplaySyncBudgetMs(2000);
+// 10000; user-tunable from the Qt launcher.
+static ConfigEntry<int> gameplaySyncBudgetMs(10000);
 static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<string> resolutionPatchGroups("recommended");
@@ -490,6 +491,10 @@ bool getIsMotionControlsEnabled() {
 
 bool getGyroSwapYawRoll() {
     return gyroSwapYawRoll.get();
+}
+
+bool getGyroInvertYaw() {
+    return gyroInvertYaw.get();
 }
 
 bool debugDump() {
@@ -893,6 +898,10 @@ void setGyroSwapYawRoll(bool enable, bool is_game_specific) {
     gyroSwapYawRoll.set(enable, is_game_specific);
 }
 
+void setGyroInvertYaw(bool enable, bool is_game_specific) {
+    gyroInvertYaw.set(enable, is_game_specific);
+}
+
 bool addGameInstallDir(const std::filesystem::path& dir, bool enabled) {
     for (const auto& install_dir : settings_install_dirs) {
         if (install_dir.path == dir) {
@@ -1137,6 +1146,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         specialPadClass.setFromToml(input, "specialPadClass", is_game_specific);
         isMotionControlsEnabled.setFromToml(input, "isMotionControlsEnabled", is_game_specific);
         gyroSwapYawRoll.setFromToml(input, "gyroSwapYawRoll", is_game_specific);
+        gyroInvertYaw.setFromToml(input, "gyroInvertYaw", is_game_specific);
         useUnifiedInputConfig.setFromToml(input, "useUnifiedInputConfig", is_game_specific);
         backgroundControllerInput.setFromToml(input, "backgroundControllerInput", is_game_specific);
         usbDeviceBackend.setFromToml(input, "usbDeviceBackend", is_game_specific);
@@ -1338,6 +1348,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     isMotionControlsEnabled.setTomlValue(data, "Input", "isMotionControlsEnabled",
                                          is_game_specific);
     gyroSwapYawRoll.setTomlValue(data, "Input", "gyroSwapYawRoll", is_game_specific);
+    gyroInvertYaw.setTomlValue(data, "Input", "gyroInvertYaw", is_game_specific);
     backgroundControllerInput.setTomlValue(data, "Input", "backgroundControllerInput",
                                            is_game_specific);
     usbDeviceBackend.setTomlValue(data, "Input", "usbDeviceBackend", is_game_specific);
@@ -1492,6 +1503,7 @@ void setDefaultValues(bool is_game_specific) {
     cursorHideTimeout.set(5, is_game_specific);
     isMotionControlsEnabled.set(true, is_game_specific);
     gyroSwapYawRoll.set(false, is_game_specific);
+    gyroInvertYaw.set(false, is_game_specific);
     backgroundControllerInput.set(false, is_game_specific);
     usbDeviceBackend.set(UsbBackendType::Real, is_game_specific);
 
@@ -1512,7 +1524,7 @@ void setDefaultValues(bool is_game_specific) {
     fsrEnabled.set(true, is_game_specific);
     rcasEnabled.set(true, is_game_specific);
     rcasAttenuation.set(250, is_game_specific);
-    gameplaySyncBudgetMs.set(2000, is_game_specific);
+    gameplaySyncBudgetMs.set(10000, is_game_specific);
     aspectRatioOverride.set("16:9", is_game_specific);
     resolutionOverride.set("Off", is_game_specific);
     resolutionPatchGroups.set("recommended", is_game_specific);

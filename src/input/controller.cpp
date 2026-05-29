@@ -73,6 +73,16 @@ void State::OnGyro(const float gyro[3]) {
         angularVelocity.y = gyro[1];
         angularVelocity.z = gyro[2];
     }
+
+    // gr2fork: optional yaw inversion. The yaw rate is always angularVelocity.y
+    // at this point -- regardless of the handheld yaw/roll swap above -- so a
+    // single negation here flips horizontal tilt/motion aiming whether or not
+    // the swap is active. Only the gyro is touched: yaw is rotation about the
+    // gravity axis, which the accelerometer cannot sense, so OnAccel is left
+    // alone. Auto-enabled by the launcher's Steam Deck preset.
+    if (Config::getGyroInvertYaw()) {
+        angularVelocity.y = -angularVelocity.y;
+    }
 }
 
 void State::OnAccel(const float accel[3]) {

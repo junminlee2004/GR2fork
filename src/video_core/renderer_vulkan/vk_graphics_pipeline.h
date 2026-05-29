@@ -120,6 +120,19 @@ public:
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1) const;
 
+    /// Repoint the per-stage Shader::Info pointers (Pipeline::stages) used by
+    /// BindResources at draw time. The async graphics-compile path builds the
+    /// pipeline from an immutable per-launch Info snapshot (so descriptor-set
+    /// layout construction can't race the GpuAssembler's per-draw RefreshFlatBuf),
+    /// then calls this to rebind stages to the live program-owned Infos, whose
+    /// flattened_ud_buf is refreshed each draw. Plain pointer copy over the same
+    /// range the ctor populates; `stages` is a protected base-class member.
+    void RebindInfoStages(std::span<const Shader::Info*, MaxShaderStages> live) noexcept {
+        for (u32 i = 0; i < MaxShaderStages; ++i) {
+            stages[i] = live[i];
+        }
+    }
+
 private:
     void BuildDescSetLayout(bool preloading);
 
