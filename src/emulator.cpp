@@ -256,7 +256,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     LOG_INFO(Loader, "Starting gr2fork (shadps4 v{} base)", Common::g_version);
     LOG_INFO(Loader, "Fork: Gravity Rush 2 focus");
-    LOG_INFO(Loader, "Build: v3.9.1");
+    LOG_INFO(Loader, "Build: v3.9.5");
 
     const bool has_game_config = std::filesystem::exists(
         Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"));
@@ -283,6 +283,13 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Vulkan hostMarkers: {}", Config::getVkHostMarkersEnabled());
     LOG_INFO(Config, "Vulkan guestMarkers: {}", Config::getVkGuestMarkersEnabled());
     LOG_INFO(Config, "Vulkan rdocEnable: {}", Config::isRdocEnabled());
+    // GpuAsse Phase D — D3' lever gate, echoed so its active state is unambiguous.
+    LOG_INFO(Config, "Vulkan shDynamicDirtySkip (D3'): {}",
+             Config::isShDynamicDirtySkipEnabled());
+    // GpuAsse — descriptor-set binding-skip cache lever, echoed so its active
+    // state is unambiguous in logs (parallels the D3' echo above).
+    LOG_INFO(Config, "Vulkan descSetBindingSkipCache: {}",
+             Config::isDescSetBindingSkipCacheEnabled());
 
     hwinfo::Memory ram;
     hwinfo::OS os;
@@ -376,19 +383,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // own release tag. Format: "Junmin Lee GR2FORK v1.0 (v0.13.0) | <game>".
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.9.1 (v{}) | {}", Common::g_version,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.9.5 (v{}) | {}", Common::g_version,
                                        game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.9.1 {}/(v{}) | {}", remote_host,
+            window_title = fmt::format("Junmin Lee GR2FORK v3.9.5 {}/(v{}) | {}", remote_host,
                                        Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.9.1 (v{}) {} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.9.5 (v{}) {} {} | {}",
                                        Common::g_version, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v3.9.1 (v{}) {}/{} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v3.9.5 (v{}) {}/{} {} | {}",
                                        Common::g_version, remote_host, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         }

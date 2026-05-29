@@ -129,15 +129,18 @@ public:
             out_ptr = zero_buf.data();
         }
 
-        // One-time Audio3D warmup mute + safety sanitization.
-        if (is_audio3d && ptr != nullptr) {
-            const u32 buffer_frames = frame_size ? (guest_buffer_size / frame_size) : 0;
-            const u32 buf_ms = (buffer_frames && sample_rate)
-                                   ? static_cast<u32>((static_cast<u64>(buffer_frames) * 1000ull +
-                                                      static_cast<u64>(sample_rate) - 1) /
-                                                     static_cast<u64>(sample_rate))
-                                   : 1;
-
+        // Per-buffer safety guard (runs for EVERY port) plus a one-time Audio3D warmup mute.
+        //
+        // Historically this guard was gated behind `is_audio3d`, so only the Audio3D port was
+        // protected. In Gravity Rush 2 the Audio3D port is S16Stereo (int16), so the gravity-kick
+        // earrape is caught by the int16 `peak > 32000` branch below -- that is the existing fix.
+        // But the Main/Bgm busses are Float_8CH and PadSpk is FloatMono, all with
+        // is_audio3d == false, so they previously bypassed the guard entirely. Certain SFX that get
+        // summed into the Float master mix (e.g. Kat's ground-slam melee combo) can produce a
+        // glitched buffer -- NaN/Inf samples or wildly out-of-range finite values -- which was
+        // handed to SDL verbatim and blasted out as the same "earrape" noise, just on a different
+        // (float) port. Sanitizing + peak-guarding every port closes that gap.
+        if (ptr != nullptr) {
             if (is_float) {
                 const float* in = static_cast<const float*>(ptr);
                 const size_t n = static_cast<size_t>(guest_buffer_size) / sizeof(float);
@@ -153,29 +156,31 @@ public:
                     peak = std::max(peak, std::fabs(v));
                 }
 
-                // If we saw non-finite samples, sanitize through a scratch copy.
+                // If we saw non-finite samples, sanitize through a scratch copy: NaN/Inf -> 0 and
+                // finite values clamped to the valid [-1, 1] range so the scratch buffer is always
+                // safe to output even if the mute window below does not engage.
                 if (bad) {
                     if (f32_buf.size() != n) {
                         f32_buf.resize(n);
                     }
                     for (size_t i = 0; i < n; ++i) {
                         const float v = in[i];
-                        f32_buf[i] = std::isfinite(v) ? v : 0.0f;
+                        f32_buf[i] = std::isfinite(v) ? std::clamp(v, -1.0f, 1.0f) : 0.0f;
                     }
                     out_ptr = f32_buf.data();
                 }
 
-                // First time Audio3D becomes non-silent, mute a short window to dodge one-time spikes.
-                if (!audio3d_seen_non_silent && peak > 1e-4f) {
+                // Audio3D only: first time the port becomes non-silent, mute a short window to
+                // dodge the one-time init SFX burst some games trigger on first use.
+                if (is_audio3d && !audio3d_seen_non_silent && peak > 1e-4f) {
                     audio3d_seen_non_silent = true;
-                    const u32 mute_buffers =
-                        std::max<u32>(1, (AUDIO3D_WARMUP_MUTE_MS + buf_ms - 1) / buf_ms);
-                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, mute_buffers);
+                    ArmWarmupMute();
                 }
 
-                // If we saw NaNs/Infs or an absurdly hot buffer, force silence briefly.
+                // If we saw NaNs/Infs or an absurdly hot buffer, force silence briefly. Legitimate
+                // game audio is normalised to <= 1.0 (0 dBFS); anything past 1.5 is a glitch.
                 if (bad || peak > 1.5f) {
-                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, 8u);
+                    ArmGlitchMute(peak, bad);
                 }
             } else {
                 const auto* in = static_cast<const int16_t*>(ptr);
@@ -187,28 +192,26 @@ public:
                     peak = std::max(peak, a);
                 }
 
-                // First time Audio3D becomes non-silent, mute a short window to dodge one-time spikes.
-                if (!audio3d_seen_non_silent && peak > 4) {
+                // Audio3D only: first time it becomes non-silent, mute a short window.
+                if (is_audio3d && !audio3d_seen_non_silent && peak > 4) {
                     audio3d_seen_non_silent = true;
-                    const u32 mute_buffers =
-                        std::max<u32>(1, (AUDIO3D_WARMUP_MUTE_MS + buf_ms - 1) / buf_ms);
-                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, mute_buffers);
+                    ArmWarmupMute();
                 }
 
                 // If it's absurdly loud/clipped, mute briefly.
                 if (peak >= 32768 || peak > 32000) {
-                    audio3d_mute_buffers = std::max(audio3d_mute_buffers, 8u);
+                    ArmGlitchMute(static_cast<float>(peak) / 32768.0f, false);
                 }
             }
 
-            if (audio3d_mute_buffers > 0) {
+            if (mute_buffers > 0) {
                 if (zero_buf.size() != guest_buffer_size) {
                     zero_buf.assign(guest_buffer_size, 0);
                 } else {
                     std::memset(zero_buf.data(), 0, guest_buffer_size);
                 }
                 out_ptr = zero_buf.data();
-                --audio3d_mute_buffers;
+                --mute_buffers;
             }
         }
 
@@ -251,13 +254,42 @@ private:
         }
     }
 
+    // Arm the one-time Audio3D warmup mute window (~AUDIO3D_WARMUP_MUTE_MS), sized in whole
+    // guest buffers. Only ever called for the Audio3D port.
+    void ArmWarmupMute() {
+        const u32 buffer_frames = frame_size ? (guest_buffer_size / frame_size) : 0;
+        const u32 buf_ms = (buffer_frames && sample_rate)
+                               ? static_cast<u32>((static_cast<u64>(buffer_frames) * 1000ull +
+                                                   static_cast<u64>(sample_rate) - 1) /
+                                                  static_cast<u64>(sample_rate))
+                               : 1;
+        const u32 warmup = std::max<u32>(1, (AUDIO3D_WARMUP_MUTE_MS + buf_ms - 1) / buf_ms);
+        mute_buffers = std::max(mute_buffers, warmup);
+    }
+
+    // Force a short silence window to ride out a glitched (NaN/Inf or absurdly hot) buffer.
+    // Re-armed every glitched buffer, so a multi-buffer glitch stays fully suppressed and a
+    // GLITCH_MUTE_BUFFERS-long silent tail plays out once clean buffers resume. The log is
+    // edge-triggered (only when a fresh mute window opens) to keep it out of the hot path.
+    void ArmGlitchMute(float normalized_peak, bool non_finite) {
+        if (mute_buffers == 0) {
+            LOG_WARNING(Lib_AudioOut,
+                        "Glitched audio buffer suppressed (audio3d={}, non_finite={}, peak={:.3f}); "
+                        "muting {} buffers",
+                        is_audio3d, non_finite, normalized_peak, GLITCH_MUTE_BUFFERS);
+        }
+        mute_buffers = std::max(mute_buffers, GLITCH_MUTE_BUFFERS);
+    }
+
+    static constexpr u32 GLITCH_MUTE_BUFFERS = 8u;
+
     u32 frame_size;
     u32 guest_buffer_size;
     u32 sample_rate;
     bool is_audio3d;
     bool is_float;
     bool audio3d_seen_non_silent{false};
-    u32 audio3d_mute_buffers{0};
+    u32 mute_buffers{0};
     std::vector<std::uint8_t> zero_buf{};
     std::vector<float> f32_buf{};
     u32 host_buffer_size{};

@@ -50,15 +50,46 @@ void State::OnTouchpad(int touchIndex, bool isDown, float x, float y) {
 }
 
 void State::OnGyro(const float gyro[3]) {
-    angularVelocity.x = gyro[0];
-    angularVelocity.y = gyro[1];
-    angularVelocity.z = gyro[2];
+    // gr2fork: handheld gyro orientation fix.
+    // SDL reports angular velocity as [pitch(X), yaw(Y), roll(Z)] in the
+    // device's own frame. A handheld (Steam Deck, ROG Ally, etc.) is held
+    // upright instead of flat like a DualShock, which rotates the device ~90°
+    // about its X axis -- so what the game expects as yaw is physically
+    // measured on the roll channel and vice versa. Swapping the two channels
+    // makes tilt/motion aiming behave as intended. Pitch (X) is shared by both
+    // orientations and is left untouched.
+    //
+    // NOTE: this is a pure channel swap. If, after enabling, one rotation
+    // direction feels inverted (a 90° reorientation is a rotation, not a pure
+    // reflection), negate the swapped term -- e.g. `angularVelocity.y = -gyro[2];`
+    // -- to flip it. Left as a plain swap by default to match the reported
+    // behaviour without assuming a sign that can only be confirmed on hardware.
+    if (Config::getGyroSwapYawRoll()) {
+        angularVelocity.x = gyro[0]; // pitch (unchanged)
+        angularVelocity.y = gyro[2]; // yaw  <- roll
+        angularVelocity.z = gyro[1]; // roll <- yaw
+    } else {
+        angularVelocity.x = gyro[0];
+        angularVelocity.y = gyro[1];
+        angularVelocity.z = gyro[2];
+    }
 }
 
 void State::OnAccel(const float accel[3]) {
-    acceleration.x = accel[0];
-    acceleration.y = accel[1];
-    acceleration.z = accel[2];
+    // gr2fork: mirror the OnGyro yaw/roll swap on the accelerometer so the
+    // reported motion frame stays internally consistent (the device's "up"
+    // tracks the same reorientation as its rotation axes). Harmless for titles
+    // that read only the fused orientation quaternion; correct for any that
+    // read raw acceleration directly.
+    if (Config::getGyroSwapYawRoll()) {
+        acceleration.x = accel[0]; // unchanged
+        acceleration.y = accel[2]; // <- Z
+        acceleration.z = accel[1]; // <- Y
+    } else {
+        acceleration.x = accel[0];
+        acceleration.y = accel[1];
+        acceleration.z = accel[2];
+    }
 }
 
 GameController::GameController() {

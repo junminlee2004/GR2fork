@@ -28,167 +28,9 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
-// GR2FORK sync-budget detection: CPUID intrinsics for IsLowEndIntelCpu().
-// Pulled in only on x86_64 hosts; ARM/other archs short-circuit the check
-// to false and never touch these headers.
-#ifdef ARCH_X86_64
-#  ifdef _MSC_VER
-#    include <intrin.h>
-#  else
-#    include <cpuid.h>
-#  endif
-#endif
-
 namespace Vulkan {
 
 namespace {
-
-// =========================================================================
-// GR2FORK sync-budget CPU detection.
-// =========================================================================
-// Identifies "weak" Intel hosts where a 200ms shader-compile sync budget
-// isn't enough to absorb a cold-compile burst, so the skipped-draw fallback
-// triggers on nearly every miss and reproduces the same infinite-loading
-// failure the 200ms floor was added to prevent. On those hosts we raise the
-// budget to 1000ms; everywhere else the 200ms default stays.
-//
-// "Weak" is two independent conditions, either of which trips the long path:
-//   (1) Intel Core CPU older than 7th-generation Kaby Lake (Nehalem through
-//       Skylake client) — and Atom Silvermont→Goldmont+ which are
-//       perma-low-end regardless of generation marketing. Detected by CPUID
-//       leaf 1 DisplayFamily/DisplayModel. Skylake-X server (model 0x55) is
-//       intentionally excluded — many-core, doesn't need the long budget.
-//   (2) std::thread::hardware_concurrency() ≤ 4, independent of vendor.
-//       Covers slow AMD APUs, Atom-class boxes, constrained VMs, etc.
-//
-// IsLowEndIntelCpu() is fail-safe to false: AMD, ARM, non-x86, CPUID
-// failures, unknown models — all return false and use the 200ms default.
-
-#ifdef ARCH_X86_64
-// Thin wrapper over __cpuid / __get_cpuid that returns false on failure.
-[[nodiscard]] bool QueryCpuid(u32 leaf, u32& eax, u32& ebx, u32& ecx, u32& edx) {
-#  ifdef _MSC_VER
-    int regs[4]{};
-    __cpuid(regs, static_cast<int>(leaf));
-    eax = static_cast<u32>(regs[0]);
-    ebx = static_cast<u32>(regs[1]);
-    ecx = static_cast<u32>(regs[2]);
-    edx = static_cast<u32>(regs[3]);
-    return true;
-#  else
-    // __get_cpuid returns 0 if the requested leaf exceeds the CPU's maximum
-    // supported leaf for that range. Treat that as "can't determine" → false.
-    unsigned int a = 0, b = 0, c = 0, d = 0;
-    if (__get_cpuid(leaf, &a, &b, &c, &d) == 0) {
-        return false;
-    }
-    eax = a; ebx = b; ecx = c; edx = d;
-    return true;
-#  endif
-}
-#endif // ARCH_X86_64
-
-[[nodiscard]] bool IsLowEndIntelCpu() {
-#ifndef ARCH_X86_64
-    return false; // ARM64 etc. — not classified here.
-#else
-    u32 eax = 0, ebx = 0, ecx = 0, edx = 0;
-
-    // Leaf 0: vendor string in ebx/edx/ecx, max basic leaf in eax.
-    if (!QueryCpuid(0u, eax, ebx, ecx, edx)) {
-        return false;
-    }
-    // "GenuineIntel" packed little-endian: ebx="Genu", edx="ineI", ecx="ntel".
-    constexpr u32 kIntelEbx = 0x756E6547u; // "Genu"
-    constexpr u32 kIntelEdx = 0x49656E69u; // "ineI"
-    constexpr u32 kIntelEcx = 0x6C65746Eu; // "ntel"
-    if (ebx != kIntelEbx || edx != kIntelEdx || ecx != kIntelEcx) {
-        return false; // Not Intel — AMD, Hygon, VIA, hypervisor mask, etc.
-    }
-    if (eax < 1u) {
-        return false; // No leaf 1 support — implausibly ancient, fail-safe.
-    }
-
-    // Leaf 1: family/model/stepping in eax (Intel SDM Vol.2A §3.2.5).
-    //   base_family = (eax >> 8)  & 0x0F
-    //   base_model  = (eax >> 4)  & 0x0F
-    //   ext_family  = (eax >> 20) & 0xFF
-    //   ext_model   = (eax >> 16) & 0x0F
-    // Family 6 and 0xF use the extended fields; everywhere else uses base.
-    if (!QueryCpuid(1u, eax, ebx, ecx, edx)) {
-        return false;
-    }
-    const u32 base_family = (eax >> 8)  & 0x0Fu;
-    const u32 base_model  = (eax >> 4)  & 0x0Fu;
-    const u32 ext_family  = (eax >> 20) & 0xFFu;
-    const u32 ext_model   = (eax >> 16) & 0x0Fu;
-    const u32 family = (base_family == 0x0Fu) ? (base_family + ext_family)
-                                              : base_family;
-    const u32 model  = (base_family == 0x06u || base_family == 0x0Fu)
-                           ? (base_model | (ext_model << 4))
-                           : base_model;
-
-    if (family != 0x06u) {
-        // Pre-P6 (e.g. P4 NetBurst on family 0xF) or some exotic Intel.
-        // Effectively dead — family 6 has been Intel's only consumer family
-        // for ~two decades. Treat as not-low-end (fail-safe).
-        return false;
-    }
-
-    // Pre-7th-gen Core microarchitectures (Nehalem through Skylake client)
-    // and Atom-class chips (Silvermont/Airmont/Goldmont/Goldmont+).
-    // Skylake-X server (0x55) is intentionally excluded — many-core, doesn't
-    // need the long budget.
-    switch (model) {
-    // Nehalem / Westmere (1st-gen Core)
-    case 0x1A: case 0x1E: case 0x1F: case 0x25:
-    case 0x2C: case 0x2E: case 0x2F:
-    // Sandy Bridge (2nd-gen Core)
-    case 0x2A: case 0x2D:
-    // Ivy Bridge (3rd-gen Core)
-    case 0x3A: case 0x3E:
-    // Haswell (4th-gen Core)
-    case 0x3C: case 0x3F: case 0x45: case 0x46:
-    // Broadwell (5th-gen Core)
-    case 0x3D: case 0x47: case 0x4F: case 0x56:
-    // Skylake client (6th-gen Core) — Skylake-X 0x55 deliberately omitted
-    case 0x4E: case 0x5E:
-    // Atom Silvermont (Bay Trail / Avoton / Rangeley)
-    case 0x37: case 0x4A: case 0x4D: case 0x5A: case 0x5D:
-    // Atom Airmont (Cherry Trail / Braswell)
-    case 0x4C:
-    // Atom Goldmont (Apollo Lake / Denverton)
-    case 0x5C: case 0x5F:
-    // Atom Goldmont Plus (Gemini Lake)
-    case 0x7A:
-        return true;
-    default:
-        // Kaby Lake (8E/9E) and everything after — including Coffee Lake,
-        // Comet Lake, Ice Lake, Tiger Lake, Rocket Lake, Alder Lake,
-        // Raptor Lake, Meteor Lake, Arrow Lake. All "not low-end".
-        return false;
-    }
-#endif // ARCH_X86_64
-}
-
-// One-shot computation of the initial sync budget. See the
-// GetInitialSyncBudget() comment block in vk_pipeline_cache.h for policy.
-// The two budget values are PipelineCache::kNormalSyncBudget and
-// PipelineCache::kLongSyncBudget (header) — tune there, not here.
-[[nodiscard]] std::chrono::milliseconds DetectInitialSyncBudget() {
-    const bool low_intel = IsLowEndIntelCpu();
-    const unsigned hw = std::thread::hardware_concurrency();
-    const bool low_threads = (hw != 0u && hw <= 4u);
-    const bool use_long = low_intel || low_threads;
-    const auto budget = use_long ? PipelineCache::kLongSyncBudget
-                                 : PipelineCache::kNormalSyncBudget;
-    LOG_INFO(Render_Vulkan,
-             "[GR2FORK sync-budget] hw_threads={} low_end_intel={} "
-             "low_thread_count={} -> kInitialSyncBudget={}ms",
-             hw, low_intel, low_threads,
-             static_cast<long long>(budget.count()));
-    return budget;
-}
 
 // =========================================================================
 // OPT(GR2 v78): Pipeline compile graveyard.
@@ -220,16 +62,6 @@ PipelineCompileGraveyard& Graveyard() {
 }
 
 } // namespace
-
-// GR2FORK sync-budget runtime detection. One-shot: the function-local static
-// is initialized on first call (thread-safe under C++11 "magic statics") and
-// returned by reference thereafter, so the CPUID query and the LOG_INFO
-// announce happen exactly once per process. See DetectInitialSyncBudget()
-// and IsLowEndIntelCpu() in the anonymous namespace above for the policy.
-std::chrono::milliseconds PipelineCache::GetInitialSyncBudget() {
-    static const std::chrono::milliseconds budget = DetectInitialSyncBudget();
-    return budget;
-}
 
 using Shader::LogicalStage;
 using Shader::Output;
@@ -765,11 +597,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
         auto pending = LaunchAsyncPipelineCompile(graphics_key, pipeline_hash);
 
         // Synchronous fast-path wait. Most compiles complete in <50ms; waiting
-        // GetInitialSyncBudget() catches them without triggering frame-skip.
-        // The budget is 200ms by default and 1000ms on weak hosts (pre-7th-gen
-        // Intel or hardware_concurrency <= 4) — see the declaration comment
-        // in vk_pipeline_cache.h.
-        if (pending->future.wait_for(GetInitialSyncBudget()) == std::future_status::ready) {
+        // the configured gameplaySyncBudgetMs catches them without triggering
+        // frame-skip. If the budget elapses the future is stashed in
+        // pending_graphics_pipelines and the draw is skipped (polled
+        // non-blockingly on subsequent frames). Read fresh from Config on this
+        // cold-only path (negligible cost) so the launcher slider takes effect
+        // on the next game launch without a rebuild.
+        const std::chrono::milliseconds sync_budget{Config::getGameplaySyncBudgetMs()};
+        if (pending->future.wait_for(sync_budget) == std::future_status::ready) {
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {
                 pipeline = pending->future.get();
@@ -1374,13 +1209,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
         // PERF(GR2FORK v1.60): return pointer into program-owned spec
-        // storage instead of copying the optional<FetchShaderData>. The
-        // FetchShaderData wraps a std::vector<VertexAttribute>; the
-        // previous by-value return forced a heap-alloc + memcpy here AND
-        // a second copy in std::tie's assignment at the call site. With
-        // the new pointer-typed Result, RefreshGraphicsStages performs
-        // exactly one deep copy at the call site (into PipelineCache's
-        // own member). Lifetime: program is owned by program_cache (a
+        // storage instead of copying the optional<FetchShaderData>. With
+        // OPT1 the FetchShaderData wraps a small_vector<VertexAttribute,16>;
+        // the previous by-value return forced a copy of the whole optional
+        // here AND a second copy in std::tie's assignment at the call site.
+        // With the pointer-typed Result, RefreshGraphicsStages performs
+        // exactly one deep copy at the call site (into PipelineCache's own
+        // member) — and OPT1 makes that one copy heap-free for the common
+        // <=16-attribute case. Lifetime: program is owned by program_cache (a
         // tsl::robin_map<size_t, std::unique_ptr<Program>>); the unique_ptr
         // keeps Program at a stable heap address, so &spec.fetch_shader_data
         // remains valid for the duration of the GetProgram call's return
@@ -1529,11 +1365,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         program->last_result.ri_bind_hash = ri_bind_hash;
     }
 
-    const std::optional<Shader::Gcn::FetchShaderData>* cached_fetch = nullptr;
-    if (stage == Stage::Vertex && !program->modules.empty()) {
-        cached_fetch = &program->modules.front().spec.fetch_shader_data;
-    }
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding, cached_fetch);
+    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     // Fast path: look up by specialization signature.
     // We use a *pair* of signatures (sig + sig2) so we can avoid expensive deep comparisons.

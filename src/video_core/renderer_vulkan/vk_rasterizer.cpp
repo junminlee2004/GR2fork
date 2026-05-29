@@ -463,7 +463,7 @@ void Rasterizer::DoDrawFromIntent(const DrawIntent& intent) {
     if (!BindResources(pipeline, regs)) [[unlikely]] {
         return;
     }
-    const auto state = BeginRendering(pipeline, regs);
+    const auto& state = BeginRendering(pipeline, regs); // D2: bind by const-ref (zero-copy hit path)
 
     {
         // GpuComm v1.14 instrumentation: vertex/index buffer binding cost.
@@ -557,7 +557,7 @@ void Rasterizer::DoDrawIndirectFromIntent(const DrawIntent& intent) {
     if (!BindResources(pipeline, regs)) [[unlikely]] {
         return;
     }
-    const auto state = BeginRendering(pipeline, regs);
+    const auto& state = BeginRendering(pipeline, regs); // D2: bind by const-ref (zero-copy hit path)
 
     {
         // GpuComm v1.14 instrumentation: vbuf cost (mirrors Draw).
@@ -895,10 +895,35 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     // gating predicate, so when one fires the other does too).
     // =========================================================================
     const bool pipeline_uses_push = pipeline && pipeline->UsesPushDescriptors();
+
+    // GR2FORK GpuAsse: the binding-skip fast path below is correct on the
+    // descriptor-set path too, not just the push-descriptor path it was
+    // historically gated to. When `all_stages_cached` holds, this draw's
+    // bindings are bit-identical to the previous consecutive same-pipeline
+    // draw, so set_writes would hash to the same signature and resolve to the
+    // same already-committed VkDescriptorSet — which is still bound (a bound
+    // descriptor set persists across draws exactly like push state; only a
+    // *fresh* desc_heap.Commit starts uninitialized, and the fast path never
+    // commits because it leaves set_writes empty -> Pipeline::BindResources
+    // returns at its `set_writes.empty()` guard before any Commit/Update).
+    // Barriers are unaffected: Buffer::GetBarrier is stateful and already
+    // returns nullopt for unchanged access on the slow path, so an identical
+    // consecutive draw emits no barrier either way. The single-entry cache
+    // only ever fast-paths a run of consecutive identical draws of the SAME
+    // pipeline (any intervening different-pipeline draw goes through the slow
+    // path and overwrites binding_skip_cache_.pipeline), so the set bound by
+    // the run's first (slow-path) draw is guaranteed to still be bound.
+    // Graphics-only and default-OFF; flip [Vulkan] descSetBindingSkipCache to
+    // A/B test. On the push path the predicate collapses to pipeline_uses_push
+    // and behavior is byte-for-byte unchanged.
+    const bool descset_skip_cache =
+        !pipeline_uses_push && pipeline && !pipeline->IsCompute() &&
+        Config::isDescSetBindingSkipCacheEnabled();
+    const bool use_skip_cache = pipeline_uses_push || descset_skip_cache;
     u64 tick = 0;
     u64 cur_stamp = 0;
 
-    if (pipeline_uses_push) [[unlikely]] {
+    if (use_skip_cache) [[unlikely]] {
         tick = scheduler.CurrentTick();
         // Phase 1D-pre-C: read pipeline stamp from the snapshot rather
         // than `liverpool->GetGfxPipelineStamp()`. The binding skip cache
@@ -1026,7 +1051,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     // PERF(GR2FORK v1.22): Hint as cold for RADV (Jun's target). The
     // existing comment block above already documents that this body is
     // dead work on RADV — the hint just gives the codegen the same signal.
-    if (pipeline_uses_push) [[unlikely]] {
+    // GR2FORK GpuAsse: when descSetBindingSkipCache is enabled, use_skip_cache
+    // is also true on the descriptor-set path, so the cache is maintained
+    // there and the fast path above can fire on the next identical draw.
+    if (use_skip_cache) [[unlikely]] {
         binding_skip_cache_.pipeline = pipeline;
         binding_skip_cache_.cmdbuf_tick = tick;
         binding_skip_cache_.uses_dma = uses_dma;
@@ -2016,8 +2044,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 
-RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
-                                       const AmdGpu::LiverpoolRegsSnapshot& regs) {
+const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
+                                              const AmdGpu::LiverpoolRegsSnapshot& regs) {
     // PERF(GR2FORK): stamp-skip fast path. See BeginRenderingCache doc in
     // vk_rasterizer.h. Verifies pipeline+stamp match, no CMASK clear flag
     // armed since populate, image layouts still match, and no image has
@@ -2104,7 +2132,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline,
     br_cache_.cb_count = 0;
     br_cache_.has_db_attachment = false;
     const auto& key = pipeline->GetGraphicsKey();
-    RenderState state;
+    // D2 (GpuAsse Phase D): build into the persistent member so the function can
+    // return `const RenderState&`. Reset to defaults, then `state` aliases the
+    // member so the rest of the slow path is unchanged. Consumed within the same
+    // draw before the next BeginRendering overwrites it (no lifetime escape).
+    cur_render_state_ = RenderState{};
+    RenderState& state = cur_render_state_;
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u32>::max();

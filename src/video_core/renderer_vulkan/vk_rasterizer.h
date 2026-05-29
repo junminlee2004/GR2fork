@@ -200,8 +200,8 @@ private:
     // `liverpool->regs` may have moved on to the next packet.
     void PrepareRenderState(const GraphicsPipeline* pipeline,
                             const AmdGpu::LiverpoolRegsSnapshot& regs);
-    RenderState BeginRendering(const GraphicsPipeline* pipeline,
-                               const AmdGpu::LiverpoolRegsSnapshot& regs);
+    const RenderState& BeginRendering(const GraphicsPipeline* pipeline,
+                                      const AmdGpu::LiverpoolRegsSnapshot& regs);
     void Resolve(const AmdGpu::LiverpoolRegsSnapshot& regs);
     void DepthStencilCopy(bool is_depth, bool is_stencil,
                           const AmdGpu::LiverpoolRegsSnapshot& regs);
@@ -465,6 +465,14 @@ private:
         std::array<BeginRenderingCacheEntry, AmdGpu::NUM_COLOR_BUFFERS> cb_data{};
         BeginRenderingCacheEntry db_data{};
     } br_cache_{};
+
+    // D2 (GpuAsse Phase D): persistent build target for the BeginRendering slow
+    // path so the function can return `const RenderState&` (zero-copy on the
+    // br_cache_ hit path, which returns br_cache_.state by reference). Always
+    // active — pure copy-elision plumbing with no behavioral effect; `state` is
+    // fully consumed within the same draw (scheduler.BeginRendering) before the
+    // next BeginRendering overwrites this, so there is no lifetime escape.
+    RenderState cur_render_state_{};
 
     // =========================================================================
     // Per-stage binding skip cache

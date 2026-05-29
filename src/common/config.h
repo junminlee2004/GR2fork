@@ -97,8 +97,19 @@ bool vkDisablePushDescriptorsEnabled();
 void setVkDisablePushDescriptors(bool enable, bool is_game_specific = false);
 bool isBeginRenderingCacheEnabled();
 void setBeginRenderingCacheEnabled(bool enable, bool is_game_specific = false);
+// GpuAsse Phase D — D3': suppress dynamic_dirty_ on user_data-only SH writes.
+bool isShDynamicDirtySkipEnabled();
+void setShDynamicDirtySkipEnabled(bool enable, bool is_game_specific = false);
 bool isPipelineUdHashLruEnabled();
 void setPipelineUdHashLruEnabled(bool enable, bool is_game_specific = false);
+// GpuAsse: extend the per-draw binding-skip fast path (historically gated to
+// the push-descriptor path, which is dead on RADV) to the descriptor-set path.
+// On a bit-identical consecutive same-pipeline draw the full set_writes rebuild
+// is skipped; the previously committed/bound descriptor set stays bound.
+// Default ON (baseline). Measured ~0.03% hit on GR2/CUSA04943 (negligible);
+// see config.cpp and the GpuAssembler handoff doc. Set false per-game to disable.
+bool isDescSetBindingSkipCacheEnabled();
+void setDescSetBindingSkipCacheEnabled(bool enable, bool is_game_specific = false);
 bool accurateRenderTargetCacheEnabled();
 void setAccurateRenderTargetCacheEnabled(bool enable, bool is_game_specific = false);
 bool accurateVertexBufferCacheEnabled();
@@ -154,6 +165,13 @@ int getExtraDmemInMbytes();
 void setExtraDmemInMbytes(int value, bool is_game_specific = false);
 bool getIsMotionControlsEnabled();
 void setIsMotionControlsEnabled(bool use, bool is_game_specific = false);
+// gr2fork: handheld gyro orientation fix. When held upright like a handheld
+// (Steam Deck, ROG Ally, etc.) instead of flat like a DualShock, the device's
+// physical yaw and roll gyro axes are effectively swapped. Enabling this swaps
+// the yaw/roll components of the motion data so tilt-aiming behaves as intended.
+// Auto-enabled by the launcher's Steam Deck preset.
+bool getGyroSwapYawRoll();
+void setGyroSwapYawRoll(bool enable, bool is_game_specific = false);
 std::string getDefaultControllerID();
 void setDefaultControllerID(std::string id);
 bool getBackgroundControllerInput();
@@ -166,6 +184,14 @@ bool getRcasEnabled();
 void setRcasEnabled(bool enable, bool is_game_specific = false);
 int getRcasAttenuation();
 void setRcasAttenuation(int value, bool is_game_specific = false);
+// GR2FORK: pipeline-compile synchronous-wait budget, in milliseconds. On first
+// encounter of a new graphics pipeline, the GpuComm thread blocks up to this
+// long for the async compile to finish inline before falling back to skipping
+// the draw. Default 2000. Lives in the [GPU] section; user-tunable via the Qt
+// launcher slider (0..50000 ms). See vk_pipeline_cache for the wait site and
+// the "do not set near zero" rationale.
+int getGameplaySyncBudgetMs();
+void setGameplaySyncBudgetMs(int value, bool is_game_specific = false);
 std::string getAspectRatioOverride();
 void setAspectRatioOverride(const std::string& value, bool is_game_specific = false);
 

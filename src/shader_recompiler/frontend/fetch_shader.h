@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 #include "common/types.h"
 #include "shader_recompiler/info.h"
 
@@ -55,7 +56,15 @@ struct VertexAttribute {
 
 struct FetchShaderData {
     u32 size = 0;
-    std::vector<VertexAttribute> attributes;
+    // PERF(GR2FORK OPT1): inline-capacity 16 eliminates per-copy heap malloc/free
+    // for the common GR2 vertex layout (~10-12 attributes). FetchShaderData is
+    // copied on every ParseFetchShader hit, every StageSpecialization parse-store,
+    // and every RefreshGraphicsStages `fetch_shader = *ptr`; the std::vector backing
+    // store made each of those a heap round-trip. >16 attributes spills to heap,
+    // i.e. exactly the prior always-heap behaviour, so there is no regression case.
+    // Behaviourally transparent: size + element-wise hash/equality/serialization are
+    // container-agnostic (see ComputeSig, operator==, FetchShaderData::Serialize).
+    boost::container::small_vector<VertexAttribute, 16> attributes;
     s8 vertex_offset_sgpr = -1;   ///< SGPR of vertex offset from VADDR
     s8 instance_offset_sgpr = -1; ///< SGPR of instance offset from VADDR
 

@@ -167,15 +167,18 @@ public:
 
     // PERF(GR2FORK v1.60): the third tuple element used to be a
     // std::optional<Shader::Gcn::FetchShaderData> RETURNED BY VALUE. That
-    // value contains a std::vector<VertexAttribute> internally, so every
-    // GetProgram call performed a heap-alloc + memcpy of the attribute
-    // vector to construct the tuple, then std::tie at the call site
-    // assigned it into a local optional, then RefreshGraphicsStages did
-    // ANOTHER copy from local into PipelineCache::fetch_shader. Two
-    // unnecessary deep copies per stage per draw, ~5 stages × ~5000 draws/s
-    // = ~25K extra heap ops/s on the GpuComm thread. perf attributed
+    // value contains the attribute list internally, so every GetProgram
+    // call copied the whole optional to construct the tuple, then std::tie
+    // at the call site assigned it into a local optional, then
+    // RefreshGraphicsStages did ANOTHER copy from local into
+    // PipelineCache::fetch_shader. Two unnecessary deep copies per stage
+    // per draw, ~5 stages × ~5000 draws/s = ~25K extra copies/s on the
+    // GpuComm thread. perf attributed
     // _Optional_payload_base<FetchShaderData>::_M_copy_assign at 0.37% of
-    // GpuComm under nominally-unrelated frames (skid).
+    // GpuComm under nominally-unrelated frames (skid). The pointer return
+    // removes the redundant return-path copy; OPT1 (small_vector<...,16>
+    // attribute storage) additionally makes the single remaining call-site
+    // copy heap-free for the common <=16-attribute case.
     //
     // The pointer points into program->modules[N].spec.fetch_shader_data,
     // which is owned by the program (whose unique_ptr lives in
@@ -252,71 +255,32 @@ private:
         bool permafailed{false};
     };
 
-    // Thresholds. Tune via constants here; no config plumbing to avoid scope creep.
+    // Thresholds for the async-compile + driver-hang watchdog.
     //
-    // GR2FORK: reverted from the photo-mode-gated split back to v3.0's single
-    // sync-budget constant. The wait site blocks the GpuComm thread for up to
-    // GetInitialSyncBudget() on first encounter of a new pipeline; if the
-    // compile finishes in that window the pipeline is installed inline,
-    // otherwise the future is stashed in pending_graphics_pipelines and the
-    // draw is skipped (TryFinalizePending polls non-blockingly on subsequent
-    // frames).
+    // GR2FORK: the synchronous sync-budget is now user-tunable via the [GPU]
+    // gameplaySyncBudgetMs config key (default 2000; surfaced as a slider in
+    // the Qt launcher, range 0..50000 ms). It is read fresh from Config at the
+    // wait site in GetGraphicsPipeline — a cold-compile-only ([[unlikely]])
+    // path, so the per-read cost is irrelevant and there is no hot-path
+    // regression. The wait site blocks the GpuComm thread for up to that many
+    // milliseconds on first encounter of a new pipeline; if the compile
+    // finishes in that window the pipeline is installed inline, otherwise the
+    // future is stashed in pending_graphics_pipelines and the draw is skipped
+    // (TryFinalizePending polls non-blockingly on subsequent frames).
     //
-    // ⚠ DO NOT LOWER kNormalSyncBudget below 200ms. Empirically confirmed
-    //   (see chat "Infinite loading and shader cache issues", 2026-05-25):
-    //   the v3.4 split that put kGameplaySyncBudget at 0ms produced infinite
-    //   loading screens — transiently relieved by clearing the shader cache,
-    //   recurring after a few minutes of play. The skipped-draw fallback
-    //   that fires when a compile exceeds the budget interacts badly with
-    //   the game's loading flow when the budget is so small that nearly
-    //   every cold compile triggers it. 200ms catches the vast majority of
-    //   compiles inline; the current 400ms default doubles the cushion to
-    //   absorb the longer cold-compile tail observed on real hardware
-    //   without changing the failure-mode characteristics.
-    //   If artifacts appear, RAISE — never lower.
+    // DO NOT set the budget near zero. Empirically confirmed (see chat
+    //   "Infinite loading and shader cache issues", 2026-05-25): a near-zero
+    //   gameplay budget produced infinite loading screens, because the
+    //   skipped-draw fallback that fires when a compile exceeds the budget
+    //   interacts badly with the game's loading flow when the budget is so
+    //   small that nearly every cold compile triggers it. 2000ms (the default)
+    //   catches the vast majority of cold compiles inline. If artifacts
+    //   appear, RAISE the budget -- never lower it. The 0 end of the slider is
+    //   exposed for diagnostics only.
     //
-    // GR2FORK runtime-tuned: GetInitialSyncBudget() returns kLongSyncBudget
-    // (1000ms) instead of kNormalSyncBudget (400ms) on CPUs where the normal
-    // budget isn't enough to absorb a cold compile burst — specifically
-    //   (a) low-end Intel parts pre-7th-generation Core (Nehalem through
-    //       Skylake client, plus the Atom Silvermont→Goldmont+ line)
-    //       detected by CPUID, and
-    //   (b) any host where std::thread::hardware_concurrency() returns ≤ 4
-    //       (independent of vendor, covers slow AMD APUs / Atom-class boxes /
-    //       VMs with constrained core pinning).
-    // On those hosts the normal budget triggered the skipped-draw path on
-    // nearly every cold compile, reproducing the same infinite-loading
-    // failure mode the floor was introduced to fix. 1000ms catches the vast
-    // majority of cold compiles inline on the slow hosts while still
-    // bounding worst-case GpuComm stalls. Detection is one-shot at first
-    // call (function-local static, thread-safe), so no per-frame CPUID cost.
-    //
-    // Skylake-X server (model 0x55) is intentionally NOT classified as
-    // low-end despite being Skylake-era — it has many more cores and doesn't
-    // need the long budget. The check is fail-safe: on AMD, on ARM, or on
-    // any CPUID failure GetInitialSyncBudget() returns kNormalSyncBudget.
-    //
-    // Tuning: edit kNormalSyncBudget / kLongSyncBudget below. Both are
-    // ordinary constexpr, so the change rebuilds in one TU and is picked
-    // up by GetInitialSyncBudget() automatically (it reads them at first
-    // call). No other site references these constants.
-    //
-    // ⚠ public access on the two budget constants is required: the picker
-    // (DetectInitialSyncBudget in the anonymous namespace of
-    // vk_pipeline_cache.cpp) is a free function — not a class member —
-    // because we need it to run before any PipelineCache instance exists
-    // (it's called from the function-local static inside
-    // GetInitialSyncBudget). Marking these two private would force a
-    // friend declaration or a member-function detour with no real
-    // encapsulation benefit, since they're literally tunable knobs that
-    // a future reader is meant to read. Everything else in this block
-    // stays private.
-public:
-    static constexpr std::chrono::milliseconds kNormalSyncBudget{2000};
-    static constexpr std::chrono::milliseconds kLongSyncBudget{10000};
-
-private:
-    [[nodiscard]] static std::chrono::milliseconds GetInitialSyncBudget();
+    // kHangLogThreshold / kPermaFailThreshold stay compile-time constants: they
+    // govern the non-blocking escalation inside TryFinalizePending, not the
+    // inline wait, and have no reason to be user-facing.
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
     static constexpr std::chrono::seconds      kPermaFailThreshold{30};
 

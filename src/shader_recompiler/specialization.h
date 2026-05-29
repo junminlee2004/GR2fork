@@ -110,10 +110,8 @@ struct StageSpecialization {
 
     StageSpecialization() = default;
 
-    // 5th param accepted for codegodplus ABI compat but IGNORED.
     StageSpecialization(const Info& info_, const RuntimeInfo& runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_,
-                        const std::optional<Gcn::FetchShaderData>* /*preparsed_fetch*/ = nullptr)
+                        Backend::Bindings start_)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
         // NOGLITCH: unconditional parse for ALL stages.
         fetch_shader_data = Gcn::ParseFetchShader(info_);

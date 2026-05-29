@@ -271,6 +271,20 @@ private:
         dynamic_dirty_ = true;
     }
 
+    /// D3' (GpuAsse Phase D): mark that a key-affecting SH register changed WITHOUT
+    /// raising dynamic_dirty_. Used for user_data-only SH writes (the per-draw SRT
+    /// root/resource-pointer re-emit). We must keep gfx_key_dirty_+stamp so that
+    /// perm_idx/pipeline resolution stays correct (suppressing those is the v17/
+    /// CUSA03694-class hazard and is NEVER done). But dynamic_dirty_ has exactly
+    /// one reader — UpdateDynamicState — whose sub-functions read only context regs
+    /// (viewport/scissor/blend/depth/raster). user_data CANNOT affect any of those,
+    /// so leaving dynamic_dirty_ alone here is provably correct and saves the ~0.48%
+    /// of spurious per-draw dynamic-state sub-rebuilds. See IsUserDataOnlyShReg.
+    void MarkGfxKeyDirtyNoDynamic() noexcept {
+        pipeline_dirty_ = true;
+        gfx_key_dirty_ = true;
+    }
+
     /// Bump the stamp only if dirty (called from draw/dispatch handlers).
     void FlushGfxPipelineDirty() noexcept {
         if (pipeline_dirty_) {
@@ -316,6 +330,38 @@ private:
         if (in_range(wo(regs.viewport_control),
                       wo(regs.viewport_control) + sizeof(regs.viewport_control) / 4)) return true;
         return false;
+    }
+
+    /// D3' (GpuAsse Phase D): returns true iff the SH register write range
+    /// [reg_addr, reg_addr+nwords) lies ENTIRELY inside one shader program's
+    /// 16-word user_data block. These are the per-draw SRT root + resource
+    /// pointer SGPRs that the guest re-emits every draw; they affect the
+    /// pipeline key (so we still set gfx_key_dirty_) but cannot affect any
+    /// dynamic state (so dynamic_dirty_ can be suppressed — see
+    /// MarkGfxKeyDirtyNoDynamic).
+    ///
+    /// Mirror of IsDynamicStateOnlyContextReg's proven wo() pointer-arithmetic
+    /// pattern. The "entire range in user_data" test is intentionally strict:
+    /// a mixed packet that also touches a program-address/settings word (where
+    /// perm-relevant sharp structure lives) fails the test and falls back to
+    /// the full MarkGfxKeyDirty, so a genuine dynamic/key change riding in the
+    /// same packet is never misclassified.
+    bool IsUserDataOnlyShReg(u32 reg_addr, u32 nwords) const noexcept {
+        if (nwords == 0) {
+            return false;
+        }
+        const u32* base = regs.reg_array.data();
+        auto wo = [base](const auto& field) noexcept -> u32 {
+            return static_cast<u32>(reinterpret_cast<const u32*>(&field) - base);
+        };
+        const u32 end = reg_addr + nwords; // exclusive
+        auto in_ud = [&](const UserData& ud) noexcept -> bool {
+            const u32 s = wo(ud[0]);
+            return reg_addr >= s && end <= s + AmdGpu::NUM_USER_DATA;
+        };
+        return in_ud(regs.ps_program.user_data) || in_ud(regs.vs_program.user_data) ||
+               in_ud(regs.gs_program.user_data) || in_ud(regs.es_program.user_data) ||
+               in_ud(regs.hs_program.user_data) || in_ud(regs.ls_program.user_data);
     }
 
     void ProcessCommands();

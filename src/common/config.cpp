@@ -152,6 +152,7 @@ static ConfigEntry<int> cursorHideTimeout(5); // 5 seconds (default)
 static ConfigEntry<bool> useSpecialPad(false);
 static ConfigEntry<int> specialPadClass(1);
 static ConfigEntry<bool> isMotionControlsEnabled(true);
+static ConfigEntry<bool> gyroSwapYawRoll(false);
 static ConfigEntry<bool> useUnifiedInputConfig(true);
 static ConfigEntry<string> defaultControllerID("");
 static ConfigEntry<bool> backgroundControllerInput(false);
@@ -181,6 +182,9 @@ static ConfigEntry<bool> isHDRAllowed(false);
 static ConfigEntry<bool> fsrEnabled(false);
 static ConfigEntry<bool> rcasEnabled(true);
 static ConfigEntry<int> rcasAttenuation(250);
+// GR2FORK: pipeline-compile sync-wait budget in ms (see config.h). Default
+// 2000; user-tunable from the Qt launcher.
+static ConfigEntry<int> gameplaySyncBudgetMs(2000);
 static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<string> resolutionPatchGroups("recommended");
@@ -204,11 +208,41 @@ static ConfigEntry<bool> vkDisablePushDescriptors(false);
 // Default ON. Set false to disable if shadow flicker or other rendering
 // artifacts return (e.g. register-driven depth_clear_enable edge cases).
 static ConfigEntry<bool> beginRenderingCacheEnable(true);
+// GpuAsse Phase D — D3': suppress dynamic_dirty_ on user_data-only SH writes in
+// Liverpool::SetShReg. gfx_key_dirty_+stamp are still set (perm_idx safety
+// untouched). dynamic_dirty_ has a single reader (UpdateDynamicState) whose
+// subs read only context regs, which user_data cannot affect — so this skips
+// ~0.48% of spurious per-draw dynamic-state sub-rebuilds. Default ON (project
+// baseline). Set false per-game in [Vulkan] if dynamic-state artifacts appear.
+// Probe-validated (GR2: ~88% of key-dirty SH writes are user_data-only;
+// UpdateDynamicState dirty-rate 100% -> ~32% once enabled).
+static ConfigEntry<bool> shDynamicDirtySkip(true);
 // GR2FORK: 32-slot LRU on Program (vk_pipeline_cache) keyed on ud_hash that
 // skips the StageSpecialization constructor when a permutation has been
 // resolved for this ud_hash before. Default ON. Set false to disable if
 // warmup flicker or stale-permutation artifacts return.
 static ConfigEntry<bool> pipelineUdHashLruEnable(true);
+// GR2FORK GpuAsse: extend the binding-skip fast path (vk_rasterizer
+// BindResources) to the descriptor-set path. It was historically gated to
+// push-descriptor pipelines only (pipeline->UsesPushDescriptors()), which is
+// statically false on RADV — so on Jun's deployment the whole machinery was
+// dead. The fast path proves a draw's bindings are bit-identical to the
+// previous consecutive same-pipeline draw and leaves set_writes empty; on the
+// descriptor-set path an empty set_writes makes Pipeline::BindResources return
+// before committing a fresh VkDescriptorSet, so the set the previous identical
+// draw bound stays bound (correct — nothing else binds between two consecutive
+// same-pipeline draws). Cuts the 4.94%-self set_writes rebuild for redundant
+// draws.
+//
+// Default ON (baseline). MEASURED on Gravity Rush 2 (CUSA04943): aggregate
+// hit rate ~0.03% over 9.4M BindResources calls (fast_replay=0 — the gfx
+// pipeline stamp bumps every draw; fast_pushud 36-128/200K — user_data differs
+// every draw), i.e. negligible benefit and a marginal net cost from the
+// per-draw skip-cache bookkeeping, because GR2's draw stream has ~no
+// back-to-back identical (same pipeline + same user_data) draws. Kept ON as a
+// project-wide baseline; may pay off on titles with more redundant draw
+// streams. Set false per-game to disable. See the GpuAssembler handoff doc.
+static ConfigEntry<bool> descSetBindingSkipCache(true);
 // GR2FORK: gates rt_cache_ in vk_rasterizer.cpp PrepareRenderState. Hash
 // keyed on (color/depth address+extent) misses TextureCache image-recreate
 // at the same VAddr -> stale image_id -> shadow flicker. Default false
@@ -454,6 +488,10 @@ bool getIsMotionControlsEnabled() {
     return isMotionControlsEnabled.get();
 }
 
+bool getGyroSwapYawRoll() {
+    return gyroSwapYawRoll.get();
+}
+
 bool debugDump() {
     return isDebugDump.get();
 }
@@ -573,8 +611,16 @@ bool isBeginRenderingCacheEnabled() {
     return beginRenderingCacheEnable.get();
 }
 
+bool isShDynamicDirtySkipEnabled() {
+    return shDynamicDirtySkip.get();
+}
+
 bool isPipelineUdHashLruEnabled() {
     return pipelineUdHashLruEnable.get();
+}
+
+bool isDescSetBindingSkipCacheEnabled() {
+    return descSetBindingSkipCache.get();
 }
 
 bool accurateRenderTargetCacheEnabled() {
@@ -609,8 +655,16 @@ void setBeginRenderingCacheEnabled(bool enable, bool is_game_specific) {
     beginRenderingCacheEnable.set(enable, is_game_specific);
 }
 
+void setShDynamicDirtySkipEnabled(bool enable, bool is_game_specific) {
+    shDynamicDirtySkip.set(enable, is_game_specific);
+}
+
 void setPipelineUdHashLruEnabled(bool enable, bool is_game_specific) {
     pipelineUdHashLruEnable.set(enable, is_game_specific);
+}
+
+void setDescSetBindingSkipCacheEnabled(bool enable, bool is_game_specific) {
+    descSetBindingSkipCache.set(enable, is_game_specific);
 }
 
 void setAccurateRenderTargetCacheEnabled(bool enable, bool is_game_specific) {
@@ -835,6 +889,10 @@ void setIsMotionControlsEnabled(bool use, bool is_game_specific) {
     isMotionControlsEnabled.set(use, is_game_specific);
 }
 
+void setGyroSwapYawRoll(bool enable, bool is_game_specific) {
+    gyroSwapYawRoll.set(enable, is_game_specific);
+}
+
 bool addGameInstallDir(const std::filesystem::path& dir, bool enabled) {
     for (const auto& install_dir : settings_install_dirs) {
         if (install_dir.path == dir) {
@@ -964,6 +1022,26 @@ void setRcasAttenuation(int value, bool is_game_specific) {
     rcasAttenuation.set(value, is_game_specific);
 }
 
+int getGameplaySyncBudgetMs() {
+    // Defensive clamp: the wait site feeds this straight into a
+    // std::chrono::milliseconds for future::wait_for. The launcher slider is
+    // bounded to [0, 50000], but a hand-edited config.toml could be anything;
+    // clamp out negatives (which would behave like 0 anyway) and cap at a sane
+    // ceiling so a typo can't wedge the GpuComm thread for minutes.
+    int v = gameplaySyncBudgetMs.get();
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 50000) {
+        v = 50000;
+    }
+    return v;
+}
+
+void setGameplaySyncBudgetMs(int value, bool is_game_specific) {
+    gameplaySyncBudgetMs.set(value, is_game_specific);
+}
+
 std::string getAspectRatioOverride() {
     return aspectRatioOverride.get();
 }
@@ -1058,6 +1136,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         useSpecialPad.setFromToml(input, "useSpecialPad", is_game_specific);
         specialPadClass.setFromToml(input, "specialPadClass", is_game_specific);
         isMotionControlsEnabled.setFromToml(input, "isMotionControlsEnabled", is_game_specific);
+        gyroSwapYawRoll.setFromToml(input, "gyroSwapYawRoll", is_game_specific);
         useUnifiedInputConfig.setFromToml(input, "useUnifiedInputConfig", is_game_specific);
         backgroundControllerInput.setFromToml(input, "backgroundControllerInput", is_game_specific);
         usbDeviceBackend.setFromToml(input, "usbDeviceBackend", is_game_specific);
@@ -1093,6 +1172,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         fsrEnabled.setFromToml(gpu, "fsrEnabled", is_game_specific);
         rcasEnabled.setFromToml(gpu, "rcasEnabled", is_game_specific);
         rcasAttenuation.setFromToml(gpu, "rcasAttenuation", is_game_specific);
+        gameplaySyncBudgetMs.setFromToml(gpu, "gameplaySyncBudgetMs", is_game_specific);
         aspectRatioOverride.setFromToml(gpu, "aspectRatioOverride", is_game_specific);
         resolutionOverride.setFromToml(gpu, "resolutionOverride", is_game_specific);
         resolutionPatchGroups.setFromToml(gpu, "resolutionPatchGroups", is_game_specific);
@@ -1115,7 +1195,9 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         vkForcePushDescriptors.setFromToml(vk, "forcePushDescriptors", is_game_specific);
         vkDisablePushDescriptors.setFromToml(vk, "disablePushDescriptors", is_game_specific);
         beginRenderingCacheEnable.setFromToml(vk, "beginRenderingCacheEnable", is_game_specific);
+        shDynamicDirtySkip.setFromToml(vk, "shDynamicDirtySkip", is_game_specific);
         pipelineUdHashLruEnable.setFromToml(vk, "pipelineUdHashLruEnable", is_game_specific);
+        descSetBindingSkipCache.setFromToml(vk, "descSetBindingSkipCache", is_game_specific);
         accurateRenderTargetCache.setFromToml(vk, "accurateRenderTargetCache",
                                               is_game_specific);
         accurateVertexBufferCache.setFromToml(vk, "accurateVertexBufferCache",
@@ -1255,6 +1337,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     cursorHideTimeout.setTomlValue(data, "Input", "cursorHideTimeout", is_game_specific);
     isMotionControlsEnabled.setTomlValue(data, "Input", "isMotionControlsEnabled",
                                          is_game_specific);
+    gyroSwapYawRoll.setTomlValue(data, "Input", "gyroSwapYawRoll", is_game_specific);
     backgroundControllerInput.setTomlValue(data, "Input", "backgroundControllerInput",
                                            is_game_specific);
     usbDeviceBackend.setTomlValue(data, "Input", "usbDeviceBackend", is_game_specific);
@@ -1278,6 +1361,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     fsrEnabled.setTomlValue(data, "GPU", "fsrEnabled", is_game_specific);
     rcasEnabled.setTomlValue(data, "GPU", "rcasEnabled", is_game_specific);
     rcasAttenuation.setTomlValue(data, "GPU", "rcasAttenuation", is_game_specific);
+    gameplaySyncBudgetMs.setTomlValue(data, "GPU", "gameplaySyncBudgetMs", is_game_specific);
     aspectRatioOverride.setTomlValue(data, "GPU", "aspectRatioOverride", is_game_specific);
     resolutionOverride.setTomlValue(data, "GPU", "resolutionOverride", is_game_specific);
     resolutionPatchGroups.setTomlValue(data, "GPU", "resolutionPatchGroups", is_game_specific);
@@ -1298,7 +1382,10 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     vkDisablePushDescriptors.setTomlValue(data, "Vulkan", "disablePushDescriptors", is_game_specific);
     beginRenderingCacheEnable.setTomlValue(data, "Vulkan", "beginRenderingCacheEnable",
                                            is_game_specific);
+    shDynamicDirtySkip.setTomlValue(data, "Vulkan", "shDynamicDirtySkip", is_game_specific);
     pipelineUdHashLruEnable.setTomlValue(data, "Vulkan", "pipelineUdHashLruEnable",
+                                         is_game_specific);
+    descSetBindingSkipCache.setTomlValue(data, "Vulkan", "descSetBindingSkipCache",
                                          is_game_specific);
     accurateRenderTargetCache.setTomlValue(data, "Vulkan", "accurateRenderTargetCache",
                                            is_game_specific);
@@ -1404,6 +1491,7 @@ void setDefaultValues(bool is_game_specific) {
     cursorState.set(HideCursorState::Idle, is_game_specific);
     cursorHideTimeout.set(5, is_game_specific);
     isMotionControlsEnabled.set(true, is_game_specific);
+    gyroSwapYawRoll.set(false, is_game_specific);
     backgroundControllerInput.set(false, is_game_specific);
     usbDeviceBackend.set(UsbBackendType::Real, is_game_specific);
 
@@ -1424,6 +1512,7 @@ void setDefaultValues(bool is_game_specific) {
     fsrEnabled.set(true, is_game_specific);
     rcasEnabled.set(true, is_game_specific);
     rcasAttenuation.set(250, is_game_specific);
+    gameplaySyncBudgetMs.set(2000, is_game_specific);
     aspectRatioOverride.set("16:9", is_game_specific);
     resolutionOverride.set("Off", is_game_specific);
     resolutionPatchGroups.set("recommended", is_game_specific);
@@ -1443,7 +1532,9 @@ void setDefaultValues(bool is_game_specific) {
     vkForcePushDescriptors.set(false, is_game_specific);
     vkDisablePushDescriptors.set(false, is_game_specific);
     beginRenderingCacheEnable.set(true, is_game_specific);
+    shDynamicDirtySkip.set(true, is_game_specific);
     pipelineUdHashLruEnable.set(true, is_game_specific);
+    descSetBindingSkipCache.set(true, is_game_specific);
     accurateRenderTargetCache.set(false, is_game_specific);
     accurateVertexBufferCache.set(false, is_game_specific);
 

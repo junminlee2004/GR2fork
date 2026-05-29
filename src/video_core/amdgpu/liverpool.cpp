@@ -801,8 +801,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (CopyRegWordsFastIfChangedSmall(
                         &regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                         header + 2, count - 1)) {
-                        MarkGfxKeyDirty();
+                        // D3' (GpuAsse Phase D): the guest re-emits the per-draw
+                        // user_data SGPRs (SRT root + resource pointers) every
+                        // draw, and the unconditional MarkGfxKeyDirty() here used
+                        // to raise dynamic_dirty_ as well — defeating
+                        // UpdateDynamicState's skip on EVERY draw for nothing
+                        // (user_data cannot change any dynamic state). Classify
+                        // user_data-only writes and use the narrower mark that
+                        // keeps key+stamp (perm_idx safety) but NOT dynamic_dirty.
+                        // Config-gated; a mixed packet that also touches a
+                        // program-address word fails the strict "entire range in
+                        // user_data" test and takes the full mark below, so
+                        // genuine changes are never dropped. The flag is checked
+                        // first so IsUserDataOnlyShReg costs nothing when off.
+                        if (Config::isShDynamicDirtySkipEnabled() &&
+                            IsUserDataOnlyShReg(Regs::ShRegWordOffset + set_data->reg_offset,
+                                                count - 1)) {
+                            MarkGfxKeyDirtyNoDynamic();
+                        } else {
+                            MarkGfxKeyDirty();
                         }
+                    }
                 }
                 break;
             }
