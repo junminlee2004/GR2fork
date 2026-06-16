@@ -23,7 +23,22 @@ OrbisFiberContext* GetFiberContext() {
     return Core::GetTcbBase()->tcb_fiber;
 }
 
-extern "C" s32 PS4_SYSV_ABI _sceFiberSetJmp(OrbisFiberContext* ctx) asm("_sceFiberSetJmp");
+// GR2FORK combined-binary fix (2026-06-16): _sceFiberSetJmp is a hand-rolled asm
+// setjmp. Mark it returns_twice so the compiler treats every call site like a real
+// setjmp -- control can re-enter the point after the call via _sceFiberLongJmp with
+// a FOREIGN register state, so the compiler must NOT keep values computed before the
+// call live in registers across it; it must re-materialize them afterward. Without
+// this, in the dlopened core the general-dynamic TLS resolution of g_curthread (used
+// by the post-resume GetFiberContext() re-fetch == GetTcbBase()->tcb_fiber) was
+// cached in a register that _sceFiberLongJmp stranded, so the inlined re-fetch read
+// a stale 0 while tcb_fiber was valid in memory -> null-deref of g_ctx->prev_fiber.
+// PROVEN by a 32-site fiber breadcrumb: the inlined re-fetch logged 0 while a
+// function-call read of the identical expression returned the live pointer, with the
+// tcb pointer itself stable. Standalone is local-exec (a single %fs read, never
+// cached across calls) so it never hit this; returns_twice immunizes the access
+// regardless of TLS model and works for every thread_local read across the boundary.
+extern "C" __attribute__((returns_twice)) s32 PS4_SYSV_ABI
+_sceFiberSetJmp(OrbisFiberContext* ctx) asm("_sceFiberSetJmp");
 extern "C" s32 PS4_SYSV_ABI _sceFiberLongJmp(OrbisFiberContext* ctx) asm("_sceFiberLongJmp");
 extern "C" void PS4_SYSV_ABI _sceFiberSwitchEntry(OrbisFiberData* data,
                                                   bool set_fpu) asm("_sceFiberSwitchEntry");

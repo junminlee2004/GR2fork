@@ -150,8 +150,6 @@
 [submodule "externals/mesa-kosmickrisp"]
 	path = externals/mesa-kosmickrisp
 	url = https://github.com/shadexternals/mesa-kosmickrisp
-	shallow = true
-[submodule "externals/vulkan-loader"]
-	path = externals/vulkan-loader
-	url = https://github.com/KhronosGroup/Vulkan-Loader
-	shallow = true
+[submodule "externals/sdl3_mixer"]
+	path = externals/sdl3_mixer
+	url = https://github.com/libsdl-org/SDL_mixer.git
