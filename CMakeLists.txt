@@ -259,27 +259,34 @@ if(COMBINED_EMBED_CORES)
     # COFF (Windows) and ELF (Linux) need different read-only sections and the ELF
     # build has a .note.GNU-stack line COFF rejects, so pick the matching template.
     # Both resolve the same $<TARGET_FILE:core_*> genexes (to .dll vs .so paths).
+    # Also pin the actual built core-library paths for OBJECT_DEPENDS below. These are
+    # NOT $<TARGET_FILE:> genexes -- OBJECT_DEPENDS does NOT evaluate generator
+    # expressions, it would hand the literal string to ninja as a missing file. They
+    # must match exactly what file(GENERATE) bakes into the .incbin lines, i.e.
+    # ${CMAKE_BINARY_DIR}/libcore_*.{so,dll} (Combine.cmake sets the "lib" PREFIX and
+    # the cores link into the build root).
     if(WIN32)
         set(_embed_in ${COMBINED_CMAKE}/embed_cores_win.S.in)
+        set(_core_libs "${CMAKE_BINARY_DIR}/libcore_gr2.dll;${CMAKE_BINARY_DIR}/libcore_main.dll")
     else()
         set(_embed_in ${COMBINED_CMAKE}/embed_cores.S.in)
+        set(_core_libs "${CMAKE_BINARY_DIR}/libcore_gr2.so;${CMAKE_BINARY_DIR}/libcore_main.so")
     endif()
     file(GENERATE
         OUTPUT ${_embed_s}
         INPUT  ${_embed_in})
-    # The .incbin directives in the generated stub read the *built* core libraries
-    # ($<TARGET_FILE:core_gr2/main>), so the assembler must run AFTER both cores have
-    # linked. add_dependencies() only orders the cores before shadps4's LINK step, NOT
-    # before this per-object ASSEMBLE step, so without an explicit per-object dependency
-    # the embed object races the core links (ninja dies with
-    #   "Could not find incbin file .../libcore_gr2.so").
-    # OBJECT_DEPENDS on the actual core artifacts makes ninja block the assemble until
-    # they exist; it accepts generator expressions (CMake >= 3.20), which also yields
-    # the correct per-platform name (.so / .dll, incl. the "lib" prefix Combine sets).
+    # The .incbin directives in the generated stub read the *built* core libraries, so
+    # the assembler must run AFTER both cores have linked. add_dependencies() only orders
+    # the cores before shadps4's LINK step, NOT before this per-object ASSEMBLE step, so
+    # without an explicit per-object dependency the embed object races the core links
+    # ("Could not find incbin file .../libcore_gr2.so"). OBJECT_DEPENDS on the real lib
+    # paths (_core_libs) makes ninja recognize them as core-target outputs and block the
+    # assemble until they exist. NOTE: a $<TARGET_FILE:> genex does NOT work here --
+    # OBJECT_DEPENDS passes it to ninja verbatim ("missing and no known rule to make it").
     set_source_files_properties(${_embed_s} PROPERTIES
         GENERATED ON
         LANGUAGE ASM
-        OBJECT_DEPENDS "$<TARGET_FILE:core_gr2>;$<TARGET_FILE:core_main>")
+        OBJECT_DEPENDS "${_core_libs}")
     target_sources(shadps4 PRIVATE ${_embed_s})
     target_compile_definitions(shadps4 PRIVATE COMBINED_EMBED_CORES)
     add_dependencies(shadps4 core_gr2 core_main)
