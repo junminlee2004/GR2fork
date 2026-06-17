@@ -90,17 +90,32 @@ endif()
 if(WIN32)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set(BUILD_SHARED_LIBS OFF)
-    # windows.h (pulled in by the cores' Win32 paths) defines min()/max() FUNCTION
-    # macros that wreck std::min/std::max/std::clamp -- e.g. `std::max({a, b})` in
-    # common/logging/log.h expands to a broken macro ("expected unqualified-id"), since
-    # the comma inside the {} braces isn't protected from macro-argument splitting.
-    # NOMINMAX suppresses them, but ONLY if defined before any windows.h include, so it
-    # has to be a global -D here (a per-file `#define NOMINMAX` is too late once another
-    # header already pulled windows.h into the TU). _CRT_SECURE_NO_WARNINGS silences the
-    # UCRT "use *_s instead" deprecation warnings (mbstowcs, etc.). Mirrors upstream
-    # shadPS4's Windows definitions. This is before the cores + add_subdirectory(externals)
-    # so add_compile_definitions() reaches every target.
-    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    # Replicate upstream shadPS4's Windows compile definitions verbatim. The cores ARE
+    # that source and assume these, and the combined umbrella is the only place to set
+    # them: src/ and src-gr2/ are pure-source trees with no CMakeLists of their own.
+    # (clang-cl makes CMake's MSVC variable true, so the if(MSVC) blocks apply here.)
+    if(MSVC)
+        # MSVC/clang-cl: turn off the "use the *_s variant" deprecation opinions.
+        add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS)
+    endif()
+    # NOMINMAX: windows.h's min()/max() FUNCTION macros wreck std::min/std::max/std::clamp
+    # -- e.g. `std::max({a, b})` in common/logging/log.h expands to a broken macro
+    # ("expected unqualified-id") because the comma inside {} isn't protected from
+    # macro-argument splitting. Must precede any windows.h include, hence a global -D.
+    # WIN32_LEAN_AND_MEAN trims windows.h (upstream pairs the two).
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        # Avoid a timespec redefinition between <time.h> and windows.h.
+        add_compile_definitions(_TIMESPEC_DEFINED)
+    endif()
+    # Target Windows 10 RS5. CRUCIAL: this keeps NTDDI *below* the SDK's gate for the
+    # newer NT decls -- e.g. enum _QUEUE_USER_APC_FLAGS in processthreadsapi.h -- so the
+    # cores' own hand-rolled ntapi.h declarations are the sole definitions and don't
+    # collide with the SDK's. Without this pin the 10.0.26100 SDK defaults NTDDI to its
+    # maximum, declares _QUEUE_USER_APC_FLAGS itself, and the core build dies with
+    # "redefinition of '_QUEUE_USER_APC_FLAGS'". (This block is before the cores +
+    # add_subdirectory(externals), so add_compile_definitions() reaches every target.)
+    add_compile_definitions(NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 endif()
 
 # --- Architecture variable that externals (ffmpeg-core, …) read. The trees set
