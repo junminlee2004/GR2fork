@@ -739,7 +739,38 @@ void Instance::CollectPhysicalMemoryInfo() {
     const size_t num_props = memory_props.memoryHeapCount;
     total_memory_budget = 0;
     u64 device_initial_usage = 0;
+
+    // Total physical device-local VRAM. Computed up front, independent of the
+    // budget strategy, so we can pick the allocation policy *before* we start
+    // accumulating the reported budget below. This is the same sum the per-heap
+    // loop used to build inline.
     u64 local_memory = 0;
+    for (size_t i = 0; i < num_props; ++i) {
+        const bool is_device_local =
+            (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
+            vk::MemoryHeapFlags{};
+        if (is_device_local) {
+            local_memory += memory_props.memoryHeaps[i].size;
+        }
+    }
+
+    // VRAM-size-gated allocation strategy. Replaces the old compile-time choice
+    // between a separate low-VRAM build and a high-VRAM build: the right policy
+    // is now selected at runtime from the detected device-local VRAM.
+    //   * Small discrete cards (< 9 GiB) take the AGGRESSIVE path: report the
+    //     full physical heap and skip the system reserve, so a 4/6/8 GB card
+    //     can use almost all of its VRAM before VK_ERROR_OUT_OF_DEVICE_MEMORY
+    //     fires. (heapBudget pre-deducts the desktop compositor + other apps'
+    //     current usage — e.g. ~3367 MiB reported on a 4096 MiB 3050 Ti — and
+    //     the extra min(budget/8, 1_GB) reserve double-counts on top of that.)
+    //   * Larger discrete cards (>= 9 GiB) keep the CONSERVATIVE path:
+    //     heapBudget plus a precautionary system reserve. They have VRAM to
+    //     spare and don't need to squeeze.
+    // Integrated GPUs are unaffected — both old builds used heapBudget plus the
+    // shared 8 GiB carve-out below, so low_vram is forced false for them.
+    static constexpr u64 low_vram_threshold = 9_GB;
+    const bool low_vram = !IsIntegrated() && local_memory < low_vram_threshold;
+
     for (size_t i = 0; i < num_props; ++i) {
         const bool is_device_local =
             (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
@@ -749,20 +780,11 @@ void Instance::CollectPhysicalMemoryInfo() {
             continue;
         }
         valid_heaps.push_back(i);
-        if (is_device_local) {
-            local_memory += memory_props.memoryHeaps[i].size;
-        }
         if (supports_memory_budget) {
             device_initial_usage += budget.heapUsage[i];
-            // FIX(GR2FORK): on discrete GPUs report the full physical heap
-            // size instead of heapBudget for device-local heaps. heapBudget
-            // pre-deducts the desktop compositor and other apps' current
-            // VRAM (e.g. ~3367 MiB on a 4096 MiB 3050 Ti), leaving usable
-            // VRAM on the table — the game can in practice use almost the
-            // full physical heap before VK_ERROR_OUT_OF_DEVICE_MEMORY
-            // fires. Integrated GPUs still need heapBudget since they
-            // share the system pool.
-            if (!IsIntegrated() && is_device_local) {
+            if (low_vram && is_device_local) {
+                // Aggressive path: report the full physical heap on a small
+                // discrete card instead of the pre-deducted heapBudget.
                 total_memory_budget += memory_props.memoryHeaps[i].size;
             } else {
                 total_memory_budget += budget.heapBudget[i];
@@ -773,21 +795,27 @@ void Instance::CollectPhysicalMemoryInfo() {
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
     if (!IsIntegrated()) {
-        // FIX(GR2FORK): no additional system reserve on discrete GPUs.
-        // VK_EXT_memory_budget already reports a dynamic heapBudget that
-        // accounts for the desktop compositor, other apps' current VRAM
-        // usage, and driver overhead — subtracting another min(budget/8,
-        // 1_GB) on top double-counts and eats 16-25% of usable VRAM on
-        // small cards (4 GB / 3050 Ti reported ~2.9 GB instead of ~3.3+).
-        // If actual allocations approach the limit the driver will return
-        // VK_ERROR_OUT_OF_DEVICE_MEMORY and the texture cache can react;
-        // we don't need a precautionary skim.
-        return;
+        if (!low_vram) {
+            // Conservative path: reserve some memory for the system on larger
+            // discrete cards. Small cards skip this (handled by low_vram above).
+            const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
+            total_memory_budget -= system_memory;
+        }
+    } else {
+        // Leave at least 8 GB for the system on integrated GPUs.
+        const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
+        total_memory_budget = static_cast<u64>(
+            std::max<s64>(available_memory - 8_GB, static_cast<s64>(local_memory)));
     }
-    // Leave at least 8 GB for the system on integrated GPUs.
-    const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
-    total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(local_memory)));
+
+    LOG_INFO(Render_Vulkan,
+             "GPU_VRAM: {} MiB device-local ({}); allocation_strategy: {}; "
+             "total_memory_budget: {} MiB",
+             local_memory / 1_MB, IsIntegrated() ? "integrated" : "discrete",
+             low_vram ? "low-vram aggressive (full heap, no reserve)"
+                      : (IsIntegrated() ? "integrated (heapBudget, 8 GiB reserve)"
+                                        : "default conservative (heapBudget, system reserve)"),
+             total_memory_budget / 1_MB);
 }
 
 void Instance::CollectToolingInfo() const {
