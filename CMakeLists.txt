@@ -267,7 +267,19 @@ if(COMBINED_EMBED_CORES)
     file(GENERATE
         OUTPUT ${_embed_s}
         INPUT  ${_embed_in})
-    set_source_files_properties(${_embed_s} PROPERTIES GENERATED ON LANGUAGE ASM)
+    # The .incbin directives in the generated stub read the *built* core libraries
+    # ($<TARGET_FILE:core_gr2/main>), so the assembler must run AFTER both cores have
+    # linked. add_dependencies() only orders the cores before shadps4's LINK step, NOT
+    # before this per-object ASSEMBLE step, so without an explicit per-object dependency
+    # the embed object races the core links (ninja dies with
+    #   "Could not find incbin file .../libcore_gr2.so").
+    # OBJECT_DEPENDS on the actual core artifacts makes ninja block the assemble until
+    # they exist; it accepts generator expressions (CMake >= 3.20), which also yields
+    # the correct per-platform name (.so / .dll, incl. the "lib" prefix Combine sets).
+    set_source_files_properties(${_embed_s} PROPERTIES
+        GENERATED ON
+        LANGUAGE ASM
+        OBJECT_DEPENDS "$<TARGET_FILE:core_gr2>;$<TARGET_FILE:core_main>")
     target_sources(shadps4 PRIVATE ${_embed_s})
     target_compile_definitions(shadps4 PRIVATE COMBINED_EMBED_CORES)
     add_dependencies(shadps4 core_gr2 core_main)
