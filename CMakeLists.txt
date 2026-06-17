@@ -90,6 +90,17 @@ endif()
 if(WIN32)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set(BUILD_SHARED_LIBS OFF)
+    # windows.h (pulled in by the cores' Win32 paths) defines min()/max() FUNCTION
+    # macros that wreck std::min/std::max/std::clamp -- e.g. `std::max({a, b})` in
+    # common/logging/log.h expands to a broken macro ("expected unqualified-id"), since
+    # the comma inside the {} braces isn't protected from macro-argument splitting.
+    # NOMINMAX suppresses them, but ONLY if defined before any windows.h include, so it
+    # has to be a global -D here (a per-file `#define NOMINMAX` is too late once another
+    # header already pulled windows.h into the TU). _CRT_SECURE_NO_WARNINGS silences the
+    # UCRT "use *_s instead" deprecation warnings (mbstowcs, etc.). Mirrors upstream
+    # shadPS4's Windows definitions. This is before the cores + add_subdirectory(externals)
+    # so add_compile_definitions() reaches every target.
+    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # --- Architecture variable that externals (ffmpeg-core, …) read. The trees set
