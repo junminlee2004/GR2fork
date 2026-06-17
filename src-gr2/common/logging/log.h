@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#define NOMINMAX
+
 #pragma once
 
 #include <algorithm>
