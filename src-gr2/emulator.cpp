@@ -682,6 +682,16 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     g_window = window.get();
 
+    // [GR2FORK] Point the window/taskbar icon at the game's own icon0.png so GR2
+    // (and every other title) shows its cover art instead of the generic shadPS4
+    // icon. /app0 is already mounted above, so this resolves into the game's
+    // sce_sys folder. Ported from upstream shadPS4 PR #4586. Silently skipped if
+    // the game ships no icon0.png; SetIcon itself is best-effort past that.
+    const auto icon_path = mnt->GetHostPath("/app0/sce_sys/icon0.png");
+    if (std::filesystem::exists(icon_path)) {
+        window->SetIcon(icon_path);
+    }
+
     const auto& mount_data_dir = Common::FS::GetUserPath(Common::FS::PathType::GameDataDir) / id;
     if (!std::filesystem::exists(mount_data_dir)) {
         std::filesystem::create_directory(mount_data_dir);

@@ -327,6 +327,20 @@ function(add_core)
         # INTERFACE link libraries.
         target_link_libraries(core_${name} PRIVATE
             ws2_32 iphlpapi winmm bcrypt userenv version)
+        # wepoll = the epoll()-for-Windows shim (externals/ext-wepoll, a WIN32-only
+        # add_subdirectory). The network layer's net_epoll.{h,cpp} and net.cpp do
+        # #include <wepoll.h>, so the core MUST link the wepoll target -- that is what
+        # puts wepoll's header on the include path (via its INTERFACE include dir) AND
+        # its symbols on the link line. mincore + wbemuuid round out upstream's Windows
+        # link set. Upstream: target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid).
+        target_link_libraries(core_${name} PRIVATE mincore wepoll wbemuuid)
+        if(MSVC)
+            # ThinLTO via clang-cl can emit calls to compiler-rt builtins (e.g. 128-bit
+            # integer division) that aren't otherwise pulled in; upstream links this
+            # explicitly. clang-cl drives the link, so its clang-rt lib dir is on the
+            # search path and the bare lib name resolves.
+            target_link_libraries(core_${name} PRIVATE clang_rt.builtins-x86_64.lib)
+        endif()
     endif()
     if(ENABLE_DISCORD_RPC)
         target_compile_definitions(core_${name} PRIVATE ENABLE_DISCORD_RPC)

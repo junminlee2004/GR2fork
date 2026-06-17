@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,8 @@ public:
     WindowSystemInfo GetWindowInfo() const {
         return window_info;
     }
+
+    void SetIcon(const std::filesystem::path& path);
 
     void WaitEvent();
     void InitTimers();
