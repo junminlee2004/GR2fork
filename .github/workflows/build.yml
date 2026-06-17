@@ -114,6 +114,75 @@ jobs:
         name: shadps4-combined-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
         path: ${{github.workspace}}/build/shadps4.exe
 
+  # RelWithDebInfo variant of the same combined single-file exe, gated on the normal
+  # (Release) windows-sdl job via `needs:` so the two heavy Windows builds run in
+  # series, not in parallel. Build type is RelWithDebInfo = optimized (/O2 /Ob1
+  # /DNDEBUG, asserts off like Release) PLUS /Zi debug info, and lld-link emits a PDB
+  # per binary. IPO/ThinLTO is intentionally NOT enabled here: LTO inlining shreds
+  # stack frames and locals, which defeats the point of a debuggable build, and it
+  # would compound the link memory of an already-heavy debuginfo build. (Add
+  # -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO=ON if you want it to match the
+  # Release codegen exactly.) lld kept for linker parity with windows-sdl; JOB_POOLS
+  # link=1 still serializes the (large, debuginfo) core links. Uploads the exe + every
+  # PDB (shadps4.pdb + libcore_{gr2,main}.pdb) so embedded-core crashes can be symbolized.
+  windows-sdl-relwithdebinfo:
+    runs-on: windows-latest
+    needs: [get-info, windows-sdl]
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Setup MSVC environment (Windows)
+      uses: egor-tensin/vs-shell@v2
+      with:
+        arch: x64
+
+    - name: Cache CMake Configuration
+      uses: actions/cache@v5
+      env:
+          cache-name: ${{ runner.os }}-sdl-relwithdebinfo-cache-cmake-configuration
+      with:
+          path: |
+            ${{github.workspace}}/build
+          key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            ${{ env.cache-name }}-
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-sdl-relwithdebinfo-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Print CPU Info
+      run: bash -c "cat /proc/cpuinfo"
+
+    # Same as windows-sdl but CMAKE_BUILD_TYPE=RelWithDebInfo and no IPO (see job comment).
+    - name: Configure CMake
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_ASM_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config RelWithDebInfo --parallel $env:NUMBER_OF_PROCESSORS
+
+    # Informational: the debug exe must also depend on only system DLLs.
+    - name: Verify core DLL self-containment (dumpbin /dependents)
+      continue-on-error: true
+      shell: cmd
+      run: |
+        if exist "${{github.workspace}}\build\libcore_gr2.dll" dumpbin /dependents "${{github.workspace}}\build\libcore_gr2.dll"
+        if exist "${{github.workspace}}\build\libcore_main.dll" dumpbin /dependents "${{github.workspace}}\build\libcore_main.dll"
+
+    - name: Upload Windows SDL RelWithDebInfo artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: shadps4-combined-win64-sdl-relwithdebinfo-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
+        path: |
+          ${{github.workspace}}/build/shadps4.exe
+          ${{github.workspace}}/build/*.pdb
+
   linux-sdl:
     runs-on: ubuntu-24.04
     needs: get-info
@@ -130,10 +199,14 @@ jobs:
     - name: Install dependencies
       run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 lld-19 ninja-build build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
 
+    # The cached build/ dir pins CMAKE_GENERATOR in its CMakeCache.txt. This job now
+    # uses -G Ninja (it was Unix Makefiles upstream), so the cache-name carries `ninja`
+    # to bust any stale Makefiles build/ -- otherwise the restored cache makes CMake
+    # refuse to switch generators ("does not match the generator used previously").
     - name: Cache CMake Configuration
       uses: actions/cache@v5
       env:
-          cache-name: ${{ runner.os }}-sdl-cache-cmake-configuration
+          cache-name: ${{ runner.os }}-sdl-ninja-cache-cmake-configuration
       with:
           path: |
             ${{github.workspace}}/build
