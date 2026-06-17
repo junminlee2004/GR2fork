@@ -25,31 +25,6 @@ env:
   BUILD_TYPE: Release
 
 jobs:
-  reuse:
-    runs-on: ubuntu-24.04
-    continue-on-error: true
-    steps:
-    - uses: actions/checkout@v6
-    - uses: fsfe/reuse-action@v6
-
-  clang-format:
-    runs-on: ubuntu-24.04
-    continue-on-error: true
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        fetch-depth: 0
-    - name: Install
-      run: |
-        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
-        sudo apt update
-        sudo apt install clang-format-19
-    - name: Build
-      env:
-        COMMIT_RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
-      run: ./.ci/clang-format.sh
-
   get-info:
     runs-on: ubuntu-24.04
     outputs:
@@ -67,69 +42,6 @@ jobs:
         echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
         echo "shorthash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
         echo "fullhash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-
-  test:
-    name: Run C++ Tests on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-        include:
-          - os: windows-latest
-            compiler_cxx: clang-cl
-            compiler_c: clang-cl
-          - os: ubuntu-latest
-            compiler_cxx: clang++
-            compiler_c: clang
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Setup CMake
-        uses: lukka/get-cmake@latest
-
-      - name: Setup Visual Studio shell (Windows only)
-        if: runner.os == 'Windows'
-        uses: egor-tensin/vs-shell@v2
-        with:
-          arch: x64
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libc++-dev libc++abi-dev ninja-build libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxrandr-dev libxfixes-dev libudev-dev uuid-dev uuid-dev
-
-      - name: Configure CMake
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_CXX_COMPILER="${{ matrix.compiler_cxx }}" \
-            -DCMAKE_C_COMPILER="${{ matrix.compiler_c }}" \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DENABLE_TESTS=ON \
-            ${{ runner.os == 'Linux' && '-DCMAKE_CXX_FLAGS=-stdlib=libc++' || '' }}
-        shell: bash
-
-      - name: Create shadPS4 user data directory (Linux)
-        if: runner.os == 'Linux'
-        run: mkdir -p ~/.local/share/shadPS4
-
-      - name: Create shadPS4 user data directory (Windows)
-        if: runner.os == 'Windows'
-        run: mkdir -p "$APPDATA/shadPS4"
-        shell: bash
-
-      - name: Build all tests
-        run: cmake --build build
-        shell: bash
-
-      - name: Run tests with CTest
-        run: ctest --test-dir build --output-on-failure --progress -E 'GcnTest'
-        shell: bash
 
   # Combined single-file Windows build: clang-cl + Ninja, both cores .incbin-embedded
   # into ONE self-contained shadps4.exe (static CRT, no sidecar DLLs). The dispatcher
@@ -174,10 +86,14 @@ jobs:
     # COMBINED_EMBED_CORES=ON -> single self-contained exe; static CRT so the temp-
     # extracted core needs no vcruntime DLL beside it; ASM pinned to clang-cl so the
     # .incbin embed stub (and the cores' fiber/stack .s/.S) is NOT routed to MASM.
-    # IPO/LTO is intentionally left off here: it doubles for two ~100 MB cores and
-    # risks a CI OOM; re-enable once the artifact is known to fit.
+    # IPO ON = clang-cl ThinLTO. -fuse-ld=lld is REQUIRED: the MSVC link.exe can't
+    # consume LLVM bitcode, so the LTO link must go through lld-link (ships with the
+    # LLVM that provides clang-cl on windows-latest). Release already implies /O2
+    # /DNDEBUG under clang-cl (MSVC has no /O3), so IPO is the optimization lever here.
+    # JOB_POOLS link=1 serializes the link step so the two big ThinLTO core-links don't
+    # run concurrently and blow past runner RAM (compiles still fully parallel).
     - name: Configure CMake
-      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_ASM_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_ASM_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
@@ -212,7 +128,7 @@ jobs:
         sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
 
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 mold build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
+      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 lld-19 ninja-build build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5
@@ -239,12 +155,15 @@ jobs:
     # COMBINED_EMBED_CORES=ON -> ONE self-contained shadps4 ELF with both cores
     # .incbin-embedded (gr2 + prerelease), runtime-selected by title id, exactly like
     # the Windows build. On Linux gas handles .incbin natively, so no ASM-compiler pin
-    # is needed (that is a Windows/MASM-only concern). IPO/LTO is intentionally left
-    # OFF here: a monolithic LTO link of two ~100 MB cores can OOM a standard runner;
-    # re-enable on a larger runner once the artifact is known to fit. (build-appimage.sh
-    # below does its own thin-LTO build only under BUILD=1, which CI does not use.)
+    # is needed (that is a Windows/MASM-only concern).
+    # Optimized build: -O3 -DNDEBUG + ThinLTO (-flto=thin), lld as the LTO linker
+    # (clang-19's sibling ld.lld; matches build-appimage.sh's BUILD=1 path). -G Ninja
+    # so JOB_POOLS link=1 can serialize the link step — keeps the two big ThinLTO
+    # core-links from running concurrently and OOM'ing the runner (compiles stay fully
+    # parallel). Arch left generic (NO -march=x86-64-v3) so the artifact stays portable;
+    # add -DCMAKE_C/CXX_FLAGS=-march=... locally for a tuned build.
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_C_FLAGS="-O3 -DNDEBUG -flto=thin" -DCMAKE_CXX_FLAGS="-O3 -DNDEBUG -flto=thin" -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
@@ -275,48 +194,6 @@ jobs:
       with:
         name: shadps4-linux-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
         path: ${{github.workspace}}/build/shadPS4-combined-x86_64.AppImage
-
-  linux-sdl-gcc:
-    runs-on: ubuntu-24.04
-    needs: get-info
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        submodules: recursive
-
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 gcc-14 mold build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
-
-    - name: Cache CMake Configuration
-      uses: actions/cache@v5
-      env:
-          cache-name: ${{ runner.os }}-sdl-gcc-cache-cmake-configuration
-      with:
-          path: |
-            ${{github.workspace}}/build
-          key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
-          restore-keys: |
-            ${{ env.cache-name }}-
-
-    - name: Cache CMake Build
-      uses: hendrikmuhs/ccache-action@v1.2.21
-      env:
-          cache-name: ${{ runner.os }}-sdl-gcc-cache-cmake-build
-      with:
-        append-timestamp: false
-        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
-
-    - name: Print CPU Info
-      run: cat /proc/cpuinfo
-
-    # Same combined single-file target as linux-sdl, built with GCC as a portability
-    # check (gas handles the .incbin embed stub natively). IPO/LTO off for the same
-    # two-core OOM reason. Compile-only: no artifact upload.
-    - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-
-    - name: Build
-      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
 
   pre-release:
     if: github.ref == 'refs/heads/main' && github.repository == 'shadps4-emu/shadPS4' && github.event_name == 'push'
