@@ -29,7 +29,8 @@
 #include "video_core/renderdoc.h"
 
 #ifdef __APPLE__
-#include "SDL3/SDL_metal.h"
+#include <SDL3/SDL_metal.h>
+#include "common/apple.h"
 #endif
 
 namespace Frontend {
@@ -177,6 +178,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
 WindowSDL::~WindowSDL() = default;
 
 void WindowSDL::SetIcon(const std::filesystem::path& path) {
+#ifdef __APPLE__
+    // Use native path which matches system icon look-and-feel.
+    Common::SetAppIcon(path);
+#else
     Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read,
                             Common::FS::FileType::BinaryFile,
                             Common::FS::FileShareFlag::ShareReadWrite};
@@ -214,8 +219,11 @@ void WindowSDL::SetIcon(const std::filesystem::path& path) {
     if (surface == nullptr) {
         LOG_ERROR(Core, "Failed to create SDL surface for window icon: {}", SDL_GetError());
     }
-    SDL_SetWindowIcon(window, surface);
+    if (!SDL_SetWindowIcon(window, surface)) {
+        LOG_ERROR(Core, "Failed to set SDL window icon: {}", SDL_GetError());
+    }
     SDL_DestroySurface(surface);
+#endif
 }
 
 void WindowSDL::WaitEvent() {

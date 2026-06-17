@@ -23,32 +23,6 @@ OrbisFiberContext* GetFiberContext() {
     return Core::GetTcbBase()->tcb_fiber;
 }
 
-#if defined(_MSC_VER)
-#define GR2_NOINLINE __declspec(noinline)
-#else
-#define GR2_NOINLINE __attribute__((noinline))
-#endif
-
-// GR2FORK combined-binary fix: a deliberately NON-INLINED re-fetch of the current
-// run context, used ONLY at the two post-longjmp resume sites. In the dlopened core
-// the inlined GetFiberContext() read can observe a stale/transient 0 from tcb_fiber
-// across the hand-rolled _sceFiberSetJmp/_sceFiberLongJmp boundary, because the
-// general-dynamic TLS resolution of g_curthread is cached in a register the longjmp
-// strands. A fresh function call re-resolves correctly (proven by a 32-site fiber
-// breadcrumb: inlined re-fetch = 0 while a function-call read of the identical
-// GetTcbBase()->tcb_fiber returned the live pointer, tcb stable). returns_twice was
-// tried and FAILED to force this on the real toolchain -- the noinline call is the
-// mechanism that actually works. Fence + bounded re-read are belt-and-suspenders.
-GR2_NOINLINE OrbisFiberContext* GR2_ResumeRefetchFiberContext() {
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    OrbisFiberContext* ctx = Core::GetTcbBase()->tcb_fiber;
-    for (s32 i = 0; !ctx && i < 1024; ++i) {
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-        ctx = Core::GetTcbBase()->tcb_fiber;
-    }
-    return ctx;
-}
-
 extern "C" s32 PS4_SYSV_ABI _sceFiberSetJmp(OrbisFiberContext* ctx) asm("_sceFiberSetJmp");
 extern "C" s32 PS4_SYSV_ABI _sceFiberLongJmp(OrbisFiberContext* ctx) asm("_sceFiberLongJmp");
 extern "C" void PS4_SYSV_ABI _sceFiberSwitchEntry(OrbisFiberData* data,
@@ -404,20 +378,7 @@ s32 PS4_SYSV_ABI sceFiberSwitchImpl(OrbisFiber* fiber, void* addr_context, u64 s
         __builtin_trap();
     }
 
-    // GR2FORK combined-binary fix: route the post-longjmp re-fetch through the
-    // noinline helper so the GD-TLS read happens fresh (inlined GetFiberContext()
-    // returns a stale 0 here in the dlopened core). Guard kept as a tripwire.
-    g_ctx = GR2_ResumeRefetchFiberContext();
-    if (!g_ctx) {
-        LOG_ERROR(Lib_Fiber,
-                  "sceFiberSwitchImpl: tcb_fiber is null after resume (fiber '{}'); "
-                  "bailing safely instead of dereferencing null.",
-                  fiber->name);
-        if (arg_on_run) {
-            *arg_on_run = 0;
-        }
-        return ORBIS_OK;
-    }
+    g_ctx = GetFiberContext();
     if (g_ctx->prev_fiber) {
         g_ctx->prev_fiber->state = FiberState::Idle;
         g_ctx->prev_fiber = nullptr;
@@ -455,18 +416,7 @@ s32 PS4_SYSV_ABI sceFiberReturnToThread(u64 arg_on_return, u64* arg_on_run) {
         OrbisFiberContext ctx{};
         s32 jmp = _sceFiberSetJmp(&ctx);
         if (jmp) {
-            // GR2FORK combined-binary fix: noinline re-fetch (see helper). Guard
-            // kept as a tripwire -- safe-bail instead of deref-null.
-            g_ctx = GR2_ResumeRefetchFiberContext();
-            if (!g_ctx) {
-                LOG_ERROR(Lib_Fiber,
-                          "sceFiberReturnToThread: tcb_fiber is null after resume; "
-                          "bailing safely instead of dereferencing null.");
-                if (arg_on_run) {
-                    *arg_on_run = 0;
-                }
-                return ORBIS_OK;
-            }
+            g_ctx = GetFiberContext();
             if (g_ctx->prev_fiber) {
                 g_ctx->prev_fiber->state = FiberState::Idle;
                 g_ctx->prev_fiber = nullptr;
