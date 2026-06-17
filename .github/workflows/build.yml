@@ -74,15 +74,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest]
         include:
           - os: windows-latest
             compiler_cxx: clang-cl
             compiler_c: clang-cl
           - os: ubuntu-latest
-            compiler_cxx: clang++
-            compiler_c: clang
-          - os: macos-latest
             compiler_cxx: clang++
             compiler_c: clang
 
@@ -107,11 +104,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libc++-dev libc++abi-dev ninja-build libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxrandr-dev libxfixes-dev libudev-dev uuid-dev uuid-dev
 
-      # - name: Install dependencies (macOS)
-      #   if: runner.os == 'macOS'
-      #   run: |
-      #     brew install
-
       - name: Configure CMake
         run: |
           cmake -B build -G Ninja \
@@ -119,17 +111,12 @@ jobs:
             -DCMAKE_C_COMPILER="${{ matrix.compiler_c }}" \
             -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_TESTS=ON \
-            ${{ runner.os == 'Linux' && '-DCMAKE_CXX_FLAGS=-stdlib=libc++' || '' }} \
-            ${{ runner.os == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES=x86_64' || '' }}
+            ${{ runner.os == 'Linux' && '-DCMAKE_CXX_FLAGS=-stdlib=libc++' || '' }}
         shell: bash
 
       - name: Create shadPS4 user data directory (Linux)
         if: runner.os == 'Linux'
         run: mkdir -p ~/.local/share/shadPS4
-
-      - name: Create shadPS4 user data directory (macOS)
-        if: runner.os == 'macOS'
-        run: mkdir -p ~/Library/Application\ Support/shadPS4
 
       - name: Create shadPS4 user data directory (Windows)
         if: runner.os == 'Windows'
@@ -144,13 +131,23 @@ jobs:
         run: ctest --test-dir build --output-on-failure --progress -E 'GcnTest'
         shell: bash
 
+  # Combined single-file Windows build: clang-cl + Ninja, both cores .incbin-embedded
+  # into ONE self-contained shadps4.exe (static CRT, no sidecar DLLs). The dispatcher
+  # selects core_gr2 / core_main at runtime by the launched title id, same as Linux.
   windows-sdl:
-    runs-on: windows-2025-vs2026
+    runs-on: windows-latest
     needs: get-info
     steps:
     - uses: actions/checkout@v6
       with:
         submodules: recursive
+
+    # clang-cl needs the MSVC headers/libs (INCLUDE/LIB) on PATH; this also makes
+    # clang-cl available as the C/CXX *and* ASM compiler for the GAS-syntax .S stubs.
+    - name: Setup MSVC environment (Windows)
+      uses: egor-tensin/vs-shell@v2
+      with:
+        arch: x64
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5
@@ -174,72 +171,32 @@ jobs:
     - name: Print CPU Info
       run: bash -c "cat /proc/cpuinfo"
 
+    # COMBINED_EMBED_CORES=ON -> single self-contained exe; static CRT so the temp-
+    # extracted core needs no vcruntime DLL beside it; ASM pinned to clang-cl so the
+    # .incbin embed stub (and the cores' fiber/stack .s/.S) is NOT routed to MASM.
+    # IPO/LTO is intentionally left off here: it doubles for two ~100 MB cores and
+    # risks a CI OOM; re-enable once the artifact is known to fit.
     - name: Configure CMake
-      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_ASM_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
 
+    # Verify the single-file guarantee: the temp-extracted core must depend on only
+    # system DLLs. Informational (does not fail the build) -- the cores are built
+    # static, so this is the check most likely to reveal a stray external DLL dep.
+    - name: Verify core DLL self-containment (dumpbin /dependents)
+      continue-on-error: true
+      shell: cmd
+      run: |
+        if exist "${{github.workspace}}\build\libcore_gr2.dll" dumpbin /dependents "${{github.workspace}}\build\libcore_gr2.dll"
+        if exist "${{github.workspace}}\build\libcore_main.dll" dumpbin /dependents "${{github.workspace}}\build\libcore_main.dll"
+
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
       with:
-        name: shadps4-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
-        path: ${{github.workspace}}/build/shadPS4.exe
-
-  macos-sdl:
-    runs-on: macos-15
-    needs: get-info
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        submodules: recursive
-
-    - name: Setup latest Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: latest
-
-    - name: Cache CMake Configuration
-      uses: actions/cache@v5
-      env:
-          cache-name: ${{ runner.os }}-sdl-cache-cmake-configuration
-      with:
-          path: |
-            ${{github.workspace}}/build
-          key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
-          restore-keys: |
-            ${{ env.cache-name }}-
-
-    - name: Cache CMake Build
-      uses: hendrikmuhs/ccache-action@v1.2.21
-      env:
-          cache-name: ${{runner.os}}-sdl-cache-cmake-build
-      with:
-        append-timestamp: false
-        create-symlink: true
-        key: ${{env.cache-name}}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
-        variant: sccache
-
-    - name: Print CPU Info
-      run: sysctl hw machdep.cpu
-
-    - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
-
-    - name: Build
-      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(sysctl -n hw.ncpu)
-
-    - name: Package and Upload macOS SDL artifact
-      run: |
-        mkdir upload
-        mv ${{github.workspace}}/build/shadps4 upload
-        mv ${{github.workspace}}/build/libvulkan.dylib upload
-        mv ${{github.workspace}}/build/libvulkan_kosmickrisp.dylib upload
-        mv ${{github.workspace}}/build/kosmickrisp_mesa_icd.json upload
-    - uses: actions/upload-artifact@v7
-      with:
-        name: shadps4-macos-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
-        path: upload/
+        name: shadps4-combined-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
+        path: ${{github.workspace}}/build/shadps4.exe
 
   linux-sdl:
     runs-on: ubuntu-24.04
@@ -279,31 +236,45 @@ jobs:
     - name: Print CPU Info
       run: cat /proc/cpuinfo
 
+    # COMBINED_EMBED_CORES=ON -> ONE self-contained shadps4 ELF with both cores
+    # .incbin-embedded (gr2 + prerelease), runtime-selected by title id, exactly like
+    # the Windows build. On Linux gas handles .incbin natively, so no ASM-compiler pin
+    # is needed (that is a Windows/MASM-only concern). IPO/LTO is intentionally left
+    # OFF here: a monolithic LTO link of two ~100 MB cores can OOM a standard runner;
+    # re-enable on a larger runner once the artifact is known to fit. (build-appimage.sh
+    # below does its own thin-LTO build only under BUILD=1, which CI does not use.)
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
 
-    - name: Package and Upload Linux(ubuntu64) SDL artifact
+    # Confirm the embed build produced the single self-contained binary + the loose
+    # cores (the .incbin inputs, also the dep-collection inputs for build-appimage.sh).
+    - name: Verify combined embed build
       run: |
-        ls -la ${{ github.workspace }}/build/shadps4
+        ls -la ${{github.workspace}}/build/shadps4 ${{github.workspace}}/build/libcore_gr2.so ${{github.workspace}}/build/libcore_main.so
+        echo "shadps4 size: $(( $(stat -c%s ${{github.workspace}}/build/shadps4) / 1024 / 1024 )) MB (embed build is large; a tiny binary means a DEV build)"
 
+    # Upload the raw self-contained ELF (both cores baked in, no sidecars needed).
     - uses: actions/upload-artifact@v7
       with:
         name: shadps4-ubuntu64-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
-        path: ${{ github.workspace }}/build/shadps4
+        path: ${{github.workspace}}/build/shadps4
 
-    - name: Run AppImage packaging script
-      run:  ./.github/linux-appimage-sdl.sh
+    # Package an AppImage with the combined-aware script (NOT the old upstream
+    # linux-appimage-sdl.sh, which does a naive `linuxdeploy --executable` that cannot
+    # see the embedded cores' deps). BUILD_DIR points it at the already-built embed
+    # tree (no rebuild, no BUILD=1); it bundles SDL3/FFmpeg/OpenAL/etc. from the loose
+    # cores, drops the redundant cores, and writes a custom AppRun that exports
+    # LD_LIBRARY_PATH so the memfd-dlopened core resolves its bundled deps.
+    - name: Package AppImage (combined embed)
+      run: BUILD_DIR=${{github.workspace}}/build OUT=${{github.workspace}}/build/shadPS4-combined-x86_64.AppImage ./build-appimage.sh
 
-    - name: Package and Upload Linux SDL artifact
-      run: |
-        tar cf shadps4-linux-sdl.tar.gz -C ${{github.workspace}}/build shadps4
     - uses: actions/upload-artifact@v7
       with:
         name: shadps4-linux-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
-        path: Shadps4-sdl.AppImage
+        path: ${{github.workspace}}/build/shadPS4-combined-x86_64.AppImage
 
   linux-sdl-gcc:
     runs-on: ubuntu-24.04
@@ -338,15 +309,18 @@ jobs:
     - name: Print CPU Info
       run: cat /proc/cpuinfo
 
+    # Same combined single-file target as linux-sdl, built with GCC as a portability
+    # check (gas handles the .incbin embed stub natively). IPO/LTO off for the same
+    # two-core OOM reason. Compile-only: no artifact upload.
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
 
   pre-release:
     if: github.ref == 'refs/heads/main' && github.repository == 'shadps4-emu/shadPS4' && github.event_name == 'push'
-    needs: [get-info, windows-sdl, macos-sdl, linux-sdl]
+    needs: [get-info, windows-sdl, linux-sdl]
     runs-on: ubuntu-latest
     steps:
     - name: Download all artifacts
@@ -357,7 +331,6 @@ jobs:
     - name: Make SDL artifacts executable
       run: |
         chmod -R a+x ./artifacts/shadps4-linux-sdl-*
-        chmod -R a+x ./artifacts/shadps4-macos-sdl-*
 
     - name: Compress individual directories (without parent directory)
       run: |
@@ -398,7 +371,6 @@ jobs:
         ARTIFACTS_DIR=./artifacts
         REPO_WINDOWS="shadps4-emu/shadps4-binaries-Windows"
         REPO_LINUX="shadps4-emu/shadps4-binaries-Linux"
-        REPO_MAC="shadps4-emu/shadps4-binaries-Mac"
 
         for file in "$ARTIFACTS_DIR"/*.zip; do
           filename=$(basename "$file")
@@ -409,8 +381,6 @@ jobs:
             REPO=$REPO_WINDOWS
           elif [[ "$filename" == *"linux"* ]] || [[ "$filename" == *"ubuntu64"* ]]; then
             REPO=$REPO_LINUX
-          elif [[ "$filename" == *"macos"* ]]; then
-            REPO=$REPO_MAC
           fi
 
           # If REPO is empty, skip file

@@ -255,9 +255,14 @@ function(add_core)
         POSITION_INDEPENDENT_CODE ON)
 
     # Export ONLY core_entry; localize everything else (incl. statically linked
-    # externals' symbols) so two cores never interpose.
-    target_link_options(core_${name} PRIVATE
-        -Wl,--version-script=${CMAKE_SOURCE_DIR}/cmake/export.map)
+    # externals' symbols) so two cores never interpose. ELF-only: link.exe/lld-link
+    # ignore --version-script. On Windows a DLL exports nothing unless marked, so
+    # the __declspec(dllexport) on core_entry (dispatcher/core_entry.cpp) already
+    # makes it the SOLE export -- there is no flat global namespace to interpose in.
+    if(NOT WIN32)
+        target_link_options(core_${name} PRIVATE
+            -Wl,--version-script=${CMAKE_SOURCE_DIR}/cmake/export.map)
+    endif()
 
     # Retarget main() for THIS TU only (source stays byte-identical).
     set_source_files_properties(${src}/main.cpp
@@ -310,6 +315,18 @@ function(add_core)
         if(ENABLE_USERFAULTFD)
             target_compile_definitions(core_${name} PRIVATE ENABLE_USERFAULTFD)
         endif()
+    endif()
+    if(WIN32)
+        # Win32 system import libs the emulator's Windows code paths reference that
+        # are NOT already auto-linked via #pragma comment(lib, ...) -- dbghelp/psapi
+        # are pulled in that way by common/{crash_handler,hang_watchdog}.cpp. An
+        # unreferenced import lib costs nothing (no DLL is added to the import table
+        # unless a symbol is actually used), so over-listing here is harmless; tune
+        # the set against the first real link if a symbol is still undefined. SDL3
+        # and FFmpeg (built static, Workstream D) carry most of their own deps via
+        # INTERFACE link libraries.
+        target_link_libraries(core_${name} PRIVATE
+            ws2_32 iphlpapi winmm bcrypt userenv version)
     endif()
     if(ENABLE_DISCORD_RPC)
         target_compile_definitions(core_${name} PRIVATE ENABLE_DISCORD_RPC)

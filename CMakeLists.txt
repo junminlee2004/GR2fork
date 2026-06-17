@@ -31,6 +31,16 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Windows: the .incbin embed stub AND the cores' GAS-syntax fiber/stack .s/.S must
+# be assembled by clang's integrated assembler, NOT MASM -- ml64 has no .incbin and
+# cannot parse AT&T syntax. CMake defaults the plain ASM language to MASM on Windows,
+# so pin the ASM compiler to clang-cl BEFORE project() enables ASM. Guard with
+# CMAKE_HOST_WIN32 (the only platform var available this early) and honor an explicit
+# -DCMAKE_ASM_COMPILER override (the CI passes one).
+if(CMAKE_HOST_WIN32 AND NOT DEFINED CMAKE_ASM_COMPILER)
+    set(CMAKE_ASM_COMPILER clang-cl)
+endif()
+
 project(shadPS4_combined CXX C ASM)
 
 option(ENABLE_DISCORD_RPC     "Enable the Discord RPC integration" ON)
@@ -60,6 +70,26 @@ endif()
 # --- PIE: keep the base address high so it doesn't clash with PS4 guest memory.
 if(UNIX AND NOT APPLE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# --- Windows single-file self-containment. The chosen core DLL is extracted to
+#     %TEMP% with NO sidecar beside it, so it must carry all its deps -- exactly
+#     like the Linux .so statically links externals. Both knobs are set here,
+#     before any target (and before add_subdirectory(externals)), so they seed the
+#     externals and the cores:
+#       * static CRT (/MT) -> no vcruntime/msvcp DLLs needed beside the temp core.
+#         Seeds each target's MSVC_RUNTIME_LIBRARY (CMP0091 is NEW; we require >= 3.24).
+#       * BUILD_SHARED_LIBS OFF -> externals build as static libs baked into the core,
+#         not separate DLLs. (This only affects externals that don't force their own
+#         type; the cores stay SHARED via their explicit add_library(... SHARED ...),
+#         and matches upstream's lone-shadPS4.exe Windows artifact.)
+#     Two static CRTs across the core_entry boundary is safe: only int/char** cross
+#     it (raw pointers the core never frees with the dispatcher's CRT), the same
+#     isolation the Linux RTLD_LOCAL dlopen boundary already relies on. Verify with
+#     `dumpbin /dependents libcore_gr2.dll` -> only system DLLs (kernel32, user32, …).
+if(WIN32)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set(BUILD_SHARED_LIBS OFF)
 endif()
 
 # --- Architecture variable that externals (ffmpeg-core, …) read. The trees set
@@ -213,14 +243,30 @@ add_core(
 add_executable(shadps4 dispatcher/main.cpp dispatcher/core_loader.cpp)
 target_link_libraries(shadps4 PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(shadps4 PROPERTIES OUTPUT_NAME shadps4)
+if(WIN32)
+    # std::getenv in dispatcher/main.cpp trips MSVC's "deprecated" CRT warning; it
+    # is the standard, correct call -- silence it. ${CMAKE_DL_LIBS} is empty on
+    # Windows (LoadLibrary lives in kernel32, always linked), so the line above is a
+    # harmless no-op there. A target with main() defaults to the console subsystem,
+    # which is what the dispatcher's stderr diagnostics want.
+    target_compile_definitions(shadps4 PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 
 if(COMBINED_EMBED_CORES)
     # Release: bake both .so into the dispatcher. file(GENERATE) resolves the
     # $<TARGET_FILE:...> genexes in the .S template to the real built paths.
     set(_embed_s ${CMAKE_BINARY_DIR}/embed_cores.generated.S)
+    # COFF (Windows) and ELF (Linux) need different read-only sections and the ELF
+    # build has a .note.GNU-stack line COFF rejects, so pick the matching template.
+    # Both resolve the same $<TARGET_FILE:core_*> genexes (to .dll vs .so paths).
+    if(WIN32)
+        set(_embed_in ${COMBINED_CMAKE}/embed_cores_win.S.in)
+    else()
+        set(_embed_in ${COMBINED_CMAKE}/embed_cores.S.in)
+    endif()
     file(GENERATE
         OUTPUT ${_embed_s}
-        INPUT  ${COMBINED_CMAKE}/embed_cores.S.in)
+        INPUT  ${_embed_in})
     set_source_files_properties(${_embed_s} PROPERTIES GENERATED ON LANGUAGE ASM)
     target_sources(shadps4 PRIVATE ${_embed_s})
     target_compile_definitions(shadps4 PRIVATE COMBINED_EMBED_CORES)
