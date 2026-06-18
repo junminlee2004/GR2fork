@@ -110,36 +110,48 @@ function(combine_imgui_fonts name src out_var)
     set(${out_var} ${gen} PARENT_SCOPE)
 endfunction()
 
-# embedded resources (cmrc): match the tree's EXPLICIT 14-file set per-tree,
-# without pulling in the ~40 Qt-launcher icons that also live in images/.
+# embedded resources (cmrc): match the tree's EXPLICIT per-tree resource set, without
+# pulling in the ~40 Qt-launcher icons that also live alongside them.
 #   - The 4 trophy-tier pngs + trophy.wav are opened via a CONSTRUCTED alias
-#     ("src/images/" + tier + ".png"), so they are NOT greppable -> include the
-#     known set when present.
+#     ("src/<dir>/" + tier + ".png"), so they are NOT greppable -> include the known
+#     set when present.
 #   - Everything else the core embeds (shadps4.png, big_picture/*) is opened as a
-#     STRING LITERAL, so derive those from the source's "src/images/…" literals.
-# Result: prerelease -> exactly its 14; gr2 (v0.13.0) -> exactly its 5. The source
-# hardcodes the alias "src/images/…", so cmrc is given WHENCE=<src>/images +
-# PREFIX=src/images -> the alias reads src/images/… for BOTH cores regardless of
-# the folder name (gr2's folder is src-gr2).
+#     STRING LITERAL, so derive those from the source's "src/<dir>/…" literals.
+#
+# RESOURCE-DIR SPLIT: upstream #4590 ("Clean up resource files") renamed src/images ->
+# src/resources. core_main, once synced past that commit, uses resources/ and opens
+# "src/resources/…"; older trees (core_gr2, v0.13.0) still use images/ and open
+# "src/images/…". Detect which THIS tree uses so BOTH the WHENCE dir and the cmrc alias
+# PREFIX match what the source actually opens. The source hardcodes "src/<dir>/…" (the
+# literal "src/", not the folder name), so the alias reads "src/resources/…" or
+# "src/images/…" for either core regardless of the on-disk folder (src vs src-gr2).
+# When core_gr2 is eventually synced past #4590 too, the resources/ dir appears and this
+# switches over automatically -- no edit needed.
 function(combine_resources name src)
-    set(imgdir ${src}/images)
+    if(EXISTS ${src}/resources)
+        set(resdir    ${src}/resources)
+        set(resprefix src/resources)
+    else()
+        set(resdir    ${src}/images)
+        set(resprefix src/images)
+    endif()
     set(cmrc_rel "")
 
     # (1) dynamically-opened, not greppable: include the known trophy set if present
     foreach(f trophy.wav bronze.png gold.png platinum.png silver.png)
-        if(EXISTS ${imgdir}/${f})
+        if(EXISTS ${resdir}/${f})
             list(APPEND cmrc_rel ${f})
         endif()
     endforeach()
 
-    # (2) literal-opened: derive from the source's "src/images/…" string literals
+    # (2) literal-opened: derive from the source's "src/(images|resources)/…" literals
     execute_process(
-        COMMAND grep -rhoE "\"src/images/[^\"]+\"" ${src}
+        COMMAND grep -rhoE "\"src/(images|resources)/[^\"]+\"" ${src}
         OUTPUT_VARIABLE _grep_out ERROR_QUIET)
-    string(REGEX MATCHALL "src/images/[^\"]+" _aliases "${_grep_out}")
+    string(REGEX MATCHALL "src/(images|resources)/[^\"]+" _aliases "${_grep_out}")
     foreach(a IN LISTS _aliases)
-        string(REPLACE "src/images/" "" rel "${a}")
-        if(EXISTS ${imgdir}/${rel})
+        string(REGEX REPLACE "^src/(images|resources)/" "" rel "${a}")
+        if(EXISTS ${resdir}/${rel})
             list(APPEND cmrc_rel ${rel})
         endif()
     endforeach()
@@ -147,18 +159,18 @@ function(combine_resources name src)
     list(REMOVE_DUPLICATES cmrc_rel)
     set(res_files "")
     foreach(rel IN LISTS cmrc_rel)
-        list(APPEND res_files ${imgdir}/${rel})
+        list(APPEND res_files ${resdir}/${rel})
     endforeach()
 
     list(LENGTH res_files _n)
-    message(STATUS "core_${name}: embedding ${_n} cmrc resource(s) from ${imgdir}")
+    message(STATUS "core_${name}: embedding ${_n} cmrc resource(s) from ${resdir} (alias ${resprefix}/…)")
 
     cmrc_add_resource_library(embedded_resources_${name}
         ALIAS res_${name}::embedded
         NAMESPACE res)
     cmrc_add_resources(embedded_resources_${name}
-        WHENCE ${imgdir}
-        PREFIX src/images
+        WHENCE ${resdir}
+        PREFIX ${resprefix}
         ${res_files})
 endfunction()
 
