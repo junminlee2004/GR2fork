@@ -44,10 +44,10 @@ public:
     // HANDOFF §9: PM4-parser → assembler queue depth. The first queue is
     // deepest because PM4 packets can burst (CE writes hundreds of regs between
     // draws). The same binary runs Gravity Rush 2 (and every other title) as
-    // well as Gravity Rush Remastered and inFAMOUS Second Son; GRR uses a
-    // shallower 32-slot queue, inFAMOUS Second Son a much deeper one, and every
-    // other title uses 256. The active depth is selected once at construction
-    // from the boot-time title detection (Config::isInfamousSecondSon() /
+    // well as Gravity Rush Remastered and inFAMOUS Second Son; GRR and every
+    // other non-ISS title use a 256-slot queue, while inFAMOUS Second Son uses a
+    // much deeper one. The active depth is selected once at construction from
+    // the boot-time title detection (Config::isInfamousSecondSon() /
     // Config::isGravityRushRemastered()); see ActiveQueueSize().
     //
     // SIZED FROM MEASUREMENT: a 65536-slot measurement run reported a true peak
@@ -58,7 +58,7 @@ public:
     // If a heavier scene ever overflows 4096, the producer ASSERT will name the
     // new cap; re-run oversized to re-measure and bump to the next power of two.
     static constexpr u32 kQueueSizeDefault = 256;
-    static constexpr u32 kQueueSizeGrr = 32;
+    static constexpr u32 kQueueSizeGrr = 256;
     static constexpr u32 kQueueSizeIss = 4096;
     static_assert((kQueueSizeDefault & (kQueueSizeDefault - 1)) == 0,
                   "kQueueSizeDefault must be a power of two");
@@ -201,8 +201,8 @@ private:
     const u32 queue_mask_;
 
     // SPSC ring storage. Heap-allocated (queue_size_ × 64 B/intent: 16 KiB at
-    // the 256-slot default, 2 KiB on GRR's 32-slot queue) to keep the
-    // BundleAssembler value type small and to ensure cache-line alignment of
+    // the 256-slot default and on GRR, 256 KiB on ISS's 4096-slot queue) to keep
+    // the BundleAssembler value type small and to ensure cache-line alignment of
     // the slot array regardless of where the BundleAssembler itself sits in
     // memory.
     std::unique_ptr<DrawIntent[]> queue_;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// LiverpoolRegsSnapshotPool — 16-slot ring of LiverpoolRegsSnapshot.
+// LiverpoolRegsSnapshotPool — SPSC ring of LiverpoolRegsSnapshot (per-title depth).
 //
 // Turn 1 of the GpuComm 4-stage pipeline split (HANDOFF Section 5 + 16).
 // INERT this turn — built and linked, but no call site yet.
@@ -19,8 +19,9 @@
 // next-but-15 intent is captured. If that invariant breaks, Capture() will
 // stall with kPoolFull spin (visible in profiler as a hot std::this_thread::yield).
 //
-// Pool size is 16 — covers the queue depth between Stage 1 and the slowest
-// downstream consumer with margin for spikes (HANDOFF §4 Barrier 1).
+// Pool depth is per-title (64 default, 128 on GRR) — covers the queue depth
+// between Stage 1 and the slowest downstream consumer with margin for spikes
+// (HANDOFF §4 Barrier 1).
 
 #pragma once
 
@@ -36,20 +37,27 @@ union Regs;
 class LiverpoolRegsSnapshotPool {
 public:
     // Snapshot-pool ring depth. The same emulator binary runs Gravity Rush 2
-    // (and every other title) as well as Gravity Rush Remastered; GRR runs a
-    // shallower 16-slot ring while every other title uses 64. The active depth
-    // is selected once at construction from the boot-time title detection
+    // (and every other title) as well as Gravity Rush Remastered; GRR uses a
+    // 128-slot ring while every other title uses 64. The active depth is
+    // selected once at construction from the boot-time title detection
     // (Config::isGravityRushRemastered()); see ActiveNumSlots(). Storage below
-    // is sized to the larger (default) depth; a GRR session uses only the first
-    // kNumSlotsGrr entries via slot_mask_.
+    // is sized to kNumSlotsStorage (the larger of the two depths); any session
+    // uses only the first ActiveNumSlots() entries via slot_mask_.
     static constexpr u32 kNumSlotsDefault = 64;
-    static constexpr u32 kNumSlotsGrr = 16;
+    static constexpr u32 kNumSlotsGrr = 128;
+
+    // Storage is sized to the LARGEST active depth across configurations (see
+    // slots_ below); a session indexes only the first ActiveNumSlots() entries
+    // via slot_mask_. With GRR now deeper than the default this is kNumSlotsGrr.
+    static constexpr u32 kNumSlotsStorage =
+        kNumSlotsGrr > kNumSlotsDefault ? kNumSlotsGrr : kNumSlotsDefault;
+
     static_assert((kNumSlotsDefault & (kNumSlotsDefault - 1)) == 0,
                   "kNumSlotsDefault must be a power of two");
     static_assert((kNumSlotsGrr & (kNumSlotsGrr - 1)) == 0,
                   "kNumSlotsGrr must be a power of two");
-    static_assert(kNumSlotsGrr <= kNumSlotsDefault,
-                  "storage is sized to kNumSlotsDefault; GRR depth must not exceed it");
+    static_assert(kNumSlotsGrr <= kNumSlotsStorage && kNumSlotsDefault <= kNumSlotsStorage,
+                  "snapshot storage must cover every configuration's active depth");
 
     // Active ring depth for this session: kNumSlotsGrr on Remastered, else
     // kNumSlotsDefault. Static so telemetry (Rasterizer::LogHwm) can report the
@@ -117,9 +125,9 @@ private:
 
     // Storage. Aligned to a cache line so the first slot starts on a cache-line
     // boundary (each slot already spans many lines, so adjacent slots can't
-    // false-share). Sized to kNumSlotsDefault, the maximum across
-    // configurations; a GRR session uses only the first kNumSlotsGrr entries.
-    alignas(64) std::array<LiverpoolRegsSnapshot, kNumSlotsDefault> slots_;
+    // false-share). Sized to kNumSlotsStorage, the maximum active depth across
+    // configurations; any session uses only the first ActiveNumSlots() entries.
+    alignas(64) std::array<LiverpoolRegsSnapshot, kNumSlotsStorage> slots_;
 
     // Producer cursor (next-to-write). Wraps past UINT32_MAX naturally.
     alignas(64) std::atomic<u32> head_;

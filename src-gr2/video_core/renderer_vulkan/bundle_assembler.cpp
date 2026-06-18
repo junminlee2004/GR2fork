@@ -48,8 +48,8 @@ BundleAssembler::BundleAssembler(Rasterizer& rasterizer,
                  "NO GpuAssembler jthread — GpuComm records inline; assembler "
                  "core returned to guest)",
                  queue_size_,
-                 queue_size_ == kQueueSizeGrr ? "GR-Remastered"
-                     : (queue_size_ == kQueueSizeIss ? "Infamous-Second-Son" : "default"),
+                 Config::isInfamousSecondSon() ? "Infamous-Second-Son"
+                     : (Config::isGravityRushRemastered() ? "GR-Remastered" : "default"),
                  sizeof(DrawIntent));
         return;
     }
@@ -63,8 +63,8 @@ BundleAssembler::BundleAssembler(Rasterizer& rasterizer,
              "(queue={} slots [{}], intent_size={}B, dedicated jthread, "
              "primary-CB direct recording — no recorder, no secondaries)",
              queue_size_,
-             queue_size_ == kQueueSizeGrr ? "GR-Remastered"
-                 : (queue_size_ == kQueueSizeIss ? "Infamous-Second-Son" : "default"),
+             Config::isInfamousSecondSon() ? "Infamous-Second-Son"
+                 : (Config::isGravityRushRemastered() ? "GR-Remastered" : "default"),
              sizeof(DrawIntent));
     thread_ = std::jthread([this](std::stop_token stop) noexcept {
         DrainLoop(stop);

@@ -60,7 +60,7 @@ static constexpr std::array<u64, 5> kGrrSunWorldShaders = {
 // texture (fs_img16, the 480x270 blur) is multiplied per-channel by CB#0 dwords 8/9/10 and then
 // added to the scene; dword 11 is an extra depth-gated bloom boost (applied where depth > 0.5).
 // Scaling 8/9/10 together scales overall bloom while preserving its tint. 1.0 == stock.
-static constexpr f32 kGrrBloomScale = 1.0f;
+static constexpr f32 kGrrBloomScale = 0.6f;
 
 // [GR2FORK] Highlight shaping in the composite's tonemap (extended Reinhard:
 //   _274 = (1 + L*data[15]) / (1 + L), with a highlight rolloff _301 = data[12] + brightness).
@@ -245,7 +245,7 @@ struct Gr2FragHarness {
     bool active = false;                            // GRR serial matched
     u32 rt = 0;                                     // target render-target index
     f32 warmth = 0.00f;                             // full-screen tint on the composite, [-1, 1]
-    f32 contrast = 1.02f;                            // GR2_CONTRAST: full-screen contrast about 0.5 on the composite
+    f32 contrast = 1.015f;                            // GR2_CONTRAST: full-screen contrast about 0.5 on the composite
     f32 sky_warmth = 0.00f;                         // GR2_SKY_WARMTH: warm/cool tint on the skybox, [-1, 1]
     f32 sky_bright = 0.70f;                          // GR2_SKY_BRIGHTNESS: uniform brightness on the skybox
     f32 cloud_bright = 1.50f;                        // GR2_CLOUD_BRIGHTNESS: uniform brightness on the clouds
