@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-support me here: https://gofund.me/3340f1576
+Support My Project Here for Restored Online in the Future: https://gofund.me/3340f1576
 
 <h1 align="center">
   <br>
