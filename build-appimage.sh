@@ -24,7 +24,15 @@ REPO="${REPO:-$PWD}"
 BUILD_DIR="${BUILD_DIR:-$REPO/build_opt}"
 APPDIR="${APPDIR:-$REPO/AppDir}"
 OUT="${OUT:-$REPO/shadPS4-combined-x86_64.AppImage}"
-ICON_SRC="${ICON_SRC:-$REPO/src/images/shadps4.png}"
+# App icon: core_main's icon moved src/images -> src/resources upstream (#4590); older
+# trees (core_gr2) still use images/. Honor an explicit ICON_SRC, else auto-detect so a
+# directory rename can't silently drop us to the 1x1 placeholder.
+if [[ -z "${ICON_SRC:-}" ]]; then
+    for _ic in "$REPO/src/resources/shadps4.png" "$REPO/src/images/shadps4.png" "$REPO/src-gr2/images/shadps4.png"; do
+        [[ -f "$_ic" ]] && { ICON_SRC="$_ic"; break; }
+    done
+    ICON_SRC="${ICON_SRC:-$REPO/src/resources/shadps4.png}"
+fi
 MARCH="${MARCH:-znver4}"
 JOBS="$(nproc)"
 
