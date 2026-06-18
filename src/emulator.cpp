@@ -410,17 +410,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string remote_host = Common::GetRemoteNameFromLink();
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2fork v4.9 - shadPS4 v{} | {}", Common::g_version, game_title);
+            window_title = fmt::format("shadPS4 v{} | {}", Common::g_version, game_title);
         } else {
             window_title =
-                fmt::format("Junmin Lee GR2fork v4.9 - shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
+                fmt::format("shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2fork v4.9 - shadPS4 v{} {} {} | {}", Common::g_version,
+            window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2fork v4.9 - shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
+            window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
@@ -431,9 +431,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     g_window = window.get();
 
     std::filesystem::path icon_path = mnt->GetHostPath("/app0/sce_sys/icon0.png");
-    if (std::filesystem::exists(icon_path)) {
-        window->SetIcon(icon_path);
-    }
+    window->SetIcon(icon_path);
 
     const auto& mount_data_dir = Common::FS::GetUserPath(Common::FS::PathType::GameDataDir);
     mnt->Mount(mount_data_dir, "/data");
