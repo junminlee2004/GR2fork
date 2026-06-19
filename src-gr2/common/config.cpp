@@ -243,6 +243,7 @@ static ConfigEntry<int> gameplaySyncBudgetMs(50);
 static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<string> resolutionPatchGroups("recommended");
+static ConfigEntry<string> resolutionPatchGroupsGrr("recommended");
 
 // Vulkan
 static ConfigEntry<s32> gpuId(-1);
@@ -1316,6 +1317,14 @@ void setResolutionPatchGroups(const std::string& value, bool is_game_specific) {
     resolutionPatchGroups.set(value, is_game_specific);
 }
 
+std::string getResolutionPatchGroupsGrr() {
+    return resolutionPatchGroupsGrr.get();
+}
+
+void setResolutionPatchGroupsGrr(const std::string& value, bool is_game_specific) {
+    resolutionPatchGroupsGrr.set(value, is_game_specific);
+}
+
 int getUsbDeviceBackend() {
     return usbDeviceBackend.get();
 }
@@ -1423,6 +1432,7 @@ static void loadFromToml(const std::filesystem::path& path, bool is_game_specifi
         aspectRatioOverride.setFromToml(gpu, "aspectRatioOverride", is_game_specific);
         resolutionOverride.setFromToml(gpu, "resolutionOverride", is_game_specific);
         resolutionPatchGroups.setFromToml(gpu, "resolutionPatchGroups", is_game_specific);
+        resolutionPatchGroupsGrr.setFromToml(gpu, "resolutionPatchGroupsGrr", is_game_specific);
         gr2FixNativeCubeViewsEnable.setFromToml(gpu, "gr2FixNativeCubeViews", is_game_specific);
     }
 
@@ -1699,6 +1709,7 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         aspectRatioOverride.setFromJson(g, "aspectRatioOverride", is_game_specific);
         resolutionOverride.setFromJson(g, "resolutionOverride", is_game_specific);
         resolutionPatchGroups.setFromJson(g, "resolutionPatchGroups", is_game_specific);
+        resolutionPatchGroupsGrr.setFromJson(g, "resolutionPatchGroupsGrr", is_game_specific);
         gr2FixNativeCubeViewsEnable.setFromJson(g, "gr2FixNativeCubeViews", is_game_specific);
         vkForcePushDescriptors.setFromJson(g, "vkForcePushDescriptors", is_game_specific);
         vkDisablePushDescriptors.setFromJson(g, "vkDisablePushDescriptors", is_game_specific);
@@ -1855,6 +1866,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     aspectRatioOverride.setJsonValue(data, "GR2Fork", "aspectRatioOverride", is_game_specific);
     resolutionOverride.setJsonValue(data, "GR2Fork", "resolutionOverride", is_game_specific);
     resolutionPatchGroups.setJsonValue(data, "GR2Fork", "resolutionPatchGroups", is_game_specific);
+    resolutionPatchGroupsGrr.setJsonValue(data, "GR2Fork", "resolutionPatchGroupsGrr",
+                                          is_game_specific);
     gr2FixNativeCubeViewsEnable.setJsonValue(data, "GR2Fork", "gr2FixNativeCubeViews",
                                              is_game_specific);
     vkForcePushDescriptors.setJsonValue(data, "GR2Fork", "vkForcePushDescriptors", is_game_specific);
@@ -2010,6 +2023,7 @@ void setDefaultValues(bool is_game_specific) {
     aspectRatioOverride.set("16:9", is_game_specific);
     resolutionOverride.set("Off", is_game_specific);
     resolutionPatchGroups.set("recommended", is_game_specific);
+    resolutionPatchGroupsGrr.set("recommended", is_game_specific);
 
     // gr2fork: v4.4 -> v4.5 toggles. Reset-to-default means EVERY optimization
     // and fix is re-enabled and the GCN compat master is off. Polaris users

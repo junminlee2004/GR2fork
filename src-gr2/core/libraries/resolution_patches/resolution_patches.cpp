@@ -10,7 +10,9 @@
 #include <string>
 #include <string_view>
 
+#include "common/config.h"
 #include "common/logging/log.h"
+#include "common/types.h"
 #include "core/libraries/resolution_patches/resolution_patches.h"
 
 namespace Libraries::ResolutionPatches {
@@ -1459,6 +1461,572 @@ bool MatchGroupName(std::string_view tok, Group& out) {
     return false;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Gravity Rush Remastered (GRR) resolution patches
+// ════════════════════════════════════════════════════════════════════════
+//
+// GRR's render-target dimension family is structurally DIFFERENT from GR2's:
+//
+//   * Main RT  = 1920 x 1088   1080 padded UP to the 64-texel tile
+//                              alignment (1088 = 17 x 64). NO (1/W,1/H)
+//                              reciprocal rodata, NO 540.0f, and NO integer
+//                              (1920,1080) struct init like GR2's B1.
+//   * Half     =  960 x  544   (main / 2)
+//   * Quarter  =  480 x  272   (main / 4)
+//
+// The render-target HEIGHT is ALWAYS aligned up to a multiple of 64. The
+// encoders below compute the final (W, H) the same way the GR2 path does
+// (ComposeFinalImpl = pixel density x aspect), then align the height up:
+//
+//   align64(h) = ((h + 63) / 64) * 64
+//     1080 -> 1088    1440 -> 1472    2160 -> 2176
+//      720 ->  768     900 ->  960     540 ->  576
+//
+// All sites verified against the GRR eboot. Idempotent at native: at 1080p
+// the encoders reproduce 1920 / 1088 / 960 / 544 / 480 / 272 exactly, which
+// matches the stock bytes byte-for-byte.
+
+constexpr std::uint32_t Align64(std::uint32_t v) {
+    return ((v + 63u) / 64u) * 64u;
+}
+
+// GRR dimension Kinds. "W" is the composed final width; "Halign" is the
+// 64-aligned final height. Half/Quarter are computed in float so a non-16:9
+// aspect can never produce an integer-parity surprise.
+enum class GrrKind {
+    W_f,             // final_W                  (stock 1920.0f)
+    Halign_f,        // align64(final_H)         (stock 1088.0f)
+    HalfW_f,         // final_W / 2              (stock  960.0f)
+    HalfHalign_f,    // align64(final_H) / 2     (stock  544.0f)
+    QuarterW_f,      // final_W / 4              (stock  480.0f)
+    QuarterHalign_f, // align64(final_H) / 4     (stock  272.0f)
+    Hexact_f,        // final_H (NOT aligned)    (stock 1080.0f) — C1 only
+    // Integer register-immediate render-target dimensions (groups S1..S4).
+    // These are `mov r32, imm32` operands feeding the RT allocator at
+    // 0x223e0 / wrapper 0x1cac0, NOT rodata floats. Width and pitch encode
+    // final_W; height encodes the EXACT final_H (the allocator tile-aligns
+    // internally, so the logical height is passed unaligned — stock is 1080,
+    // not the 1088 used by the R1 float family).
+    W_u32,           // final_W (also pitch=W)   (stock 1920 = 80 07 00 00)
+    H_u32,           // final_H exact            (stock 1080 = 38 04 00 00)
+    // Half-resolution integer RT dims (groups S5..S6 — post-process buffers
+    // created at half the scene resolution via the same wrapper 0x1cac0).
+    HalfW_u32,       // final_W / 2 (also pitch) (stock  960 = c0 03 00 00)
+    HalfH_u32,       // final_H / 2 exact        (stock  540 = 1c 02 00 00)
+    HalfHalign_u32,  // align64(final_H) / 2     (stock  544 = 20 02 00 00)
+};
+
+// GRR patch groups. Their own bit-space, fully independent of the GR2
+// PatchGroupBit enum.
+enum class GrrGroup : std::uint8_t {
+    R1 = 0,  // MAIN RT dimension array — the GRR analog of GR2's B1. 28 sites
+             // (14 W/H pairs) of `mov dword ptr [rcx+disp], imm32` in the
+             // descriptor-array init fn @ 0x1ebfac. Highest confidence; the
+             // working main lever. IN `recommended`.
+    U1,      // Half/quarter UI float cluster @ 0x105f440..0x105f4cc. 24 rodata
+             // floats (960/544/480/272). Lower confidence (UI sub-RT scale);
+             // OPT-IN — off in `recommended`. For RenderDoc bisection.
+    C1,      // Reference-resolution table @ 0x104cd10 / 0x104cd14
+             // (1920.0f / 1080.0f EXACT — note 1080, not 1088). Sits inside a
+             // camera/effect config table (neighbours -0.7222, 4.8, -2.72,
+             // 0.75 ...) and may be a divisor → could corrupt. OPT-IN — off
+             // in `recommended`.
+    // ── Scene render-target ALLOCATION groups (added 2026-06-17) ───────────
+    // R1/U1/C1 were confirmed in-game to move only the UI (even with `all`).
+    // The actual 3D scene targets are created by the RT allocator at
+    // 0x223e0 and its wrapper 0x1cac0, with integer (W,H) passed in
+    // registers. These groups patch those register-immediates. ALL are
+    // OPT-IN and currently UNVERIFIED: enable ONE at a time (e.g.
+    // resolutionPatchGroupsGrr = "recommended,s2") and check in-game whether
+    // the 3D scene resolution changes and whether anything corrupts. Scaling
+    // an RT without its companion viewport/scissor can clip the image — that
+    // is exactly what the per-group bisection is meant to isolate. They ARE
+    // included in `all` (so `all` now attempts real scene-res scaling), but
+    // NOT in `recommended` (which stays the clean UI-only set).
+    S1,      // 3-RT MRT set (pixel-format 4) created together in the init fn
+             // at 0x1c440 — sequential object slots [ctx+0x188/0x218/0x2a8],
+             // each cleared to 0xffff00ff. Strongest candidate for the main
+             // scene colour / G-buffer set. 6 sites: 3× W (r8d) + 3× H (r9d).
+    S2,      // Single RT, pixel-format 9 (likely an HDR/float scene buffer),
+             // created via wrapper 0x1cac0 @ 0x2fb3a. 3 sites: W (ecx),
+             // H (r8d), pitch (r9d).
+    S3,      // Single RT, pixel-format 2, via 0x1cac0 @ 0x6ed3f. 3 sites:
+             // W (ecx), H (r8d), pitch (r9d).
+    S4,      // Single RT, pixel-format 0xA, via 0x1cac0 @ 0x256d76. 3 sites:
+             // W (ecx), H (r8d), pitch (r9d).
+    // ── Half-resolution post-process RTs (added 2026-06-18) ────────────────
+    // Found by enumerating every call to the RT wrapper (loaded 0x153b0):
+    // alongside the full-res scene RTs there are buffers created at HALF the
+    // scene resolution (960x540 / 960x544) — bloom/DOF/SSAO-class targets.
+    // They scale with the scene; left unscaled they end up mismatched against
+    // a scaled main RT. OPT-IN, included in `all`. (NOTE: many OTHER RTs are
+    // created with dimensions read at runtime from a render-config struct —
+    // word[ctx+0xf984]/[+0xf9e4] — and have NO patchable immediate; those are
+    // not covered here. If the main 3D scene still doesn't scale with S1..S6,
+    // the scene RT is one of those dynamic ones and needs a runtime hook.)
+    S5,      // Half-res RT, pixel-format 9 (likely half-res HDR/bloom), via
+             // 0x153b0. 3 sites: W (ecx 960), H (r8d 540 = exact half), pitch
+             // (r9d 960).
+    S6,      // Half-res RT, pixel-format 11, via 0x153b0. 3 sites: W (ecx 960),
+             // H (r8d 544 = align64(1080)/2), pitch (r9d 960).
+    // ── Group S7: SECOND-allocator scene RT (the GR2 "H group" analog) ──────
+    // The 0x153b0/0x1acd0 allocator (S1-S6) is NOT the only RT-creation path.
+    // A parallel family of registration wrappers (0x161b0 etc.) feeds a SECOND
+    // low-level allocator 0x1aea0 that uses a DIFFERENT surface-size routine
+    // (0x4850e0, not the 0x4820e0 every other RT goes through) — which is why
+    // it was missed by a 0x4820e0-based enumeration. Enumerating that family,
+    // exactly one resolution-class RT is created through it: fmt 2 at 1920x1080
+    // (the others are 2048x2048 shadow/cube maps). Left unscaled, this buffer
+    // renders at 1080p while the S1-S6 scene RTs render at 4K — the classic
+    // desync that corrupts the 3D image (mirrors GR2, where the H group was the
+    // separate registration path that had to be scaled in lockstep with the
+    // main RT chain). 2 sites: W (ecx 1920), H (r8d 1080). No pitch (r9d=flag).
+    S7,
+    // ── Group T1: comic-panel text-cull NEUTRALIZER (added 2026-06-18) ──────
+    // NOT a dimension group — a raw GCN-bytecode patch class (see
+    // kGrrBytePatchSites below). After the scene RTs are scaled to 4K (S1-S7)
+    // the two ComicDemo *Scissor* fragment shaders cull ALL their text: each
+    // carries a per-fragment "survivor" exec-mask narrowed by a scissor test
+    // whose bounds are loaded from a resolution-derived const buffer. At the
+    // scaled resolution those bounds go wrong, the mask empties, and the
+    // challenge-mission menu text (and any comic text routed through these
+    // shaders) disappears entirely. T1 neutralizes the narrowing by turning
+    // each `s_andn2_b64 sN,sN,vcc` (survivor &= ~scissor_fail) into
+    // `s_and_b64 sN,sN,sN` (survivor unchanged; SCC=1 so the s_cbranch_scc0
+    // early-outs never fire and the final `s_mov exec,sN` restores the entry
+    // mask) — the export then runs under the full entry mask, exactly like the
+    // non-scissor ComicDemoText_fso. 6 sites (2 in ComicDemoTextScissor_fso,
+    // 4 in ComicDemoTextMaskedScissor_fso).
+    //
+    // SIDE-EFFECT: this removes scissor clipping for EVERY draw through those
+    // two shaders, so comic text in normal (non-bugged) cutscenes loses its
+    // panel-edge clip and can overflow. It is the explicitly-requested "nop the
+    // text culling" fix and is fully reversible with `~t1`. The clipping-
+    // preserving alternative (fix the CPU-side resolution-derived scissor-rect
+    // computation to be scale-aware) has not been located. IN `recommended`
+    // and `all` so the text is visible by default; use `safe`/`min` for the
+    // pure R1-only set without it, or `~t1` to drop it from any set.
+    // ★ OBSOLETE (2026-06-19): superseded by FragCoordResolutionScalePass —
+    // excluded from every preset; reachable only via the explicit `t1` token.
+    T1,
+    // ── Group T2: comic FrameParam canvas fake -> 1080p (added 2026-06-18) ──
+    // NOT a dimension group — a fixed-byte in-place rewrite (see
+    // kGrrBlobPatchSites). The ComicDemo renderer lays out its 2D content
+    // against a "current canvas" rect read from a comic-private, triple-
+    // buffered frame-rect ring (reader fn @ loaded VA 0x67150, whose ONLY
+    // caller is the comic FrameParam upload at 0xEBBD0E). The ring's two size
+    // components hold the canvas HALF-dims; the comic doubles them and uploads
+    // them as u_v4FrameParam (the textbox / frame-layout rect). The ring's
+    // baked default is 960.0f/544.0f (-> 1920x1088 = native 1080p), but when
+    // the scene RTs are scaled (S1-S7) a per-frame "custom canvas" path repopu-
+    // lates the ring with the SCALED RT dims, so the comic's frame rect tracks
+    // the 4K/720p surface and the textbox content overflows / shrinks.
+    //
+    // T2 pins the two size components the reader returns to the baked 960.0f/
+    // 544.0f (it rewrites the two 17-byte `lea;vmovss[ring];vmovss[*out]`
+    // blocks in 0x67150 to `mov dword[*out], <imm>` + NOP padding), so the
+    // comic's frame rect is ALWAYS the native 1080p canvas regardless of the
+    // scaled RT. Comic-scoped: the reader is comic-exclusive, the 3D scene
+    // reads the surface through a different path and is untouched.
+    //
+    // SCOPE LIMIT (why this is OPT-IN, in `all` but NOT `recommended`): this
+    // fixes ONLY u_v4FrameParam (textbox / frame rect). The comic PANEL scale
+    // (MVP) and u_v4Scissor are computed in a separate virtual-dispatch matrix
+    // path whose canvas read is NOT statically locatable (its source offset is
+    // byte-indistinguishable from matrix coefficients), so those are NOT fixed
+    // here and need a runtime probe. Enabling T2 alone can therefore leave the
+    // textbox at 1080p while panels still track the scaled RT (a mixed state).
+    // Enable with `t2` once validated; drop with `~t2`.
+    // ★ OBSOLETE (2026-06-19): superseded by FragCoordResolutionScalePass —
+    // excluded from every preset; reachable only via the explicit `t2` token.
+    T2,
+    Count
+};
+
+constexpr std::uint32_t GrrGroupBit(GrrGroup g) {
+    return 1u << static_cast<std::uint32_t>(g);
+}
+
+// GRR group masks (independent of the GR2 mask space).
+//
+// `recommended` = the full render-target dimension set: R1 (main RT) + U1 (UI
+// float cluster) + C1 (reference-resolution table) + S1..S7 (the scene-RT
+// allocator groups). This is now IDENTICAL to `all`. The comic text-cull
+// groups T1/T2 are OBSOLETE: the FragCoord shader-recompiler pass
+// (FragCoordResolutionScalePass) normalizes screen-space / UI coordinates
+// correctly at the shader level, so the T1/T2 bytecode patches are redundant.
+// They are excluded from every preset but remain enumerable for bisection /
+// history via the explicit `t1` / `t2` (or `grr_t1` / `grr_t2`) tokens. For the
+// minimal "R1 only, no scissor change" lever use the `safe` / `min` tokens.
+constexpr std::uint32_t kGrrMaskRecommended =
+    GrrGroupBit(GrrGroup::R1) | GrrGroupBit(GrrGroup::U1) | GrrGroupBit(GrrGroup::C1) |
+    GrrGroupBit(GrrGroup::S1) | GrrGroupBit(GrrGroup::S2) | GrrGroupBit(GrrGroup::S3) |
+    GrrGroupBit(GrrGroup::S4) | GrrGroupBit(GrrGroup::S5) | GrrGroupBit(GrrGroup::S6) |
+    GrrGroupBit(GrrGroup::S7);
+constexpr std::uint32_t kGrrMaskAll =
+    GrrGroupBit(GrrGroup::R1) | GrrGroupBit(GrrGroup::U1) | GrrGroupBit(GrrGroup::C1) |
+    GrrGroupBit(GrrGroup::S1) | GrrGroupBit(GrrGroup::S2) | GrrGroupBit(GrrGroup::S3) |
+    GrrGroupBit(GrrGroup::S4) | GrrGroupBit(GrrGroup::S5) | GrrGroupBit(GrrGroup::S6) |
+    GrrGroupBit(GrrGroup::S7);
+
+struct GrrResSite {
+    std::uint32_t va_offset;
+    GrrKind       kind;
+    GrrGroup      group;
+    const char*   label;
+};
+
+// IMPORTANT — these va_offset values are TRUE LOADED virtual addresses, i.e.
+// what `base_virtual_addr + va_offset` resolves to at runtime (the patch adds
+// exactly that). They are NOT raw ELF-file offsets. The GRR eboot is a SELF
+// whose code+rodata segment (ELF ph[0], p_vaddr=0) is stored at SELF segment
+// payload offset 0xB710 — NOT at the ELF p_offset of 0x4000. The loader copies
+// it as one contiguous block (module.cpp Module::LoadModuleToMemory ->
+// elf.LoadSegment), so for any V in that segment: base_virtual_addr + V holds
+// file[V + 0xB710]. A first cut of this table was derived from static file
+// analysis that used the ELF p_offset (0x4000) and was therefore 0x7710 too
+// high on every VA — the patches silently mismatched (memcmp guard) and nothing
+// applied. All VAs below have been corrected by -0x7710 and re-verified against
+// the loader mapping. If you add a site from fresh file analysis, map it with
+// va = file_offset - 0xB710, not file_offset - 0x4000. (The discovery comments
+// in the GrrGroup enum above still cite the original analysis VAs / struct
+// offsets; the authoritative runtime values are the numeric fields here.)
+// 77 verified sites: 28 (R1) + 24 (U1) + 2 (C1) + 6 (S1) + 3 (S2) + 3 (S3) + 3 (S4) + 3 (S5) + 3 (S6) + 2 (S7).
+constexpr std::array<GrrResSite, 77> kGrrResSites = {{
+    // ── Group R1: main RT (W,H) descriptor-array init — fn 0x1e489c (28) ──
+    //  14 paired `mov dword ptr [rcx+disp], imm32` stores. Each entry's imm
+    //  is the last 4 bytes of the mov. W -> final_W, H -> align64(final_H).
+    {0x1e48b0, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 0"},
+    {0x1e48b7, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 0"},
+    {0x1e48e8, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 1"},
+    {0x1e48ef, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 1"},
+    {0x1e4a4d, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 2"},
+    {0x1e4a57, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 2"},
+    {0x1e4a9d, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 3"},
+    {0x1e4aa7, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 3"},
+    {0x1e4c62, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 4"},
+    {0x1e4c6c, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 4"},
+    {0x1e4cb2, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 5"},
+    {0x1e4cbc, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 5"},
+    {0x1e4e71, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 6"},
+    {0x1e4e7b, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 6"},
+    {0x1e4ec1, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 7"},
+    {0x1e4ecb, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 7"},
+    {0x1e5075, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 8"},
+    {0x1e507f, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 8"},
+    {0x1e50c5, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 9"},
+    {0x1e50cf, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 9"},
+    {0x1e527d, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 10"},
+    {0x1e5287, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 10"},
+    {0x1e52cd, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 11"},
+    {0x1e52d7, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 11"},
+    {0x1e5481, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 12"},
+    {0x1e548b, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 12"},
+    {0x1e54d1, GrrKind::W_f,      GrrGroup::R1, "R1.W  (mov [rcx+disp],1920.0f) — fn 0x1e489c entry 13"},
+    {0x1e54db, GrrKind::Halign_f, GrrGroup::R1, "R1.H  (mov [rcx+disp],1088.0f) — fn 0x1e489c entry 13"},
+
+    // ── Group U1: half/quarter UI float cluster 0x1057d30..0x1057dbc (24) ──
+    //  HalfW=960 -> final_W/2, HalfH=544 -> align64(final_H)/2,
+    //  QW=480 -> final_W/4,   QH=272 -> align64(final_H)/4.
+    {0x1057d30, GrrKind::HalfW_f,         GrrGroup::U1, "U1.halfW (960.0f) @ 0x1057d30"},
+    {0x1057d38, GrrKind::QuarterW_f,      GrrGroup::U1, "U1.quartW(480.0f) @ 0x1057d38"},
+    {0x1057d3c, GrrKind::HalfHalign_f,    GrrGroup::U1, "U1.halfH (544.0f) @ 0x1057d3c"},
+    {0x1057d40, GrrKind::QuarterHalign_f, GrrGroup::U1, "U1.quartH(272.0f) @ 0x1057d40"},
+    {0x1057d44, GrrKind::HalfW_f,         GrrGroup::U1, "U1.halfW (960.0f) @ 0x1057d44"},
+    {0x1057d4c, GrrKind::QuarterW_f,      GrrGroup::U1, "U1.quartW(480.0f) @ 0x1057d4c"},
+    {0x1057d50, GrrKind::HalfHalign_f,    GrrGroup::U1, "U1.halfH (544.0f) @ 0x1057d50"},
+    {0x1057d54, GrrKind::QuarterHalign_f, GrrGroup::U1, "U1.quartH(272.0f) @ 0x1057d54"},
+    {0x1057d60, GrrKind::HalfW_f,         GrrGroup::U1, "U1.halfW (960.0f) @ 0x1057d60"},
+    {0x1057d64, GrrKind::HalfHalign_f,    GrrGroup::U1, "U1.halfH (544.0f) @ 0x1057d64"},
+    {0x1057d68, GrrKind::HalfW_f,         GrrGroup::U1, "U1.halfW (960.0f) @ 0x1057d68"},
+    {0x1057d6c, GrrKind::HalfHalign_f,    GrrGroup::U1, "U1.halfH (544.0f) @ 0x1057d6c"},
+    {0x1057d80, GrrKind::QuarterW_f,      GrrGroup::U1, "U1.quartW(480.0f) @ 0x1057d80"},
+    {0x1057d84, GrrKind::QuarterHalign_f, GrrGroup::U1, "U1.quartH(272.0f) @ 0x1057d84"},
+    {0x1057d88, GrrKind::QuarterW_f,      GrrGroup::U1, "U1.quartW(480.0f) @ 0x1057d88"},
+    {0x1057d8c, GrrKind::QuarterHalign_f, GrrGroup::U1, "U1.quartH(272.0f) @ 0x1057d8c"},
+    {0x1057d90, GrrKind::HalfW_f,         GrrGroup::U1, "U1.halfW (960.0f) @ 0x1057d90"},
+    {0x1057d94, GrrKind::HalfHalign_f,    GrrGroup::U1, "U1.halfH (544.0f) @ 0x1057d94"},
+    {0x1057d98, GrrKind::HalfW_f,         GrrGroup::U1, "U1.halfW (960.0f) @ 0x1057d98"},
+    {0x1057d9c, GrrKind::HalfHalign_f,    GrrGroup::U1, "U1.halfH (544.0f) @ 0x1057d9c"},
+    {0x1057db0, GrrKind::QuarterW_f,      GrrGroup::U1, "U1.quartW(480.0f) @ 0x1057db0"},
+    {0x1057db4, GrrKind::QuarterHalign_f, GrrGroup::U1, "U1.quartH(272.0f) @ 0x1057db4"},
+    {0x1057db8, GrrKind::QuarterW_f,      GrrGroup::U1, "U1.quartW(480.0f) @ 0x1057db8"},
+    {0x1057dbc, GrrKind::QuarterHalign_f, GrrGroup::U1, "U1.quartH(272.0f) @ 0x1057dbc"},
+
+    // ── Group C1: reference-resolution table — RISKY, opt-in (2) ───────────
+    //  W -> final_W, H -> final_H EXACT (NOT aligned: stock is 1080, not 1088).
+    {0x1045600, GrrKind::W_f,      GrrGroup::C1, "C1.W (1920.0f) @ 0x1045600 — camera/effect config table (risky)"},
+    {0x1045604, GrrKind::Hexact_f, GrrGroup::C1, "C1.H (1080.0f EXACT) @ 0x1045604 — camera/effect config table (risky)"},
+
+    // ── Group S1: 3-RT MRT set (fmt 4) via direct 0x1acd0 in fn 0x14d30 (6) ─
+    //  W -> r8d imm, H -> r9d imm. The [rsp] arg (also 1920) is NOT read by
+    //  0x1acd0's body, so it is intentionally left unpatched.
+    {0x14d54, GrrKind::W_u32, GrrGroup::S1, "S1.W #1 (r8d 1920) @ 0x14d54 — scene MRT, call 0x1acd0"},
+    {0x14d5a, GrrKind::H_u32, GrrGroup::S1, "S1.H #1 (r9d 1080) @ 0x14d5a — scene MRT, call 0x1acd0"},
+    {0x14de9, GrrKind::W_u32, GrrGroup::S1, "S1.W #2 (r8d 1920) @ 0x14de9 — scene MRT, call 0x1acd0"},
+    {0x14def, GrrKind::H_u32, GrrGroup::S1, "S1.H #2 (r9d 1080) @ 0x14def — scene MRT, call 0x1acd0"},
+    {0x14e89, GrrKind::W_u32, GrrGroup::S1, "S1.W #3 (r8d 1920) @ 0x14e89 — scene MRT, call 0x1acd0"},
+    {0x14e8f, GrrKind::H_u32, GrrGroup::S1, "S1.H #3 (r9d 1080) @ 0x14e8f — scene MRT, call 0x1acd0"},
+
+    // ── Group S2: single RT (fmt 9) via wrapper 0x153b0 @ 0x2842a (3) ───────
+    //  ecx=W, r8d=H, r9d=pitch(=W).
+    {0x28417, GrrKind::W_u32, GrrGroup::S2, "S2.W (ecx 1920) @ 0x28417 — fmt9 RT, call 0x153b0"},
+    {0x2841d, GrrKind::H_u32, GrrGroup::S2, "S2.H (r8d 1080) @ 0x2841d — fmt9 RT, call 0x153b0"},
+    {0x28423, GrrKind::W_u32, GrrGroup::S2, "S2.pitch (r9d 1920) @ 0x28423 — fmt9 RT, call 0x153b0"},
+
+    // ── Group S3: single RT (fmt 2) via wrapper 0x153b0 @ 0x6762f (3) ───────
+    {0x6761c, GrrKind::W_u32, GrrGroup::S3, "S3.W (ecx 1920) @ 0x6761c — fmt2 RT, call 0x153b0"},
+    {0x67622, GrrKind::H_u32, GrrGroup::S3, "S3.H (r8d 1080) @ 0x67622 — fmt2 RT, call 0x153b0"},
+    {0x67628, GrrKind::W_u32, GrrGroup::S3, "S3.pitch (r9d 1920) @ 0x67628 — fmt2 RT, call 0x153b0"},
+
+    // ── Group S4: single RT (fmt 0xA) via wrapper 0x153b0 @ 0x24f666 (3) ────
+    {0x24f653, GrrKind::W_u32, GrrGroup::S4, "S4.W (ecx 1920) @ 0x24f653 — fmtA RT, call 0x153b0"},
+    {0x24f659, GrrKind::H_u32, GrrGroup::S4, "S4.H (r8d 1080) @ 0x24f659 — fmtA RT, call 0x153b0"},
+    {0x24f65f, GrrKind::W_u32, GrrGroup::S4, "S4.pitch (r9d 1920) @ 0x24f65f — fmtA RT, call 0x153b0"},
+
+    // ── Group S5: half-res RT (fmt 9) via wrapper 0x153b0 @ 0x2878c (3) ─────
+    //  ecx=W(960), r8d=H(540 exact half), r9d=pitch(960).
+    {0x28779, GrrKind::HalfW_u32,      GrrGroup::S5, "S5.W (ecx 960) @ 0x28779 — half-res fmt9, call 0x153b0"},
+    {0x2877f, GrrKind::HalfH_u32,      GrrGroup::S5, "S5.H (r8d 540) @ 0x2877f — half-res fmt9, call 0x153b0"},
+    {0x28785, GrrKind::HalfW_u32,      GrrGroup::S5, "S5.pitch (r9d 960) @ 0x28785 — half-res fmt9, call 0x153b0"},
+
+    // ── Group S6: half-res RT (fmt 11) via wrapper 0x153b0 @ 0x1b622e (3) ───
+    //  ecx=W(960), r8d=H(544 = align64(1080)/2), r9d=pitch(960).
+    {0x1b621b, GrrKind::HalfW_u32,      GrrGroup::S6, "S6.W (ecx 960) @ 0x1b621b — half-res fmt11, call 0x153b0"},
+    {0x1b6221, GrrKind::HalfHalign_u32, GrrGroup::S6, "S6.H (r8d 544) @ 0x1b6221 — half-res fmt11, call 0x153b0"},
+    {0x1b6227, GrrKind::HalfW_u32,      GrrGroup::S6, "S6.pitch (r9d 960) @ 0x1b6227 — half-res fmt11, call 0x153b0"},
+
+    // ── Group S7: 2nd-allocator scene RT (fmt2 1920x1080) via 0x161b0->0x1aea0
+    //  @ 0x284ad. ecx=W(1920), r8d=H(1080). The GR2 "H group" analog.
+    {0x2849a, GrrKind::W_u32, GrrGroup::S7, "S7.W (ecx 1920) @ 0x2849a — fmt2 RT, 2nd allocator (call 0x161b0->0x1aea0)"},
+    {0x284a0, GrrKind::H_u32, GrrGroup::S7, "S7.H (r8d 1080) @ 0x284a0 — fmt2 RT, 2nd allocator (call 0x161b0->0x1aea0)"},
+}};
+
+// ── RAW GCN-BYTECODE PATCH SITES (group T1) ────────────────────────────────
+// A distinct patch class from kGrrResSites: instead of re-encoding a
+// resolution-derived W/H immediate, each site overwrites a fixed 4-byte GCN
+// instruction with another fixed 4-byte instruction. expected[] / replacement[]
+// are therefore resolution-INDEPENDENT (the same bytes at every target res).
+//
+// These six sites live in the comic shaders' GCN bytecode, which is in the
+// eboot's SECOND load segment (ELF ph[1], p_vaddr=0x15e8000), NOT the
+// code+rodata segment ph[0] that every kGrrResSites entry targets. For
+// STATIC file analysis the ph[1] mapping is file_offset = loaded_VA + 0xEC10
+// (ph[1] is stored at SELF payload offset 0x15f6c10; 0x15f6c10 - 0x15e8000 =
+// 0xEC10) — different from ph[0]'s 0xB710. At RUNTIME the addressing is
+// uniform: the loader places every PT_LOAD at base_virtual_addr + p_vaddr, so
+// `eboot_base + va_offset` resolves correctly here exactly as it does for the
+// ph[0] sites. The va_offset values below are LOADED VAs (derived as
+// file_offset - 0xEC10 and re-verified against the eboot bytes).
+//
+// The narrowing instruction is `s_andn2_b64 sN,sN,vcc` (survivor &= ~fail):
+//   ComicDemoTextScissor_fso       sN=s24  bytes 18 6a 98 8a -> 18 18 98 87
+//   ComicDemoTextMaskedScissor_fso sN=s20  bytes 14 6a 94 8a -> 14 14 94 87
+// The replacement `s_and_b64 sN,sN,sN` leaves sN = entry mask M and sets
+// SCC=1, so the paired `s_cbranch_scc0` never early-outs and the trailing
+// `s_mov_b64 exec,sN` restores M before the colour export. Same length (4B).
+struct GrrBytePatchSite {
+    std::uint32_t              va_offset;
+    std::array<std::uint8_t,4> expected;     // stock 4 bytes (memcmp-guarded)
+    std::array<std::uint8_t,4> replacement;  // patched 4 bytes
+    GrrGroup                   group;
+    const char*                label;
+};
+
+// 6 sites: 2 (ComicDemoTextScissor_fso, s24) + 4 (ComicDemoTextMaskedScissor_fso, s20).
+constexpr std::array<GrrBytePatchSite, 6> kGrrBytePatchSites = {{
+    // ComicDemoTextScissor_fso — 2-bound scissor; survivor mask s24.
+    {0x16b1bd4, {0x18, 0x6a, 0x98, 0x8a}, {0x18, 0x18, 0x98, 0x87}, GrrGroup::T1,
+     "T1 TextScissor s_andn2_b64 s24,s24,vcc -> s_and_b64 s24,s24,s24 (bound 0)"},
+    {0x16b1be8, {0x18, 0x6a, 0x98, 0x8a}, {0x18, 0x18, 0x98, 0x87}, GrrGroup::T1,
+     "T1 TextScissor s_andn2_b64 s24,s24,vcc -> s_and_b64 s24,s24,s24 (bound 1)"},
+    // ComicDemoTextMaskedScissor_fso — 4-bound rect scissor; survivor mask s20.
+    {0x16b305c, {0x14, 0x6a, 0x94, 0x8a}, {0x14, 0x14, 0x94, 0x87}, GrrGroup::T1,
+     "T1 MaskedScissor s_andn2_b64 s20,s20,vcc -> s_and_b64 s20,s20,s20 (bound 0)"},
+    {0x16b3078, {0x14, 0x6a, 0x94, 0x8a}, {0x14, 0x14, 0x94, 0x87}, GrrGroup::T1,
+     "T1 MaskedScissor s_andn2_b64 s20,s20,vcc -> s_and_b64 s20,s20,s20 (bound 1)"},
+    {0x16b308c, {0x14, 0x6a, 0x94, 0x8a}, {0x14, 0x14, 0x94, 0x87}, GrrGroup::T1,
+     "T1 MaskedScissor s_andn2_b64 s20,s20,vcc -> s_and_b64 s20,s20,s20 (bound 2)"},
+    {0x16b30a8, {0x14, 0x6a, 0x94, 0x8a}, {0x14, 0x14, 0x94, 0x87}, GrrGroup::T1,
+     "T1 MaskedScissor s_andn2_b64 s20,s20,vcc -> s_and_b64 s20,s20,s20 (bound 3)"},
+}};
+
+// ── VARIABLE-LENGTH IN-PLACE PATCH SITES (group T2) ────────────────────────
+// Like kGrrBytePatchSites but for fixed-byte rewrites longer than 4 bytes:
+// each site overwrites `len` bytes (<= kGrrBlobMax) of x86-64 with another
+// fixed `len`-byte sequence. Resolution-INDEPENDENT (same bytes at every
+// target res). va_offset is a LOADED VA in ph0 (file = VA + 0xB710); the
+// runtime addressing eboot_base + va_offset is correct here as for every other
+// ph0 site.
+//
+// T2 targets the comic frame-rect ring reader at 0x67150. The two SIZE
+// components are returned by two identical 17-byte blocks:
+//   lea rax,[rip+ring_comp]; vmovss xmm0,[rax+r8*4]; vmovss [*out],xmm0
+// We rewrite each to `mov dword ptr [*out], <960.0f|544.0f>` + NOP padding,
+// so the reader always reports the native 1080p half-canvas (960x544) instead
+// of the per-frame custom (S1-scaled) value. *out is rdx for the width
+// component, rcx for the height component (the comic passes those pointers).
+// The X/Y origin components (comp0->*rdi, comp1->*rsi) are left untouched.
+constexpr std::size_t kGrrBlobMax = 24;
+struct GrrBlobPatchSite {
+    std::uint32_t                       va_offset;
+    std::uint32_t                       len;       // active bytes (<= kGrrBlobMax)
+    std::array<std::uint8_t, kGrrBlobMax> expected; // first `len` are stock
+    std::array<std::uint8_t, kGrrBlobMax> replacement;
+    GrrGroup                            group;
+    const char*                         label;
+};
+
+// 2 sites: the width and height components of the 0x67150 ring reader.
+// 960.0f = 0x44700000 (LE 00 00 70 44), 544.0f = 0x44080000 (LE 00 00 08 44).
+constexpr std::array<GrrBlobPatchSite, 2> kGrrBlobPatchSites = {{
+    // comp2 (canvas half-WIDTH -> *rdx): stock
+    //   48 8d 05 fd c9 e6 01  lea rax,[rip+0x1e6c9fd]
+    //   c4 a1 7a 10 04 80     vmovss xmm0,[rax+r8*4]
+    //   c5 fa 11 02           vmovss [rdx],xmm0
+    // -> c7 02 00 00 70 44    mov dword[rdx],0x44700000 (960.0f) + 11x NOP
+    {0x67194, 17,
+     {0x48,0x8d,0x05,0xfd,0xc9,0xe6,0x01, 0xc4,0xa1,0x7a,0x10,0x04,0x80, 0xc5,0xfa,0x11,0x02, 0,0,0,0,0,0,0},
+     {0xc7,0x02,0x00,0x00,0x70,0x44, 0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90, 0,0,0,0,0,0,0},
+     GrrGroup::T2, "T2 comic canvas WIDTH @0x67194 -> 960.0f (frame-rect ring reader)"},
+    // comp3 (canvas half-HEIGHT -> *rcx): stock
+    //   48 8d 05 f8 c9 e6 01  lea rax,[rip+0x1e6c9f8]
+    //   c4 a1 7a 10 04 80     vmovss xmm0,[rax+r8*4]
+    //   c5 fa 11 01           vmovss [rcx],xmm0
+    // -> c7 01 00 00 08 44    mov dword[rcx],0x44080000 (544.0f) + 11x NOP
+    {0x671a5, 17,
+     {0x48,0x8d,0x05,0xf8,0xc9,0xe6,0x01, 0xc4,0xa1,0x7a,0x10,0x04,0x80, 0xc5,0xfa,0x11,0x01, 0,0,0,0,0,0,0},
+     {0xc7,0x01,0x00,0x00,0x08,0x44, 0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90,0x90, 0,0,0,0,0,0,0},
+     GrrGroup::T2, "T2 comic canvas HEIGHT @0x671a5 -> 544.0f (frame-rect ring reader)"},
+}};
+
+constexpr std::array<std::uint8_t, 4> GrrExpectedForKind(GrrKind k) {
+    switch (k) {
+    case GrrKind::W_f:             return {0x00, 0x00, 0xF0, 0x44}; // 1920.0f
+    case GrrKind::Halign_f:        return {0x00, 0x00, 0x88, 0x44}; // 1088.0f
+    case GrrKind::HalfW_f:         return {0x00, 0x00, 0x70, 0x44}; //  960.0f
+    case GrrKind::HalfHalign_f:    return {0x00, 0x00, 0x08, 0x44}; //  544.0f
+    case GrrKind::QuarterW_f:      return {0x00, 0x00, 0xF0, 0x43}; //  480.0f
+    case GrrKind::QuarterHalign_f: return {0x00, 0x00, 0x88, 0x43}; //  272.0f
+    case GrrKind::Hexact_f:        return {0x00, 0x00, 0x87, 0x44}; // 1080.0f
+    case GrrKind::W_u32:           return {0x80, 0x07, 0x00, 0x00}; // 1920
+    case GrrKind::H_u32:           return {0x38, 0x04, 0x00, 0x00}; // 1080
+    case GrrKind::HalfW_u32:       return {0xC0, 0x03, 0x00, 0x00}; //  960
+    case GrrKind::HalfH_u32:       return {0x1C, 0x02, 0x00, 0x00}; //  540
+    case GrrKind::HalfHalign_u32:  return {0x20, 0x02, 0x00, 0x00}; //  544
+    }
+    return {0, 0, 0, 0};
+}
+
+std::array<std::uint8_t, 4> GrrEncodeForKind(const Resolution& sz, GrrKind k) {
+    const float fw          = static_cast<float>(sz.width);
+    const float fh_aligned  = static_cast<float>(Align64(static_cast<std::uint32_t>(sz.height)));
+    const float fh_exact    = static_cast<float>(sz.height);
+    switch (k) {
+    case GrrKind::W_f:             return FloatBytes(fw);
+    case GrrKind::Halign_f:        return FloatBytes(fh_aligned);
+    case GrrKind::HalfW_f:         return FloatBytes(fw * 0.5f);
+    case GrrKind::HalfHalign_f:    return FloatBytes(fh_aligned * 0.5f);
+    case GrrKind::QuarterW_f:      return FloatBytes(fw * 0.25f);
+    case GrrKind::QuarterHalign_f: return FloatBytes(fh_aligned * 0.25f);
+    case GrrKind::Hexact_f:        return FloatBytes(fh_exact);
+    case GrrKind::W_u32:           return U32Bytes(static_cast<std::uint32_t>(sz.width));
+    case GrrKind::H_u32:           return U32Bytes(static_cast<std::uint32_t>(sz.height));
+    case GrrKind::HalfW_u32:
+        return U32Bytes(static_cast<std::uint32_t>(sz.width) / 2u);
+    case GrrKind::HalfH_u32:
+        return U32Bytes(static_cast<std::uint32_t>(sz.height) / 2u);
+    case GrrKind::HalfHalign_u32:
+        return U32Bytes(Align64(static_cast<std::uint32_t>(sz.height)) / 2u);
+    }
+    return {0, 0, 0, 0};
+}
+
+const char* GrrGroupName(GrrGroup g) {
+    switch (g) {
+    case GrrGroup::R1: return "R1";
+    case GrrGroup::U1: return "U1";
+    case GrrGroup::C1: return "C1";
+    case GrrGroup::S1: return "S1";
+    case GrrGroup::S2: return "S2";
+    case GrrGroup::S3: return "S3";
+    case GrrGroup::S4: return "S4";
+    case GrrGroup::S5: return "S5";
+    case GrrGroup::S6: return "S6";
+    case GrrGroup::S7: return "S7";
+    case GrrGroup::T1: return "T1";
+    case GrrGroup::T2: return "T2";
+    default:           return "?";
+    }
+}
+
+// GRR group-mask parser. Shares the GR2 config string. GRR groups are
+// addressed with distinct tokens so the two paths never clash:
+//   * presets "recommended"/"prod" -> R1 + T1 (UI scale + text-cull fix)
+//   * "safe"/"min"    -> R1 only (pure minimal UI set, no scissor change)
+//   * "all"/"default" -> every group incl. T1
+//   * "none"/"off"    -> nothing
+//   * "grr_r1"/"r1"   -> R1   ("r1"/"u1" don't collide with any GR2 token)
+//   * "grr_u1"/"u1"   -> U1
+//   * "grr_c1"        -> C1   (prefixed-only — bare "c1" is GR2's C1 group)
+//   * "grr_s1".."s7"  -> S1..S7 scene render-target groups ("s1".."s7" also
+//                        accepted; no GR2 collision). OPT-IN, in `all`.
+//   * "grr_t1"/"t1"   -> T1   comic text-cull neutralizer (raw bytecode patch;
+//                        in `recommended`/`all`, drop with `~t1`).
+//   * "grr_t2"/"t2"   -> T2   comic FrameParam canvas->1080p (in-place rewrite;
+//                        OPT-IN, in `all` only — textbox-only, see enum note).
+// Any other token (including GR2's a1..q1) is an unknown no-op on this path.
+std::uint32_t ParseGrrGroupMaskFromConfig(std::string_view raw) {
+    const std::string s = LowerTrim(raw);
+    if (s.empty() || s == "recommended" || s == "prod") return kGrrMaskRecommended;
+    if (s == "all" || s == "default")                   return kGrrMaskAll;
+    if (s == "none" || s == "off")                      return 0u;
+
+    std::uint32_t mask = 0;
+    bool seen_any = false;
+
+    std::size_t i = 0;
+    while (i < s.size()) {
+        std::size_t j = i;
+        while (j < s.size() && s[j] != ',' && s[j] != '|') j++;
+        std::string_view tok(s.data() + i, j - i);
+        i = j + 1;
+        if (tok.empty()) continue;
+
+        bool negate = false;
+        if (tok.front() == '~' || tok.front() == '!') { negate = true; tok.remove_prefix(1); }
+        if (tok.empty()) continue;
+
+        std::uint32_t add = 0;
+        bool known = true;
+        if      (tok == "all" || tok == "default")      add = kGrrMaskAll;
+        else if (tok == "recommended" || tok == "prod") add = kGrrMaskRecommended;
+        else if (tok == "safe" || tok == "min")         add = GrrGroupBit(GrrGroup::R1); // pure R1, no T1
+        else if (tok == "none" || tok == "off")         add = 0;
+        else if (tok == "grr_r1" || tok == "r1")        add = GrrGroupBit(GrrGroup::R1);
+        else if (tok == "grr_u1" || tok == "u1")        add = GrrGroupBit(GrrGroup::U1);
+        else if (tok == "grr_c1")                       add = GrrGroupBit(GrrGroup::C1);
+        else if (tok == "grr_s1" || tok == "s1")        add = GrrGroupBit(GrrGroup::S1);
+        else if (tok == "grr_s2" || tok == "s2")        add = GrrGroupBit(GrrGroup::S2);
+        else if (tok == "grr_s3" || tok == "s3")        add = GrrGroupBit(GrrGroup::S3);
+        else if (tok == "grr_s4" || tok == "s4")        add = GrrGroupBit(GrrGroup::S4);
+        else if (tok == "grr_s5" || tok == "s5")        add = GrrGroupBit(GrrGroup::S5);
+        else if (tok == "grr_s6" || tok == "s6")        add = GrrGroupBit(GrrGroup::S6);
+        else if (tok == "grr_s7" || tok == "s7")        add = GrrGroupBit(GrrGroup::S7);
+        else if (tok == "grr_t1" || tok == "t1")        add = GrrGroupBit(GrrGroup::T1);
+        else if (tok == "grr_t2" || tok == "t2")        add = GrrGroupBit(GrrGroup::T2);
+        else                                            known = false; // GR2-only / unknown — no-op here
+
+        if (known) {
+            if (negate) mask &= ~add;
+            else        mask |= add;
+            seen_any = true;
+        }
+    }
+
+    return seen_any ? mask : kGrrMaskRecommended;
+}
+
 } // namespace
 
 std::uint32_t ParseGroupMaskFromConfig(std::string_view raw,
@@ -1567,7 +2135,11 @@ std::uint32_t ResolutionAwareRecommended(int target_height) {
 
 int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
                               float aspect_ratio,
-                              std::string_view groups_config) {
+                              std::string_view groups_config,
+                              ResPatchStats* stats) {
+    if (stats) {
+        *stats = ResPatchStats{};
+    }
     if (eboot_base == 0) {
         LOG_ERROR(Core, "[GR2 Resolution] eboot_base is 0 — cannot patch");
         return 0;
@@ -1666,12 +2238,41 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
             group_mask &= ~static_cast<std::uint32_t>(PatchGroupBit::M1);
         } else {
             constexpr std::uint32_t kBssFlagOffset = 0x01b586c0;
-            auto* flag_ptr = reinterpret_cast<std::uint8_t*>(eboot_base + kBssFlagOffset);
-            const std::uint8_t prev = *flag_ptr;
-            *flag_ptr = 0x01;
-            LOG_INFO(Core,
-                "[GR2 Resolution] M1: wrote BSS_FLAG[0x{:x}]=1 (was 0x{:02x}) — PS4-Pro 4K path enabled",
-                kBssFlagOffset, prev);
+            // Defense-in-depth: this is the ONE write in the whole pass that
+            // lands at a fixed eboot offset with no per-site byte check. If
+            // the GRR title flag were ever wrong/unset and a non-GR2 eboot
+            // reached this branch, the write would corrupt whatever lives at
+            // that offset (in the GRR eboot, 0x01b586c0 is real file-backed
+            // .data). Confirm this really is the GR2 eboot by checking the
+            // B1.W main-RT site (0x0102aa21) still holds stock 1920
+            // (80 07 00 00) OR has already been patched to target_W (handles
+            // an idempotent re-run). M1's 4K path requires B1 to be present
+            // anyway, so if B1 doesn't look right, skipping the flag write is
+            // also the semantically correct outcome.
+            constexpr std::uint32_t kB1WOffset = 0x0102aa21;
+            const std::uint8_t* b1w =
+                reinterpret_cast<const std::uint8_t*>(eboot_base + kB1WOffset);
+            const std::uint8_t stock_w[4] = {0x80, 0x07, 0x00, 0x00}; // 1920
+            const auto target_w_bytes =
+                U32Bytes(static_cast<std::uint32_t>(final_sz.width));
+            const bool b1_is_gr2 =
+                (std::memcmp(b1w, stock_w, 4) == 0) ||
+                (std::memcmp(b1w, target_w_bytes.data(), 4) == 0);
+            if (!b1_is_gr2) {
+                LOG_INFO(Core,
+                    "[GR2 Resolution] M1: BSS_FLAG write SKIPPED — B1.W @ 0x{:x} "
+                    "holds {:02x} {:02x} {:02x} {:02x} (neither stock 1920 nor "
+                    "target_W={}); does not look like the GR2 eboot",
+                    kB1WOffset, b1w[0], b1w[1], b1w[2], b1w[3], final_sz.width);
+            } else {
+                auto* flag_ptr =
+                    reinterpret_cast<std::uint8_t*>(eboot_base + kBssFlagOffset);
+                const std::uint8_t prev = *flag_ptr;
+                *flag_ptr = 0x01;
+                LOG_INFO(Core,
+                    "[GR2 Resolution] M1: wrote BSS_FLAG[0x{:x}]=1 (was 0x{:02x}) — PS4-Pro 4K path enabled",
+                    kBssFlagOffset, prev);
+            }
         }
     }
 
@@ -1929,7 +2530,246 @@ int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
             "[GR2 Resolution]   {} ({}): patched={} already={} mismatch={} skipped={}",
             GroupName(g), enabled ? "ENABLED" : "disabled", p, a, m, k);
     }
+
+    if (stats) {
+        stats->patched = total_patched;
+        stats->already = total_already;
+        stats->mismatched = total_mismatch;
+        stats->skipped = total_skipped;
+    }
     return total_patched;
+}
+
+int ApplyGrrResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
+                              float aspect_ratio,
+                              std::string_view groups_config,
+                              ResPatchStats* stats) {
+    if (stats) {
+        *stats = ResPatchStats{};
+    }
+    if (eboot_base == 0) {
+        LOG_ERROR(Core, "[GRR Resolution] eboot_base is 0 — cannot patch");
+        return 0;
+    }
+    if (resolution == TargetResolution::Off) {
+        LOG_INFO(Core, "[GRR Resolution] target=Off; nothing to patch");
+        return 0;
+    }
+
+    // Final framebuffer dims compose exactly as on the GR2 path (pixel
+    // density x aspect); GRR then aligns the RT HEIGHT up to a multiple of 64.
+    const Resolution final_sz = ComposeFinalImpl(resolution, aspect_ratio);
+    const std::uint32_t aligned_h =
+        Align64(static_cast<std::uint32_t>(final_sz.height));
+
+    const std::uint32_t group_mask = ParseGrrGroupMaskFromConfig(groups_config);
+    if (group_mask == 0) {
+        LOG_INFO(Core,
+            "[GRR Resolution] group mask is empty (groups='{}') — nothing to patch",
+            std::string(groups_config));
+        return 0;
+    }
+
+    s32 per_group_patched[static_cast<int>(GrrGroup::Count)] = {0};
+    s32 per_group_already[static_cast<int>(GrrGroup::Count)] = {0};
+    s32 per_group_mismatch[static_cast<int>(GrrGroup::Count)] = {0};
+    s32 per_group_skipped[static_cast<int>(GrrGroup::Count)] = {0};
+
+    for (const auto& site_info : kGrrResSites) {
+        const std::uint32_t bit = GrrGroupBit(site_info.group);
+        if ((group_mask & bit) == 0) {
+            per_group_skipped[static_cast<int>(site_info.group)]++;
+            continue;
+        }
+
+        std::uint8_t* site = reinterpret_cast<std::uint8_t*>(eboot_base + site_info.va_offset);
+        const auto expected    = GrrExpectedForKind(site_info.kind);
+        const auto replacement = GrrEncodeForKind(final_sz, site_info.kind);
+
+        if (std::memcmp(site, replacement.data(), 4) == 0) {
+            per_group_already[static_cast<int>(site_info.group)]++;
+            continue;
+        }
+        if (std::memcmp(site, expected.data(), 4) != 0) {
+            LOG_WARNING(Core,
+                "[GRR Resolution] {} @ vaddr 0x{:x}: unexpected bytes "
+                "(got {:02x} {:02x} {:02x} {:02x}, expected {:02x} {:02x} {:02x} {:02x}) — NOT patched",
+                site_info.label, site_info.va_offset,
+                site[0], site[1], site[2], site[3],
+                expected[0], expected[1], expected[2], expected[3]);
+            per_group_mismatch[static_cast<int>(site_info.group)]++;
+            continue;
+        }
+        std::memcpy(site, replacement.data(), 4);
+        per_group_patched[static_cast<int>(site_info.group)]++;
+    }
+
+    // Raw GCN-bytecode patches (group T1). Resolution-independent: each site
+    // has fixed expected[]/replacement[] bytes. Same three-way memcmp guard as
+    // above (==replacement -> already; ==expected -> write; neither -> warn +
+    // skip), counted into the SAME per-group arrays so T1 shows in the
+    // per-group breakdown. These target ph[1] (data segment) — the runtime
+    // addressing eboot_base + va_offset is uniform across segments.
+    for (const auto& bp : kGrrBytePatchSites) {
+        const std::uint32_t bit = GrrGroupBit(bp.group);
+        if ((group_mask & bit) == 0) {
+            per_group_skipped[static_cast<int>(bp.group)]++;
+            continue;
+        }
+
+        std::uint8_t* site = reinterpret_cast<std::uint8_t*>(eboot_base + bp.va_offset);
+
+        if (std::memcmp(site, bp.replacement.data(), 4) == 0) {
+            per_group_already[static_cast<int>(bp.group)]++;
+            continue;
+        }
+        if (std::memcmp(site, bp.expected.data(), 4) != 0) {
+            LOG_WARNING(Core,
+                "[GRR Resolution] {} @ vaddr 0x{:x}: unexpected bytes "
+                "(got {:02x} {:02x} {:02x} {:02x}, expected {:02x} {:02x} {:02x} {:02x}) — NOT patched",
+                bp.label, bp.va_offset,
+                site[0], site[1], site[2], site[3],
+                bp.expected[0], bp.expected[1], bp.expected[2], bp.expected[3]);
+            per_group_mismatch[static_cast<int>(bp.group)]++;
+            continue;
+        }
+        std::memcpy(site, bp.replacement.data(), 4);
+        per_group_patched[static_cast<int>(bp.group)]++;
+    }
+
+    // Variable-length in-place rewrites (group T2). Same three-way guard, but
+    // compares/writes bp.len bytes instead of 4. Counted into the same
+    // per-group arrays. ph0 sites (file = VA + 0xB710); eboot_base + va_offset
+    // resolves at runtime as for every other ph0 site.
+    for (const auto& bp : kGrrBlobPatchSites) {
+        const std::uint32_t bit = GrrGroupBit(bp.group);
+        if ((group_mask & bit) == 0) {
+            per_group_skipped[static_cast<int>(bp.group)]++;
+            continue;
+        }
+        if (bp.len == 0 || bp.len > kGrrBlobMax) {
+            LOG_WARNING(Core, "[GRR Resolution] {} @ vaddr 0x{:x}: bad blob len {} — skipped",
+                        bp.label, bp.va_offset, bp.len);
+            per_group_skipped[static_cast<int>(bp.group)]++;
+            continue;
+        }
+
+        std::uint8_t* site = reinterpret_cast<std::uint8_t*>(eboot_base + bp.va_offset);
+
+        if (std::memcmp(site, bp.replacement.data(), bp.len) == 0) {
+            per_group_already[static_cast<int>(bp.group)]++;
+            continue;
+        }
+        if (std::memcmp(site, bp.expected.data(), bp.len) != 0) {
+            LOG_WARNING(Core,
+                "[GRR Resolution] {} @ vaddr 0x{:x}: unexpected bytes "
+                "(first byte got {:02x}, expected {:02x}) over {} bytes — NOT patched",
+                bp.label, bp.va_offset, site[0], bp.expected[0], bp.len);
+            per_group_mismatch[static_cast<int>(bp.group)]++;
+            continue;
+        }
+        std::memcpy(site, bp.replacement.data(), bp.len);
+        per_group_patched[static_cast<int>(bp.group)]++;
+    }
+
+    s32 total_patched = 0, total_already = 0, total_mismatch = 0, total_skipped = 0;
+    for (int i = 0; i < static_cast<int>(GrrGroup::Count); i++) {
+        total_patched  += per_group_patched[i];
+        total_already  += per_group_already[i];
+        total_mismatch += per_group_mismatch[i];
+        total_skipped  += per_group_skipped[i];
+    }
+
+    LOG_INFO(Core,
+        "[GRR Resolution] target={} aspect={:.4f} -> final={}x{} "
+        "(RT height aligned to {} = align64({})) mask=0x{:04x} — "
+        "{} patched, {} already, {} mismatched, {} skipped (of {} total)",
+        TargetName(resolution), aspect_ratio,
+        final_sz.width, final_sz.height, aligned_h, final_sz.height,
+        group_mask, total_patched, total_already, total_mismatch, total_skipped,
+        static_cast<int>(kGrrResSites.size() + kGrrBytePatchSites.size()
+                         + kGrrBlobPatchSites.size()));
+
+    for (int gi = 0; gi < static_cast<int>(GrrGroup::Count); gi++) {
+        const auto g = static_cast<GrrGroup>(gi);
+        const int p = per_group_patched[gi], a = per_group_already[gi];
+        const int m = per_group_mismatch[gi], k = per_group_skipped[gi];
+        if (p + a + m + k == 0) continue;
+        const bool enabled = (group_mask & GrrGroupBit(g)) != 0;
+        LOG_INFO(Core,
+            "[GRR Resolution]   {} ({}): patched={} already={} mismatch={} skipped={}",
+            GrrGroupName(g), enabled ? "ENABLED" : "disabled", p, a, m, k);
+    }
+
+    if (stats) {
+        stats->patched = total_patched;
+        stats->already = total_already;
+        stats->mismatched = total_mismatch;
+        stats->skipped = total_skipped;
+    }
+    return total_patched;
+}
+
+int ApplyResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
+                           float aspect_ratio,
+                           std::string_view gr2_groups_config,
+                           std::string_view grr_groups_config) {
+    if (eboot_base == 0) {
+        LOG_ERROR(Core, "[Resolution] eboot_base is 0 — cannot patch");
+        return 0;
+    }
+    if (resolution == TargetResolution::Off) {
+        LOG_INFO(Core, "[Resolution] resolutionOverride=Off — resolution patching disabled");
+        return 0;
+    }
+
+    const bool is_grr = Config::isGravityRushRemastered();
+
+    // ── Phase 1: GR2 first (unless we positively know this is GRR) ────────
+    //
+    // The GRR title flag is set in emulator.cpp BEFORE the eboot module is
+    // loaded, so it is reliable here. When it is set we SKIP the GR2 attempt
+    // entirely: running GR2's 540-site loop on a GRR eboot would emit a wall
+    // of "unexpected bytes" warnings and — worse — its M1 path performs a BSS
+    // write at a fixed offset that lands inside GRR's real .data (the write
+    // is now guarded by a B1.W identity check, but skipping the whole GR2
+    // pass is cleaner and avoids the log spam). When the flag is NOT set we
+    // still try GR2 first and fall back only on a genuine zero-hit result, so
+    // the byte-level evidence — not just the flag — ultimately drives the
+    // decision.
+    if (!is_grr) {
+        ResPatchStats gr2{};
+        const int gr2_patched = ApplyGr2ResolutionPatches(
+            eboot_base, resolution, aspect_ratio, gr2_groups_config, &gr2);
+        const bool gr2_matched = (gr2.patched > 0 || gr2.already > 0);
+        if (gr2_matched) {
+            return gr2_patched;
+        }
+        LOG_INFO(Core,
+            "[Resolution] GR2 resolution patches matched no sites "
+            "(patched={} already={} mismatched={}) — falling back to GRR",
+            gr2.patched, gr2.already, gr2.mismatched);
+    } else {
+        LOG_INFO(Core,
+            "[Resolution] Gravity Rush Remastered detected — using GRR "
+            "resolution patches (GR2 path skipped)");
+    }
+
+    // ── Phase 2: GRR fallback ─────────────────────────────────────────────
+    ResPatchStats grr{};
+    const int grr_patched = ApplyGrrResolutionPatches(
+        eboot_base, resolution, aspect_ratio, grr_groups_config, &grr);
+    const bool grr_matched = (grr.patched > 0 || grr.already > 0);
+    if (grr_matched) {
+        return grr_patched;
+    }
+
+    LOG_WARNING(Core,
+        "[Resolution] neither GR2 nor GRR resolution constants matched this "
+        "eboot (GRR: patched={} already={} mismatched={}) — no resolution "
+        "patches applied. The eboot may be an unsupported title or version.",
+        grr.patched, grr.already, grr.mismatched);
+    return 0;
 }
 
 TargetResolution ParseResolutionFromConfig(std::string_view s) {

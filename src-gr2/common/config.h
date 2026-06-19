@@ -293,6 +293,13 @@ void setResolutionOverride(const std::string& value, bool is_game_specific = fal
 std::string getResolutionPatchGroups();
 void setResolutionPatchGroups(const std::string& value, bool is_game_specific = false);
 
+// GRR (CUSA01130 family) resolution-patch group selector — independent of the
+// GR2 selector above. Only the selector for the path that actually runs (GR2
+// vs GRR, decided by isGravityRushRemastered / auto-fallback) has any effect.
+// Default "recommended" = R1 (UI RT) only; scene-RT groups S1..S4 are opt-in.
+std::string getResolutionPatchGroupsGrr();
+void setResolutionPatchGroupsGrr(const std::string& value, bool is_game_specific = false);
+
 bool getIsConnectedToNetwork();
 void setConnectedToNetwork(bool enable, bool is_game_specific = false);
 void setUserName(const std::string& name, bool is_game_specific = false);

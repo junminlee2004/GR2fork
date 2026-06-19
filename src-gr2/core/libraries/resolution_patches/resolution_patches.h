@@ -109,6 +109,8 @@
 #include <string>
 #include <string_view>
 
+#include "common/types.h"
+
 namespace Libraries::ResolutionPatches {
 
 enum class TargetResolution {
@@ -723,9 +725,78 @@ inline constexpr std::uint32_t kGroupMaskWithoutG1 =
 //                          defaults to kGroupMaskRecommended. Driven
 //                          from Config::getResolutionPatchGroups()
 //                          (config.toml [GPU] resolutionPatchGroups).
+// Outcome of a single resolution-patch pass. Filled when a non-null pointer
+// is passed to ApplyGr2ResolutionPatches / ApplyGrrResolutionPatches. The
+// combined entry point (ApplyResolutionPatches) uses (patched + already) > 0
+// as the signal that a given title's constants were actually present in the
+// eboot — i.e. that the title path "matched" — which is what drives the
+// GR2→GRR fallback decision.
+struct ResPatchStats {
+    s32 patched = 0;     // sites freshly written this call
+    s32 already = 0;     // sites already at the target value (idempotent re-run)
+    s32 mismatched = 0;  // sites whose bytes matched neither stock nor target
+    s32 skipped = 0;     // sites belonging to a disabled group
+};
+
 int ApplyGr2ResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
                               float aspect_ratio,
-                              std::string_view groups_config);
+                              std::string_view groups_config,
+                              ResPatchStats* stats = nullptr);
+
+// Apply the Gravity Rush Remastered (GRR) resolution+aspect override.
+//
+// GRR (CUSA01130 / CUSA01112 / CUSA01113 / CUSA02318) bakes its render-target
+// dimensions as a DIFFERENT constant family than GR2: the main render target
+// is 1920x1088 — 1080 padded UP to the 64-texel tile alignment (1088 = 17x64)
+// — with half (960x544) and quarter (480x272) sub-RT floats. There are no
+// (1/W,1/H) reciprocal rodata, no 540.0f, and no integer (1920,1080) struct
+// init like GR2's B1. The render-target HEIGHT is always aligned up to a
+// multiple of 64 (align64: 1080->1088, 1440->1472, 2160->2176, 720->768).
+// See resolution_patches.cpp for the GRR group classification (R1 main RT,
+// U1 half/quarter UI cluster, C1 reference-resolution table).
+//
+// Same contract as ApplyGr2ResolutionPatches: idempotent, each site is
+// memcmp-guarded against its stock bytes (never blind-writes), and a warning
+// is logged per mismatched site. Returns the number of sites patched.
+// `groups_config` is the GRR-only selector (Config::getResolutionPatchGroupsGrr,
+// config.toml [GPU] resolutionPatchGroupsGrr), independent of the GR2 selector.
+// Tokens: "recommended" (R1 main UI RT + T1 comic text-cull fix — the default),
+// "safe"/"min" (R1 only, no scissor change), "all" (every group), "none", or
+// per-group "r1"/"grr_r1", "u1"/"grr_u1", "grr_c1", the scene-RT groups
+// "s1".."s7"/"grr_s1".."grr_s7", and "t1"/"grr_t1" (the comic-panel text-cull
+// neutralizer — a raw GCN-bytecode patch of the two ComicDemo *Scissor*
+// fragment shaders that NOPs their resolution-derived scissor discard so the
+// challenge-mission / comic text is visible after upscaling; removes scissor
+// clipping for those shaders as a side-effect — drop it with "~t1"), all with
+// ~/! negation. "t2"/"grr_t2" is OPT-IN (in "all" only): a comic FrameParam
+// canvas->1080p in-place rewrite that pins the comic frame/textbox rect to the
+// native 1080p canvas regardless of the scaled RT (textbox-only; panels/scissor
+// need a separate fix — see the GrrGroup::T2 note in the .cpp).
+// R1/U1/C1 were found in-game to move only the UI; S1..S4 patch the integer
+// dimensions passed to the render-target allocator (0x223e0 / 0x1cac0) and
+// are the candidate 3D-scene-resolution levers (OPT-IN, bisect one at a time).
+int ApplyGrrResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
+                              float aspect_ratio,
+                              std::string_view groups_config,
+                              ResPatchStats* stats = nullptr);
+
+// Combined resolution-patch entry point — THIS is what module.cpp calls at
+// eboot load. Tries the GR2 resolution patches first; if they match no sites
+// (the eboot is not GR2), falls back to the GRR resolution patches. When the
+// GRR title flag (Config::isGravityRushRemastered, set before the eboot is
+// loaded) is positively set, the GR2 attempt is skipped entirely and the GRR
+// path is used directly. Returns the number of sites patched by whichever
+// title path matched, or 0 if neither did.
+//
+// The two paths take SEPARATE group selectors so GR2 and GRR groups toggle
+// independently: `gr2_groups_config` (Config::getResolutionPatchGroups) drives
+// the GR2 path, `grr_groups_config` (Config::getResolutionPatchGroupsGrr)
+// drives the GRR path. Only the selector for the path that actually runs has
+// any effect.
+int ApplyResolutionPatches(uintptr_t eboot_base, TargetResolution resolution,
+                           float aspect_ratio,
+                           std::string_view gr2_groups_config,
+                           std::string_view grr_groups_config);
 
 // Parse a config string into a TargetResolution. ("Off", "540p", "720p",
 // "900p", "1080p", "1440p", "2160p"/"4K", "4320p"/"8K", or "WxH" forms.)

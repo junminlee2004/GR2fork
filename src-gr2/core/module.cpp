@@ -267,12 +267,20 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             //       "m1"                M1 alone, nothing else
             //       "b1,d1,h1,h2,m1"    minimal 4K-target set
             //     See ParseGroupMaskFromConfig for full grammar.
-            Libraries::ResolutionPatches::ApplyGr2ResolutionPatches(
+            // Combined GR2/GRR entry point: tries the GR2 dimension
+            // constants first and, if no sites match (the eboot is not
+            // GR2), falls back to the Gravity Rush Remastered constants.
+            // When Config::isGravityRushRemastered is positively set the
+            // GR2 attempt is skipped and the GRR path runs directly. The
+            // GR2 and GRR group selectors are independent; only the one
+            // for the path that actually runs has any effect.
+            Libraries::ResolutionPatches::ApplyResolutionPatches(
                 base_virtual_addr,
                 Libraries::ResolutionPatches::ParseResolutionFromConfig(
                     Config::getResolutionOverride()),
                 Libraries::AspectPatches::TargetAspectToRatio(_gr2_aspect_target),
-                Config::getResolutionPatchGroups());
+                Config::getResolutionPatchGroups(),
+                Config::getResolutionPatchGroupsGrr());
         }
     }
 }

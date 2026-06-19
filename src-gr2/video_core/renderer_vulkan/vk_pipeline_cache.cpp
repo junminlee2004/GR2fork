@@ -11,6 +11,7 @@
 #include <xxhash.h>
 
 #include "common/config.h"
+#include "core/libraries/resolution_patches/resolution_patches.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -559,6 +560,31 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
              "(forced on; GR2_NOSTAGECMP)",
              StageCmpNarrowEnabled());
     const auto& vk12_props = instance.GetVk12Properties();
+    // GR2FORK: the FragCoord screen-space correction pass (recompiler.cpp,
+    // FragCoordResolutionScalePass) needs the guest-side resolution-patch
+    // pixel-density ratio. With the res patches active, the game renders
+    // geometry at the chosen target resolution (FragCoord spans 0..target),
+    // while the inverse-resolution shader constants are LEFT NATIVE (the
+    // inv-res eboot groups E1/D1/G1 are not what drives this — the shader
+    // pass replaces them). The pass divides FragCoord by this ratio so that
+    // `FragCoord * (1/native)` normalized sampling lands in [0,1] against the
+    // scaled buffer. The ratio is target_vertical / 1080 and is uniform across
+    // both axes because the patches preserve pixel density across aspect. It
+    // is exactly 1.0 when resolutionOverride is "Off" (no patches → the pass
+    // is a byte-identical no-op), so the correction auto-activates precisely
+    // when, and by the same factor as, the resolution patches.
+    float gr2fork_res_density = 1.0f;
+    {
+        const auto rp_target = Libraries::ResolutionPatches::ParseResolutionFromConfig(
+            Config::getResolutionOverride());
+        if (rp_target != Libraries::ResolutionPatches::TargetResolution::Off) {
+            const auto rp_base = Libraries::ResolutionPatches::TargetResolutionToBaseSize(rp_target);
+            if (rp_base.height > 0) {
+                gr2fork_res_density = static_cast<float>(rp_base.height) / 1080.0f;
+            }
+        }
+    }
+
     profile = Shader::Profile{
         // When binding a UBO, we calculate its size considering the offset in the larger buffer
         // cache underlying resource. In some cases, it may produce sizes exceeding the system
@@ -567,6 +593,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
         .max_shared_memory_size = instance.MaxComputeSharedMemorySize(),
+        .internal_resolution_scale = gr2fork_res_density,
         .supported_spirv = SpirvVersion1_6,
         .subgroup_size = instance.SubgroupSize(),
         .support_int8 = instance.IsShaderInt8Supported(),

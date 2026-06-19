@@ -131,43 +131,42 @@ public:
 
         // Per-buffer safety guard (runs for EVERY port) plus a one-time Audio3D warmup mute.
         //
-        // Historically this guard was gated behind `is_audio3d`, so only the Audio3D port was
-        // protected. In Gravity Rush 2 the Audio3D port is S16Stereo (int16), so the gravity-kick
-        // earrape is caught by the int16 `peak > 32000` branch below -- that is the existing fix.
-        // But the Main/Bgm busses are Float_8CH and PadSpk is FloatMono, all with
-        // is_audio3d == false, so they previously bypassed the guard entirely. Certain SFX that get
-        // summed into the Float master mix (e.g. Kat's ground-slam melee combo) can produce a
-        // glitched buffer -- NaN/Inf samples or wildly out-of-range finite values -- which was
-        // handed to SDL verbatim and blasted out as the same "earrape" noise, just on a different
-        // (float) port. Sanitizing + peak-guarding every port closes that gap.
+        // The whole point of this guard is to kill the "gravity-kick earrape": certain SFX (notably
+        // Kat's cross+square ground-slam melee combo) overflow the guest's master mix and arrive here
+        // as a glitched buffer. There are two distinct failure modes, one per sample format, and they
+        // need different handling:
+        //
+        //   * Float busses (Main/Bgm = Float_8CH, PadSpk = FloatMono). The bad buffer carries NaN/Inf
+        //     or finite-but-out-of-range values (peak >> 1.0). These are RECOVERABLE: we fold every
+        //     sample back into [-1, 1] in place. Clamping is *identity* on correct audio (already
+        //     <= 0 dBFS), so everything else summed into the same master buffer -- music, ambience --
+        //     is left bit-exact; only the runaway SFX excursion is tamed. We deliberately do NOT mute
+        //     these: muting the shared master buffer would gate every other sound off too, and a
+        //     spammed combo would chop the whole bus on/off (audible as its own crackle).
+        //   * The int16 Audio3D bus (S16Stereo). By the time we see it, the overflow has already been
+        //     truncated/wrapped into the int16 range, so the garbage is baked in and UNRECOVERABLE --
+        //     clamping is a no-op. A short mute is the only recourse, but it must fire ONLY on the real
+        //     wrap/square signature, never on merely-loud-but-clean audio.
+        //
+        // Old behaviour this replaces (the holes that let the crackle through): the float path passed
+        // finite buffers with peak in (1.0, 1.5] to SDL verbatim, so the over-unity shoulder of a hot
+        // transient (the slam-kick tail) still clipped at the device and crackled; it also muted the
+        // entire buffer on a SINGLE stray NaN. The int16 path muted on peak > 32000, i.e. anything past
+        // -0.18 dBFS, chopping legitimately loud sounds.
         if (ptr != nullptr) {
             if (is_float) {
                 const float* in = static_cast<const float*>(ptr);
                 const size_t n = static_cast<size_t>(guest_buffer_size) / sizeof(float);
 
                 float peak = 0.0f;
-                bool bad = false;
+                size_t non_finite = 0;
                 for (size_t i = 0; i < n; ++i) {
                     const float v = in[i];
                     if (!std::isfinite(v)) {
-                        bad = true;
+                        ++non_finite;
                         continue;
                     }
                     peak = std::max(peak, std::fabs(v));
-                }
-
-                // If we saw non-finite samples, sanitize through a scratch copy: NaN/Inf -> 0 and
-                // finite values clamped to the valid [-1, 1] range so the scratch buffer is always
-                // safe to output even if the mute window below does not engage.
-                if (bad) {
-                    if (f32_buf.size() != n) {
-                        f32_buf.resize(n);
-                    }
-                    for (size_t i = 0; i < n; ++i) {
-                        const float v = in[i];
-                        f32_buf[i] = std::isfinite(v) ? std::clamp(v, -1.0f, 1.0f) : 0.0f;
-                    }
-                    out_ptr = f32_buf.data();
                 }
 
                 // Audio3D only: first time the port becomes non-silent, mute a short window to
@@ -177,19 +176,48 @@ public:
                     ArmWarmupMute();
                 }
 
-                // If we saw NaNs/Infs or an absurdly hot buffer, force silence briefly. Legitimate
-                // game audio is normalised to <= 1.0 (0 dBFS); anything past 1.5 is a glitch.
-                if (bad || peak > 1.5f) {
-                    ArmGlitchMute(peak, bad);
+                // The actual earrape fix for the float busses. Sanitize in place whenever the buffer
+                // is hot (any sample past 0 dBFS) OR carries any non-finite sample: NaN/Inf -> 0 and
+                // finite values hard-clamped to [-1, 1]. Nothing past full scale can ever reach SDL,
+                // and because clamping does nothing to in-range samples the rest of the mix is
+                // untouched -- no dropouts, no gating, just the runaway excursion capped.
+                if (non_finite > 0 || peak > 1.0f) {
+                    if (f32_buf.size() != n) {
+                        f32_buf.resize(n);
+                    }
+                    for (size_t i = 0; i < n; ++i) {
+                        const float v = in[i];
+                        f32_buf[i] = std::isfinite(v) ? std::clamp(v, -1.0f, 1.0f) : 0.0f;
+                    }
+                    out_ptr = f32_buf.data();
+                    LogLimiterEdge(peak, non_finite);
+                } else {
+                    limiter_engaged = false; // clean buffer: re-arm the edge-triggered log
+                }
+
+                // A buffer that is *mostly* non-finite is too broken to repair cleanly (NaN->0
+                // scattered across most of it would click), so silence it for a short tail. A lone
+                // stray NaN does NOT trigger this -- it was already neutralised to 0 above, with no
+                // dropout. This is the only path on which a float port mutes.
+                if (n > 0 && non_finite * 4 >= n) {
+                    ArmGlitchMute(peak, true);
                 }
             } else {
                 const auto* in = static_cast<const int16_t*>(ptr);
                 const size_t n = static_cast<size_t>(guest_buffer_size) / sizeof(int16_t);
 
                 int peak = 0;
+                size_t harsh = 0; // adjacent samples a near-full-scale jump apart: the wrap/square tell
+                int prev = (n > 0) ? static_cast<int>(in[0]) : 0;
                 for (size_t i = 0; i < n; ++i) {
-                    const int a = std::abs(static_cast<int>(in[i]));
+                    const int s = static_cast<int>(in[i]);
+                    const int a = (s < 0) ? -s : s;
                     peak = std::max(peak, a);
+                    const int d = s - prev;
+                    if (d > INT16_HARSH_DELTA || d < -INT16_HARSH_DELTA) {
+                        ++harsh;
+                    }
+                    prev = s;
                 }
 
                 // Audio3D only: first time it becomes non-silent, mute a short window.
@@ -198,8 +226,13 @@ public:
                     ArmWarmupMute();
                 }
 
-                // If it's absurdly loud/clipped, mute briefly.
-                if (peak >= 32768 || peak > 32000) {
+                // int16 earrape == wrap-around / full-scale square content, already baked in and
+                // unrecoverable, so mute briefly. Discriminate it from clean-but-loud audio by the
+                // SIGNATURE, not the level: it pins near full scale AND has a high density of
+                // near-full-scale sample-to-sample jumps. Smooth loud audio (even at 0 dBFS) has
+                // essentially none of those jumps, so it now passes through untouched instead of
+                // being chopped by the old peak-only test.
+                if (n > 0 && peak >= INT16_EARRAPE_PEAK && harsh * INT16_HARSH_DENOM >= n) {
                     ArmGlitchMute(static_cast<float>(peak) / 32768.0f, false);
                 }
             }
@@ -281,7 +314,29 @@ private:
         mute_buffers = std::max(mute_buffers, GLITCH_MUTE_BUFFERS);
     }
 
+    // Edge-triggered log for the float limiter so the hot path never logs per-buffer: it fires once
+    // on a clean->limiting transition and stays quiet until a clean buffer re-arms it (see the
+    // `limiter_engaged = false` reset in Output()).
+    void LogLimiterEdge(float peak, size_t non_finite) {
+        if (!limiter_engaged) {
+            limiter_engaged = true;
+            LOG_WARNING(Lib_AudioOut,
+                        "Audio limiter engaged (is_float={}, audio3d={}, non_finite={}, peak={:.3f}); "
+                        "folding buffer to <= 0 dBFS",
+                        is_float, is_audio3d, non_finite, peak);
+        }
+    }
+
     static constexpr u32 GLITCH_MUTE_BUFFERS = 8u;
+
+    // int16 wrap/square earrape discriminator (Audio3D S16 bus). BOTH must hold before we mute:
+    //   * peak within (32767 - INT16_EARRAPE_PEAK) of full scale -- essentially pinned at the rails;
+    //   * at least 1/INT16_HARSH_DENOM of adjacent sample pairs jump by more than INT16_HARSH_DELTA.
+    // Clean loud audio satisfies the first but never the second (a smooth waveform has no near-full-
+    // scale adjacent jumps), so it is no longer chopped the way the old peak-only test chopped it.
+    static constexpr int INT16_EARRAPE_PEAK = 32760;    // <= 8 LSB below full scale (32767)
+    static constexpr int INT16_HARSH_DELTA = 48000;     // adjacent-sample jump (max possible 65535)
+    static constexpr size_t INT16_HARSH_DENOM = 16u;    // density gate: >= 6.25% of pairs are harsh
 
     u32 frame_size;
     u32 guest_buffer_size;
@@ -289,6 +344,7 @@ private:
     bool is_audio3d;
     bool is_float;
     bool audio3d_seen_non_silent{false};
+    bool limiter_engaged{false};
     u32 mute_buffers{0};
     std::vector<std::uint8_t> zero_buf{};
     std::vector<float> f32_buf{};

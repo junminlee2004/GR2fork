@@ -12,6 +12,13 @@ struct Profile {
     u32 max_viewport_width{};
     u32 max_viewport_height{};
     u32 max_shared_memory_size{};
+    // GR2FORK internal resolution scaling: the device-side upscale factor
+    // (1.0 = disabled). Baked into the clip-disabled screen-space->NDC render
+    // space so screen-space passthrough draws fill a scaled render target. The
+    // viewport (set per-pass in the rasterizer) compensates by 1/scale for
+    // draws that target a NATIVE buffer, keeping the device viewport within
+    // maxViewportDimensions. Constant for a session (frozen at startup).
+    float internal_resolution_scale{1.0f};
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
     bool support_int8{};
