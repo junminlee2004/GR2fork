@@ -562,19 +562,25 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const auto& vk12_props = instance.GetVk12Properties();
     // GR2FORK: the FragCoord screen-space correction pass (recompiler.cpp,
     // FragCoordResolutionScalePass) needs the guest-side resolution-patch
-    // pixel-density ratio. With the res patches active, the game renders
-    // geometry at the chosen target resolution (FragCoord spans 0..target),
-    // while the inverse-resolution shader constants are LEFT NATIVE (the
-    // inv-res eboot groups E1/D1/G1 are not what drives this — the shader
-    // pass replaces them). The pass divides FragCoord by this ratio so that
+    // pixel-density ratio. The pass divides FragCoord by this ratio so that
     // `FragCoord * (1/native)` normalized sampling lands in [0,1] against the
-    // scaled buffer. The ratio is target_vertical / 1080 and is uniform across
-    // both axes because the patches preserve pixel density across aspect. It
-    // is exactly 1.0 when resolutionOverride is "Off" (no patches → the pass
-    // is a byte-identical no-op), so the correction auto-activates precisely
-    // when, and by the same factor as, the resolution patches.
+    // scaled buffer (ratio = target_vertical / 1080, uniform across both axes
+    // because the patches preserve pixel density across aspect).
+    //
+    // ★ GATED TO GRR. The pass is only correct when the active res patches
+    // leave the inverse-resolution shader constants NATIVE. GRR's group set
+    // (R1/U1/C1/S1-S7) is pure render-target DIMENSION patching → inv_res stays
+    // native → the pass must run. GR2's default set includes D1, which rewrites
+    // the MAIN screen-vec (W,H,1/W,1/H) — InvW/InvH included — to 1/target; the
+    // pass on top of that double-corrects (FragCoord_native * 1/target = half).
+    // So scope the scale to GRR (Config::isGravityRushRemastered, auto-set from
+    // the title-id in emulator.cpp before the eboot loads, reliable here). For
+    // GR2 the density stays 1.0 → the pass is a byte-identical no-op and D1
+    // continues to own normalization, so GR2's existing path is untouched. (If
+    // GR2 ever drops D1 to move inv_res normalization onto the shader pass too,
+    // widen this gate accordingly.) Also 1.0 when resolutionOverride is "Off".
     float gr2fork_res_density = 1.0f;
-    {
+    if (Config::isGravityRushRemastered()) {
         const auto rp_target = Libraries::ResolutionPatches::ParseResolutionFromConfig(
             Config::getResolutionOverride());
         if (rp_target != Libraries::ResolutionPatches::TargetResolution::Off) {

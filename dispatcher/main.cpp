@@ -42,7 +42,7 @@ bool ValidCore(const std::string& c) {
 bool IsGravityRushTitle(std::string_view id) {
     static constexpr std::string_view kIds[] = {
         // Gravity Rush 2
-        "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547", "PCJS50010", "PCAS00079",
+        "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547", "PCJS50010", "PCAS00079", "CUSA04935"
         // Gravity Rush Remastered
         "CUSA01112", "CUSA01113", "CUSA01113P", "CUSA01130",
         "CUSA02318", "CUSA00546", "CUSA02443", "CUSA04246",
