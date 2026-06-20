@@ -137,6 +137,11 @@ void setDescSetBindingSkipCacheEnabled(bool enable, bool is_game_specific = fals
 // getters anymore.
 bool gr2FixNativeCubeViews(); // skybox seam fix: native cubemap image views
 void setGr2FixNativeCubeViews(bool enable, bool is_game_specific = false);
+// GR2FORK: user toggle to remove GR2's fullscreen motion-blur pass. When true the
+// rasterizer drops the motion-blur fragment shader (hash 0xf696fe23) draw. Default
+// false (motion blur on). Persisted [GR2Fork] disableMotionBlur key.
+bool disableMotionBlur();
+void setDisableMotionBlur(bool enable, bool is_game_specific = false);
 bool accurateRenderTargetCacheEnabled();
 void setAccurateRenderTargetCacheEnabled(bool enable, bool is_game_specific = false);
 bool accurateVertexBufferCacheEnabled();
@@ -299,6 +304,21 @@ void setResolutionPatchGroups(const std::string& value, bool is_game_specific = 
 // Default "recommended" = R1 (UI RT) only; scene-RT groups S1..S4 are opt-in.
 std::string getResolutionPatchGroupsGrr();
 void setResolutionPatchGroupsGrr(const std::string& value, bool is_game_specific = false);
+
+// GR2FORK shader-hash GPU-work skip. gr2SkippedShaders is a comma-separated list
+// of selectors: "0x<hash>" (skip all draws/dispatches whose fragment/compute
+// pgm_hash matches) or "0x<hash>@<W>x<H>" (draws only; skip just at that render
+// extent, for shaders the probe flagged SHARED). Hashes match the shader-dump
+// filenames (fs_0x<hash> / cs_0x<hash>). Empty string = disabled.
+std::string getGr2SkippedShaders();
+void setGr2SkippedShaders(const std::string& value, bool is_game_specific = false);
+
+// Fast gate + lookup used by the rasterizer per draw/dispatch. gr2ShaderSkipActive
+// is a cheap atomic (false when the list is empty -> zero per-draw cost); when it
+// returns true, gr2IsShaderSkipped does the hash/extent lookup. Pass the render
+// extent for draws, or 0/0 for compute dispatches.
+bool gr2ShaderSkipActive();
+bool gr2IsShaderSkipped(u64 hash, u32 width, u32 height);
 
 bool getIsConnectedToNetwork();
 void setConnectedToNetwork(bool enable, bool is_game_specific = false);

@@ -5,6 +5,9 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
 #include <fmt/core.h>
 #include <fmt/xchar.h> // for wstring support
 #include <nlohmann/json.hpp>
@@ -244,6 +247,7 @@ static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<string> resolutionPatchGroups("recommended");
 static ConfigEntry<string> resolutionPatchGroupsGrr("recommended");
+static ConfigEntry<string> gr2SkippedShaders("");
 
 // Vulkan
 static ConfigEntry<s32> gpuId(-1);
@@ -343,6 +347,11 @@ static ConfigEntry<bool> accurateVertexBufferCache(false);
 // 2026-06-10 incident).
 // ===========================================================================
 static ConfigEntry<bool> gr2FixNativeCubeViewsEnable(true);  // skybox seams GR2_NOCUBEVIEW
+
+// GR2FORK: user toggle to remove GR2's fullscreen motion-blur pass. When true, the
+// rasterizer drops the motion-blur fragment shader (hash 0xf696fe23) draw.
+// Persisted [GR2Fork] key, default false (motion blur on, matching the game).
+static ConfigEntry<bool> disableMotionBlurEnable(false);
 
 // GR2FORK: per-session "is this Gravity Rush Remastered?" flag. NOT persisted
 // (not a ConfigEntry) — it is a runtime fact about the loaded title, recorded
@@ -821,6 +830,16 @@ bool gr2FixNativeCubeViews() {
 // directly via its own Config.
 void setGr2FixNativeCubeViews(bool enable, bool is_game_specific) {
     gr2FixNativeCubeViewsEnable.set(enable, is_game_specific);
+}
+
+// GR2FORK: motion-blur removal toggle. Read by the rasterizer per draw to drop
+// GR2's fullscreen motion-blur pass (fragment hash 0xf696fe23).
+bool disableMotionBlur() {
+    return disableMotionBlurEnable.get();
+}
+
+void setDisableMotionBlur(bool enable, bool is_game_specific) {
+    disableMotionBlurEnable.set(enable, is_game_specific);
 }
 
 bool accurateRenderTargetCacheEnabled() {
@@ -1325,6 +1344,105 @@ void setResolutionPatchGroupsGrr(const std::string& value, bool is_game_specific
     resolutionPatchGroupsGrr.set(value, is_game_specific);
 }
 
+// ---- GR2FORK shader-hash GPU-work skip (probe -> skip -> confirm loop) ----
+// gr2SkippedShaders is a comma-separated list of shader selectors. Each draw's
+// FRAGMENT pgm_hash and each dispatch's COMPUTE pgm_hash (the same hashes the
+// shader dumps are named by: fs_0x<hash> / cs_0x<hash>) is checked against the
+// list; a match drops that draw/dispatch entirely (its GPU work is skipped).
+// Per-token grammar:
+//   0x<hash>           skip every draw/dispatch using this shader hash
+//   0x<hash>@<W>x<H>   skip only when the render-target extent is WxH (draws
+//                      only -- for shaders the probe flagged SHARED across RTs)
+static std::mutex gr2_skip_mtx;
+static std::unordered_set<u64> gr2_skip_any;   // hash-only selectors
+static std::unordered_set<u64> gr2_skip_ext;   // hash+extent selectors (packed)
+static std::atomic<bool> gr2_skip_active{false};
+
+static u64 gr2SkipExtKey(u64 hash, u32 w, u32 h) noexcept {
+    return hash ^ (static_cast<u64>(w) * 0x9e3779b97f4a7c15ULL) ^ (static_cast<u64>(h) << 33);
+}
+
+static void rebuildGr2ShaderSkipCache() {
+    const std::string spec = gr2SkippedShaders.get();
+    std::unordered_set<u64> any, ext;
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t comma = spec.find(',', pos);
+        std::string tok =
+            spec.substr(pos, comma == std::string::npos ? spec.size() - pos : comma - pos);
+        pos = (comma == std::string::npos) ? spec.size() + 1 : comma + 1;
+        const size_t b = tok.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) {
+            continue;
+        }
+        const size_t e = tok.find_last_not_of(" \t\r\n");
+        tok = tok.substr(b, e - b + 1);
+        const size_t at = tok.find('@');
+        const std::string hpart = (at == std::string::npos) ? tok : tok.substr(0, at);
+        u64 hash = 0;
+        try {
+            hash = std::stoull(hpart, nullptr, 16);
+        } catch (...) {
+            LOG_WARNING(Config, "gr2SkippedShaders: ignoring malformed entry '{}'", tok);
+            continue;
+        }
+        if (at == std::string::npos) {
+            any.insert(hash);
+            continue;
+        }
+        const std::string rpart = tok.substr(at + 1);
+        const size_t xpos = rpart.find('x');
+        if (xpos == std::string::npos) {
+            LOG_WARNING(Config, "gr2SkippedShaders: ignoring bad extent in '{}'", tok);
+            continue;
+        }
+        try {
+            const u32 w = static_cast<u32>(std::stoul(rpart.substr(0, xpos)));
+            const u32 h = static_cast<u32>(std::stoul(rpart.substr(xpos + 1)));
+            ext.insert(gr2SkipExtKey(hash, w, h));
+        } catch (...) {
+            LOG_WARNING(Config, "gr2SkippedShaders: ignoring bad extent in '{}'", tok);
+            continue;
+        }
+    }
+    const size_t n_any = any.size();
+    const size_t n_ext = ext.size();
+    {
+        std::lock_guard<std::mutex> lk(gr2_skip_mtx);
+        gr2_skip_any = std::move(any);
+        gr2_skip_ext = std::move(ext);
+        gr2_skip_active.store(!(gr2_skip_any.empty() && gr2_skip_ext.empty()),
+                              std::memory_order_relaxed);
+    }
+    LOG_INFO(Config, "gr2SkippedShaders: {} hash-only + {} hash@extent selector(s) (active={})",
+             n_any, n_ext, (n_any + n_ext) != 0);
+}
+
+std::string getGr2SkippedShaders() {
+    return gr2SkippedShaders.get();
+}
+
+void setGr2SkippedShaders(const std::string& value, bool is_game_specific) {
+    gr2SkippedShaders.set(value, is_game_specific);
+    rebuildGr2ShaderSkipCache();
+}
+
+bool gr2ShaderSkipActive() {
+    return gr2_skip_active.load(std::memory_order_relaxed);
+}
+
+bool gr2IsShaderSkipped(u64 hash, u32 width, u32 height) {
+    std::lock_guard<std::mutex> lk(gr2_skip_mtx);
+    if (gr2_skip_any.find(hash) != gr2_skip_any.end()) {
+        return true;
+    }
+    if (width != 0 && height != 0 &&
+        gr2_skip_ext.find(gr2SkipExtKey(hash, width, height)) != gr2_skip_ext.end()) {
+        return true;
+    }
+    return false;
+}
+
 int getUsbDeviceBackend() {
     return usbDeviceBackend.get();
 }
@@ -1434,6 +1552,7 @@ static void loadFromToml(const std::filesystem::path& path, bool is_game_specifi
         resolutionPatchGroups.setFromToml(gpu, "resolutionPatchGroups", is_game_specific);
         resolutionPatchGroupsGrr.setFromToml(gpu, "resolutionPatchGroupsGrr", is_game_specific);
         gr2FixNativeCubeViewsEnable.setFromToml(gpu, "gr2FixNativeCubeViews", is_game_specific);
+        disableMotionBlurEnable.setFromToml(gpu, "disableMotionBlur", is_game_specific);
     }
 
     if (data.contains("Vulkan")) {
@@ -1710,7 +1829,10 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         resolutionOverride.setFromJson(g, "resolutionOverride", is_game_specific);
         resolutionPatchGroups.setFromJson(g, "resolutionPatchGroups", is_game_specific);
         resolutionPatchGroupsGrr.setFromJson(g, "resolutionPatchGroupsGrr", is_game_specific);
+        gr2SkippedShaders.setFromJson(g, "gr2SkippedShaders", is_game_specific);
+        rebuildGr2ShaderSkipCache();
         gr2FixNativeCubeViewsEnable.setFromJson(g, "gr2FixNativeCubeViews", is_game_specific);
+        disableMotionBlurEnable.setFromJson(g, "disableMotionBlur", is_game_specific);
         vkForcePushDescriptors.setFromJson(g, "vkForcePushDescriptors", is_game_specific);
         vkDisablePushDescriptors.setFromJson(g, "vkDisablePushDescriptors", is_game_specific);
         beginRenderingCacheEnable.setFromJson(g, "beginRenderingCacheEnable", is_game_specific);
@@ -1866,10 +1988,12 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     aspectRatioOverride.setJsonValue(data, "GR2Fork", "aspectRatioOverride", is_game_specific);
     resolutionOverride.setJsonValue(data, "GR2Fork", "resolutionOverride", is_game_specific);
     resolutionPatchGroups.setJsonValue(data, "GR2Fork", "resolutionPatchGroups", is_game_specific);
+    gr2SkippedShaders.setJsonValue(data, "GR2Fork", "gr2SkippedShaders", is_game_specific);
     resolutionPatchGroupsGrr.setJsonValue(data, "GR2Fork", "resolutionPatchGroupsGrr",
                                           is_game_specific);
     gr2FixNativeCubeViewsEnable.setJsonValue(data, "GR2Fork", "gr2FixNativeCubeViews",
                                              is_game_specific);
+    disableMotionBlurEnable.setJsonValue(data, "GR2Fork", "disableMotionBlur", is_game_specific);
     vkForcePushDescriptors.setJsonValue(data, "GR2Fork", "vkForcePushDescriptors", is_game_specific);
     vkDisablePushDescriptors.setJsonValue(data, "GR2Fork", "vkDisablePushDescriptors",
                                           is_game_specific);
@@ -2024,11 +2148,14 @@ void setDefaultValues(bool is_game_specific) {
     resolutionOverride.set("Off", is_game_specific);
     resolutionPatchGroups.set("recommended", is_game_specific);
     resolutionPatchGroupsGrr.set("recommended", is_game_specific);
+    gr2SkippedShaders.set("", is_game_specific);
+    rebuildGr2ShaderSkipCache();
 
     // gr2fork: v4.4 -> v4.5 toggles. Reset-to-default means EVERY optimization
     // and fix is re-enabled and the GCN compat master is off. Polaris users
     // disable individual toggles from here, never the other way around.
     gr2FixNativeCubeViewsEnable.set(true, is_game_specific);
+    disableMotionBlurEnable.set(false, is_game_specific);
 
     // GS - Vulkan
     gpuId.set(-1, is_game_specific);

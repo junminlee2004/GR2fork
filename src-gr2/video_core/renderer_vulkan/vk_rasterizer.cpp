@@ -22,6 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <xxhash.h>
 
 #ifdef MemoryBarrier
@@ -81,6 +84,44 @@ static bool ViewRefFastPathEnabled() noexcept {
 static bool NullSharpBindEnabled() noexcept {
     static const bool enabled = []() noexcept {
         const char* e = std::getenv("GR2_NONULLSHARP");
+        return !(e && e[0] == '1');
+    }();
+    return enabled;
+}
+
+// FIX(GR2FORK): robust device-lost absorption for WRITABLE null descriptors.
+//
+// When a storage buffer or storage image fails to resolve to a real guest
+// allocation (a zeroed/stale V#, an unmapped range, a sharp base of 0) the
+// bind paths below fall back to a null descriptor (VK_NULL_HANDLE) on every
+// device that advertises robustness2 nullDescriptor. robustNullDescriptor
+// guarantees that LOADS from a null descriptor return 0 on all drivers, but
+// it leaves STORES and atomics implementation-defined:
+//   - RADV (Mesa) silently drops the store — which is why none of the dev
+//     handhelds (Steam Deck / ROG Ally / Legion Go, all RADV) ever saw this.
+//   - NVIDIA and the AMD *Windows* proprietary driver instead translate the
+//     null-descriptor store into a real write to GPU VA 0x0, which the GPU
+//     page-fault unit reports as WRITE_INVALID @ 0x0 and the queue surfaces
+//     as VK_ERROR_DEVICE_LOST on the graphics submit. That is the CUSA03694
+//     "device lost a few seconds in" crash on a Ryzen 5800X + discrete AMD
+//     box (a fragment/compute store through one of these fallback bindings).
+//
+// With this ON (default), writable null binds are routed to the real
+// NULL_BUFFER / NULL_IMAGE sink — the exact resources non-nullDescriptor
+// devices already use for the same fallback. The store then lands inside a
+// real, allocated VkBuffer/VkImage and is dropped, because the device runs
+// with robustBufferAccess2 + robustImageAccess2 (verified in the crash log),
+// so any in-bounds-of-binding-but-past-the-tiny-sink access is well-defined
+// and any out-of-range access is discarded. Net effect: every driver now
+// absorbs the bogus store exactly like RADV, so the device is never lost.
+// READS keep the cheaper null descriptor (they already return 0 everywhere).
+//
+// FORCED ON — env kill GR2_NONULLWRITESINK=1 restores the raw VK_NULL_HANDLE
+// writable bind verbatim (the pre-fix behavior). Read once, first call
+// post-config-load. Echoed once per consuming site the first time it fires.
+static bool NullWriteSinkEnabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* e = std::getenv("GR2_NONULLWRITESINK");
         return !(e && e[0] == '1');
     }();
     return enabled;
@@ -488,6 +529,13 @@ void Rasterizer::EliminateFastClear(const AmdGpu::LiverpoolRegsSnapshot& regs) {
     DoScopeMarkerEndInline(/*from_guest=*/false);
 }
 
+namespace {
+// FEATURE(GR2FORK MB): GR2's fullscreen motion-blur fragment-shader hash,
+// confirmed by per-shader visual test. Gated by Config::disableMotionBlur();
+// dropping the draw removes the motion-blur pass entirely.
+constexpr u64 GR2_MOTION_BLUR_PS_HASH = 0xf696fe23ULL;
+} // namespace
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // Phase 1D-0/0b: Stage 1 — build a DrawIntent and hand off to
     // BundleAssembler. The actual per-draw work runs out of
@@ -575,6 +623,17 @@ void Rasterizer::DoDrawFromIntent(const DrawIntent& intent) {
         return;
     }
     const auto& state = BeginRendering(pipeline, regs); // D2: bind by const-ref (zero-copy hit path)
+
+    // FEATURE(GR2FORK MB): motion-blur removal. Drop GR2's fullscreen motion-blur
+    // draw before vertex-buffer bind / render so the pass never shades.
+    // ResetBindings mirrors the normal draw exit below.
+    if (Config::disableMotionBlur()) {
+        const auto* fs_hash = pipeline->TryGetStage(Shader::LogicalStage::Fragment);
+        if (fs_hash && fs_hash->pgm_hash == GR2_MOTION_BLUR_PS_HASH) {
+            ResetBindings();
+            return;
+        }
+    }
 
     {
         // GpuComm v1.14 instrumentation: vertex/index buffer binding cost.
@@ -669,6 +728,16 @@ void Rasterizer::DoDrawIndirectFromIntent(const DrawIntent& intent) {
         return;
     }
     const auto& state = BeginRendering(pipeline, regs); // D2: bind by const-ref (zero-copy hit path)
+
+    // FEATURE(GR2FORK MB): motion-blur removal (mirrors DoDrawFromIntent); an
+    // indirect draw can carry the fullscreen motion-blur pass too.
+    if (Config::disableMotionBlur()) {
+        const auto* fs_hash = pipeline->TryGetStage(Shader::LogicalStage::Fragment);
+        if (fs_hash && fs_hash->pgm_hash == GR2_MOTION_BLUR_PS_HASH) {
+            ResetBindings();
+            return;
+        }
+    }
 
     {
         // GpuComm v1.14 instrumentation: vbuf cost (mirrors Draw).
@@ -769,6 +838,7 @@ void Rasterizer::DoDispatchDirectFromIntent(const DrawIntent& intent) {
 
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
+
     // PERF(GR2FORK v1.26): ExecuteShaderHLE handles a small set of
     // recognised compute kernels (specific clear/copy patterns) — most
     // game compute dispatches fall through to the regular path.
@@ -1515,6 +1585,28 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const vk::DescriptorType dtype =
         is_storage ? vk::DescriptorType::eStorageBuffer : vk::DescriptorType::eUniformBuffer;
 
+        // FIX(GR2FORK): robust device-lost absorption — see NullWriteSinkEnabled()
+        // for the full rationale. Any of the fallback branches above can leave a
+        // VK_NULL_HANDLE in buffer_infos.back() (special-type miss, or the
+        // zero-base null-sharp path). For a WRITABLE storage buffer that null
+        // descriptor is the VA-0 store that loses the device on NVIDIA /
+        // AMD-Windows. Redirect the binding to the real NULL_BUFFER sink so the
+        // store is absorbed on every driver (reads stay on the null descriptor).
+        // One chokepoint covers all current and future writable-null buffer paths.
+        if (is_storage && desc.is_written && NullWriteSinkEnabled() &&
+            static_cast<VkBuffer>(buffer_infos.back().buffer) == VK_NULL_HANDLE) [[unlikely]] {
+            auto& sink = buffer_cache.GetBuffer(VideoCore::NULL_BUFFER_ID);
+            buffer_infos.back() = vk::DescriptorBufferInfo{sink.Handle(), 0, VK_WHOLE_SIZE};
+            static std::atomic<bool> logged_once{false};
+            if (!logged_once.exchange(true, std::memory_order_relaxed)) {
+                LOG_INFO(Render_Vulkan,
+                         "GR2 null-write-sink: absorbed a writable null STORAGE BUFFER "
+                         "bind (ps={:#018x} slot={}) into the real NULL_BUFFER — prevents "
+                         "WRITE_INVALID @ 0x0 device-lost. Disable: GR2_NONULLWRITESINK=1",
+                         static_cast<u64>(stage.pgm_hash), dst_binding);
+            }
+        }
+
         const auto bi_handle = reinterpret_cast<u64>(static_cast<VkBuffer>(buffer_infos.back().buffer));
         const u64 bi_offset = static_cast<u64>(buffer_infos.back().offset);
         const u64 bi_range  = static_cast<u64>(buffer_infos.back().range);
@@ -1860,9 +1952,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // keep binding.unified and the descriptorCount-N write aligned.
             const u32 null_count = b.num_bindings ? b.num_bindings : 1u;
             for (u32 null_i = 0; null_i < null_count; ++null_i) {
-                if (null_descriptors_supported) {
+                // FIX(GR2FORK): robust device-lost absorption (see NullWriteSinkEnabled()).
+                // A WRITABLE storage image that didn't resolve takes the real NULL_IMAGE
+                // sink instead of a null descriptor, so a shader imageStore is absorbed on
+                // every driver (robustImageAccess2 discards out-of-extent writes) rather
+                // than faulting at GPU VA 0x0 on NVIDIA / the AMD Windows driver. Sampled
+                // (read) null images keep the cheaper null descriptor — it already returns
+                // 0 everywhere. The real-NULL_IMAGE branch is the same path that
+                // non-nullDescriptor devices already use, so this is a proven binding.
+                const bool redirect_storage_null = is_storage && NullWriteSinkEnabled();
+                if (null_descriptors_supported && !redirect_storage_null) {
                     image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
                 } else {
+                    if (redirect_storage_null) [[unlikely]] {
+                        static std::atomic<bool> logged_once{false};
+                        if (!logged_once.exchange(true, std::memory_order_relaxed)) {
+                            LOG_INFO(Render_Vulkan,
+                                     "GR2 null-write-sink: absorbed a writable null STORAGE "
+                                     "IMAGE bind (ps={:#018x}) into the real NULL_IMAGE — "
+                                     "prevents WRITE_INVALID @ 0x0 device-lost. Disable: "
+                                     "GR2_NONULLWRITESINK=1",
+                                     static_cast<u64>(stage.pgm_hash));
+                        }
+                    }
                     VideoCore::ImageViewInfo view_info{};
                     if (base_desc) {
                         view_info = base_desc->view_info;
