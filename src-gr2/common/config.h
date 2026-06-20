@@ -137,6 +137,10 @@ void setDescSetBindingSkipCacheEnabled(bool enable, bool is_game_specific = fals
 // getters anymore.
 bool gr2FixNativeCubeViews(); // skybox seam fix: native cubemap image views
 void setGr2FixNativeCubeViews(bool enable, bool is_game_specific = false);
+// GR2FORK: replace the title-screen theme with a user audio file from the "mods" folder
+// (see ajm/title_theme_mod.h). Default false.
+bool getGR2TitleThemeMod();
+void setGR2TitleThemeMod(bool enable, bool is_game_specific = false);
 // GR2FORK: user toggle to remove GR2's fullscreen motion-blur pass. When true the
 // rasterizer drops the motion-blur fragment shader (hash 0xf696fe23) draw. Default
 // false (motion blur on). Persisted [GR2Fork] disableMotionBlur key.

@@ -115,6 +115,8 @@ private:
     AjmInstanceGapless m_gapless{};
     AjmSidebandResampleParameters m_resample_parameters{};
     u32 m_total_samples{};
+    AjmCodecType m_codec_type{}; // [SNDMOD-PROBE] codec identity for logging (TEMPORARY)
+    bool m_probe_logged = false; // [SNDMOD-PROBE] one log line per decode stream (TEMPORARY)
     std::unique_ptr<AjmCodec> m_codec;
 };
 

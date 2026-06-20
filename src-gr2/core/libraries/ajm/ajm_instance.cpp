@@ -5,7 +5,10 @@
 #include "ajm_instance.h"
 #include "ajm_mp3.h"
 #include "ajm_result.h"
+#include "common/config.h"
 
+#include <algorithm>
+#include <string>
 #include <magic_enum/magic_enum.hpp>
 
 namespace Libraries::Ajm {
@@ -23,7 +26,8 @@ u8 GetPCMSize(AjmFormatEncoding format) {
     }
 }
 
-AjmInstance::AjmInstance(AjmCodecType codec_type, AjmInstanceFlags flags) : m_flags(flags) {
+AjmInstance::AjmInstance(AjmCodecType codec_type, AjmInstanceFlags flags)
+    : m_flags(flags), m_codec_type(codec_type) {
     switch (codec_type) {
     case AjmCodecType::At9Dec: {
         m_codec = std::make_unique<AjmAt9Decoder>(AjmFormatEncoding(flags.format),
@@ -44,6 +48,7 @@ void AjmInstance::Reset() {
     m_total_samples = 0;
     m_gapless.Reset();
     m_codec->Reset();
+    m_probe_logged = false; // [SNDMOD-PROBE] re-log on the next stream for a recycled instance
 }
 
 void AjmInstance::ExecuteJob(AjmJob& job) {
@@ -104,6 +109,30 @@ void AjmInstance::ExecuteJob(AjmJob& job) {
     auto in_size = in_buf.size();
     auto out_size = out_buf.Size();
     u32 frames_decoded = 0;
+
+    // [SNDMOD-PROBE] Investigation probe, GATED behind the mod toggle (kept for finding future
+    // sounds to replace). One line per decode stream while the feature is on: dumps the leading
+    // input bytes (a stable fingerprint) and the decoded format, so the name->hash table can be
+    // built offline from the unpacked PSARC.
+    if (!m_probe_logged && !job.input.buffer.empty() && Config::getGR2TitleThemeMod()) {
+        m_probe_logged = true;
+        static constexpr char kHex[] = "0123456789abcdef";
+        const size_t n = std::min<size_t>(in_size, size_t{32});
+        std::string head;
+        head.reserve(n * 3);
+        for (size_t i = 0; i < n; ++i) {
+            const u8 b = in_buf[i];
+            head.push_back(kHex[b >> 4]);
+            head.push_back(kHex[b & 0xF]);
+            head.push_back(' ');
+        }
+        const AjmSidebandFormat sf = m_codec->GetFormat();
+        LOG_INFO(Lib_Ajm,
+                 "[SNDMOD-PROBE] decode stream: instance={} codec={} in_size={} channels={} "
+                 "sampl_freq={} head=[ {}]",
+                 job.instance_id, magic_enum::enum_name(m_codec_type), in_size, sf.num_channels,
+                 sf.sampl_freq, head);
+    }
 
     if (!job.input.buffer.empty()) {
         for (;;) {

@@ -152,6 +152,7 @@ static auto UserPaths = [] {
     create_path(PathType::FontsDir, user_dir / FONTS_DIR);
     create_path(PathType::HomeDir, user_dir / HOME_DIR);
     create_path(PathType::CustomModulesDir, user_dir / CUSTOM_MODULES_DIR);
+    create_path(PathType::ModsDir, user_dir / MODS_DIR);
 
     // STRUCTURE(GR2FORK): provision the PS4 "home" account layout so the on-disk
     // tree matches the prerelease build, which creates these in

@@ -4,7 +4,13 @@
 #include "ajm_result.h"
 #include "common/assert.h"
 #include "core/libraries/ajm/ajm_at9.h"
+#include "core/libraries/ajm/title_theme_mod.h"
 #include "error_codes.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <vector>
 
 extern "C" {
 #include <decoder.h>
@@ -18,6 +24,51 @@ struct ChunkHeader {
     u32 length;
 };
 static_assert(sizeof(ChunkHeader) == 8);
+
+// [SNDMOD] Peak magnitude (max |sample|, normalized to [0,1]) of one just-decoded frame, read per
+// the decoder's output format. Lets the direct player scale its replacement to the same level the
+// game plays the original title theme at, instead of blasting a full-scale file over the SFX.
+static float Sndmod_PeakOf(const std::vector<u8>& buf, AjmFormatEncoding fmt) {
+    float peak = 0.0f;
+    switch (fmt) {
+    case AjmFormatEncoding::S16: {
+        const auto* p = reinterpret_cast<const s16*>(buf.data());
+        const size_t n = buf.size() / sizeof(s16);
+        for (size_t i = 0; i < n; ++i) {
+            const float v = std::abs(static_cast<float>(p[i])) / 32768.0f;
+            if (v > peak) {
+                peak = v;
+            }
+        }
+        break;
+    }
+    case AjmFormatEncoding::S32: {
+        const auto* p = reinterpret_cast<const s32*>(buf.data());
+        const size_t n = buf.size() / sizeof(s32);
+        for (size_t i = 0; i < n; ++i) {
+            const float v = std::abs(static_cast<float>(p[i])) / 2147483648.0f;
+            if (v > peak) {
+                peak = v;
+            }
+        }
+        break;
+    }
+    case AjmFormatEncoding::Float: {
+        const auto* p = reinterpret_cast<const float*>(buf.data());
+        const size_t n = buf.size() / sizeof(float);
+        for (size_t i = 0; i < n; ++i) {
+            const float v = std::abs(p[i]);
+            if (v > peak) {
+                peak = v;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return peak;
+}
 
 struct AudioFormat {
     u16 fmt_type;
@@ -69,6 +120,10 @@ void AjmAt9Decoder::Reset() {
 
     m_num_frames = 0;
     m_superframe_bytes_remain = m_codec_info.superframeSize;
+
+    // [SNDMOD] re-evaluate the title-theme fingerprint for each new stream on a recycled decoder.
+    m_swap_checked = false;
+    m_swap_active = false;
 }
 
 void AjmAt9Decoder::Initialize(const void* buffer, u32 buffer_size) {
@@ -152,6 +207,27 @@ DecoderResult AjmAt9Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
         return result;
     }
 
+    // [SNDMOD] On a stream's first frame, detect the title-screen theme by its 32-byte first-frame
+    // fingerprint. Active() (toggle ON + a usable file loaded) is tested FIRST, so when the mod is
+    // off the fingerprint compare never runs -- detection is fully gated behind the toggle. This
+    // intentionally targets ONLY the title theme.
+    if (!m_swap_checked) {
+        m_swap_checked = true;
+        if (TitleThemeMod::Get().Active()) {
+            static constexpr u8 kTitleTheme[32] = {
+                0x32, 0x93, 0x05, 0x20, 0xaa, 0x12, 0x9f, 0x9d, 0x23, 0x12, 0xc0,
+                0x0b, 0x32, 0x49, 0x55, 0xfb, 0xff, 0xef, 0x89, 0x13, 0x2e, 0xd4,
+                0x1c, 0x7e, 0xde, 0x34, 0x07, 0x51, 0x3c, 0x1d, 0x54, 0x42};
+            if (in_buf.size() >= sizeof(kTitleTheme) &&
+                std::memcmp(in_buf.data(), kTitleTheme, sizeof(kTitleTheme)) == 0) {
+                m_swap_active = true;
+                LOG_INFO(Lib_Ajm,
+                         "[SNDMOD] title-screen theme matched -> muting original, playing via "
+                         "direct player");
+            }
+        }
+    }
+
     int ret = 0;
     int bytes_used = 0;
     switch (m_format) {
@@ -176,6 +252,19 @@ DecoderResult AjmAt9Decoder::ProcessData(std::span<u8>& in_buf, SparseOutputBuff
         result.result = ORBIS_AJM_RESULT_CODEC_ERROR | ORBIS_AJM_RESULT_FATAL;
         result.internal_result = ret;
         return result;
+    }
+
+    // [SNDMOD] Mute the original title theme in-place; the separate direct player (its own SDL
+    // mixer device) provides the replacement, bypassing the game's movie-audio pipeline that
+    // mangles injected PCM. NotifyFrame() starts that player on the first frame and keeps the
+    // watchdog heartbeat alive so it stops shortly after the title theme does.
+    if (m_swap_active) {
+        // Measure the original's level BEFORE muting it, and hand it to the player so it can scale
+        // the replacement to match (rather than playing a full-scale file far louder than the game
+        // ever plays its BGM). Then mute the original in-place.
+        const float ref_peak = Sndmod_PeakOf(m_pcm_buffer, m_format);
+        std::memset(m_pcm_buffer.data(), 0, m_pcm_buffer.size());
+        TitleThemeMod::Get().NotifyFrame(ref_peak);
     }
 
     result.frames_decoded += 1;

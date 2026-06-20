@@ -347,6 +347,7 @@ static ConfigEntry<bool> accurateVertexBufferCache(false);
 // 2026-06-10 incident).
 // ===========================================================================
 static ConfigEntry<bool> gr2FixNativeCubeViewsEnable(true);  // skybox seams GR2_NOCUBEVIEW
+static ConfigEntry<bool> gr2TitleThemeMod(false);           // GR2FORK: title-theme replacement
 
 // GR2FORK: user toggle to remove GR2's fullscreen motion-blur pass. When true, the
 // rasterizer drops the motion-blur fragment shader (hash 0xf696fe23) draw.
@@ -830,6 +831,15 @@ bool gr2FixNativeCubeViews() {
 // directly via its own Config.
 void setGr2FixNativeCubeViews(bool enable, bool is_game_specific) {
     gr2FixNativeCubeViewsEnable.set(enable, is_game_specific);
+}
+
+// GR2FORK: gate for the title-screen-theme replacement (ajm/title_theme_mod.h). Default false.
+bool getGR2TitleThemeMod() {
+    return gr2TitleThemeMod.get();
+}
+
+void setGR2TitleThemeMod(bool enable, bool is_game_specific) {
+    gr2TitleThemeMod.set(enable, is_game_specific);
 }
 
 // GR2FORK: motion-blur removal toggle. Read by the rasterizer per draw to drop
@@ -1832,6 +1842,7 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         gr2SkippedShaders.setFromJson(g, "gr2SkippedShaders", is_game_specific);
         rebuildGr2ShaderSkipCache();
         gr2FixNativeCubeViewsEnable.setFromJson(g, "gr2FixNativeCubeViews", is_game_specific);
+        gr2TitleThemeMod.setFromJson(g, "GR2TitleThemeMod", is_game_specific);
         disableMotionBlurEnable.setFromJson(g, "disableMotionBlur", is_game_specific);
         vkForcePushDescriptors.setFromJson(g, "vkForcePushDescriptors", is_game_specific);
         vkDisablePushDescriptors.setFromJson(g, "vkDisablePushDescriptors", is_game_specific);
@@ -1993,6 +2004,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
                                           is_game_specific);
     gr2FixNativeCubeViewsEnable.setJsonValue(data, "GR2Fork", "gr2FixNativeCubeViews",
                                              is_game_specific);
+    gr2TitleThemeMod.setJsonValue(data, "GR2Fork", "GR2TitleThemeMod", is_game_specific);
     disableMotionBlurEnable.setJsonValue(data, "GR2Fork", "disableMotionBlur", is_game_specific);
     vkForcePushDescriptors.setJsonValue(data, "GR2Fork", "vkForcePushDescriptors", is_game_specific);
     vkDisablePushDescriptors.setJsonValue(data, "GR2Fork", "vkDisablePushDescriptors",
@@ -2155,6 +2167,7 @@ void setDefaultValues(bool is_game_specific) {
     // and fix is re-enabled and the GCN compat master is off. Polaris users
     // disable individual toggles from here, never the other way around.
     gr2FixNativeCubeViewsEnable.set(true, is_game_specific);
+    gr2TitleThemeMod.set(false, is_game_specific); // GR2FORK: title-theme replacement off
     disableMotionBlurEnable.set(false, is_game_specific);
 
     // GS - Vulkan

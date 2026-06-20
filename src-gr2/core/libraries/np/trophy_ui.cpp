@@ -154,6 +154,20 @@ void TrophyUI::Draw() {
         std::min(io.DisplaySize.y, (70 * AdjustHeight)),
     };
 
+    // TEMP PROBE (GR2FORK trophy-font DPI investigation): always-on, fires once
+    // per trophy at first Draw. Captures the draw-time display/font state the
+    // box geometry and font scale are derived from. Remove once resolved.
+    if (!probe_logged) {
+        probe_logged = true;
+        LOG_INFO(Lib_NpTrophy,
+                 "[GR2FORK][DPIPROBE] trophy draw: io.DisplaySize={}x{} "
+                 "io.FBScale={}x{} io.FontGlobalScale={} AdjustW={} AdjustH={} "
+                 "window_size={}x{} appliedFontScale(1.2*AdjustH)={}",
+                 io.DisplaySize.x, io.DisplaySize.y, io.DisplayFramebufferScale.x,
+                 io.DisplayFramebufferScale.y, io.FontGlobalScale, AdjustWidth,
+                 AdjustHeight, window_size.x, window_size.y, 1.2f * AdjustHeight);
+    }
+
     elapsed_time += io.DeltaTime;
     float progress = std::min(elapsed_time / animation_duration, 1.0f);
 

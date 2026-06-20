@@ -162,6 +162,26 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         GetIO().FontGlobalScale *= dpi;
     }
 
+    // TEMP PROBE (GR2FORK trophy-font DPI investigation): always-on, fires once
+    // at init. Captures every quantity that feeds trophy/menu font sizing so we
+    // can compare Windows vs Linux in a single run. Remove once resolved.
+    {
+        SDL_Window* probe_w = window.GetSDLWindow();
+        s32 log_w = 0, log_h = 0, px_w = 0, px_h = 0;
+        SDL_GetWindowSize(probe_w, &log_w, &log_h);
+        SDL_GetWindowSizeInPixels(probe_w, &px_w, &px_h);
+        const float probe_disp_scale = SDL_GetWindowDisplayScale(probe_w);
+        const ImGuiIO& probe_io = GetIO();
+        LOG_INFO(ImGui,
+                 "[GR2FORK][DPIPROBE] init: WindowGet={}x{} SDL_logical={}x{} "
+                 "SDL_pixels={}x{} DisplayScale={} -> io.DisplaySize={}x{} "
+                 "io.FontGlobalScale={} io.FBScale={}x{}",
+                 window.GetWidth(), window.GetHeight(), log_w, log_h, px_w, px_h,
+                 probe_disp_scale, probe_io.DisplaySize.x, probe_io.DisplaySize.y,
+                 probe_io.FontGlobalScale, probe_io.DisplayFramebufferScale.x,
+                 probe_io.DisplayFramebufferScale.y);
+    }
+
     std::at_quick_exit([] { SaveIniSettingsToDisk(GetIO().IniFilename); });
 }
 

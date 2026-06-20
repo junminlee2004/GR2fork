@@ -407,6 +407,20 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         }
         port.output_cv.wait(lock, [&] { return !port.output_ready; });
         if (ptr != nullptr && port.IsOpen()) {
+            // [SNDMOD-OUT] Investigation probe, GATED behind the mod toggle (kept for finding
+            // future sounds to replace). One line per port while the feature is on: confirms real
+            // PCM is flowing out of this port and reports the final-mix format.
+            static std::array<bool, SCE_AUDIO_OUT_NUM_PORTS> sndmod_seen{};
+            const s32 sndmod_idx = handle - 1;
+            if (Config::getGR2TitleThemeMod() && sndmod_idx >= 0 &&
+                sndmod_idx < SCE_AUDIO_OUT_NUM_PORTS && !sndmod_seen[sndmod_idx]) {
+                sndmod_seen[sndmod_idx] = true;
+                LOG_INFO(Lib_AudioOut,
+                         "[SNDMOD-OUT] first output: handle={} buffer_bytes={} channels={} "
+                         "sample_rate={}",
+                         handle, port.BufferSize(), u32(port.format_info.num_channels),
+                         port.sample_rate);
+            }
             std::memcpy(port.output_buffer, ptr, port.BufferSize());
             port.output_ready = true;
             port.last_output_time = Kernel::sceKernelGetProcessTime();

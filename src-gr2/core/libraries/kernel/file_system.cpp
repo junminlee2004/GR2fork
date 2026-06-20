@@ -6,6 +6,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
+#include "common/config.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -77,6 +78,22 @@ namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
+
+    // [SNDMOD-OPEN] Investigation probe, GATED behind the mod toggle so it only logs while the
+    // sound-replacement feature is on (kept for finding future sounds to replace). Flags audio-
+    // relevant opens so the log is greppable.
+    if (Config::getGR2TitleThemeMod()) {
+        const std::string_view sndmod_p{raw_path};
+        const auto sndmod_has = [&](std::string_view s) {
+            return sndmod_p.find(s) != std::string_view::npos;
+        };
+        if (sndmod_has(".psarc") || sndmod_has(".at9") || sndmod_has(".sbnk") ||
+            sndmod_has(".ac3") || sndmod_has(".wav") || sndmod_has("sound") ||
+            sndmod_has("audio") || sndmod_has("/bgm") || sndmod_has("voice") ||
+            sndmod_has("se_")) {
+            LOG_INFO(Kernel_Fs, "[SNDMOD-OPEN] audio-relevant path = {}", raw_path);
+        }
+    }
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();

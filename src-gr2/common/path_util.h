@@ -28,6 +28,7 @@ enum class PathType {
     FontsDir,       // Where dumped system fonts are stored.
     HomeDir,        // PS4 home directory (savedata lives under here).
     CustomModulesDir, // Where custom modules are stored.
+    ModsDir,        // Where user audio/asset mods are stored (e.g. title-theme replacement).
 };
 
 constexpr auto PORTABLE_DIR = "user";
@@ -53,6 +54,7 @@ constexpr auto CACHE_DIR = "cache";
 constexpr auto FONTS_DIR = "fonts";
 constexpr auto HOME_DIR = "home";
 constexpr auto CUSTOM_MODULES_DIR = "custom_modules";
+constexpr auto MODS_DIR = "mods";
 
 // Filenames
 constexpr auto LOG_FILE = "shad_log.txt";

@@ -63,6 +63,11 @@ private:
     u32 m_num_frames{};
     Atrac9CodecInfo m_codec_info{};
     std::vector<u8> m_pcm_buffer;
+
+    // [SNDMOD] Title-theme replacement state: matches the theme by first-frame fingerprint and,
+    // if GR2TitleThemeMod is on with a usable file, overwrites its decoded PCM. Reset per stream.
+    bool m_swap_checked{};
+    bool m_swap_active{};
 };
 
 } // namespace Libraries::Ajm

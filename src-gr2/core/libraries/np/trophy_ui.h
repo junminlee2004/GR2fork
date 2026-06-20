@@ -34,6 +34,11 @@ private:
 
     MIX_Mixer* mixer;
     MIX_Audio* audio;
+
+    // TEMP PROBE (GR2FORK trophy-font DPI investigation): one-shot guard so the
+    // draw-time probe logs once per trophy instead of every frame. Remove once
+    // resolved.
+    bool probe_logged = false;
 };
 
 struct TrophyInfo {
