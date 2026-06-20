@@ -1,28 +1,26 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// v208: sceContentDelete HLE — now actually deletes instead of stubbing.
+// sceContentDelete HLE — deletes the photo the gallery selected.
 //
 // Three NIDs are imported from libSceContentDelete:
 //   pXJh3aVk8Ks  (FuncA)
 //   5XLSih32qHA  (FuncB)
 //   zoxb0wEChEM  (FuncC)
 //
-// We don't yet know which NID corresponds to which operation (init / delete /
-// terminate). Rather than wait for a round-trip to identify, v208 takes the
-// shotgun approach: ANY of the three functions, if called with a string arg
-// that looks like a content_id (prefix "UP9000-"), routes to DeleteContentById.
+// They are Init / DeleteById / Terminate in some order we don't need to pin
+// down. GR2 deletes by looping its selected-photo list and calling
+// sceContentDeleteById(idHandle) once per photo, where idHandle is the opaque
+// 8-byte value our search wrote to SceContentSearchContentInfo +0x00 (tracked
+// in ContentSearch's id<->handle table). We map that handle back to a content
+// id and delete the file + drop it from the search.
 //
-// If multiple NIDs are called with the same content_id for a single action
-// (e.g. FuncA=begin, FuncB=commit, FuncC=end), DeleteContentById handles it
-// idempotently: first call removes the entry + file, subsequent calls find
-// nothing to remove and return false harmlessly.
-//
-// Logging remains verbose so we can identify each NID's true role on the
-// next run — this also serves as a fallback if the "UP9000-" heuristic
-// misses something.
+// Only the DeleteById call carries a real handle; Init (workspace) and
+// Terminate (ctx) miss the table and no-op. We do a pure table lookup and never
+// dereference the arg as a pointer, so an unknown value is harmless. Repeated
+// calls for the same photo are idempotent (DeleteContentById no-ops once the id
+// is gone).
 
-#include <cstring>
 #include <string>
 
 #include "common/logging/log.h"
@@ -32,61 +30,28 @@
 
 namespace Libraries::ContentDelete {
 
-// Best-effort content_id extraction from an arg. Returns empty string if the
-// pointer doesn't lead to a plausible content_id.
-//
-// NAMING(GR2FORK v1.0): content ids are now "YYYYMMDD_HHMMSS_NNN" (19 chars,
-// digits + underscore only). Previously they were "UP9000-CUSA04943_00-
-// SCREENSHOTnnnnn" (36 chars). We no longer gate on the "UP" prefix — we
-// accept any printable ASCII string of plausible length and let
-// Libraries::ContentSearch::DeleteContentById() decide whether it matches
-// a tracked photo. DeleteContentById bails out cleanly for unknown ids,
-// so speculative calls are safe.
-static std::string TryExtractContentId(u64 arg) {
-    if (arg <= 0x100000 || arg >= 0x800000000000ULL) return {};
-    const char* s = reinterpret_cast<const char*>(arg);
-    // Printable-first-char sanity check
-    if (s[0] < 0x20 || s[0] >= 0x7f) return {};
-    // Copy up to 64 chars, stopping at null or non-printable
-    char buf[65] = {0};
-    u32 len = 0;
-    for (; len < 64; ++len) {
-        char c = s[len];
-        if (c == 0) break;
-        if (c < 0x20 || c >= 0x7f) return {}; // non-printable midway → not a string
-        buf[len] = c;
-    }
-    // "YYYYMMDD_HHMMSS_NNN" is 19 chars. Accept slightly shorter in case the
-    // PS4 side ever passes a sub-form, and much longer for legacy UP-prefixed
-    // ids that may still be in-memory after migration.
-    if (len < 12) return {}; // too short to be any plausible id
-    return std::string(buf, len);
-}
-
-// Shared handler: log the call and, if any arg is a content_id, delete it.
+// Map a delete handle to its content id and delete. The handle is the first
+// integer arg, but we check the first two for ABI slack — GetContentIdByHandle
+// is a pure table lookup (no dereference) and DeleteContentById is self-guarding
+// (no-ops on unknown ids), so checking both is safe and can never act on the
+// wrong photo.
 static int HandleDeleteCall(const char* func_name, u64 a1, u64 a2, u64 a3,
                              u64 a4, u64 a5, u64 a6) {
     LOG_INFO(Core, "[ContentDelete] {} called: "
              "a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x}",
              func_name, a1, a2, a3, a4, a5, a6);
 
-    // Try to extract a content_id from each of the first two args (the rest
-    // are very unlikely to hold strings). If found, route to DeleteContentById.
     for (u64 arg : {a1, a2}) {
-        auto id = TryExtractContentId(arg);
+        const std::string id = Libraries::ContentSearch::GetContentIdByHandle(arg);
         if (id.empty()) continue;
 
-        LOG_INFO(Core, "[ContentDelete] {} — detected content_id '{}', "
-                 "routing to DeleteContentById", func_name, id);
-        bool deleted = Libraries::ContentSearch::DeleteContentById(id);
-        LOG_INFO(Core, "[ContentDelete] {} — DeleteContentById('{}') returned {}",
-                 func_name, id, deleted ? "true (removed)" : "false (not found)");
-        // Only act on the first content_id we find. No two args should both
-        // be content_ids for a single delete operation.
-        break;
+        const bool deleted = Libraries::ContentSearch::DeleteContentById(id);
+        LOG_INFO(Core, "[ContentDelete] {} — handle {:#x} -> id '{}' -> {}",
+                 func_name, arg, id, deleted ? "deleted" : "not found");
+        return 0; // handled this photo; don't double-act on the other arg
     }
 
-    return 0; // ORBIS_OK — game expects success
+    return 0; // ORBIS_OK — Init/Terminate, or a handle we don't track: nothing to do
 }
 
 // NID pXJh3aVk8Ks
@@ -111,8 +76,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceContentDeleteFuncB);
     LIB_FUNCTION("zoxb0wEChEM", "libSceContentDelete", 1, "libSceContentDelete",
                  sceContentDeleteFuncC);
-    LOG_INFO(Core, "[ContentDelete] v208 HLE registered — content_id detection "
-             "will route to DeleteContentById");
+    LOG_INFO(Core, "[ContentDelete] HLE registered — sceContentDeleteById maps "
+             "the content-ID handle back to a file via ContentSearch");
 }
 
 } // namespace Libraries::ContentDelete

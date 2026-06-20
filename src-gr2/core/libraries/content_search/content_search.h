@@ -38,6 +38,12 @@ namespace Libraries::ContentSearch {
     std::string GetContentIdByIndex(u32 index);
     bool DeleteContentById(const std::string& content_id);
 
+    // Map an opaque 8-byte content-ID handle (the value the search wrote to
+    // SceContentSearchContentInfo +0x00) back to its content id. Returns "" if
+    // the handle was never assigned. Used by sceContentDeleteById, and available
+    // for a future metadata-by-handle (caption) path.
+    std::string GetContentIdByHandle(u64 handle);
+
     int PS4_SYSV_ABI sceContentSearchInit(u64 a1 = 0, u64 a2 = 0, u64 a3 = 0, u64 a4 = 0,
                                           u64 a5 = 0, u64 a6 = 0, u64 a7 = 0, u64 a8 = 0);
     int PS4_SYSV_ABI sceContentSearchSearchContent(u64 a1 = 0, u64 a2 = 0, u64 a3 = 0, u64 a4 = 0,

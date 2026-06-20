@@ -7,21 +7,11 @@
 
 namespace Libraries::ScreenshotService {
 
-// Apply the GR2 eboot binary patches that make the in-game photo gallery's
-// VIEW (Cross) and MARK (Square) actions work on HLE-provided photos.
+// The GR2 View/Mark eboot binary patches were removed: once HLE search results
+// carry real per-photo records and paths, the game's own View (Cross) / Mark
+// (Square) gates pass without NOPing them.
 //
-// Thirteen jcc-rel32 instructions in the Mark/View wrapper + dispatcher are
-// NOP'd (or one je-rel8 is converted to jmp-rel8). These gates originally
-// short-circuit to the sys_ng ("unavailable") sound whenever a cell's
-// +0x08 / sub_obj2 / sub_obj1 dereference chain points at null — the exact
-// state of the HLE-populated cells. With the gates removed, the Mark and
-// View paths complete instead of bouncing to sys_ng.
-//
-// Triangle (Delete) is NOT patched — those gates are intentionally left in
-// place; delete support is a separate problem.
-//
-// Safe to call multiple times; verifies expected opcode bytes before writing
-// and no-ops if already patched or unrecognized.
-void ApplyViewMarkPatches(uintptr_t eboot_base);
+// The gallery-visibility helpers (IsGalleryVisible / PollGalleryStateAndLogEdges)
+// remain defined in screenshot_service.cpp.
 
 } // namespace Libraries::ScreenshotService

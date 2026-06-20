@@ -345,6 +345,10 @@ std::filesystem::path GetSaveDataPath();
 std::filesystem::path GetHomeDir();
 void setHomeDir(const std::filesystem::path& path);
 std::string getUserName();
+// GR2FORK (online restoration): host that all guest sceHttp URLs are rewritten to
+// (host swapped + scheme forced to http) so GR2's discontinued online traffic is
+// redirected to a local/self-hosted server. Default "localhost". See network/http.cpp.
+std::string GetHttpHostOverride();
 bool GetUseUnifiedInputConfig();
 void SetUseUnifiedInputConfig(bool use);
 bool GetOverrideControllerColor();

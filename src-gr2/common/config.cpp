@@ -195,6 +195,8 @@ static ConfigEntry<double> trophyNotificationDuration(6.0);
 static ConfigEntry<string> logFilter("");
 static ConfigEntry<string> logType("sync");
 static ConfigEntry<string> userName("shadPS4");
+// GR2FORK (online restoration): redirect target for all guest sceHttp requests.
+static ConfigEntry<string> httpHostOverride("localhost");
 static ConfigEntry<bool> isShowSplash(false);
 static ConfigEntry<string> isSideTrophy("right");
 static ConfigEntry<bool> isConnectedToNetwork(false);
@@ -604,6 +606,10 @@ string getLogType() {
 
 string getUserName() {
     return userName.get();
+}
+
+string GetHttpHostOverride() {
+    return httpHostOverride.get();
 }
 
 bool getUseSpecialPad() {
@@ -1499,6 +1505,7 @@ static void loadFromToml(const std::filesystem::path& path, bool is_game_specifi
         logFilter.setFromToml(general, "logFilter", is_game_specific);
         logType.setFromToml(general, "logType", is_game_specific);
         userName.setFromToml(general, "userName", is_game_specific);
+        httpHostOverride.setFromToml(general, "httpHostOverride", is_game_specific);
         isShowSplash.setFromToml(general, "showSplash", is_game_specific);
         isSideTrophy.setFromToml(general, "sideTrophy", is_game_specific);
 
@@ -1829,6 +1836,7 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
 
         isPSNSignedIn.setFromJson(g, "isPSNSignedIn", is_game_specific);
         userName.setFromJson(g, "userName", is_game_specific);
+        httpHostOverride.setFromJson(g, "httpHostOverride", is_game_specific);
         // Prefer gr2fork's exact logType string over the Log.sync-derived value above.
         logType.setFromJson(g, "logType", is_game_specific);
         isFpsColor.setFromJson(g, "fpsColor", is_game_specific);
@@ -1992,6 +2000,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     // ---- GR2Fork (gr2fork-only; preserved verbatim by the prerelease) ----
     isPSNSignedIn.setJsonValue(data, "GR2Fork", "isPSNSignedIn", is_game_specific);
     userName.setJsonValue(data, "GR2Fork", "userName", is_game_specific);
+    httpHostOverride.setJsonValue(data, "GR2Fork", "httpHostOverride", is_game_specific);
     logType.setJsonValue(data, "GR2Fork", "logType", is_game_specific);
     gyroSwapYawRoll.setJsonValue(data, "GR2Fork", "gyroSwapYawRoll", is_game_specific);
     gyroInvertYaw.setJsonValue(data, "GR2Fork", "gyroInvertYaw", is_game_specific);
@@ -2126,6 +2135,7 @@ void setDefaultValues(bool is_game_specific) {
     logFilter.set("", is_game_specific);
     logType.set("sync", is_game_specific);
     userName.set("shadPS4", is_game_specific);
+    httpHostOverride.set("localhost", is_game_specific);
     isShowSplash.set(false, is_game_specific);
     isSideTrophy.set("right", is_game_specific);
 

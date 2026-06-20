@@ -15,11 +15,11 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common/logging/log.h"
 #include "common/elf_info.h"
-#include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "common/thread.h"
@@ -27,7 +27,6 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/content_search/content_search.h"
-#include "core/libraries/screenshot_service/screenshot_service.h"
 
 namespace Libraries::ContentSearch {
 
@@ -72,6 +71,38 @@ static void FreeMetadataHandle(u32 handle) {
     std::lock_guard lock(s_metadata_mutex);
     u32 slot = handle & 0xF;
     s_metadata_sessions[slot].valid = false;
+}
+
+// ─── Stable content-ID handle table ─────────────────────────────────────
+// GR2 stores the 8-byte handle we put at SceContentSearchContentInfo +0x00 and
+// hands it back verbatim to OpenMetadataByContentId() and sceContentDeleteById().
+// Delete is batched (the game loops its multi-selection), so the handle MUST be
+// a stable per-id identity, not a list position — otherwise deleting one photo
+// renumbers the rest and the next deleteById() in the batch hits the wrong row.
+// Handles are assigned once per id and reused for the whole session; they carry
+// a "GR2D" tag in the high bits purely so they're unmistakable in logs and can
+// never collide with a small workspace size.
+static std::mutex s_handle_mutex;
+static std::unordered_map<u64, std::string> s_handle_to_id;
+static std::unordered_map<std::string, u64> s_id_to_handle;
+static u64 s_next_handle = 0x4752324400000001ULL; // 'G''R''2''D' | ordinal 1
+
+static u64 GetOrAssignHandle(const std::string& cid) {
+    std::lock_guard lock(s_handle_mutex);
+    auto it = s_id_to_handle.find(cid);
+    if (it != s_id_to_handle.end()) return it->second;
+    const u64 h = s_next_handle++;
+    s_id_to_handle.emplace(cid, h);
+    s_handle_to_id.emplace(h, cid);
+    return h;
+}
+
+static void ForgetHandleForId(const std::string& cid) {
+    std::lock_guard lock(s_handle_mutex);
+    auto it = s_id_to_handle.find(cid);
+    if (it == s_id_to_handle.end()) return;
+    s_handle_to_id.erase(it->second);
+    s_id_to_handle.erase(it);
 }
 
 // Screenshot directory + mount
@@ -169,24 +200,59 @@ void WriteSearchOutputs(u64 a7, u64 hit) {
     *adv   = hit;
 }
 
-// Populate a single ContentSearch entry (0x960 bytes)
-void PopulateEntry(u8* entry, u32 index, const std::string& cid) {
-    u64 record_id = static_cast<u64>(index + 1);
+// Populate a single ContentSearch entry (0x960 bytes).
+//
+// GR2's roll (FilmAlbum) builds a 0xa10-byte record per photo by copying these
+// exact fields out of each 0x960 result entry:
+//   record +0x00c  <-  entry +0x018   (path #1 — full JPEG)
+//   record +0x40d  <-  entry +0x52b   (path #2 — thumbnail)
+//   record +0x80e  <-  entry +0x424   (content-ID string)
+//   record +0x000  <-  entry +0x000   (8-byte content-ID handle)
+// then opens whichever path string sits in the record through the eboot's FIOS
+// wrapper (0x5745c0). That wrapper opens a leading-'/' path verbatim, but
+// PREPENDS "/arc0/" to any path that does NOT start with '/'.
+//
+// PAWPRINT ROOT CAUSE (fixed here): +0x018 was carrying the bare content-id
+// ("20260620_143025_001") with no leading slash, so the wrapper turned it into
+// "/arc0/20260620_143025_001" — which doesn't exist — and the grid/full-view
+// fell back to the placeholder paw-print. +0x52b already held a correct
+// absolute path, but the full-JPEG field (#1) is the one the loader needs.
+//
+// FIX: put the ABSOLUTE mounted path ("/screenshot/<id>.jpg") in BOTH path
+// fields. The JPEG lives at <ScreenshotsDir>/Gravity Rush 2/<id>.jpg, which is
+// mounted at the guest path "/screenshot" (see MountScreenshotDir). The
+// grid-vs-full-view path split lives in an un-dumped selection handler, so
+// serving both fields is the robust contract; when no separate thumbnail file
+// exists the UI decoder downscales the full JPEG for the grid.
+void PopulateEntry(u8* entry, const std::string& cid) {
+    // +0x000 (8B): opaque content-ID handle. GR2 stores this verbatim and hands
+    // it back to OpenMetadataByContentId() and sceContentDeleteById(). Use a
+    // STABLE per-id handle (not a list position) so deleting one photo never
+    // shifts another photo's handle mid-batch.
+    u64 record_id = GetOrAssignHandle(cid);
     std::memcpy(entry + 0x000, &record_id, 8);
 
+    // +0x00C (4B): content type/format. Type 1 already yields correct grid-slot
+    // population (the photo count is honored), so it is left unchanged.
     u32 ctype = 1;
     std::memcpy(entry + 0x00C, &ctype, 4);
 
-    std::memset(entry + 0x018, 0, 0x401);
-    std::strncpy(reinterpret_cast<char*>(entry + 0x018), cid.c_str(), 0x400);
-
-    char title[64] = {};
-    std::snprintf(title, sizeof(title), "Photo %04u", index);
-    std::memset(entry + 0x424, 0, 0x101);
-    std::strncpy(reinterpret_cast<char*>(entry + 0x424), title, 0x100);
-
+    // Build the absolute guest path once and use it for BOTH path fields.
     char filepath[512] = {};
     std::snprintf(filepath, sizeof(filepath), "/screenshot/%s.jpg", cid.c_str());
+
+    // +0x018 (<=0x401): path #1 -> full JPEG. MUST be absolute (leading '/') so
+    // the FIOS wrapper opens it as-is instead of prepending "/arc0/".
+    std::memset(entry + 0x018, 0, 0x401);
+    std::strncpy(reinterpret_cast<char*>(entry + 0x018), filepath, 0x400);
+
+    // +0x424 (<=0x101): content-ID as a STRING. The metadata worker can re-find
+    // the photo by this id, so it must be the real id (not a display label).
+    std::memset(entry + 0x424, 0, 0x101);
+    std::strncpy(reinterpret_cast<char*>(entry + 0x424), cid.c_str(), 0x100);
+
+    // +0x52B (<=0x401): path #2 -> thumbnail. No separate thumbnail is written,
+    // so point it at the same JPEG; the UI decoder downscales for the grid.
     std::memset(entry + 0x52B, 0, 0x401);
     std::strncpy(reinterpret_cast<char*>(entry + 0x52B), filepath, 0x400);
 }
@@ -251,6 +317,12 @@ std::string GetContentIdByIndex(u32 index) {
     return s_exported_ids[index];
 }
 
+std::string GetContentIdByHandle(u64 handle) {
+    std::lock_guard lock(s_handle_mutex);
+    auto it = s_handle_to_id.find(handle);
+    return (it == s_handle_to_id.end()) ? std::string{} : it->second;
+}
+
 bool DeleteContentById(const std::string& content_id) {
     {
         std::lock_guard lock(s_ids_mutex);
@@ -258,6 +330,11 @@ bool DeleteContentById(const std::string& content_id) {
         if (it == s_exported_ids.end()) return false;
         s_exported_ids.erase(it);
     }
+    // Drop the id<->handle mapping so a stale handle can never resolve to a
+    // since-deleted (or future-reused) id. Done AFTER releasing s_ids_mutex so
+    // the lock order stays one-directional (s_ids_mutex then s_handle_mutex).
+    ForgetHandleForId(content_id);
+
     auto path = GetScreenshotDir() / (content_id + ".jpg");
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -307,15 +384,6 @@ std::string GetLastSavedContentId() {
 
 int PS4_SYSV_ABI sceContentSearchInit(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7,
                                       u64 a8) {
-    // Apply the View+Mark gate NOPs so Cross and Square work on HLE photos.
-    // Safe to call multiple times — verifies bytes before writing.
-    {
-        const uintptr_t base = MemoryPatcher::g_eboot_address;
-        if (base != 0) {
-            Libraries::ScreenshotService::ApplyViewMarkPatches(base);
-        }
-    }
-
     MountScreenshotDir();
     {
         std::lock_guard lock(s_ids_mutex);
@@ -352,7 +420,7 @@ int PS4_SYSV_ABI sceContentSearchSearchContent(u64 a1, u64 a2, u64 a3, u64 a4, u
         for (u32 i = 0; i < hit; i++) {
             u8* entry = reinterpret_cast<u8*>(a8) + static_cast<u64>(i) * ENTRY_SIZE;
             u32 global_idx = start + i;
-            PopulateEntry(entry, global_idx, s_exported_ids[global_idx]);
+            PopulateEntry(entry, s_exported_ids[global_idx]);
         }
     }
 

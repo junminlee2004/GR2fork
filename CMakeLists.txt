@@ -260,7 +260,7 @@ add_core(
     SRC      ${SRC_GR2}
     EXCLUDES core/libraries/screenshot_service/screenshot_service2.cpp
              shader_recompiler/frontend/translate/emit_spirv.cpp
-    LIBS     SDL3_mixer::SDL3_mixer miniz)
+    LIBS     SDL3_mixer::SDL3_mixer miniz Cpp_Httplib)
 
 # --- core_main: the byte-untouched prerelease. ---------------------------------
 add_core(

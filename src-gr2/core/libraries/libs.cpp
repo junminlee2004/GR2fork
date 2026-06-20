@@ -33,6 +33,7 @@
 #include "core/libraries/network/netctl.h"
 #include "core/libraries/network/ssl.h"
 #include "core/libraries/network/ssl2.h"
+#include "core/libraries/secure/secure.h"
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_commerce.h"
 #include "core/libraries/np/np_common.h"
@@ -91,6 +92,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     Libraries::AudioOut::RegisterLib(sym);
     Libraries::Http::RegisterLib(sym);
     Libraries::Http2::RegisterLib(sym);
+    Libraries::LibSecure::RegisterLib(sym);
     Libraries::Net::RegisterLib(sym);
     Libraries::NetCtl::RegisterLib(sym);
     Libraries::SaveData::RegisterLib(sym);
