@@ -6,7 +6,6 @@
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_impl.h"
 #include "core/libraries/libs.h"
-#include <array>
 #include <mutex>
 #include <string_view>
 #include <unordered_set>
@@ -14,8 +13,8 @@
 
 namespace Libraries::AvPlayer {
 
-// FIX(GR2FORK v6 / v6.3): tutorial-wins serialization — filename-identified,
-// with frozen-stream flush on release.
+// FIX(GR2FORK v6 / v7): tutorial-wins serialization — SIZE-identified, with
+// frozen-stream flush on release.
 //
 // Tutorial overlays collide with a concurrent background video in the
 // GpuComm/assembler split (shared bind-state in one cmdbuf), which can't be
@@ -24,45 +23,39 @@ namespace Libraries::AvPlayer {
 // are suppressed (frozen). The v6 stall-watchdog (avplayer_source.cpp) keeps a
 // suppressed stream's decoder from wedging.
 //
-// v6.3 changes two things:
-//   1. Identification is by source FILENAME, not the 768x416 frame size. The
-//      size matched any like-sized cutscene/preview and would wrongly suppress
-//      legitimate streams; the twelve info/ tutorial files are matched exactly.
-//   2. When the active tutorial ends and no tutorial remains, every other live
-//      stream (all of which were suppressed/frozen) is flushed immediately, so
-//      a frozen video can't sit dead and stall GR2's streaming queue into an
-//      infinite load.
+// v7 reverts identification from source FILENAME back to the FRAME SIZE
+// signature. In GR2 the tutorial info videos are uniquely 768x416 (e.g.
+// info/ep03_info_06_01.mp4); that distinctive dimension IS the tutorial
+// signature. Keying on size rather than a hardcoded twelve-filename list keeps
+// the policy working when filenames differ — across game versions / regions
+// and other titles in the fork (e.g. GRR) — without maintaining a name table.
+// Trade-off vs the v6.3 filename gate: any non-tutorial stream that happens to
+// be exactly 768x416 would now be treated as the tutorial. No such look-alike
+// is known in GR2's video set; this is the deliberately chosen behavior.
 //
-// The gate is otherwise the corrected v6 form: decide suppression BEFORE
-// consuming (never discard a consumed frame), and drop only the first racing
-// frame of a freshly-claimed tutorial.
+// The rest is the corrected v6 form, unchanged:
+//   - decide suppression BEFORE consuming (never discard a consumed frame);
+//   - drop only the first racing frame of a freshly-claimed tutorial
+//     (FIX v6.1/6.2: the first tutorial frame presents from a stale UBO/texture
+//     cache at the shared VAddr; by frame 2 the tick key has turned over);
+//   - when the active tutorial ends and no tutorial remains, flush every other
+//     live stream (all suppressed/frozen by it) at once, so a frozen video
+//     can't sit dead and stall GR2's streaming queue into an infinite load.
 namespace {
 
-// The GR2 tutorial info videos, by exact source filename. These twelve files
-// (under the game's info/ folder) ARE the tutorial overlays; matching the
-// source path against them is definitive.
-constexpr std::array<std::string_view, 12> kTutorialVideoFiles{{
-    "ep02_info_02.mp4", "ep02_info_04.mp4", "ep02_info_05.mp4", "ep02_info_06.mp4",
-    "ep02_info_07.mp4", "ep02_info_08.mp4", "ep02_info_09.mp4", "ep02_info_13.mp4",
-    "ep03_info_02_01.mp4", "ep03_info_03_01.mp4", "ep03_info_04_01.mp4", "ep03_info_06_01.mp4",
-}};
+// The GR2 tutorial info videos are uniquely 768x416. That dimension is the
+// tutorial signature; a frame measuring exactly this claims tutorial status.
+constexpr u32 kTutorialWidth = 768;
+constexpr u32 kTutorialHeight = 416;
 
-bool IsTutorialFilename(std::string_view path) noexcept {
-    // Substring match handles full paths, e.g. /app0/.../info/ep03_info_06_01.mp4.
-    for (const auto name : kTutorialVideoFiles) {
-        if (path.find(name) != std::string_view::npos) {
-            return true;
-        }
-    }
-    return false;
+bool IsTutorialDims(u32 w, u32 h) noexcept {
+    return w == kTutorialWidth && h == kTutorialHeight;
 }
 
 std::mutex g_tutorial_mutex;
 AvPlayerHandle g_tutorial_handle = nullptr; // currently-active (suppressing) tutorial
 bool g_tutorial_primed = false;             // first-frame drop done for the active tutorial
 
-// Handles whose current source is one of the tutorial files above.
-std::unordered_set<AvPlayerHandle> g_tutorial_sources;
 // Every live handle (Init..Close), so suppression release can flush the others.
 std::unordered_set<AvPlayerHandle> g_live_handles;
 
@@ -71,37 +64,27 @@ void RegisterLiveHandle(AvPlayerHandle h) {
     g_live_handles.insert(h);
 }
 
-// Mark/unmark a handle's source as a tutorial from its filename. A handle being
-// repurposed for a non-tutorial source loses tutorial status.
-void SetTutorialSource(AvPlayerHandle h, bool is_tutorial) {
-    std::scoped_lock lock{g_tutorial_mutex};
-    if (is_tutorial) {
-        g_tutorial_sources.insert(h);
-    } else {
-        g_tutorial_sources.erase(h);
-    }
-}
-
 // Suppress every handle except the one currently designated the tutorial.
 bool ShouldSuppress(AvPlayerHandle h) noexcept {
     std::scoped_lock lock{g_tutorial_mutex};
     return g_tutorial_handle != nullptr && g_tutorial_handle != h;
 }
 
-// Claim tutorial status when a confirmed tutorial-source handle delivers a
-// frame, and decide whether THIS frame must be dropped.
+// Claim tutorial status when a handle delivers a frame of the tutorial SIZE
+// (768x416), and decide whether THIS frame must be dropped.
 //
 // FIX(GR2FORK v6.1/6.2): the very first tutorial frame races its own
 // invalidation — Path D still holds a stale UBO copy and the texture cache a
 // stale image at the shared VAddr from the prior stream, so frame 1 presents
 // corrupt; by the next frame the tick key has turned over and the cache
 // re-copies clean. So drop the first frame after claiming and present from the
-// second. FIX(GR2FORK v6.3): the claim requires the handle's source to be a
-// known tutorial file (set at AddSource), so a like-sized clip can never be
-// mistaken for the tutorial. Returns true if this (first) frame is withheld.
-bool ClaimAndShouldDropFirstFrame(AvPlayerHandle h) noexcept {
+// second. FIX(GR2FORK v7): the claim is gated on the just-retrieved frame's
+// dimensions matching the 768x416 tutorial signature, so identification is the
+// frame size again (no filename table). A non-768x416 frame never claims.
+// Returns true if this (first) frame is withheld.
+bool ClaimAndShouldDropFirstFrame(AvPlayerHandle h, u32 w, u32 h_px) noexcept {
     std::scoped_lock lock{g_tutorial_mutex};
-    if (!g_tutorial_sources.contains(h)) {
+    if (!IsTutorialDims(w, h_px)) {
         return false;
     }
     if (g_tutorial_handle == nullptr) {
@@ -136,10 +119,9 @@ std::vector<AvPlayerHandle> ClearTutorialAndCollectFlush(AvPlayerHandle h) {
     return to_flush;
 }
 
-// Drop a handle from both registries (on Close).
+// Drop a handle from the live registry (on Close).
 void ForgetHandle(AvPlayerHandle h) {
     std::scoped_lock lock{g_tutorial_mutex};
-    g_tutorial_sources.erase(h);
     g_live_handles.erase(h);
 }
 
@@ -160,11 +142,10 @@ s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filenam
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    // FIX(GR2FORK v6/v6.3): handle reuse releases any prior designation (and
-    // flushes the streams it was suppressing), then re-evaluate this handle's
-    // tutorial status from the new source filename.
+    // FIX(GR2FORK v6): handle reuse releases any prior designation (and flushes
+    // the streams it was suppressing). Tutorial identity is now decided at
+    // frame time by size (v7), so there is no per-source marking to set here.
     ReleaseTutorialAndFlush(handle);
-    SetTutorialSource(handle, filename != nullptr && IsTutorialFilename(filename));
     return handle->AddSource(filename);
 }
 
@@ -176,7 +157,6 @@ s32 PS4_SYSV_ABI sceAvPlayerAddSourceEx(AvPlayerHandle handle, AvPlayerUriType u
     }
     ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6): handle reuse
     const auto path = std::string_view(source_details->uri.name, source_details->uri.length);
-    SetTutorialSource(handle, IsTutorialFilename(path));  // FIX(GR2FORK v6.3)
     return handle->AddSourceEx(path, source_details->source_type);
 }
 
@@ -190,8 +170,8 @@ s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6/v6.3): release + flush frozen others
-    ForgetHandle(handle);             // drop from live/tutorial-source registries
+    ReleaseTutorialAndFlush(handle);  // FIX(GR2FORK v6): release + flush frozen others
+    ForgetHandle(handle);             // drop from the live-handle registry
     delete handle;
     return ORBIS_OK;
 }
@@ -251,11 +231,11 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoData(AvPlayerHandle handle, AvPlayerFrameIn
     }
     const bool got = handle->GetVideoData(*video_info);
     if (got) {
-        // FIX(GR2FORK v6.3): claim/first-frame-drop keyed on the handle's
-        // tutorial-source identity (set from the filename at AddSource), not
-        // the frame size. ClaimAndShouldDropFirstFrame is a no-op for any
-        // non-tutorial handle.
-        if (ClaimAndShouldDropFirstFrame(handle)) {
+        // FIX(GR2FORK v7): claim/first-frame-drop keyed on the just-retrieved
+        // frame's dimensions matching the 768x416 tutorial signature. A
+        // non-tutorial-sized frame is a no-op here.
+        if (ClaimAndShouldDropFirstFrame(handle, video_info->details.video.width,
+                                         video_info->details.video.height)) {
             return false; // withhold the first (racing) frame; deliver from #2
         }
     }
@@ -277,9 +257,10 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
     }
     const bool got = handle->GetVideoData(*video_info);
     if (got) {
-        // FIX(GR2FORK v6.3): see sceAvPlayerGetVideoData — claim by source
-        // identity, drop only the first racing frame.
-        if (ClaimAndShouldDropFirstFrame(handle)) {
+        // FIX(GR2FORK v7): see sceAvPlayerGetVideoData — claim by frame size
+        // (768x416), drop only the first racing frame.
+        if (ClaimAndShouldDropFirstFrame(handle, video_info->details.video.width,
+                                         video_info->details.video.height)) {
             return false;
         }
     }
