@@ -158,7 +158,10 @@ template <bool async>
 // device-loss class. Policy: a skipped write (worst case a blank/stale region for a frame) is
 // always preferable to a faulting one. GDS is a persistent host buffer and exempt.
 #define GR2_WRITE_GATE(addr_, size_, what_)                                                        \
-    if (rasterizer_ && !rasterizer_->IsMapped((addr_), (size_))) [[unlikely]] {                                    \
+    /* GR2FORK: mapping-predicate DISABLED - Rasterizer::IsMapped tracks GPU-visible ranges     \
+       only, so label/CPU-only destinations false-negative and boot hangs (1446 dropped         \
+       WriteData labels). Kept as a no-op shell pending a sound host-pointer validity check. */ \
+    if (false && !(addr_) && !(size_) && !(what_)) [[unlikely]] {                               \
         static std::atomic<u32> gate_logged{0};                                                    \
         if (gate_logged.fetch_add(1, std::memory_order_relaxed) < 32) {                            \
             LOG_WARNING(Render_Vulkan, "GR2 write-gate: dropped {} to unmapped [{:#x}, {:#x})",    \

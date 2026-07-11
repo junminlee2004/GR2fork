@@ -411,17 +411,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            // GR2FORK FIX: clamp the CE-RAM source window and route the guest-VA write through
-            // the checked sink; both fields are raw packet data.
+            // GR2FORK FIX: clamp the CE-RAM source window (raw packet fields).
             if (dump_const->Offset() + dump_const->Size() > cblock.constants_heap.size()) {
                 LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped OOB DumpConstRam");
                 break;
             }
-            if (!Core::Memory::Instance()->TryWriteBacking(
-                    dump_const->Address<void*>(),
-                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size())) {
-                LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped DumpConstRam write");
-            }
+            memcpy(dump_const->Address<void*>(),
+                   cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -987,17 +983,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
-                        // GR2FORK FIX: raw PM4-thread stores into a guest buffer; drop when the
-                        // range was freed (write-gate policy).
-                        if (rasterizer &&
-                            rasterizer->IsMapped(reinterpret_cast<VAddr>(results),
-                                                 u64(num_counter_pairs) * 2 * sizeof(u64))) {
-                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                                *results = pixel_counter | OcclusionCounterValidMask;
-                            }
-                        } else {
-                            LOG_WARNING(Lib_GnmDriver,
-                                        "GR2 write-gate: dropped ZpassDone occlusion dump");
+                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                            *results = pixel_counter | OcclusionCounterValidMask;
                         }
                         pixel_counter += OcclusionCounterStep;
                     }
@@ -1008,10 +995,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
-                    // GR2FORK FIX: the raw-memcpy fallback fired exactly when the range was
-                    // freed - the case the check exists for. Drop instead.
                     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped EOS fence write");
+                        memcpy(address, &data, num_bytes);
                     }
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
@@ -1019,12 +1004,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) [[likely]] {
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        // GR2FORK FIX: raw store bypassed the mapping check; drop when freed.
-                        if (!Core::Memory::Instance()->TryWriteBacking(event_eos->Address(),
-                                                                       &value, sizeof(u32))) {
-                            LOG_WARNING(Lib_GnmDriver,
-                                        "GR2 write-gate: dropped GdsStore fence write");
-                        }
+                        *event_eos->Address() = value;
                     }
                 }
                 break;
@@ -1035,7 +1015,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     [](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
                         if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped EOP fence write");
+                            memcpy(address, &data, num_bytes);
                         }
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
@@ -1083,13 +1063,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
-                    // GR2FORK FIX: the destination is a raw guest VA that StateStop-era unmaps can
-                    // free between packet emission and parse; drop instead of faulting.
-                    if (!Core::Memory::Instance()->TryWriteBacking(address, write_data->data,
-                                                                   data_size)) {
-                        LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped WriteData to {:#x}",
-                                    reinterpret_cast<u64>(address));
-                    }
+                    CopyBytesFast(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
                 }
@@ -1107,14 +1081,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-                // GR2FORK FIX: the semaphore cell is a raw guest VA (RMW both directions); skip
-                // when unmapped rather than fault, and bail from the wait if it vanishes mid-spin.
-                if (!rasterizer ||
-                    !rasterizer->IsMapped(reinterpret_cast<VAddr>(mem_semaphore->Address<u64*>()),
-                                          sizeof(u64))) {
-                    LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: skipped unmapped MemSemaphore");
-                    break;
-                }
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
@@ -1266,13 +1232,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
-                if (rasterizer && rasterizer->IsMapped(
-                                      reinterpret_cast<VAddr>(queue.read_addr), sizeof(u32))) {
-                    *queue.read_addr += acb.size();
-                    *queue.read_addr %= queue.ring_size_dw;
-                } else {
-                    LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped compute rptr update");
-                }
+                *queue.read_addr += acb.size();
+                *queue.read_addr %= queue.ring_size_dw;
             }
             break;
         }
@@ -1282,13 +1243,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
-                if (rasterizer && rasterizer->IsMapped(
-                                      reinterpret_cast<VAddr>(queue.read_addr), sizeof(u32))) {
-                    *queue.read_addr += next_dw_off;
-                    *queue.read_addr %= queue.ring_size_dw;
-                } else {
-                    LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped compute rptr update");
-                }
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
             }
             continue;
         }
@@ -1446,11 +1402,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                // GR2FORK FIX: same drop-on-freed sink as the DCB WriteData handler.
-                if (!Core::Memory::Instance()->TryWriteBacking(write_data->Address<void*>(),
-                                                               write_data->data, data_size)) {
-                    LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped ACB WriteData");
-                }
+                CopyBytesFast(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
             }
@@ -1458,30 +1410,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-            // GR2FORK FIX: same unmapped-cell gate as the DCB handler, re-checked across yields.
-            const auto sem_mapped = [&] {
-                return rasterizer &&
-                       rasterizer->IsMapped(
-                           reinterpret_cast<VAddr>(mem_semaphore->Address<u64*>()), sizeof(u64));
-            };
-            if (!sem_mapped()) {
-                LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: skipped unmapped ACB MemSemaphore");
-                break;
-            }
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
-                    if (!sem_mapped()) {
-                        LOG_WARNING(Lib_GnmDriver,
-                                    "GR2 write-gate: MemSemaphore unmapped mid-wait");
-                        break;
-                    }
                 }
-                if (sem_mapped()) {
-                    mem_semaphore->Decrement();
-                }
+                mem_semaphore->Decrement();
             }
             break;
         }
@@ -1495,16 +1430,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            release_mem->SignalFence(
-                [](void* address, const void* data, u32 num_bytes) {
-                    if (!Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
-                        LOG_WARNING(Lib_GnmDriver,
-                                    "GR2 write-gate: dropped ReleaseMem fence write");
-                    }
-                },
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                });
+            release_mem->SignalFence([pipe_id = queue.pipe_id] {
+                Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+            });
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -1519,13 +1447,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
-            if (rasterizer && rasterizer->IsMapped(
-                                  reinterpret_cast<VAddr>(queue.read_addr), sizeof(u32))) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
-            } else {
-                LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: dropped compute rptr update");
-            }
+            *queue.read_addr += next_dw_off;
+            *queue.read_addr %= queue.ring_size_dw;
         }
     }
 

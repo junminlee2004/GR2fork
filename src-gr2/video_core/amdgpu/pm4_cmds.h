@@ -933,39 +933,27 @@ struct PM4CmdReleaseMem {
         return data_lo | u64(data_hi) << 32;
     }
 
-    // GR2FORK FIX: fence stores go through write_mem (a checked TryWriteBacking sink at the call
-    // sites) instead of raw pointer stores - StateStop-era frees between packet emission and
-    // parse made these the last unguarded PM4 write path. dst_sel==1 selects GDS/TC, which the
-    // raw path misread as a guest VA; skip it.
-    void SignalFence(auto&& write_mem, auto&& signal_irq) const {
-        if (dst_sel.Value() == 1) {
-            LOG_WARNING(Lib_GnmDriver, "GR2 write-gate: ReleaseMem GDS-dst fence skipped");
-        } else {
-            switch (data_sel.Value()) {
-            case DataSelect::Data32Low: {
-                const u32 value = DataDWord();
-                write_mem(Address<void*>(), &value, sizeof(value));
-                break;
-            }
-            case DataSelect::Data64: {
-                const u64 value = DataQWord();
-                write_mem(Address<void*>(), &value, sizeof(value));
-                break;
-            }
-            case DataSelect::GpuClock64: {
-                const u64 value = GetGpuClock64();
-                write_mem(Address<void*>(), &value, sizeof(value));
-                break;
-            }
-            case DataSelect::PerfCounter: {
-                const u64 value = GetGpuPerfCounter();
-                write_mem(Address<void*>(), &value, sizeof(value));
-                break;
-            }
-            default: {
-                UNREACHABLE();
-            }
-            }
+    void SignalFence(auto&& signal_irq) const {
+        switch (data_sel.Value()) {
+        case DataSelect::Data32Low: {
+            *Address<u32>() = DataDWord();
+            break;
+        }
+        case DataSelect::Data64: {
+            *Address<u64>() = DataQWord();
+            break;
+        }
+        case DataSelect::GpuClock64: {
+            *Address<u64>() = GetGpuClock64();
+            break;
+        }
+        case DataSelect::PerfCounter: {
+            *Address<u64>() = GetGpuPerfCounter();
+            break;
+        }
+        default: {
+            UNREACHABLE();
+        }
         }
 
         switch (int_sel.Value()) {
