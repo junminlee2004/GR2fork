@@ -1711,7 +1711,7 @@ TEST(Ps4Redirect, MethodPreservedOn302) {
     EXPECT_EQ(MethodAfterRedirect(302, ORBIS_HTTP_METHOD_POST), ORBIS_HTTP_METHOD_POST);
 }
 TEST(Ps4Redirect, MethodPreservedOn307) {
-    // RFC 7231 §6.4.7 - 307 specifically preserves method
+    // RFC 7231 section 6.4.7 - 307 specifically preserves method
     EXPECT_EQ(MethodAfterRedirect(307, ORBIS_HTTP_METHOD_GET), ORBIS_HTTP_METHOD_GET);
     EXPECT_EQ(MethodAfterRedirect(307, ORBIS_HTTP_METHOD_POST), ORBIS_HTTP_METHOD_POST);
     EXPECT_EQ(MethodAfterRedirect(307, ORBIS_HTTP_METHOD_HEAD), ORBIS_HTTP_METHOD_HEAD);
@@ -1724,7 +1724,7 @@ TEST(Ps4Redirect, PutDowngradesToGetOn303) {
     EXPECT_EQ(MethodAfterRedirect(303, ORBIS_HTTP_METHOD_PUT), ORBIS_HTTP_METHOD_GET);
 }
 TEST(Ps4Redirect, HeadPreservedOn303) {
-    // RFC 7231 §6.4.4 carve-out: HEAD stays HEAD across 303
+    // RFC 7231 section 6.4.4 carve-out: HEAD stays HEAD across 303
     EXPECT_EQ(MethodAfterRedirect(303, ORBIS_HTTP_METHOD_HEAD), ORBIS_HTTP_METHOD_HEAD);
 }
 TEST(Ps4Redirect, GetStaysGetOn303) {

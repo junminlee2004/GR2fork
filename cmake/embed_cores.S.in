@@ -1,0 +1,33 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Release embed stub. The umbrella turns this into a concrete .S via
+ *   file(GENERATE INPUT cmake/embed_cores.S.in OUTPUT embed_cores.generated.S)
+ * which resolves the TARGET_FILE generator expressions below to the actual
+ * built .so paths. Both cores are baked into the dispatcher as byte blobs; at
+ * launch the chosen one is written to a memfd and dlopen'd, yielding a single
+ * self-contained file on disk.
+ *
+ * NOTE: file(GENERATE) evaluates every generator expression in this file, so do
+ * not write example genexes in comments -- only the two real .incbin lines below.
+ *
+ * Symbol names are deliberately un-prefixed (ELF C symbols have no leading
+ * underscore on Linux/x86_64), so they match the extern "C" declarations in
+ * dispatcher/core_loader.cpp.
+ */
+    .section .rodata
+    .balign 16
+    .global core_gr2_so_start
+core_gr2_so_start:
+    .incbin "$<TARGET_FILE:core_gr2>"
+    .global core_gr2_so_end
+core_gr2_so_end:
+
+    .balign 16
+    .global core_main_so_start
+core_main_so_start:
+    .incbin "$<TARGET_FILE:core_main>"
+    .global core_main_so_end
+core_main_so_end:
+
+    /* Non-executable stack (silences the GNU-stack linker warning). */
+    .section .note.GNU-stack,"",@progbits

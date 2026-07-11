@@ -270,9 +270,8 @@ std::expected<void, ErrorInfo> Runner::initialize() {
     fence_ = fence;
 
     // ---- Descriptor set layout with push-descriptor flag --------------
-    // Single storage buffer at binding 0. No descriptor sets are ever
-    // allocated from this layout — the layout is just used to tell the
-    // pipeline layout and shader what the push-descriptor shape is.
+    // Single storage buffer at binding 0. No sets are ever allocated from this layout; it only
+    // tells the pipeline layout and shader what the push-descriptor shape is.
     vk::DescriptorSetLayoutBinding dsl_binding{
         .binding = 0,
         .descriptorType = vk::DescriptorType::eStorageBuffer,

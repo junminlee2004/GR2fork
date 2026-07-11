@@ -1,0 +1,16 @@
+1. Did you add in your dumped sysmodules into GR2fork\user\sys_modules? 
+2. is readbacks off as it should be in the config.toml?  
+3. are you pressing the delete key in the emulator? if so then change the mapping to not press it. 
+4. have you tried going into the config menu and pressing 'restore default' and 'apply+save' ?
+5. If you are on linux, is the emulator executable toggle for run permissions checked?
+6. Is your game installed on a hard drive? that can cause crashing, I recommend you move to an SSD.
+7. Does the crash freeze your launcher or is your log file huge? disable logging
+8. Do you have an intel cpu? intel cpus are currently less stable and less performant than amd cpus for PS4 emulation. Try disabling E cores
+9. If you have audio issues,  go in game to controller speaker and turn that volume down
+10.  If you want to use a high res patch, make sure to increase dedicated memory , enable PS4 neo mode, and devkit console mode in experimental tab
+11. have you tried restarting your computer?
+12. Do you have 2022 Visual C++ dependencies installed?
+13. If you have an intel cpu and the game still doesnt launch, open the launcher, right click the game and select create shortcut for specific emulator
+version in the popup menu. Then exit the launcher and use the desktop shortcut instead to launch the game. If this works, you can use the launcher to
+configure the game but not launch the game.
+14. side note - if you have high mouse sensitivity or controller sensitivity, try turning down screen refresh rate to 60hz

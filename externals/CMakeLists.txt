@@ -391,6 +391,16 @@ set(protobuf_WITH_ZLIB                OFF CACHE INTERNAL "")
 set(protobuf_BUILD_SHARED_LIBS        OFF CACHE INTERNAL "")
 set(protobuf_FORCE_FETCH_DEPENDENCIES ON  CACHE INTERNAL "")
 if(MSVC)
-set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
+    # GR2FORK FIX: protobuf derives CMAKE_MSVC_RUNTIME_LIBRARY for its whole
+    # subtree (abseil and utf8_range included) from this option, ignoring the
+    # umbrella's value. The Windows cores build everything with the static CRT,
+    # so forcing this OFF leaves libprotobuf.lib as the lone /MD object set and
+    # the core DLLs fail to link ("/failifmismatch: mismatch detected for
+    # 'RuntimeLibrary'"). Follow the umbrella CRT choice instead.
+    if(CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+        set(protobuf_MSVC_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
+    else()
+        set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
+    endif()
 endif()
 add_subdirectory(protobuf EXCLUDE_FROM_ALL)

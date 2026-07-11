@@ -158,3 +158,6 @@
 [submodule "externals/protobuf"]
 	path = externals/protobuf
 	url = https://github.com/shadexternals/protobuf.git
+[submodule "externals/sdl3_mixer"]
+	path = externals/sdl3_mixer
+	url = https://github.com/libsdl-org/SDL_mixer.git

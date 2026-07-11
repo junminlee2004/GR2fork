@@ -1,0 +1,9 @@
+1. Download GR2fork_Linux.zip
+2. extract it to whatever directory you want
+3. prepare your game dump and make sure it is downloaded to some folder on your pc. If you want to use the 1.11 patch, make sure the patch is copied into the base game's folder as it should be instead of having it in a separate folder. MAKE SURE YOUR GAME IS INSTALLED ON AN SSD
+4. add in your dumped sysmodules into GR2fork\user\sys_modules.
+5. right click shadps4gr2forkv3.2.appimage and make it executable
+6. open GR2Launcher.appimage in GR2fork and add your Gravity Rush 2 game directory.
+7. open gui and set up configs
+8. IF YOU ARE USING AND INTEL CPU, DISABLE E CORES
+9. Final note, do not be discouraged by crashing when going into a new area. Once you build up a good shader cache collection, crashes will dwindle

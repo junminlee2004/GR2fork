@@ -421,3 +421,9 @@ cmake-build-*
 
 # Nix Result symlink
 result
+build_opt/
+/AppDir/
+*.AppImage
+
+# upstream-merge.py --build log (regenerated per run)
+upstream-merge-build.log

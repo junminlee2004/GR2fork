@@ -1,0 +1,39 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Windows/COFF embed stub (clang-cl integrated assembler).
+ *
+ * The umbrella turns this into a concrete .S via
+ *   file(GENERATE INPUT cmake/embed_cores_win.S.in OUTPUT embed_cores.generated.S)
+ * which resolves the TARGET_FILE generator expressions below to the actual built
+ * .dll paths (CMake emits forward-slash paths, which clang's IA accepts on
+ * Windows). Both cores are baked into the dispatcher as byte blobs; at launch the
+ * chosen one is written to a uniquely-named %TEMP% file and LoadLibrary'd,
+ * yielding a single self-contained .exe on disk.
+ *
+ * Differences from the ELF stub (cmake/embed_cores.S.in):
+ *   - read-only section is .rdata (COFF), not .rodata (ELF).
+ *   - NO `.section .note.GNU-stack` -- that directive is ELF-only and COFF rejects it.
+ *   - x86_64 COFF C symbols have NO leading underscore (unlike 32-bit COFF), so the
+ *     un-prefixed labels still match the extern "C" decls in dispatcher/core_loader.cpp.
+ *
+ * GOTCHA: this MUST be assembled by clang-cl's integrated assembler. CMake on
+ * Windows defaults the ASM language to MASM (ml64), which has no `.incbin`; the
+ * umbrella pins CMAKE_ASM_COMPILER=clang-cl so the generated .S routes correctly.
+ *
+ * NOTE: file(GENERATE) evaluates every generator expression in this file, so do
+ * not write example genexes in comments -- only the two real .incbin lines below.
+ */
+    .section .rdata,"dr"
+    .balign 16
+    .globl core_gr2_so_start
+core_gr2_so_start:
+    .incbin "$<TARGET_FILE:core_gr2>"
+    .globl core_gr2_so_end
+core_gr2_so_end:
+
+    .balign 16
+    .globl core_main_so_start
+core_main_so_start:
+    .incbin "$<TARGET_FILE:core_main>"
+    .globl core_main_so_end
+core_main_so_end:
