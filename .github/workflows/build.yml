@@ -80,6 +80,15 @@ jobs:
 
 
     - name: Configure CMake
+      # GR2FORK CI FIX: hash the profdata CONTENT into every ccache object key. The profile is
+      # passed as /clang:-fprofile-use=<path>; ccache hashes the command line (the path) but NOT
+      # the file's content behind the /clang: escape, so a profdata update that keeps the same
+      # path served STALE objects (old PGO ProfileSummary) for cache hits while misses rebuilt
+      # against the new profile - ThinLTO then linked mismatched ProfileSummary bitcode and died
+      # ("ProfileSummary: IDs have conflicting values" on protoc.exe). CCACHE_EXTRAFILES forces a
+      # full, consistent rebuild whenever the profdata changes. (Local has no ccache, hence green.)
+      env:
+        CCACHE_EXTRAFILES: ${{github.workspace}}/packaging/gr2win.profdata
       # GLOBAL PGO, matching the local reference build (measured ~3fps faster than core_gr2-only
       # scoping): the profile reaches every statically linked external (bundled SDL3, zlib-ng,
       # imgui, ...) plus uniform /MT+LTO flags. -Wno-profile-instr-* silences unprofiled/stale-hash
@@ -93,6 +102,8 @@ jobs:
         cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_ASM_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS $pgo" "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $pgo" -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
+      env:
+        CCACHE_EXTRAFILES: ${{github.workspace}}/packaging/gr2win.profdata
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
 
     - name: Verify core DLL self-containment (dumpbin /dependents)
