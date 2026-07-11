@@ -24,6 +24,10 @@ extern std::list<std::pair<InputEvent, bool>> pressed_keys;
 
 int mouse_joystick_binding = 0;
 float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
+// gr2fork: mouse-to-joystick sensitivity. Global multiplies both axes; the per-axis pair scales
+// horizontal / vertical independently. Applied to the raw deltas before the magnitude/angle
+// split, so higher horizontal sensitivity steers more stick output sideways for the same motion.
+float mouse_sensitivity = 1.0f, mouse_sensitivity_x = 1.0f, mouse_sensitivity_y = 1.0f;
 bool mouse_gyro_roll_mode = false;
 Uint32 mouse_polling_id = 0;
 MouseMode mouse_mode = MouseMode::Off;
@@ -168,6 +172,12 @@ void SetMouseParams(float mdo, float ms, float mso) {
     mouse_speed_offset = mso;
 }
 
+void SetMouseSensitivity(float global, float horizontal, float vertical) {
+    mouse_sensitivity = global;
+    mouse_sensitivity_x = horizontal;
+    mouse_sensitivity_y = vertical;
+}
+
 void SetMouseGyroRollMode(bool mode) {
     mouse_gyro_roll_mode = mode;
 }
@@ -210,6 +220,10 @@ void EmulateJoystick(GameController* controller, u32 interval) {
 
     float d_x = 0, d_y = 0;
     SDL_GetRelativeMouseState(&d_x, &d_y);
+
+    // gr2fork: apply global + per-axis sensitivity to the raw deltas.
+    d_x *= mouse_sensitivity * mouse_sensitivity_x;
+    d_y *= mouse_sensitivity * mouse_sensitivity_y;
 
     float output_speed =
         SDL_clamp((sqrt(d_x * d_x + d_y * d_y) + mouse_speed_offset * 128) * mouse_speed,

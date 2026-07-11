@@ -419,6 +419,18 @@ void ParseInputConfig(const std::string game_id = "") {
             }
             SetMouseParams(mouse_deadzone_offset, mouse_speed, mouse_speed_offset);
             return;
+        } else if (output_string == "mouse_sensitivity") {
+            // gr2fork: global, horizontal, vertical sensitivity multipliers (all default 1.0).
+            std::stringstream ss(input_string);
+            char comma;
+            float global_sens = 1.0f, horizontal_sens = 1.0f, vertical_sens = 1.0f;
+            ss >> global_sens >> comma >> horizontal_sens >> comma >> vertical_sens;
+            if (ss.fail()) {
+                LOG_WARNING(Input, "Failed to parse mouse sensitivity from line: {}", line);
+                return;
+            }
+            SetMouseSensitivity(global_sens, horizontal_sens, vertical_sens);
+            return;
         } else if (output_string == "touchpad_swipe_speed") {
             std::stringstream ss(input_string);
             float speed;

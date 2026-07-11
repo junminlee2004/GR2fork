@@ -30,6 +30,8 @@ void SetMouseMode(MouseMode m);
 MouseMode GetMouseMode();
 void SetMouseToJoystick(int joystick);
 void SetMouseParams(float mouse_deadzone_offset, float mouse_speed, float mouse_speed_offset);
+// gr2fork: global + per-axis (horizontal, vertical) mouse-to-joystick sensitivity multipliers.
+void SetMouseSensitivity(float global, float horizontal, float vertical);
 void SetMouseGyroRollMode(bool mode);
 void SetTouchpadSwipeSpeed(float speed);
 void SetTouchpadSwipeThreshold(float threshold);

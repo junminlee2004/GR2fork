@@ -64,16 +64,6 @@ UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
 
 UniqueBuffer::~UniqueBuffer() {
     if (buffer) {
-        // GR2FORK DIAG: log the device-address range being freed so a later
-        // device-lost WRITE_INVALID at a stale address can be matched back to
-        // the exact buffer here. Full-speed (frees are not per-frame). Only
-        // BDA buffers (bda_addr != 0) can be a stale-device-address writer.
-        if (bda_addr != 0) {
-            VmaAllocationInfo ai{};
-            vmaGetAllocationInfo(allocator, allocation, &ai);
-            LOG_DEBUG(Render_Vulkan, "GR2 buf-free dev=[{:#x},{:#x}) bytes={:#x}",
-                        static_cast<u64>(bda_addr), static_cast<u64>(bda_addr) + ai.size, ai.size);
-        }
         vmaDestroyBuffer(allocator, buffer, allocation);
     }
 }

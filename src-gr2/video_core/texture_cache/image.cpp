@@ -78,13 +78,6 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 
 UniqueImage::~UniqueImage() {
     if (image) {
-        // GR2FORK DIAG: mirror of the buf-free log - lets a WRITE_INVALID fault address be
-        // attributed page-for-page to a specific freed image. Demote once validated.
-        VmaAllocationInfo alloc_info{};
-        vmaGetAllocationInfo(allocator, allocation, &alloc_info);
-        LOG_DEBUG(Render_Vulkan, "GR2 img-free mem={:#x} off={:#x} bytes={:#x}",
-                    reinterpret_cast<u64>(alloc_info.deviceMemory), alloc_info.offset,
-                    alloc_info.size);
         vmaDestroyImage(allocator, image, allocation);
     }
 }
