@@ -325,7 +325,14 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline,
         full_key = mix(full_key, regs.depth_htile_data_base.GetAddress());
         full_key = mix(full_key, static_cast<u64>(regs.last_db_extent.raw));
     }
-    if (rt_cache_active && rt_cache_.valid && rt_cache_.hash == rt_hash) [[likely]] {
+    // GR2FORK FIX: the non-accurate hit must also match the image-registry generation. The hash
+    // covers only guest addresses + extents, so an RT freed (GC/overlap) and recreated at the
+    // same VA+extent across rapid avplayer stop/start hashed identically and the DEAD slot id was
+    // re-recorded as a write target - the deferred vmaDestroyImage then freed the memory under
+    // batches still writing it (the WRITE_INVALID image-heap device loss). Register/Unregister
+    // already bump the generation, so every deletion path invalidates this hit for free.
+    if (rt_cache_active && rt_cache_.valid && rt_cache_.hash == rt_hash &&
+        rt_cache_.registry_generation == texture_cache.ImageRegistryGeneration()) [[likely]] {
         // Fast path: render targets unchanged. Reuse cached image_ids.
         // Must still add to bound_images and re-mark is_target (cleared by ResetBindings).
         for (s32 cb = 0; cb < num_cbs; ++cb) {
@@ -420,12 +427,13 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline,
     }
 
     rt_cache_.hash = rt_hash;
+    // GR2FORK FIX: stamp the registry generation on EVERY fill (was accurate-only) - the
+    // non-accurate hit now validates against it; one relaxed atomic load per cache miss.
+    rt_cache_.registry_generation = texture_cache.ImageRegistryGeneration();
     if (accurate) {
         // Captured after every FindImage above so the next draw's fast-path compare sees the image
-        // set exactly as left here; guarded on `accurate` so GR2's cache-miss tail skips the atomic
-        // load.
+        // set exactly as left here.
         rt_cache_.full_key = full_key;
-        rt_cache_.registry_generation = texture_cache.ImageRegistryGeneration();
     }
     rt_cache_.valid = true;
 }
@@ -1775,8 +1783,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (image->depth_id) [[unlikely]] {
             // If this image has an associated depth image, it's a stencil attachment.
             // Redirect the access to the actual depth-stencil buffer.
-            image_id = image->depth_id;
-            image = &texture_cache.GetImage(image_id);
+            // GR2FORK FIX: no deletion path ever cleared depth_id, so the redirect could resolve
+            // a freed/reused slot and record it as a write target. Validate; self-heal if dead.
+            if (texture_cache.IsImageSlotAllocated(image->depth_id) &&
+                True(texture_cache.GetImageUntouched(image->depth_id).flags &
+                     VideoCore::ImageFlagBits::Registered)) {
+                image_id = image->depth_id;
+                image = &texture_cache.GetImage(image_id);
+            } else {
+                image->depth_id = {};
+            }
         }
         // OPT: Track needs_rebind here instead of a separate O(N) scan loop.
         any_needs_rebind |= image->binding.needs_rebind;

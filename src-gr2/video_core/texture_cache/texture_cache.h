@@ -231,6 +231,11 @@ public:
     /// overlap-resolved subresources - without re-running FindImage. relaxed:
     /// all (un)registration and all reads happen on the GpuAssembler resolve
     /// thread; the atomic only guarantees a non-torn read.
+    // GR2FORK FIX: thin slot-liveness probe for stale-id validation at bind sites.
+    [[nodiscard]] bool IsImageSlotAllocated(ImageId id) const noexcept {
+        return slot_images.is_allocated(id);
+    }
+
     [[nodiscard]] u64 ImageRegistryGeneration() const noexcept {
         return image_registry_generation_.load(std::memory_order_relaxed);
     }
@@ -382,6 +387,9 @@ private:
 
     void FreeImage(ImageId image_id) {
         Image& image = slot_images[image_id];
+        // GR2FORK FIX: every deletion path marks the binding stale before the id can be
+        // re-consumed within the same tick (overlap paths did this; GC/unmap did not).
+        image.binding.needs_rebind = 1u;
         if (False(image.flags & ImageFlagBits::Registered)) {
             // Already freed through another path (e.g., address conflict resolution
             // followed by GC eviction). Skip to avoid double-free.
