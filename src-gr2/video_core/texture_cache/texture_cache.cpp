@@ -181,6 +181,13 @@ void TextureCache::DownloadImageMemory(ImageId image_id) {
     }
     ASSERT(download_size <= image.info.guest_size);
     const auto [download, offset] = download_buffer.Map(download_size);
+    // GR2FORK FIX: over-ring downloads (4K RTs with the fork's resolution options) return a null
+    // map; recording the copy anyway writes past the ring. Drop instead.
+    if (download == nullptr) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "GR2 write-gate: image download dropped, {}B exceeds ring",
+                    download_size);
+        return;
+    }
     download_buffer.Commit();
     const vk::BufferImageCopy image_download = {
         .bufferOffset = offset,
@@ -238,7 +245,17 @@ bool TextureCache::ForceDownloadByAddress(VAddr address, u64 size) {
     bool is_depth{};
     {
         std::shared_lock lock{mutex};
+        // GR2FORK FIX: the tracked id can name a freed/reused slot (nothing cleared it on image
+        // deletion); dereferencing records a copy through a destroyed image. Validate first.
+        if (!slot_images.is_allocated(target_id)) {
+            LOG_WARNING(Render_Vulkan, "[GR2Photo] ForceDownload: tracked RT slot freed");
+            return false;
+        }
         img = &slot_images[target_id];
+        if (False(img->flags & ImageFlagBits::Registered) || img->backing == nullptr) {
+            LOG_WARNING(Render_Vulkan, "[GR2Photo] ForceDownload: tracked RT not live");
+            return false;
+        }
         if (img->info.size.width != 1024 || img->info.size.height != 1024) {
             LOG_WARNING(Render_Vulkan,
                         "[GR2Photo] ForceDownload: tracked RT is {}x{}, expected 1024x1024",
@@ -1824,6 +1841,14 @@ void TextureCache::TouchImage(Image& image) {
 
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
+    // GR2FORK FIX: drop the photo-RT tracker when its image dies so ForceDownload cannot
+    // resolve a freed/reused slot later.
+    {
+        std::lock_guard photo_lk{photo_rt_mutex_};
+        if (last_photo_rt_.image_id == image_id) {
+            last_photo_rt_ = {};
+        }
+    }
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
 
@@ -1914,7 +1939,15 @@ bool TextureCache::MaybeRestorePhotoSnapshot(ImageId image_id, Image& image) {
             const u32 size = photo_snapshot_.pitch * photo_snapshot_.height *
                              photo_snapshot_.bpp;
             u8* dst = std::bit_cast<u8*>(photo_snapshot_.guest_address);
-            std::memcpy(dst, photo_snapshot_.pixels.data(), size);
+            // GR2FORK FIX: the RT allocation can be freed (photo-mode exit, level change) before
+            // a dimension-matching image reuses this VA; drop and invalidate instead of writing
+            // into freed guest pages.
+            if (!Core::Memory::Instance()->TryWriteBacking(dst, photo_snapshot_.pixels.data(),
+                                                           size)) {
+                LOG_WARNING(Render_Vulkan, "GR2 write-gate: photo snapshot restore dropped");
+                photo_snapshot_.valid = false;
+                return false;
+            }
 
             // Mark as CPU-dirty so UpdateImage -> RefreshImage uploads our pixels
             image.flags |= ImageFlagBits::CpuDirty;

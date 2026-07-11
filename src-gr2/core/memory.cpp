@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
+#include <atomic>
 #include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -228,10 +229,18 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u32 num_bytes) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
-    ASSERT_MSG(IsValidMapping(virtual_addr, num_bytes), "Attempted to access invalid address {:#x}",
-               virtual_addr);
+    // GR2FORK FIX: a fence/data write to a range the guest just freed must DROP, not abort -
+    // this is the normal avplayer StateStop case (write-gate policy: blank over crash).
+    if (!IsValidMapping(virtual_addr, num_bytes)) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Core, "GR2 write-gate: dropped backing write to invalid [{:#x}, {:#x})",
+                        virtual_addr, virtual_addr + num_bytes);
+        }
+        return false;
+    }
     const auto& vma = FindVMA(virtual_addr)->second;
-    if (!HasPhysicalBacking(vma)) {
+    if (!vma.IsMapped() || !HasPhysicalBacking(vma)) {
         return false;
     }
     u8* backing = impl.BackingBase() + vma.phys_base + (virtual_addr - vma.base);

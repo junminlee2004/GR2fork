@@ -153,6 +153,9 @@ Presenter::~Presenter() {
     });
     rasterizer->WaitForAssembler(seq);
     const vk::Device device = instance.GetDevice();
+    // GR2FORK FIX: the final flip/present submits can still be writing these frame images;
+    // drain the whole device before destruction (write-into-freed on strict drivers otherwise).
+    (void)device.waitIdle();
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
@@ -234,6 +237,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
 }
 
 Frame* Presenter::PrepareLastFrame() {
+    std::scoped_lock last_lk{last_frame_mutex};
     if (last_submit_frame == nullptr) {
         return nullptr;
     }
@@ -289,6 +293,7 @@ Frame* Presenter::PrepareLastFrame() {
 }
 
 bool Presenter::CaptureScreenshot(std::vector<u8>& out_pixels, u32& out_width, u32& out_height) {
+    std::scoped_lock last_lk{last_frame_mutex};
     if (last_submit_frame == nullptr) {
         LOG_WARNING(Render_Vulkan, "CaptureScreenshot: no frame available");
         return false;
@@ -434,8 +439,19 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // scheduler, so it runs on the caller's thread. The aspect-ratio computation stays here too -
     // expected_ratio is read by OnResize on this thread; writing it in the closure would race.
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
-    const auto image_id = texture_cache.FindImage(desc);
-    texture_cache.UpdateImage(image_id);
+    // GR2FORK FIX: FindImage/UpdateImage on a CPU-dirty video-out image record barriers and
+    // uploads into draw_scheduler's OPEN command buffer; doing that from this (liverpool) thread
+    // races the assembler recording draws into the same buffer - two-thread VkCommandBuffer
+    // recording corrupts the stream (device loss during video playback, when the image is dirty
+    // every frame). Route the prelude through the assembler and block until it ran.
+    VideoCore::ImageId image_id{};
+    {
+        const u32 prelude_seq = rasterizer->PushPresenterRecord([this, &desc, &image_id] {
+            image_id = texture_cache.FindImage(desc);
+            texture_cache.UpdateImage(image_id);
+        });
+        rasterizer->WaitForAssembler(prelude_seq);
+    }
 
     Frame* frame = GetRenderFrame();
 
@@ -928,6 +944,18 @@ Frame* Presenter::GetRenderFrame() {
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
+        // GR2FORK FIX: the present fence can pass instantly for a frame requeued by the
+        // frame-skip path while this cycle's FSR/PP writes are still executing; destroying the
+        // image under them is a device-losing write. Drain the frame's timeline first - zero
+        // cost on the non-recreate steady path.
+        if (frame->ready_semaphore) {
+            const vk::SemaphoreWaitInfo wait_info{
+                .semaphoreCount = 1,
+                .pSemaphores = &frame->ready_semaphore,
+                .pValues = &frame->ready_tick,
+            };
+            (void)device.waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+        }
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
 

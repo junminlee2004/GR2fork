@@ -202,6 +202,10 @@ private:
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;
+    // GR2FORK FIX: serializes the two cold last_submit_frame readers (PrepareLastFrame idle
+    // redraw on PresentThread, CaptureScreenshot on request threads) - they record/submit/finish
+    // against the same frame and raced each other. Zero contention in normal play.
+    std::mutex last_frame_mutex;
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::optional<ImGui::RefCountedTexture> splash_img;

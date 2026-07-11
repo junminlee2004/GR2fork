@@ -158,7 +158,7 @@ template <bool async>
 // device-loss class. Policy: a skipped write (worst case a blank/stale region for a frame) is
 // always preferable to a faulting one. GDS is a persistent host buffer and exempt.
 #define GR2_WRITE_GATE(addr_, size_, what_)                                                        \
-    if (!rasterizer_ && rasterizer_->IsMapped((addr_), (size_))) [[unlikely]] {                                    \
+    if (rasterizer_ && !rasterizer_->IsMapped((addr_), (size_))) [[unlikely]] {                                    \
         static std::atomic<u32> gate_logged{0};                                                    \
         if (gate_logged.fetch_add(1, std::memory_order_relaxed) < 32) {                            \
             LOG_WARNING(Render_Vulkan, "GR2 write-gate: dropped {} to unmapped [{:#x}, {:#x})",    \
@@ -194,6 +194,13 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         return;
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
+    // GR2FORK FIX: a >ring-size bulk download returns a null map; recording the copies anyway
+    // writes past the ring on the GPU. Drop the download instead (blank-over-crash policy).
+    if (download == nullptr) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "GR2 write-gate: dropped {}B download exceeding staging ring",
+                    total_size_bytes);
+        return;
+    }
     for (auto& copy : copies) {
         // Modify copies to have the staging offset in mind
         copy.dstOffset += offset;
@@ -207,10 +214,14 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         return;
     }
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
-    const auto write_data = [&]() {
+    // GR2FORK FIX: capture by VALUE. The async path defers this lambda past the enclosing stack
+    // frame; reference captures of copies/offset/download/buffer read a destroyed frame at pop
+    // time. download points into the persistent StreamBuffer, so the pointer itself stays valid.
+    const auto write_data = [this, copies, offset, download, buffer_addr = buffer.CpuAddr(),
+                             device_addr, size, is_write]() {
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
-            const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
+            const VAddr copy_device_addr = buffer_addr + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
@@ -858,6 +869,13 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         }
         return buffer;
     }();
+    // GR2FORK FIX: GDS legs take raw PM4 offsets and the GDS buffer is 64KB; transfer commands
+    // get no robustness clamping, so an OOB copy is a device-losing write. Drop instead.
+    if ((dst_gds && dst + num_bytes > DataShareBufferSize) ||
+        (src_gds && src + num_bytes > DataShareBufferSize)) [[unlikely]] {
+        LOG_CRITICAL(Render_Vulkan, "GR2 write-gate: skipped OOB GDS CopyBuffer");
+        return;
+    }
     const vk::BufferCopy region = {
         .srcOffset = src_buffer.Offset(src),
         .dstOffset = dst_buffer.Offset(dst),
@@ -1526,7 +1544,9 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
-    GR2_WRITE_GATE(address, num_bytes, "WriteDataBuffer");
+    // NOT write-gated: ChangeRegister passes a bda_pagetable byte OFFSET here, not a guest VA,
+    // and the destination is the persistent pagetable buffer - gating would drop pagetable
+    // uploads and leave stale device addresses.
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

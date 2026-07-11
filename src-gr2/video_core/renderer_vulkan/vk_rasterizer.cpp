@@ -1366,31 +1366,44 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // graphics draws never reach this branch.
                 auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const auto& cs_program = regs.cs_program;
-                const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
+                // GR2FORK FIX: guest-derived and previously unclamped (u32 wrap); a failed Map
+                // (over-ring size) used to record a fillBuffer at offset 0 anyway - an OOB
+                // fixed-function GPU write. Null-descriptor sink on any bad case instead.
+                const u64 lds_size =
+                    u64(cs_program.SharedMemSize()) * u64(cs_program.NumWorkgroups());
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
-
-                constexpr u64 kGpuFillThreshold = 256;
-                if (lds_size >= kGpuFillThreshold) {
-                    (void)data;
-                    auto cmdbuf = scheduler.PrimaryCommandBuffer();
-                    cmdbuf.fillBuffer(lds_buffer.Handle(), offset, lds_size, 0);
-
-                    buffer_barriers.push_back(vk::BufferMemoryBarrier2{
-                        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .buffer = lds_buffer.Handle(),
-                        .offset = offset,
-                        .size = lds_size,
-                    });
+                if (data == nullptr || lds_size == 0 ||
+                    offset + lds_size > lds_buffer.SizeBytes()) [[unlikely]] {
+                    LOG_CRITICAL(Render_Vulkan,
+                                 "GR2 write-gate: LDS request {}B unmappable, null-bound",
+                                 lds_size);
+                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
-                    std::memset(data, 0, lds_size);
-                }
+                    lds_buffer.Commit();
 
-                buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                    constexpr u64 kGpuFillThreshold = 256;
+                    if (lds_size >= kGpuFillThreshold) {
+                        auto cmdbuf = scheduler.PrimaryCommandBuffer();
+                        cmdbuf.fillBuffer(lds_buffer.Handle(), offset, lds_size, 0);
+
+                        buffer_barriers.push_back(vk::BufferMemoryBarrier2{
+                            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                            .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                                             vk::AccessFlagBits2::eShaderWrite,
+                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .buffer = lds_buffer.Handle(),
+                            .offset = offset,
+                            .size = lds_size,
+                        });
+                    } else {
+                        std::memset(data, 0, lds_size);
+                    }
+
+                    buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                }
             } else if (instance.IsNullDescriptorSupported()) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -2613,6 +2626,11 @@ void Rasterizer::DoCopyBufferFromIntent(const DrawIntent& intent) {
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     auto* gds_buf = buffer_cache.GetGdsBuffer();
+    // GR2FORK FIX: the 16-bit PM4 gds_index can address past the 64KB GDS mapping; clamp.
+    if (gds_offset + sizeof(u32) > gds_buf->mapped_data.size()) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "GR2 write-gate: OOB GDS read at {:#x} dropped", gds_offset);
+        return 0;
+    }
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
     return value;
@@ -2728,12 +2746,21 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     // and the resulting GPU write into freed pages is the WRITE_INVALID device loss. Drain the
     // GPU before the pages go away when the range carries GPU-side content; such unmaps happen
     // only at content teardown (video stop, level unload), so gameplay never pays this wait.
-    if (buffer_cache.IsRegionGpuModified(addr, size) ||
-        texture_cache.FindImageFromRange(addr, size)) {
-        scheduler.Finish();
-    }
-    buffer_cache.InvalidateMemory(addr, size);
-    texture_cache.UnmapMemory(addr, size);
+    // GR2FORK FIX: Finish()/cache eviction must run on the assembler thread - it is the single
+    // writer of draw_scheduler's open command buffer (Finish from this guest thread ends a
+    // command buffer mid-record = corrupted stream), and DeferOperation pushes race the
+    // assembler's pop otherwise. Blocking hop: the caller releases the pages only after this
+    // returns, which is the whole point of the drain.
+    const bool gpu_content = buffer_cache.IsRegionGpuModified(addr, size) ||
+                             texture_cache.FindImageFromRange(addr, size);
+    const u32 unmap_seq = PushPresenterRecord([this, addr, size, gpu_content] {
+        if (gpu_content) {
+            scheduler.Finish();
+        }
+        buffer_cache.InvalidateMemory(addr, size);
+        texture_cache.UnmapMemory(addr, size);
+    });
+    WaitForAssembler(unmap_seq);
     rt_cache_.valid = false;
     br_cache_.valid = false;
     page_manager.OnGpuUnmap(addr, size);

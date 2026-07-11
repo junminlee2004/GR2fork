@@ -31,6 +31,16 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     };
     static_assert(sizeof(CopyShaderControl) == 12);
     ASSERT(ctl_buf_sharp.GetStride() == sizeof(CopyShaderControl));
+    // GR2FORK FIX: ctl_buf is a raw CPU pointer from a guest sharp, dereferenced dim_x times -
+    // a freed control buffer is a host crash and garbage entries produce huge OOB copy ranges.
+    // Fall back to the real dispatch (return false) instead of faulting.
+    if (!rasterizer.IsMapped(ctl_buf_sharp.base_address,
+                             u64(cs_program.dim_x) * sizeof(CopyShaderControl)) ||
+        !rasterizer.IsMapped(src_buf_sharp.base_address, buf_stride) ||
+        !rasterizer.IsMapped(dst_buf_sharp.base_address, buf_stride)) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "GR2 write-gate: HLE copy-shader inputs unmapped, skipped");
+        return false;
+    }
     const auto ctl_buf = reinterpret_cast<const CopyShaderControl*>(ctl_buf_sharp.base_address);
 
     static std::vector<vk::BufferCopy> copies;
@@ -109,6 +119,12 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Execute buffer copies.
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
+        if (src_buf->Handle() == VK_NULL_HANDLE || dst_buf->Handle() == VK_NULL_HANDLE)
+            [[unlikely]] {
+            LOG_CRITICAL(Render_Vulkan, "GR2 transfer-sink: skipped HLE copyBuffer (null handle)");
+            batch_start = batch_end;
+            continue;
+        }
         scheduler.PrimaryCommandBuffer().copyBuffer(src_buf->Handle(), dst_buf->Handle(), vk_copies);
         batch_start = batch_end;
     }
