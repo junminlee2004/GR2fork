@@ -403,4 +403,14 @@ if(MSVC)
         set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
     endif()
 endif()
+# GR2FORK FIX: disable IPO/ThinLTO for the whole protobuf+abseil subtree. Under global PGO the
+# profile flag reaches these objects; with ThinLTO on, linking protoc.exe does cross-module
+# function import and checks the 'ProfileSummary' module flag, which conflicts across abseil vs
+# protobuf objects whenever the profile they were compiled against differs at all (stale ccache
+# object mix in CI - local clean builds never hit it). protoc is a build-time codegen tool that
+# gains nothing from PGO/LTO, so building it as native objects removes the ThinLTO import check
+# entirely and fixes the link, cache-independent, while core_gr2/SDL3 keep their PGO+ThinLTO.
+set(_gr2_saved_ipo_release "${CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE}")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
 add_subdirectory(protobuf EXCLUDE_FROM_ALL)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE "${_gr2_saved_ipo_release}")
