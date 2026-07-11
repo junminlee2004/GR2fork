@@ -8,6 +8,7 @@
 #include "common/config.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
+#include <atomic>
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -152,7 +153,22 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
 }
 
 template <bool async>
+// GR2FORK FIX: hard gate for every GPU write channel. A write whose guest range is no longer
+// mapped targets memory whose backing can be freed under in-flight work - the WRITE_INVALID
+// device-loss class. Policy: a skipped write (worst case a blank/stale region for a frame) is
+// always preferable to a faulting one. GDS is a persistent host buffer and exempt.
+#define GR2_WRITE_GATE(addr_, size_, what_)                                                        \
+    if (!rasterizer_ && rasterizer_->IsMapped((addr_), (size_))) [[unlikely]] {                                    \
+        static std::atomic<u32> gate_logged{0};                                                    \
+        if (gate_logged.fetch_add(1, std::memory_order_relaxed) < 32) {                            \
+            LOG_WARNING(Render_Vulkan, "GR2 write-gate: dropped {} to unmapped [{:#x}, {:#x})",    \
+                        (what_), (addr_), (addr_) + (size_));                                      \
+        }                                                                                          \
+        return;                                                                                    \
+    }
+
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
+    GR2_WRITE_GATE(device_addr, size, "DownloadBufferMemory");
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
@@ -781,6 +797,7 @@ void BufferCache::BindIndexBuffer(u32 index_offset, const AmdGpu::LiverpoolRegsS
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
+        GR2_WRITE_GATE(address, num_bytes, "FillBuffer");
         texture_cache.ClearMeta(address);
         if (!IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
@@ -799,6 +816,12 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!dst_gds) {
+        GR2_WRITE_GATE(dst, num_bytes, "CopyBuffer dst");
+    }
+    if (!src_gds) {
+        GR2_WRITE_GATE(src, num_bytes, "CopyBuffer src");
+    }
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -1503,6 +1526,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    GR2_WRITE_GATE(address, num_bytes, "WriteDataBuffer");
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

@@ -2721,6 +2721,17 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    // GR2FORK FIX: guest pages are imported as GPU buffer backing (external_memory_host), so the
+    // pages the caller releases right after this hook can still be WRITTEN by queued GPU work -
+    // deferred handle destruction does not keep the pages themselves alive. GR2 frees its video
+    // buffers on the avplayer StateStop event while frames referencing them are still in flight,
+    // and the resulting GPU write into freed pages is the WRITE_INVALID device loss. Drain the
+    // GPU before the pages go away when the range carries GPU-side content; such unmaps happen
+    // only at content teardown (video stop, level unload), so gameplay never pays this wait.
+    if (buffer_cache.IsRegionGpuModified(addr, size) ||
+        texture_cache.FindImageFromRange(addr, size)) {
+        scheduler.Finish();
+    }
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     rt_cache_.valid = false;

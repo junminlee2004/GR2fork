@@ -1351,6 +1351,14 @@ class Sync:
             body = open(ppath).read()
             m = re.search(r"(?m)^# file: (.+)$", body)
             fpath = m.group(1) if m else None
+            # A patch with no hunks means its deviation was absorbed upstream at an earlier
+            # sync (regeneration wrote a header-only file). Prune it rather than feed it to
+            # git apply, which rejects an empty body with "No valid patches in input".
+            if not re.search(r"(?m)^@@", body):
+                os.remove(ppath)
+                self.patch_results.append((patch, "obsolete",
+                                           f"{fpath or patch}: empty (absorbed upstream) - pruned"))
+                continue
             if fpath and fpath not in target_files and not os.path.exists(fpath):
                 self.patch_results.append((patch, "ORPHANED",
                                            f"{fpath} no longer exists upstream — patch skipped"))
@@ -1396,13 +1404,19 @@ class Sync:
             # Raw stdout, not git_out(): .strip() drops a trailing whitespace-only context
             # line (a blank source line diffs as a single space), corrupting the hunk.
             diff = git("diff", self.target, "--", fpath).stdout
+            if not diff.strip():
+                # Deviation fully absorbed upstream - prune rather than write a header-only
+                # patch that would fail to apply next sync ("No valid patches in input").
+                os.remove(os.path.join(PATCH_DIR, patch))
+                REPORT.add("carried patches", f"{patch}: absorbed upstream - dropped")
+                continue
             header = (f"# carried local patch for the upstream mirror\n"
                       f"# file: {fpath}\n# original base: {self.target}\n")
             with open(os.path.join(PATCH_DIR, patch), "w") as f:
                 f.write(header + diff + ("\n" if diff and not diff.endswith("\n") else ""))
         with open(STATE_FILE, "w") as f:
             f.write(f"{self.target} shadPS4 upstream base (synced by upstream-merge.py)\n")
-        git("add", "--", PATCH_DIR)
+        git("add", "-A", "--", PATCH_DIR)
 
         if any(s.startswith("applied") for p, s, _ in self.patch_results
                if p.startswith("src_core_libraries_fiber")):
