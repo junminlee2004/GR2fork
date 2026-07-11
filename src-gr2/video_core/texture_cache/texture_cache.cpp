@@ -141,6 +141,12 @@ void TextureCache::ProcessDownloadImages() {
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id) {
+    // GR2FORK FIX: the id can outlive its image (readback set populated frames earlier);
+    // dereferencing a freed/reused slot records a copy through a destroyed image.
+    if (!slot_images.is_allocated(image_id) ||
+        False(slot_images[image_id].flags & ImageFlagBits::Registered)) [[unlikely]] {
+        return;
+    }
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
@@ -1842,13 +1848,14 @@ void TextureCache::TouchImage(Image& image) {
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     // GR2FORK FIX: drop the photo-RT tracker when its image dies so ForceDownload cannot
-    // resolve a freed/reused slot later.
+    // resolve a freed/reused slot later. Same for the readback download set.
     {
         std::lock_guard photo_lk{photo_rt_mutex_};
         if (last_photo_rt_.image_id == image_id) {
             last_photo_rt_ = {};
         }
     }
+    download_images.erase(image_id);
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
 

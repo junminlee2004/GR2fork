@@ -2767,18 +2767,21 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     // command buffer mid-record = corrupted stream), and DeferOperation pushes race the
     // assembler's pop otherwise. Blocking hop: the caller releases the pages only after this
     // returns, which is the whole point of the drain.
-    const bool gpu_content = buffer_cache.IsRegionGpuModified(addr, size) ||
-                             texture_cache.FindImageFromRange(addr, size);
-    const u32 unmap_seq = PushPresenterRecord([this, addr, size, gpu_content] {
+    // GR2FORK FIX: the gpu_content probe (FindImageFromRange mutates Picked flags) and the
+    // rt/br cache clears also belong on the assembler - computing/writing them from this guest
+    // thread raced Register/UnregisterImage and the per-draw cache reads.
+    const u32 unmap_seq = PushPresenterRecord([this, addr, size] {
+        const bool gpu_content = buffer_cache.IsRegionGpuModified(addr, size) ||
+                                 texture_cache.FindImageFromRange(addr, size);
         if (gpu_content) {
             scheduler.Finish();
         }
         buffer_cache.InvalidateMemory(addr, size);
         texture_cache.UnmapMemory(addr, size);
+        rt_cache_.valid = false;
+        br_cache_.valid = false;
     });
     WaitForAssembler(unmap_seq);
-    rt_cache_.valid = false;
-    br_cache_.valid = false;
     page_manager.OnGpuUnmap(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};

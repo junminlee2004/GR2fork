@@ -236,6 +236,21 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->is_hdr = swapchain.GetHDR();
 }
 
+VideoCore::Image& Presenter::RegisterVideoOutSurface(
+    const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
+    vo_buffers_addr.emplace_back(cpu_address);
+    auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+    // Blocking hop: the caller is a guest syscall, so the round-trip latency is acceptable and
+    // the cache mutation happens on its single writer (the assembler).
+    VideoCore::ImageId image_id{};
+    const u32 seq = rasterizer->PushPresenterRecord([this, &desc, &image_id] {
+        image_id = texture_cache.FindImage(desc);
+        texture_cache.GetImageUntouched(image_id).usage.vo_surface = 1u;
+    });
+    rasterizer->WaitForAssembler(seq);
+    return texture_cache.GetImageUntouched(image_id);
+}
+
 Frame* Presenter::PrepareLastFrame() {
     std::scoped_lock last_lk{last_frame_mutex};
     if (last_submit_frame == nullptr) {
@@ -445,21 +460,22 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // recording corrupts the stream (device loss during video playback, when the image is dirty
     // every frame). Route the prelude through the assembler and block until it ran.
     VideoCore::ImageId image_id{};
+    vk::Extent2D image_size{};
     {
-        const u32 prelude_seq = rasterizer->PushPresenterRecord([this, &desc, &image_id] {
+        // GR2FORK FIX: the extent is captured INSIDE the hop so no presenter-thread slot
+        // dereference remains - the old GetImageUntouched here could resolve a slot freed and
+        // reused between the hop and this read.
+        const u32 prelude_seq = rasterizer->PushPresenterRecord([this, &desc, &image_id,
+                                                                 &image_size] {
             image_id = texture_cache.FindImage(desc);
             texture_cache.UpdateImage(image_id);
+            const auto& img = texture_cache.GetImageUntouched(image_id);
+            image_size = vk::Extent2D{img.info.size.width, img.info.size.height};
         });
         rasterizer->WaitForAssembler(prelude_seq);
     }
 
     Frame* frame = GetRenderFrame();
-
-    // Look up the image without an LRU touch (see the GetImageUntouched note below) to read its
-    // size; the image_view and image.Transit happen inside the closure on the assembler thread.
-    auto& image_for_size = texture_cache.GetImageUntouched(image_id);
-    const vk::Extent2D image_size = {image_for_size.info.size.width,
-                                      image_for_size.info.size.height};
 
     // [ASPECT OVERRIDE] A non-16:9 aspectRatioOverride forces expected_ratio to match, so the
     // presenter stops letterboxing the game's native 16:9 render; 16:9/Off falls through to the
@@ -482,8 +498,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // image_id and image_size by value and reaches the schedulers/passes via `this`. Blocking
     // Push + WaitFor: the caller reads frame->ready_semaphore / ready_tick after this returns.
     const u32 seq = rasterizer->PushPresenterRecord(
-        [this, frame, attribute, image_id, image_size] {
-            DoPrepareFrameRecord(frame, attribute, image_id, image_size);
+        [this, frame, attribute, cpu_address, image_id, image_size] {
+            DoPrepareFrameRecord(frame, attribute, cpu_address, image_id, image_size);
         });
     rasterizer->WaitForAssembler(seq);
     return frame;
@@ -492,8 +508,25 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 void Presenter::DoPrepareFrameRecord(
         Frame* frame,
         const Libraries::VideoOut::BufferAttributeGroup& attribute,
+        VAddr cpu_address,
         VideoCore::ImageId image_id,
         vk::Extent2D image_size) {
+    // GR2FORK FIX: revalidate the id resolved in the earlier hop - a deletion queued between the
+    // two hops can free (and slot-reuse) the video-out image, and the blit below WRITES through
+    // it. This runs on the assembler, sequenced with all deletion, so the re-resolve is race-free.
+    {
+        auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+        const bool live =
+            texture_cache.IsImageSlotAllocated(image_id) &&
+            True(texture_cache.GetImageUntouched(image_id).flags &
+                 VideoCore::ImageFlagBits::Registered) &&
+            texture_cache.GetImageUntouched(image_id).info.guest_address ==
+                desc.info.guest_address;
+        if (!live) [[unlikely]] {
+            image_id = texture_cache.FindImage(desc);
+            texture_cache.UpdateImage(image_id);
+        }
+    }
     // The chunk that touches draw_scheduler: under sync it runs on the producer (Presenter)
     // thread, under async on the dedicated assembler thread - the assembler stays sole writer.
     const auto frame_subresources = vk::ImageSubresourceRange{

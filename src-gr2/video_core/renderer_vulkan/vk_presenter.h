@@ -82,15 +82,11 @@ public:
         pp_settings.hdr = enable ? 1 : 0;
     }
 
+    // GR2FORK FIX: FindImage/GetImage mutate the texture cache; running them on the guest
+    // syscall thread (sceVideoOutRegisterBuffers) broke the single-writer invariant every
+    // lock-free validation relies on. Defined in the .cpp: routes through the assembler hop.
     VideoCore::Image& RegisterVideoOutSurface(
-        const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
-        vo_buffers_addr.emplace_back(cpu_address);
-        auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
-        const auto image_id = texture_cache.FindImage(desc);
-        auto& image = texture_cache.GetImage(image_id);
-        image.usage.vo_surface = 1u;
-        return image;
-    }
+        const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address);
 
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
 
@@ -166,7 +162,7 @@ private:
     /// under future async; on the producer thread under sync.
     void DoPrepareFrameRecord(Frame* frame,
                               const Libraries::VideoOut::BufferAttributeGroup& attribute,
-                              VideoCore::ImageId image_id,
+                              VAddr cpu_address, VideoCore::ImageId image_id,
                               vk::Extent2D image_size);
 
     /// GR2FORK: scheduler-touching chunk of PrepareBlankFrame.

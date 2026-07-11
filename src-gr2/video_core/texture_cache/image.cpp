@@ -82,7 +82,7 @@ UniqueImage::~UniqueImage() {
         // attributed page-for-page to a specific freed image. Demote once validated.
         VmaAllocationInfo alloc_info{};
         vmaGetAllocationInfo(allocator, allocation, &alloc_info);
-        LOG_WARNING(Render_Vulkan, "GR2 img-free mem={:#x} off={:#x} bytes={:#x}",
+        LOG_DEBUG(Render_Vulkan, "GR2 img-free mem={:#x} off={:#x} bytes={:#x}",
                     reinterpret_cast<u64>(alloc_info.deviceMemory), alloc_info.offset,
                     alloc_info.size);
         vmaDestroyImage(allocator, image, allocation);

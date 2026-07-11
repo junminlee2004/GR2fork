@@ -71,7 +71,7 @@ UniqueBuffer::~UniqueBuffer() {
         if (bda_addr != 0) {
             VmaAllocationInfo ai{};
             vmaGetAllocationInfo(allocator, allocation, &ai);
-            LOG_WARNING(Render_Vulkan, "GR2 buf-free dev=[{:#x},{:#x}) bytes={:#x}",
+            LOG_DEBUG(Render_Vulkan, "GR2 buf-free dev=[{:#x},{:#x}) bytes={:#x}",
                         static_cast<u64>(bda_addr), static_cast<u64>(bda_addr) + ai.size, ai.size);
         }
         vmaDestroyBuffer(allocator, buffer, allocation);
