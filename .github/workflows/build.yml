@@ -80,15 +80,16 @@ jobs:
 
 
     - name: Configure CMake
-      # GR2FORK CI FIX: hash the profdata CONTENT into every ccache object key. The profile is
-      # passed as /clang:-fprofile-use=<path>; ccache hashes the command line (the path) but NOT
-      # the file's content behind the /clang: escape, so a profdata update that keeps the same
-      # path served STALE objects (old PGO ProfileSummary) for cache hits while misses rebuilt
-      # against the new profile - ThinLTO then linked mismatched ProfileSummary bitcode and died
-      # ("ProfileSummary: IDs have conflicting values" on protoc.exe). CCACHE_EXTRAFILES forces a
-      # full, consistent rebuild whenever the profdata changes. (Local has no ccache, hence green.)
-      env:
-        CCACHE_EXTRAFILES: ${{github.workspace}}/packaging/gr2win.profdata
+      # GR2FORK CI FIX (profdata/ccache consistency): the profile is passed as
+      # /clang:-fprofile-use=<path>; ccache hashes the command-line PATH but not the profdata
+      # CONTENT (the /clang: escape hides it, and CCACHE_EXTRAFILES did not take effect). So a
+      # profdata update with the same path served STALE bitcode (old PGO ProfileSummary) for cache
+      # hits while misses rebuilt against the new profile - ThinLTO then linked mismatched
+      # ProfileSummary modules and died ("IDs have conflicting values", on protoc first, then
+      # core_gr2 vs fmt). Fix: bake the profdata's SHA256 into a (unused) /D define that IS on the
+      # command line, so any profdata change flips the hash and forces EVERY profiled object -
+      # core AND all externals - to rebuild consistently. Non-profdata pushes still hit the cache.
+      # (Local has no ccache, so it is always a single-profile build - hence always green.)
       # GLOBAL PGO, matching the local reference build (measured ~3fps faster than core_gr2-only
       # scoping): the profile reaches every statically linked external (bundled SDL3, zlib-ng,
       # imgui, ...) plus uniform /MT+LTO flags. -Wno-profile-instr-* silences unprofiled/stale-hash
@@ -98,12 +99,11 @@ jobs:
       # and CMake would mis-read \a as an invalid escape in the -D value.
       run: |
         $prof = "${{github.workspace}}/packaging/gr2win.profdata".Replace('\','/')
-        $pgo = "/clang:-fprofile-use=$prof /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin"
+        $phash = (Get-FileHash -Algorithm SHA256 "$prof").Hash
+        $pgo = "/clang:-fprofile-use=$prof /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin /DGR2_PGO_HASH=$phash"
         cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_ASM_COMPILER=clang-cl -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS $pgo" "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $pgo" -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
-      env:
-        CCACHE_EXTRAFILES: ${{github.workspace}}/packaging/gr2win.profdata
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
 
     - name: Verify core DLL self-containment (dumpbin /dependents)
