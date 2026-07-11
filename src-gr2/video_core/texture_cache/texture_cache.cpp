@@ -1878,14 +1878,23 @@ void TextureCache::DeleteImage(ImageId image_id) {
     }
 
     // Reclaim image and any image views it references.
+    // GR2FORK FIX: trailing (double) deferral. A stale cache can re-record this image id as a
+    // write target into batches submitted AFTER the free request; a single DeferOperation stamps
+    // only the currently-open batch's tick, so the backing memory could be freed while a later
+    // batch still writes it (the WRITE_INVALID device loss on rapid avplayer stop/start). The
+    // first deferral waits out the open batch; when it retires we re-defer the real destroy to the
+    // now-current tick, which is past every batch that could have re-recorded the id during the
+    // vulnerable window. Costs up to one extra in-flight window of reclaim latency, teardown-only.
     scheduler.DeferOperation([this, image_id] {
-        Image& image = slot_images[image_id];
-        for (auto& backing : image.backing_images) {
-            for (const ImageViewId image_view_id : backing.image_view_ids) {
-                slot_image_views.erase(image_view_id);
+        scheduler.DeferOperation([this, image_id] {
+            Image& image = slot_images[image_id];
+            for (auto& backing : image.backing_images) {
+                for (const ImageViewId image_view_id : backing.image_view_ids) {
+                    slot_image_views.erase(image_view_id);
+                }
             }
-        }
-        slot_images.erase(image_id);
+            slot_images.erase(image_id);
+        });
     });
 }
 
