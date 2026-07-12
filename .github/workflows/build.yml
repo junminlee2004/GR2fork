@@ -68,15 +68,20 @@ jobs:
         # curl.exe (not Invoke-WebRequest): IWR renders a per-byte progress bar that throttles
         # large downloads to a crawl / apparent hang in non-interactive CI. curl is fast + retries.
         $ProgressPreference = "SilentlyContinue"
+        # Skip Defender scanning of the extract dir - scanning the huge static LLVM binaries is
+        # what stalled extraction for many minutes. Best-effort (needs admin, which the runner has).
+        Add-MpPreference -ExclusionPath "C:\llvm19" -ErrorAction SilentlyContinue
         $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
         curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
         New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
-        # Extract ONLY bin/ (clang-cl, lld-link + their dlls) and lib/clang/ (builtin + SIMD
-        # intrinsic headers). The full tarball is ~4GB of LLVM/Clang static libs/headers/docs
-        # that a compile never touches; extracting all of it stalls for many minutes because
-        # Defender scans every file. Selective extract finishes in seconds.
-        tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/*" "*/lib/clang/*"
+        # Extract ONLY the two exes a compile needs (clang-cl, lld-link) + clang's builtin/SIMD
+        # headers. "*/bin/*" would pull ALL of bin/ = ~3GB of huge LLVM tool binaries (each a
+        # 100MB+ static exe) that a build never runs - writing/scanning those is what stalled it.
+        # -v so the step visibly progresses instead of looking hung.
+        tar -xvf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/clang-cl.exe" "*/bin/lld-link.exe" "*/bin/*.dll" "*/lib/clang/*"
         if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
+        if (-not (Test-Path C:\llvm19\bin\lld-link.exe)) { throw "lld-link.exe not extracted" }
+        Write-Host "extraction complete"
         & C:\llvm19\bin\clang-cl.exe --version
 
     - name: Cache CMake Configuration
@@ -170,15 +175,20 @@ jobs:
         # curl.exe (not Invoke-WebRequest): IWR renders a per-byte progress bar that throttles
         # large downloads to a crawl / apparent hang in non-interactive CI. curl is fast + retries.
         $ProgressPreference = "SilentlyContinue"
+        # Skip Defender scanning of the extract dir - scanning the huge static LLVM binaries is
+        # what stalled extraction for many minutes. Best-effort (needs admin, which the runner has).
+        Add-MpPreference -ExclusionPath "C:\llvm19" -ErrorAction SilentlyContinue
         $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
         curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
         New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
-        # Extract ONLY bin/ (clang-cl, lld-link + their dlls) and lib/clang/ (builtin + SIMD
-        # intrinsic headers). The full tarball is ~4GB of LLVM/Clang static libs/headers/docs
-        # that a compile never touches; extracting all of it stalls for many minutes because
-        # Defender scans every file. Selective extract finishes in seconds.
-        tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/*" "*/lib/clang/*"
+        # Extract ONLY the two exes a compile needs (clang-cl, lld-link) + clang's builtin/SIMD
+        # headers. "*/bin/*" would pull ALL of bin/ = ~3GB of huge LLVM tool binaries (each a
+        # 100MB+ static exe) that a build never runs - writing/scanning those is what stalled it.
+        # -v so the step visibly progresses instead of looking hung.
+        tar -xvf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/clang-cl.exe" "*/bin/lld-link.exe" "*/bin/*.dll" "*/lib/clang/*"
         if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
+        if (-not (Test-Path C:\llvm19\bin\lld-link.exe)) { throw "lld-link.exe not extracted" }
+        Write-Host "extraction complete"
         & C:\llvm19\bin\clang-cl.exe --version
 
     - name: Cache CMake Configuration
