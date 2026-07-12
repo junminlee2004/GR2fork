@@ -71,7 +71,12 @@ jobs:
         $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
         curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
         New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
-        tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1
+        # Extract ONLY bin/ (clang-cl, lld-link + their dlls) and lib/clang/ (builtin + SIMD
+        # intrinsic headers). The full tarball is ~4GB of LLVM/Clang static libs/headers/docs
+        # that a compile never touches; extracting all of it stalls for many minutes because
+        # Defender scans every file. Selective extract finishes in seconds.
+        tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/*" "*/lib/clang/*"
+        if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
         & C:\llvm19\bin\clang-cl.exe --version
 
     - name: Cache CMake Configuration
@@ -168,7 +173,12 @@ jobs:
         $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
         curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
         New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
-        tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1
+        # Extract ONLY bin/ (clang-cl, lld-link + their dlls) and lib/clang/ (builtin + SIMD
+        # intrinsic headers). The full tarball is ~4GB of LLVM/Clang static libs/headers/docs
+        # that a compile never touches; extracting all of it stalls for many minutes because
+        # Defender scans every file. Selective extract finishes in seconds.
+        tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/*" "*/lib/clang/*"
+        if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
         & C:\llvm19\bin\clang-cl.exe --version
 
     - name: Cache CMake Configuration
