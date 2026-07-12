@@ -44,7 +44,9 @@ jobs:
         echo "fullhash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   windows-sdl:
-    runs-on: windows-latest
+    # GR2FORK: windows-2022 (VS 2022 / MSVC 14.4x) is compatible with the pinned Clang 19;
+    # windows-latest moved to VS 18 / MSVC 14.51 whose STL hard-requires Clang 20+ (STL1000).
+    runs-on: windows-2022
     needs: get-info
     steps:
     - uses: actions/checkout@v6
@@ -136,7 +138,9 @@ jobs:
         path: ${{github.workspace}}/build/shadps4gr2fork.exe
 
   windows-sdl-relwithdebinfo:
-    runs-on: windows-latest
+    # GR2FORK: windows-2022 (VS 2022 / MSVC 14.4x) is compatible with the pinned Clang 19;
+    # windows-latest moved to VS 18 / MSVC 14.51 whose STL hard-requires Clang 20+ (STL1000).
+    runs-on: windows-2022
     needs: [get-info, windows-sdl]
     steps:
     - uses: actions/checkout@v6
