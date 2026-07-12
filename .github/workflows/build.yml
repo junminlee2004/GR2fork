@@ -61,28 +61,49 @@ jobs:
     # shadPS4 requires clang 19 for emulation compatibility (clang 20 mis-compiles emulation
     # code); the GitHub runner ships clang 20, which also yields a different-sized/slower binary
     # than the local clang-19 reference. Pin the exact local toolchain (clang-cl + lld) = 19.1.5.
-    - name: Install Clang 19.1.5
+    - name: Locate Clang 19
+      id: clang19
       shell: pwsh
       run: |
         $ErrorActionPreference = "Stop"
-        # curl.exe (not Invoke-WebRequest): IWR renders a per-byte progress bar that throttles
-        # large downloads to a crawl / apparent hang in non-interactive CI. curl is fast + retries.
         $ProgressPreference = "SilentlyContinue"
-        # Skip Defender scanning of the extract dir - scanning the huge static LLVM binaries is
-        # what stalled extraction for many minutes. Best-effort (needs admin, which the runner has).
-        Add-MpPreference -ExclusionPath "C:\llvm19" -ErrorAction SilentlyContinue
-        $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
-        curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
-        New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
-        # Extract ONLY the two exes a compile needs (clang-cl, lld-link) + clang's builtin/SIMD
-        # headers. "*/bin/*" would pull ALL of bin/ = ~3GB of huge LLVM tool binaries (each a
-        # 100MB+ static exe) that a build never runs - writing/scanning those is what stalled it.
-        # -v so the step visibly progresses instead of looking hung.
-        tar -xvf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/clang-cl.exe" "*/bin/lld-link.exe" "*/bin/*.dll" "*/lib/clang/*"
-        if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
-        if (-not (Test-Path C:\llvm19\bin\lld-link.exe)) { throw "lld-link.exe not extracted" }
-        Write-Host "extraction complete"
-        & C:\llvm19\bin\clang-cl.exe --version
+        # Prefer an already-installed clang 19 with lld-link over downloading the 806MB LLVM
+        # release. bsdtar cannot early-exit a solid .xz, so even a 2-file extract decompresses
+        # the whole ~4GB stream to EOF - a silent multi-minute tail that reads as a hang. VS
+        # 17.14 bundles clang 19.1.x (which is exactly why its STL demands clang 19) already on
+        # disk, matched to the 14.44 MSVC - zero download, zero decompression. Emulation
+        # correctness REQUIRES clang 19 (clang 20 miscompiles guest code), so accept a dir only
+        # if clang-cl reports 19.x AND lld-link is present (ThinLTO needs lld).
+        function Get-Clang19([string]$dir) {
+          $cc = Join-Path $dir "clang-cl.exe"
+          $ld = Join-Path $dir "lld-link.exe"
+          if (-not (Test-Path $cc)) { return $null }
+          if (-not (Test-Path $ld)) { return $null }
+          if ((& $cc --version 2>&1 | Out-String) -match "clang version 19\.") { return $dir }
+          return $null
+        }
+        $bin = $null
+        foreach ($d in @((Join-Path $env:VCINSTALLDIR "Tools\Llvm\x64\bin"), "C:\Program Files\LLVM\bin")) {
+          $bin = Get-Clang19 $d
+          if ($bin) { Write-Host "Using pre-installed clang 19 at $bin"; break }
+        }
+        if (-not $bin) {
+          Write-Host "No pre-installed clang 19 + lld-link found; downloading LLVM 19.1.5 (the ~1-2 min decompress is NOT a hang)"
+          # curl.exe (not Invoke-WebRequest): IWR's per-byte progress bar throttles large
+          # downloads to an apparent hang in non-interactive CI. curl is fast + retries.
+          Add-MpPreference -ExclusionPath "C:\llvm19" -ErrorAction SilentlyContinue
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
+          curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
+          New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
+          # clang-cl/lld-link in the LLVM Windows release are statically linked (no sibling DLLs
+          # needed to run); pull just those two exes + clang's builtin/intrinsic headers.
+          tar -xvf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/clang-cl.exe" "*/bin/lld-link.exe" "*/lib/clang/*"
+          if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
+          if (-not (Test-Path C:\llvm19\bin\lld-link.exe)) { throw "lld-link.exe not extracted" }
+          $bin = "C:\llvm19\bin"
+        }
+        & (Join-Path $bin "clang-cl.exe") --version
+        "bin=$bin" >> $env:GITHUB_OUTPUT
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5
@@ -126,10 +147,14 @@ jobs:
       # Forward-slash the path: ${{github.workspace}} is a backslash path on Windows (D:\a\...)
       # and CMake would mis-read \a as an invalid escape in the -D value.
       run: |
+        # Compiler/linker dir resolved by the Locate Clang 19 step (VS-bundled or downloaded).
+        # Forward-slash for CMake; the value may contain spaces (VS path) so every -D that uses
+        # it is double-quoted to stay a single argument.
+        $clbin = "${{ steps.clang19.outputs.bin }}".Replace('\','/')
         $prof = "${{github.workspace}}/packaging/gr2win.profdata".Replace('\','/')
         $phash = (Get-FileHash -Algorithm SHA256 "$prof").Hash
         $pgo = "/clang:-fprofile-use=$prof /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin /DGR2_PGO_HASH=$phash"
-        cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=C:/llvm19/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=C:/llvm19/bin/clang-cl.exe -DCMAKE_ASM_COMPILER=C:/llvm19/bin/clang-cl.exe -DCMAKE_LINKER=C:/llvm19/bin/lld-link.exe -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS $pgo" "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $pgo" -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON "-DCMAKE_C_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_CXX_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_ASM_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_LINKER=$clbin/lld-link.exe" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS $pgo" "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $pgo" -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
@@ -168,28 +193,49 @@ jobs:
     # shadPS4 requires clang 19 for emulation compatibility (clang 20 mis-compiles emulation
     # code); the GitHub runner ships clang 20, which also yields a different-sized/slower binary
     # than the local clang-19 reference. Pin the exact local toolchain (clang-cl + lld) = 19.1.5.
-    - name: Install Clang 19.1.5
+    - name: Locate Clang 19
+      id: clang19
       shell: pwsh
       run: |
         $ErrorActionPreference = "Stop"
-        # curl.exe (not Invoke-WebRequest): IWR renders a per-byte progress bar that throttles
-        # large downloads to a crawl / apparent hang in non-interactive CI. curl is fast + retries.
         $ProgressPreference = "SilentlyContinue"
-        # Skip Defender scanning of the extract dir - scanning the huge static LLVM binaries is
-        # what stalled extraction for many minutes. Best-effort (needs admin, which the runner has).
-        Add-MpPreference -ExclusionPath "C:\llvm19" -ErrorAction SilentlyContinue
-        $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
-        curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
-        New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
-        # Extract ONLY the two exes a compile needs (clang-cl, lld-link) + clang's builtin/SIMD
-        # headers. "*/bin/*" would pull ALL of bin/ = ~3GB of huge LLVM tool binaries (each a
-        # 100MB+ static exe) that a build never runs - writing/scanning those is what stalled it.
-        # -v so the step visibly progresses instead of looking hung.
-        tar -xvf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/clang-cl.exe" "*/bin/lld-link.exe" "*/bin/*.dll" "*/lib/clang/*"
-        if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
-        if (-not (Test-Path C:\llvm19\bin\lld-link.exe)) { throw "lld-link.exe not extracted" }
-        Write-Host "extraction complete"
-        & C:\llvm19\bin\clang-cl.exe --version
+        # Prefer an already-installed clang 19 with lld-link over downloading the 806MB LLVM
+        # release. bsdtar cannot early-exit a solid .xz, so even a 2-file extract decompresses
+        # the whole ~4GB stream to EOF - a silent multi-minute tail that reads as a hang. VS
+        # 17.14 bundles clang 19.1.x (which is exactly why its STL demands clang 19) already on
+        # disk, matched to the 14.44 MSVC - zero download, zero decompression. Emulation
+        # correctness REQUIRES clang 19 (clang 20 miscompiles guest code), so accept a dir only
+        # if clang-cl reports 19.x AND lld-link is present (ThinLTO needs lld).
+        function Get-Clang19([string]$dir) {
+          $cc = Join-Path $dir "clang-cl.exe"
+          $ld = Join-Path $dir "lld-link.exe"
+          if (-not (Test-Path $cc)) { return $null }
+          if (-not (Test-Path $ld)) { return $null }
+          if ((& $cc --version 2>&1 | Out-String) -match "clang version 19\.") { return $dir }
+          return $null
+        }
+        $bin = $null
+        foreach ($d in @((Join-Path $env:VCINSTALLDIR "Tools\Llvm\x64\bin"), "C:\Program Files\LLVM\bin")) {
+          $bin = Get-Clang19 $d
+          if ($bin) { Write-Host "Using pre-installed clang 19 at $bin"; break }
+        }
+        if (-not $bin) {
+          Write-Host "No pre-installed clang 19 + lld-link found; downloading LLVM 19.1.5 (the ~1-2 min decompress is NOT a hang)"
+          # curl.exe (not Invoke-WebRequest): IWR's per-byte progress bar throttles large
+          # downloads to an apparent hang in non-interactive CI. curl is fast + retries.
+          Add-MpPreference -ExclusionPath "C:\llvm19" -ErrorAction SilentlyContinue
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
+          curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
+          New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
+          # clang-cl/lld-link in the LLVM Windows release are statically linked (no sibling DLLs
+          # needed to run); pull just those two exes + clang's builtin/intrinsic headers.
+          tar -xvf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1 "*/bin/clang-cl.exe" "*/bin/lld-link.exe" "*/lib/clang/*"
+          if (-not (Test-Path C:\llvm19\bin\clang-cl.exe)) { throw "clang-cl.exe not extracted" }
+          if (-not (Test-Path C:\llvm19\bin\lld-link.exe)) { throw "lld-link.exe not extracted" }
+          $bin = "C:\llvm19\bin"
+        }
+        & (Join-Path $bin "clang-cl.exe") --version
+        "bin=$bin" >> $env:GITHUB_OUTPUT
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5
@@ -214,7 +260,11 @@ jobs:
       run: bash -c "cat /proc/cpuinfo"
 
     - name: Configure CMake
-      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=C:/llvm19/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=C:/llvm19/bin/clang-cl.exe -DCMAKE_ASM_COMPILER=C:/llvm19/bin/clang-cl.exe -DCMAKE_LINKER=C:/llvm19/bin/lld-link.exe -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: |
+        # Compiler/linker dir resolved by the Locate Clang 19 step (VS-bundled or downloaded).
+        # Forward-slash for CMake; quote every -D that uses it since the VS path has spaces.
+        $clbin = "${{ steps.clang19.outputs.bin }}".Replace('\','/')
+        cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMBINED_EMBED_CORES=ON "-DCMAKE_C_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_CXX_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_ASM_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_LINKER=$clbin/lld-link.exe" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config RelWithDebInfo --parallel $env:NUMBER_OF_PROCESSORS
