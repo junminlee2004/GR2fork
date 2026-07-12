@@ -65,8 +65,11 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = "Stop"
+        # curl.exe (not Invoke-WebRequest): IWR renders a per-byte progress bar that throttles
+        # large downloads to a crawl / apparent hang in non-interactive CI. curl is fast + retries.
+        $ProgressPreference = "SilentlyContinue"
         $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
-        Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm19.tar.xz"
+        curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
         New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
         tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1
         & C:\llvm19\bin\clang-cl.exe --version
@@ -159,8 +162,11 @@ jobs:
       shell: pwsh
       run: |
         $ErrorActionPreference = "Stop"
+        # curl.exe (not Invoke-WebRequest): IWR renders a per-byte progress bar that throttles
+        # large downloads to a crawl / apparent hang in non-interactive CI. curl is fast + retries.
+        $ProgressPreference = "SilentlyContinue"
         $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.5/clang+llvm-19.1.5-x86_64-pc-windows-msvc.tar.xz"
-        Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm19.tar.xz"
+        curl.exe -L --fail --retry 3 --retry-all-errors -o "$env:RUNNER_TEMP\llvm19.tar.xz" $url
         New-Item -ItemType Directory -Force -Path C:\llvm19 | Out-Null
         tar -xf "$env:RUNNER_TEMP\llvm19.tar.xz" -C C:\llvm19 --strip-components=1
         & C:\llvm19\bin\clang-cl.exe --version
