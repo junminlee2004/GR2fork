@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "core/libraries/np/np_types.h"
 
 namespace Core::Loader {
 class SymbolsResolver;
@@ -69,7 +70,8 @@ s32 PS4_SYSV_ABI sceNpWebApiSetMultipartContentType();
 s32 PS4_SYSV_ABI sceNpWebApiSetRequestTimeout();
 s32 PS4_SYSV_ABI sceNpWebApiTerminate();
 s32 PS4_SYSV_ABI sceNpWebApiUnregisterExtdPushEventCallback();
-s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId();
+s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
+                                             Libraries::Np::OrbisNpId* pNpId);
 s32 PS4_SYSV_ABI sceNpWebApiVshInitialize();
 s32 PS4_SYSV_ABI Func_064C4ED1EDBEB9E8();
 s32 PS4_SYSV_ABI Func_0783955D4E9563DA();

@@ -54,4 +54,10 @@ private:
 
 using Signals = Common::Singleton<SignalDispatch>;
 
+// GR2FORK: log every slot on a guest thread stack that lands inside the eboot module as a return
+// address (runtime VA plus the ghidra offset va - 0x800000000 + 0x107BF0). Shared by the SIGSEGV
+// crash-caller dump and the sceKernelPrintBacktraceWithModuleInfo HLE hook so both use one mapping.
+// rsp/rbp are the guest stack and frame pointers; pass rbp == 0 to scan the stack only. Reads only.
+void DumpGuestEbootBacktrace(u64 rsp, u64 rbp, const char* tag, int scan_slots = 48);
+
 } // namespace Core

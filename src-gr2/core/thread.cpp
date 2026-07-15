@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "thread.h"
 #ifdef _WIN64
@@ -52,6 +55,46 @@ void InitializeContext(CONTEXT* ctx, ThreadFunc func, void* arg,
     ctx->ContextFlags =
         CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
 }
+
+// GR2FORK FIX: AV/EDR hooks and exploit-protection policies deny the custom-TEB NtCreateThread
+// call with STATUS_ACCESS_DENIED (it matches process-hollowing heuristics), which kills every
+// guest thread and boots the game to a black screen. The fallback creates a plain CreateThread
+// thread whose entry updates the TEB stack bounds to the guest stack and pivots RSP onto it, so
+// guest code sees the same stack placement as the NtCreateThread path.
+struct FallbackLaunch {
+    ThreadFunc func;
+    void* arg;
+    void* stack_addr;
+    u64 stack_size;
+};
+
+[[noreturn]] static void PivotToGuestStack(ThreadFunc func, void* arg, void* rsp) {
+    asm volatile("movq %[rsp], %%rsp\n\t"
+                 "xorl %%ebp, %%ebp\n\t"
+                 "callq *%[entry]\n\t"
+                 "ud2"
+                 :
+                 : [entry] "r"(func), [rsp] "r"(rsp), "c"(arg)
+                 : "memory");
+    __builtin_unreachable();
+}
+
+static DWORD WINAPI FallbackThreadEntry(LPVOID param) {
+    FallbackLaunch launch = *static_cast<FallbackLaunch*>(param);
+    delete static_cast<FallbackLaunch*>(param);
+
+    // Exception dispatch validates RSP against the TEB stack bounds, so they must describe the
+    // guest stack before the pivot. DeallocationStack is left pointing at the host stack so the
+    // kernel frees it at thread termination (see NativeThread::Exit).
+    const u64 top =
+        Common::AlignDown(reinterpret_cast<u64>(launch.stack_addr) + launch.stack_size, 16);
+    auto* teb = reinterpret_cast<TEB*>(NtCurrentTeb());
+    teb->Tib.StackBase = reinterpret_cast<void*>(top);
+    teb->Tib.StackLimit = launch.stack_addr;
+
+    // Pivot below the top so the entry's ABI shadow space stays inside the guest stack.
+    PivotToGuestStack(launch.func, launch.arg, reinterpret_cast<void*>(top - 0x20));
+}
 #endif
 
 NativeThread::NativeThread() : native_handle{0} {}
@@ -76,8 +119,33 @@ int NativeThread::Create(ThreadFunc func, void* arg, const ::Libraries::Kernel::
     InitializeTeb(&teb, attr);
     InitializeContext(&ctx, func, arg, attr);
 
-    return NtCreateThread(&native_handle, THREAD_ALL_ACCESS, nullptr, GetCurrentProcess(),
-                          &clientId, &ctx, &teb, false);
+    const u64 status = NtCreateThread(&native_handle, THREAD_ALL_ACCESS, nullptr,
+                                      GetCurrentProcess(), &clientId, &ctx, &teb, false);
+    if (status == 0) {
+        return 0;
+    }
+
+    static std::atomic<bool> fallback_logged{false};
+    if (!fallback_logged.exchange(true, std::memory_order_relaxed)) {
+        LOG_WARNING(Core,
+                    "[GR2FORK thread-fallback] NtCreateThread failed (status 0x{:x}); guest "
+                    "threads now run via CreateThread with a guest-stack pivot. Security "
+                    "software commonly blocks the custom-TEB path.",
+                    status);
+    }
+
+    host_stack_thread = true;
+    auto* launch = new FallbackLaunch{func, arg, attr->stackaddr_attr, attr->stacksize_attr};
+    // The host stack only hosts FallbackThreadEntry up to the pivot; 256 KB reservation is ample.
+    native_handle = CreateThread(nullptr, 256_KB, FallbackThreadEntry, launch,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (native_handle == nullptr) {
+        LOG_ERROR(Core, "[GR2FORK thread-fallback] CreateThread fallback also failed (error {}).",
+                  GetLastError());
+        delete launch;
+        return static_cast<int>(status);
+    }
+    return 0;
 #endif
 }
 
@@ -91,6 +159,13 @@ void NativeThread::Exit() {
 #ifdef _WIN64
     NtClose(native_handle);
     native_handle = nullptr;
+
+    // GR2FORK FIX: fallback threads run on a guest stack but own a CreateThread host stack;
+    // DeallocationStack still points at the host stack so terminating here frees it. The guest
+    // stack is owned and recycled by ThrState either way.
+    if (host_stack_thread) {
+        NtTerminateThread(nullptr, 0);
+    }
 
     /* The Windows kernel will free the stack
        given at thread creation via INITIAL_TEB

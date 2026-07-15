@@ -308,16 +308,18 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
 
     // GR2FORK: return EAGAIN instead of asserting on host thread-creation failure. The
     // custom-TEB NtCreateThread pattern trips AV/EDR process-hollowing heuristics on Windows and
-    // fails with STATUS_ACCESS_DENIED (0xC0000022); POSIX allows EAGAIN and guest code handles it.
+    // fails with STATUS_ACCESS_DENIED (0xC0000022); NativeThread::Create falls back to a plain
+    // CreateThread with a guest-stack pivot, so reaching here means both paths were denied.
+    // POSIX allows EAGAIN and guest code handles it.
     if (ret != 0) {
         LOG_ERROR(Kernel_Pthread,
                   "Native thread creation failed for '{}' (host error {} / 0x{:x}). "
-                  "Returning EAGAIN. On Windows, this is most commonly "
-                  "STATUS_ACCESS_DENIED (0xC0000022) from AV/EDR or Exploit "
-                  "Protection denying the custom-TEB NtCreateThread path; try "
-                  "adding the shadps4 folder to Defender exclusions, unblock the "
-                  "exe via Properties, and disable overlays (NVIDIA/Discord/MSI "
-                  "Afterburner/RTSS).",
+                  "Returning EAGAIN. On Windows this means both the custom-TEB "
+                  "NtCreateThread path and the CreateThread fallback were denied, "
+                  "most commonly STATUS_ACCESS_DENIED (0xC0000022) from AV/EDR or "
+                  "Exploit Protection; try adding the shadps4 folder to Defender "
+                  "exclusions, unblock the exe via Properties, and disable overlays "
+                  "(NVIDIA/Discord/MSI Afterburner/RTSS).",
                   new_thread->name, ret, static_cast<u32>(ret));
 
         // Reverse the CreateStack/Link/(*thread) assignment above. FreeStack is a no-op for a

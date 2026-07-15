@@ -35,6 +35,10 @@ public:
 private:
 #ifdef _WIN64
     void* native_handle;
+    // GR2FORK FIX: set when the thread was created via the CreateThread fallback instead of the
+    // custom-TEB NtCreateThread path; Exit keeps DeallocationStack intact for these threads so
+    // the kernel frees the host stack at termination.
+    bool host_stack_thread = false;
 #else
     uintptr_t native_handle;
     void* sig_stack_ptr;

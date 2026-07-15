@@ -4,16 +4,19 @@
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_web_api.h"
 
 // GR2-NPWEB userProfile responder: the World-Rankings screen resolves each row's player via
 // userProfile requests, and a 0-byte stub stalls the board. Requests forward to the local GR2
 // server (httpHostOverride) as GET /npwebapi/<apiGroup><path>; no response/non-2xx yields 0 bytes.
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
+#include <string_view>
 
 #include <httplib.h>
 
@@ -791,8 +794,98 @@ s32 PS4_SYSV_ABI sceNpWebApiUnregisterExtdPushEventCallback() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId() {
-    LOG_ERROR(Lib_NpWebApi, "(STUBBED) called");
+static std::string DecodeBase64(std::string_view in) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z')
+            return c - 'A';
+        if (c >= 'a' && c <= 'z')
+            return c - 'a' + 26;
+        if (c >= '0' && c <= '9')
+            return c - '0' + 52;
+        if (c == '+')
+            return 62;
+        if (c == '/')
+            return 63;
+        return -1;
+    };
+    std::string out;
+    int buf = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\0')
+            break;
+        const int v = val(c);
+        if (v < 0)
+            continue; // skip whitespace / invalid chars
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
+                                             Libraries::Np::OrbisNpId* pNpId) {
+    // Temporary input probe: capture the exact bytes the game passes as pJsonNpId. The input can
+    // be base64 or binary and non-printable, so log bounded hex alongside the quoted string.
+    {
+        std::string in_str, in_hex;
+        size_t in_len = 0;
+        if (pJsonNpId == nullptr) {
+            in_str = "(null)";
+        } else {
+            in_len = strnlen(pJsonNpId, 256);
+            in_str = std::string(pJsonNpId, in_len);
+            const size_t hex_n = in_len < 48 ? in_len : 48;
+            in_hex.reserve(hex_n * 3);
+            for (size_t i = 0; i < hex_n; ++i) {
+                in_hex += fmt::format("{:02x} ", static_cast<unsigned char>(pJsonNpId[i]));
+            }
+        }
+        LOG_INFO(Lib_NpWebApi, "ParseNpId input pJsonNpId='{}' strnlen={} hex: {}", in_str, in_len,
+                 in_hex);
+    }
+    // Zero the output up front so an early return or empty parse never leaves the
+    // caller with an uninitialized OrbisNpId.
+    if (pNpId != nullptr) {
+        std::memset(pNpId, 0, sizeof(Libraries::Np::OrbisNpId));
+    }
+    if (pJsonNpId == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // The serialized npId decodes to "<handle>@<seg>[/<seg>][.<seg>]": the part
+    // before '@' is the online-id handle (<=16 bytes), and the segments after it,
+    // with '/' and '.' separators removed, concatenate into the 8-byte opt.
+    const std::string decoded = DecodeBase64(pJsonNpId);
+    std::string handle;
+    std::string opt;
+    const size_t at = decoded.find('@');
+    if (at == std::string::npos) {
+        handle = decoded;
+    } else {
+        handle = decoded.substr(0, at);
+        for (size_t i = at + 1; i < decoded.size(); ++i) {
+            const char c = decoded[i];
+            if (c != '/' && c != '.') {
+                opt.push_back(c);
+            }
+        }
+    }
+    if (handle.empty()) {
+        // An empty decoded handle is not a usable identity; return an error with the output
+        // left zeroed (valid-handle flag unset) so the caller does not treat it as valid and
+        // write through a null identity pointer.
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (pNpId != nullptr) {
+        std::memcpy(pNpId->handle.data, handle.data(),
+                    std::min<size_t>(handle.size(), ORBIS_NP_ONLINEID_MAX_LENGTH));
+        std::memcpy(pNpId->opt, opt.data(), std::min<size_t>(opt.size(), sizeof(pNpId->opt)));
+        pNpId->reserved[0] = 0x01; // valid-handle flag the PRX sets
+    }
+    LOG_INFO(Lib_NpWebApi, "parsed npId -> handle='{}' opt='{}'", handle, opt);
     return ORBIS_OK;
 }
 

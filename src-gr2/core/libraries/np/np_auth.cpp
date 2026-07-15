@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -275,6 +276,173 @@ static void Gr2OpenGate(u64 base) {
              "mov eax,1;ret (reverted to plain, restores mines)  [{}]",
              gate, orig[0], orig[1], orig[2], orig[3], orig[4], orig[5],
              stuck ? "PATCHED" : "WRITE-DROPPED");
+}
+
+// FUN_00fa1720 is a deferred UI-teardown callback (coroutine scheduler) that frees the challenger
+// ghost-user-name std::string at *(param_1+0x120) on the default heap. The challenge-delivery churn
+// recycles that chunk into a 40-byte getphotoghost avatar response first, so the deferred free
+// double-frees and SceLibc aborts with "A heap error is detected". NOP only the 5-byte free CALL at
+// 0xfa2317; the following `MOV [R14+0x120],0` still nulls the pointer, so state stays
+// consistent and the tiny name string (<=40 bytes) leaks instead of aborting.
+static void Gr2NeutralizeChGhostFree(u64 base) {
+    static bool done = false;
+    if (done || base == 0) {
+        return;
+    }
+    done = true;
+    // Plain code-patch: overwrite the SceLibc free-thunk CALL with five NOPs. No stub, no per-call
+    // side effects. Verify the original is a rel32 CALL (leading E8) first, so a base-mapping error
+    // logs a mismatch instead of corrupting an unrelated instruction.
+    const u64 site = base + (0xfa2317 - 0x107BF0);
+    u8 orig[5];
+    for (u32 i = 0; i < 5; ++i) {
+        orig[i] = *reinterpret_cast<volatile u8*>(site + i);
+    }
+    if (orig[0] != 0xe8) {
+        LOG_ERROR(Lib_NpAuth,
+                  "GR2-CHGHOSTFIX: FUN_00fa1720 @{:#x} orig {:02x}{:02x}{:02x}{:02x}{:02x} not a "
+                  "rel32 CALL (E8) -- MISMATCH, not patched",
+                  site, orig[0], orig[1], orig[2], orig[3], orig[4]);
+        return;
+    }
+    for (u32 i = 0; i < 5; ++i) {
+        *reinterpret_cast<volatile u8*>(site + i) = 0x90;  // nop
+    }
+    bool stuck = true;
+    for (u32 i = 0; i < 5; ++i) {
+        if (*reinterpret_cast<volatile u8*>(site + i) != 0x90) {
+            stuck = false;
+        }
+    }
+    LOG_INFO(Lib_NpAuth,
+             "GR2-CHGHOSTFIX: FUN_00fa1720 free CALL @{:#x} orig {:02x}{:02x}{:02x}{:02x}{:02x} -> "
+             "5x nop (leaks challenger-name string, avoids double-free)  [{}]",
+             site, orig[0], orig[1], orig[2], orig[3], orig[4],
+             stuck ? "PATCHED" : "WRITE-DROPPED");
+}
+
+// GR2FORK FIX: suppress the overworld challenge puppet. Challenges are reached from a marker access
+// point and have no overworld ghost (the only overworld figures are the gold treasure and blue photo
+// Kats); the ghost path otherwise spawns a replay-playing puppet at the challenge marker. The puppet
+// spawns in Lua only when Ugc:findShowGhost (FUN_00e995a0) returns a valid handle: the native zeroes
+// R15, then writes the real handle target with MOV R15,RAX (49 89 c7) at 0xe99759. NOP that write so
+// R15 stays 0, the handle stays invalid, and no puppet spawns. The Challenges row (FUN_00e828f0,
+// separate vector) and the in-mission race ghost (FUN_00edc730, separate store) do not use this
+// native; the +0x14 visibility gate is untouched, so the row and race are unaffected.
+static void Gr2HideChallengePuppet(u64 base) {
+    static bool done = false;
+    if (done || base == 0) {
+        return;
+    }
+    done = true;
+    const u64 site = base + (0xe99759 - 0x107BF0);  // MOV R15,RAX in Ugc:findShowGhost (FUN_00e995a0)
+    u8 orig[3];
+    for (u32 i = 0; i < 3; ++i) {
+        orig[i] = *reinterpret_cast<volatile u8*>(site + i);
+    }
+    if (orig[0] != 0x49 || orig[1] != 0x89 || orig[2] != 0xc7) {
+        LOG_ERROR(Lib_NpAuth,
+                  "GR2-CHPUPPET: findShowGhost @{:#x} orig {:02x}{:02x}{:02x} not MOV R15,RAX "
+                  "(49 89 c7) -- MISMATCH, not patched",
+                  site, orig[0], orig[1], orig[2]);
+        return;
+    }
+    for (u32 i = 0; i < 3; ++i) {
+        *reinterpret_cast<volatile u8*>(site + i) = 0x90;  // nop
+    }
+    bool stuck = true;
+    for (u32 i = 0; i < 3; ++i) {
+        if (*reinterpret_cast<volatile u8*>(site + i) != 0x90) {
+            stuck = false;
+        }
+    }
+    LOG_INFO(Lib_NpAuth,
+             "GR2-CHPUPPET: findShowGhost handle write @{:#x} orig {:02x}{:02x}{:02x} -> 3x nop "
+             "(overworld challenge puppet suppressed; row + race unaffected)  [{}]",
+             site, orig[0], orig[1], orig[2], stuck ? "PATCHED" : "WRITE-DROPPED");
+}
+
+// GR2FORK FIX: global guest-heap double-free guard. Deferred UI-teardown callbacks fired on the
+// coroutine scheduler free buffers that challenge-delivery churn already recycled and freed, so the
+// same chunk is freed twice and SceLibc aborts with "A heap error is detected" (ud2 in libc.prx).
+// The offending frees are a class of sites, not one, so a per-site NOP does not scale. Instead the
+// single SceLibc free thunk is redirected: FUN_014fd2a0 tail-calls through the resolved import slot
+// _DAT_0180c8a0 as sceLibcMspaceFree(mspace, ptr) (RDI=mspace, RSI=ptr), so overwriting that slot
+// with Gr2FreeGuard routes every mspace free through the wrapper. Both game heaps (default
+// DAT_019e7560, net-scratch DAT_019e7568) pass their handle as arg0, which the wrapper forwards
+// unchanged.
+//
+// Detection is a stateless read of the SceLibc guard-heap metadata - no fork-side allocation set,
+// no lock. A live chunk carries the 8-byte cookie 0x0000000258585878 at ptr-0x10 followed by its
+// size at ptr-0x8; a freed chunk has that metadata and its user region overwritten with the
+// 0xafafafaf poison. The wrapper skips the free only on a POSITIVE full-8-byte poison match at the
+// header cookie slot (ptr-0x10) or the first user word (ptr). This is the safe direction: a wrong
+// offset assumption makes the guard inert (it never matches) rather than dropping live frees, a
+// live object practically never holds eight 0xaf bytes, and both reads stay within the metadata the
+// real free dereferences anyway. Skipping a free of an already-free chunk leaks it (tiny, <=40-byte
+// UI objects) instead of aborting - the same trade the per-site NOP makes.
+using Gr2MspaceFreeFn = PS4_SYSV_ABI void (*)(void* mspace, void* ptr);
+static std::atomic<Gr2MspaceFreeFn> g_gr2_orig_free{nullptr};
+static std::atomic<u64> g_gr2_df_skipped{0};
+static constexpr u64 kGr2FreePoison = 0xafafafafafafafafull;
+
+static PS4_SYSV_ABI void Gr2FreeGuard(void* mspace, void* ptr) {
+    const Gr2MspaceFreeFn orig = g_gr2_orig_free.load(std::memory_order_acquire);
+    if (orig == nullptr) {
+        return;  // never reached once installed; never re-enter the thunk that was replaced
+    }
+    if (ptr == nullptr) {
+        orig(mspace, nullptr);  // libc free(NULL) is a no-op; delegate for identical semantics
+        return;
+    }
+    // Already-free test: full 8-byte poison at the header cookie slot or the first user word.
+    const u64 hdr = *reinterpret_cast<volatile u64*>(reinterpret_cast<u8*>(ptr) - 0x10);
+    const u64 user = *reinterpret_cast<volatile u64*>(ptr);
+    if (hdr == kGr2FreePoison || user == kGr2FreePoison) {
+        const u64 n = g_gr2_df_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n & 0xff) == 0) {
+            LOG_ERROR(Lib_NpAuth,
+                      "GR2-FREEGUARD: skipped double-free of {:#x} (chunk poisoned) -- {} skipped",
+                      reinterpret_cast<u64>(ptr), n);
+        }
+        return;  // chunk is already free -> dropping this free avoids the SceLibc abort
+    }
+    orig(mspace, ptr);
+}
+
+// Install the guard by swapping the resolved free-thunk import slot _DAT_0180c8a0. One-shot, but
+// Gr2ArcProbe runs every video flip, so an unresolved import defers and retries on the next flip
+// rather than latching. GR2-serial-gated at the call site (probe_is_gr2), so other titles are
+// untouched.
+static void Gr2InstallFreeGuard(u64 base) {
+    static bool done = false;
+    if (done || base == 0) {
+        return;
+    }
+    const u64 slot = base + (0x180c8a0 - 0x107BF0);
+    const u64 orig = *reinterpret_cast<volatile u64*>(slot);
+    if (orig < 0x10000 || orig >= 0x800000000000ull) {
+        static bool deferred = false;
+        if (!deferred) {
+            deferred = true;
+            LOG_INFO(Lib_NpAuth,
+                     "GR2-FREEGUARD-INSTALL: _DAT_0180c8a0 @{:#x} = {:#x} unresolved -- DEFER",
+                     slot, orig);
+        }
+        return;  // do not latch; retry on a later flip once the import resolves
+    }
+    done = true;
+    g_gr2_orig_free.store(reinterpret_cast<Gr2MspaceFreeFn>(orig), std::memory_order_release);
+    // The import slot lives in the eboot data segment; make its page writable before the swap.
+    const u64 pg = slot & ~static_cast<u64>(0xfff);
+    const int mp = Gr2MakeRWX(reinterpret_cast<void*>(pg), 0x2000);
+    *reinterpret_cast<volatile u64*>(slot) = reinterpret_cast<u64>(&Gr2FreeGuard);
+    const u64 readback = *reinterpret_cast<volatile u64*>(slot);
+    const bool ok = (readback == reinterpret_cast<u64>(&Gr2FreeGuard));
+    LOG_INFO(Lib_NpAuth,
+             "GR2-FREEGUARD-INSTALL: _DAT_0180c8a0 @{:#x} orig={:#x} -> &Gr2FreeGuard={:#x} "
+             "mprotect={} [{}]",
+             slot, orig, reinterpret_cast<u64>(&Gr2FreeGuard), mp, ok ? "PATCHED" : "MISMATCH");
 }
 
 // Hook FUN_00fdf150 (announcement-screen list builder) at entry so the cm12 slot is re-asserted
@@ -1628,6 +1796,9 @@ void Gr2ArcProbe(const char* where) {
     // corrupt it (mining rows stop repopulating on reload). Only Gr2OpenGate (patches eboot code,
     // never the save; needed for mines to render) and read-only watchers run here.
     Gr2OpenGate(base);                 // code-patch only; opens the render gate (mines + all categories)
+    Gr2NeutralizeChGhostFree(base);    // code-patch only; NOPs the challenger-name deferred free
+    Gr2HideChallengePuppet(base);      // code-patch only; suppresses the inaccurate overworld puppet
+    Gr2InstallFreeGuard(base);         // redirects the SceLibc free thunk; skips already-free chunks
     // cm12 injection hooks disabled: with empty challenge data the game resolves the sender, then
     // reads a second uninitialized online-id field -> npwebapi profiles?onlineId=<garbage> ->
     // NpToolkit write-back -> heap double-free. Re-enable only with matching challenge data.
@@ -1654,14 +1825,12 @@ void Gr2ArcProbe(const char* where) {
     (void)&Gr2InstallE8cc30Hook;
     (void)&Gr2InjectChallenge;
 #else
-    // Read-only receive-capture hook on FUN_00e8cc30 entry: logs GR2-ENTRY (each +0x263b8 entry's
-    // selector +0x10 and name +0x20/+0x38) so the id and name the scan reads from a seeded entry are
-    // visible, plus GR2-CAP/GR2-NAMETBL/GR2-MGRSLOT. No writes.
-    Gr2InstallE8cc30Hook(base);
-    // Seed one id=0 pending challenge entry so the game's caseD_0 builds the real cat-0 slot from
-    // the network getmaildetail (mission + validity minutes) - game-built and save-consistent.
-    // Gated by GR2_SEED_CHALLENGE; requires the server running + a stored challenge.
-    static constexpr bool GR2_SEED_CHALLENGE = true;   // seed the game-built challenge slot
+    // The FUN_00e8cc30 receive-capture hook disturbs normal announcements (they render as
+    // already-read) and is not needed here, so it stays off, referenced only below. Challenge
+    // delivery is server-side only: with GR2_SEED_CHALLENGE false the id=0 seed and the cm12
+    // overworld-ghost activation below do not run, so the fork writes no challenge slots.
+    (void)&Gr2InstallE8cc30Hook;
+    static constexpr bool GR2_SEED_CHALLENGE = false;  // off: real challenges arrive as savedata mail; the seed only faked a hardcoded cm12 slot
     if constexpr (GR2_SEED_CHALLENGE) {
         // Only this seed populates the +0x263b8 pending list, and its download_mail_detail is
         // sent only while the boot rkg pump is live (~30s from boot), so it retries every ~55
@@ -1673,16 +1842,44 @@ void Gr2ArcProbe(const char* where) {
         const u64 mgr = Gr2ReadGlobal<u64>(0x1bea890);
         if (mgr >= 0x10000) {
             const u64 cm12 = mgr + 8 + 11 * 0xcd0;  // cm12 mission block (mission index 11)
-            // check whether caseD_0 has built a cm12 challenge slot (any of the 10 sub-slots)
-            if (!built) {
+            // Retained but inactive under GR2_SEED_CHALLENGE=false. caseD_0 builds a full cm12
+            // sub-slot but leaves its visibility gate (u16 at +0x14) at 0. The overworld-ghost
+            // collector FUN_00e946f0/findShowGhost shows the ghost only for sub-slots whose gate
+            // is in the visible set (!= 0 && != 3). When enabled, it samples the built slot on a
+            // throttled cadence, logs telemetry, and forces the gate to 1 for a bounded window.
+            static u32 sample_tk = 0;
+            static u32 win_tk = 0;  // frames since the cm12 slot first appeared
+            ++sample_tk;
+            if (built) {
+                ++win_tk;
+            }
+            if ((sample_tk % 30) == 0) {
                 for (u32 i = 0; i < 10; ++i) {
-                    if (*reinterpret_cast<volatile u32*>(cm12 + i * 0x148 + 0xb4) == 0x76f0fed2) {
-                        built = true;
+                    const u64 s = cm12 + i * 0x148;
+                    if (*reinterpret_cast<volatile u32*>(s + 0xb4) == 0x76f0fed2) {
+                        built = true;  // slot exists; the seed retry below stops appending entries
+                        const u16 gate = *reinterpret_cast<volatile u16*>(s + 0x14);
+                        // Collect count: cm12 sub-slots findShowGhost would treat as visible.
+                        u32 collect = 0;
+                        for (u32 j = 0; j < 10; ++j) {
+                            const u16 g = *reinterpret_cast<volatile u16*>(cm12 + j * 0x148 + 0x14);
+                            if (g != 0 && g != 3) {
+                                ++collect;
+                            }
+                        }
                         LOG_INFO(Lib_NpAuth,
-                                 "GR2-SEEDWATCH: challenge slot BUILT at cm12 sub-slot {} (+0x14={:#x} "
-                                 "+0x140={:#x}) -> DONE",
-                                 i, *reinterpret_cast<volatile u32*>(cm12 + i * 0x148 + 0x14),
-                                 *reinterpret_cast<volatile u64*>(cm12 + i * 0x148 + 0x140));
+                                 "GR2-GHOST: cm12 sub-slot {} +0x14={:#x} +0x10={:#x} +0x140={:#x} "
+                                 "sm(+0x263c8)={:#x} collect={}/10 win={}",
+                                 i, gate, *reinterpret_cast<volatile u32*>(s + 0x10),
+                                 *reinterpret_cast<volatile u64*>(s + 0x140),
+                                 *reinterpret_cast<volatile u32*>(mgr + 0x263c8), collect, win_tk);
+                        // Force the gate on for a bounded window (about 4000 frames) so the puppet
+                        // can be reached; re-assert only on this cadence, never per frame.
+                        if (win_tk < 4000 && gate != 1) {
+                            *reinterpret_cast<volatile u16*>(s + 0x14) = 1;  // force gate visible
+                            LOG_INFO(Lib_NpAuth,
+                                     "GR2-GHOSTACT: cm12 sub-slot {} st {:#x}->1", i, gate);
+                        }
                         break;
                     }
                 }

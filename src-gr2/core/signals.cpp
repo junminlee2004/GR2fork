@@ -38,6 +38,39 @@ extern thread_local Pthread* g_curthread;
 
 namespace Core {
 
+// GR2FORK: walk a guest thread stack and log every slot that lands inside the eboot module as a
+// return address (runtime VA plus the ghidra offset va - 0x800000000 + 0x107BF0). Shared by the
+// SIGSEGV crash-caller dump and the sceKernelPrintBacktraceWithModuleInfo HLE hook. rsp/rbp are
+// the guest stack and frame pointers; pass rbp == 0 to scan the stack only. Reads only.
+void DumpGuestEbootBacktrace(u64 rsp, u64 rbp, const char* tag, int scan_slots) {
+    const auto to_ghidra = [](u64 a) -> u64 {
+        return (a >= 0x800000000ull && a < 0x801b80000ull) ? a - 0x800000000ull + 0x107BF0ull : 0;
+    };
+    // Top of the guest stack: every eboot-range slot is a candidate return address (the call
+    // chain). A leaf libc routine pushes no frame, so the first hit is usually the direct caller.
+    if (rsp > 0x10000) {
+        const u64* s = reinterpret_cast<const u64*>(rsp);
+        for (int i = 0; i < scan_slots; ++i) {
+            const u64 g = to_ghidra(s[i]);
+            if (g) {
+                LOG_CRITICAL(Core, "  [{}] stack[{}] = {:#x}  -> EBOOT ghidra {:#x}", tag, i, s[i],
+                             g);
+            }
+        }
+    }
+    // Follow the rbp frame chain too, in case the immediate caller set a frame.
+    u64 fp = rbp;
+    for (int depth = 0; depth < 12 && fp > 0x10000; ++depth) {
+        const u64 ret = *reinterpret_cast<const u64*>(fp + 8);
+        const u64 g = to_ghidra(ret);
+        if (g) {
+            LOG_CRITICAL(Core, "  [{}] frame[{}] ret={:#x} -> EBOOT ghidra {:#x}", tag, depth, ret,
+                         g);
+        }
+        fp = *reinterpret_cast<const u64*>(fp);
+    }
+}
+
 #if defined(_WIN32)
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
@@ -333,10 +366,6 @@ static void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
             auto& gregs = uctx->uc_mcontext.gregs;
             const u64 rsp_val = static_cast<u64>(gregs[REG_RSP]);
             const u64 rbp_val = static_cast<u64>(gregs[REG_RBP]);
-            auto to_ghidra = [](u64 a) -> u64 {
-                return (a >= 0x800000000ull && a < 0x801b80000ull) ? a - 0x800000000ull + 0x107BF0ull
-                                                                   : 0;
-            };
             LOG_CRITICAL(Core,
                          "[CRASH-CALLER] thread='{}' rip={:#x} fault={:#x} | rax={:#x} rbx={:#x} "
                          "rcx={:#x} rdx={:#x} rdi={:#x} rsi={:#x} rbp={:#x} rsp={:#x}",
@@ -345,27 +374,8 @@ static void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                          static_cast<u64>(gregs[REG_RBX]), static_cast<u64>(gregs[REG_RCX]),
                          static_cast<u64>(gregs[REG_RDX]), static_cast<u64>(gregs[REG_RDI]),
                          static_cast<u64>(gregs[REG_RSI]), rbp_val, rsp_val);
-            // Top of the guest stack: log every eboot-range slot (return addresses = the call
-            // chain). A leaf libc strlen pushes no frame, so stack[0] is usually the direct caller.
-            if (rsp_val > 0x10000) {
-                const u64* s = reinterpret_cast<const u64*>(rsp_val);
-                for (int i = 0; i < 48; ++i) {
-                    const u64 g = to_ghidra(s[i]);
-                    if (g) {
-                        LOG_CRITICAL(Core, "  stack[{}] = {:#x}  -> EBOOT ghidra {:#x}", i, s[i], g);
-                    }
-                }
-            }
-            // Also follow the rbp frame chain (in case the immediate caller did set a frame).
-            u64 fp = rbp_val;
-            for (int depth = 0; depth < 12 && fp > 0x10000; ++depth) {
-                const u64 ret = *reinterpret_cast<const u64*>(fp + 8);
-                const u64 g = to_ghidra(ret);
-                if (g) {
-                    LOG_CRITICAL(Core, "  frame[{}] ret={:#x} -> EBOOT ghidra {:#x}", depth, ret, g);
-                }
-                fp = *reinterpret_cast<const u64*>(fp);
-            }
+            // Top of the guest stack plus the rbp frame chain: log eboot-range return addresses.
+            DumpGuestEbootBacktrace(rsp_val, rbp_val, "CRASH-CALLER", 48);
         }
 #endif
         UNREACHABLE_MSG(

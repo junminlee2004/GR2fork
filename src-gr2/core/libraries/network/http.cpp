@@ -1,8 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string_view>
+#include <thread>
 #include "common/config.h"
+#include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/http.h"
@@ -47,11 +55,11 @@ std::string ReplaceHost(std::string url, const std::string& new_host, bool force
     }
 
     // Force the local GR2 server's port: honor a port already present in new_host, otherwise
-    // append :8443. This is what makes "ssps4...:443" become "localhost:8443" rather than
-    // "localhost:443".
+    // append the configured override port (httpHostOverridePort, default 8443). This is what
+    // makes "ssps4...:443" become "localhost:8443" rather than "localhost:443".
     std::string authority = new_host;
     if (authority.find(':') == std::string::npos) {
-        authority += ":8443";
+        authority += ":" + std::to_string(Config::GetHttpHostOverridePort());
     }
 
     url.replace(host_start, host_end - host_start, authority);
@@ -212,6 +220,77 @@ int PS4_SYSV_ABI sceHttpCreateRequest2() {
     return ORBIS_OK;
 }
 
+// GR2FORK: fork-side profile avatar upload. The restoration server stores each player's avatar
+// but, once remote, cannot read the client's filesystem, so the fork POSTs the local avatar file
+// (user/home/1000/gr2_avatar.png) to /uploadavatar. The server keys the image by the
+// X-GR2-Player header, then center-crops and resizes it, so the raw bytes are sent as-is. Runs on
+// a detached thread and only for GR2 titles.
+static void Gr2UploadAvatarOnce() {
+    // GR2-only: the avatar file and endpoint belong to the GR2 restoration flow. Other titles
+    // (GRR: CUSA01130) have no gr2_avatar.png and must not post. Mirrors np_auth's serial gate.
+    static constexpr const char* kGr2Serials[] = {
+        "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+        "PCJS50010", "PCAS00079", "CUSA04935",
+    };
+    const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
+    bool is_gr2 = false;
+    for (const char* s : kGr2Serials) {
+        if (serial == s) {
+            is_gr2 = true;
+            break;
+        }
+    }
+    if (!is_gr2) {
+        return;
+    }
+
+    const std::filesystem::path avatar_path =
+        Common::FS::GetUserPath(Common::FS::PathType::HomeDir) / "1000" / "gr2_avatar.png";
+    std::error_code ec;
+    if (!std::filesystem::exists(avatar_path, ec)) {
+        return;
+    }
+
+    const std::string host = Config::GetHttpHostOverride();
+    const int port = Config::GetHttpHostOverridePort();
+    const std::string player = UserManagement.GetDefaultUser().user_name;
+
+    // Detached so the game thread never blocks on file I/O or the network round-trip. The thread
+    // owns copies of every input and touches no shared state after launch.
+    std::thread([avatar_path, host, port, player] {
+        std::ifstream f(avatar_path, std::ios::binary);
+        if (!f) {
+            return;
+        }
+        std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (body.empty()) {
+            return;
+        }
+
+        // Sanitize the display name into a valid header value, matching the X-GR2-Player rule the
+        // leaderboard path uses (drop control bytes and DEL). The server rejects an empty name.
+        std::string safe;
+        safe.reserve(player.size());
+        for (unsigned char c : player) {
+            if (c >= 0x20 && c != 0x7f) {
+                safe.push_back(static_cast<char>(c));
+            }
+        }
+        if (safe.empty()) {
+            return;
+        }
+
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        cli.set_write_timeout(5, 0);
+
+        httplib::Headers headers;
+        headers.emplace("X-GR2-Player", safe);
+        cli.Post("/uploadavatar", headers, body.data(), body.size(), "application/octet-stream");
+    }).detach();
+}
+
 int PS4_SYSV_ABI sceHttpCreateRequestWithURL(s32 tmpl_id, s32 method, const char* url,
                                              u64 content_length) {
     LOG_INFO(Lib_Http, "called template id = '{}' method = '{}' url = '{}', content length = '{}'",
@@ -230,6 +309,14 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(s32 tmpl_id, s32 method, const char
     if (url == nullptr) {
 
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    // GR2FORK: the first game HTTP request is a clean one-shot point where both the configured
+    // host and the local player's name are known. Push the profile avatar to the restoration
+    // server exactly once per boot; the guard latches before the attempt so it never repeats.
+    static std::atomic<bool> avatar_upload_started{false};
+    if (!avatar_upload_started.exchange(true)) {
+        Gr2UploadAvatarOnce();
     }
 
     static s32 request_id_counter = 0;
