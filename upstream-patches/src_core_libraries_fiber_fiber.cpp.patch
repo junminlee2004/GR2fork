@@ -1,8 +1,8 @@
 # carried local patch for the upstream mirror
 # file: src/core/libraries/fiber/fiber.cpp
-# original base: cf3bb346bf9d73471e7bb64a8bcafd52f36c3685
+# original base: 2c9caf6bfbe7e1dc7a1b4565af8d84c56469dd56
 diff --git a/src/core/libraries/fiber/fiber.cpp b/src/core/libraries/fiber/fiber.cpp
-index 9c8e64a1..58256bff 100644
+index dc34345b..473278e4 100644
 --- a/src/core/libraries/fiber/fiber.cpp
 +++ b/src/core/libraries/fiber/fiber.cpp
 @@ -23,6 +23,32 @@ OrbisFiberContext* GetFiberContext() {
