@@ -55,6 +55,30 @@ std::mutex g_np_web_mtx;
 std::map<s64, NpWebResponse> g_np_web_requests;
 s64 g_np_web_next_id = 0x4e500001; // keep the recognizable id prefix from the old fixed value
 
+// GR2 own-name fix: the game-bundled NpToolkit2 PRX renders the World-Rankings OWN line from a
+// singular /v1/users/<onlineId>/profile fetch, then hands sceNpWebApiUtilityParseNpId an EMPTY npId
+// (it does not extract the flat-string npId the server sends in that form). We cannot patch the
+// closed PRX, so remember the onlineId of the profile it just fetched and return it as the handle
+// when ParseNpId is passed an empty npId -> the live player's own name renders instead of a garbage
+// glyph. The challenger path (plural /profiles) passes a real base64 npId and never hits the fallback.
+std::mutex g_last_profile_mtx;
+std::string g_last_profile_online_id;
+
+void CaptureProfileOnlineId(std::string_view path) {
+    // match ".../users/<onlineId>/profile" (the singular userProfile form only)
+    const auto u = path.find("/users/");
+    if (u == std::string_view::npos) {
+        return;
+    }
+    const auto start = u + 7; // strlen("/users/")
+    const auto slash = path.find('/', start);
+    if (slash == std::string_view::npos || path.compare(slash, 8, "/profile") != 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_last_profile_mtx);
+    g_last_profile_online_id = std::string(path.substr(start, slash - start));
+}
+
 // GR2 challenge probe: the "Incoming Challenge" entry comes from the challenge subsystem (cat-0
 // slot, item+0xa0=challenger name, item+0xb4=FNV("cm%02d")) on a PSN push event that a discarding
 // stub loses. These handlers log the six argument registers raw (no deref) and return unique ids.
@@ -507,6 +531,7 @@ s32 PS4_SYSV_ABI sceNpWebApiCreateRequest(s32 handle, const char* apiGroup, cons
         slot.offset = 0;
         slot.fetched = false;
     }
+    CaptureProfileOnlineId(req_path); // remember own-line onlineId for the ParseNpId empty-npId fallback
     LOG_ERROR(Lib_NpWebApi,
               "[GR2-NPWEB] CreateRequest handle={} apiGroup='{}' path='{}' method={} "
               "contentParam={} -> req={:#x}",
@@ -871,6 +896,21 @@ s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
             if (c != '/' && c != '.') {
                 opt.push_back(c);
             }
+        }
+    }
+    if (handle.empty()) {
+        // GR2 own-name fix: NpToolkit2 renders the World-Rankings OWN line from the singular
+        // /users/<id>/profile fetch, then calls this with an EMPTY npId (it does not extract the
+        // flat-string npId the server sends in that form). Fall back to the onlineId of the profile
+        // it just fetched (see CaptureProfileOnlineId) so the live player's own name renders instead
+        // of a garbage glyph. A non-empty npId (the challenger's plural /profiles path) decodes above
+        // and never reaches this fallback.
+        std::lock_guard<std::mutex> lk(g_last_profile_mtx);
+        if (!g_last_profile_online_id.empty()) {
+            handle = g_last_profile_online_id;
+            opt.clear();
+            LOG_INFO(Lib_NpWebApi, "ParseNpId empty npId -> fallback to profile onlineId '{}'",
+                     handle);
         }
     }
     if (handle.empty()) {

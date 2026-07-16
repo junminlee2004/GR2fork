@@ -468,11 +468,14 @@ int PS4_SYSV_ABI sceHttpCookieImport();
 int PS4_SYSV_ABI sceHttpCreateConnection();
 int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, bool enableKeepalive);
 int PS4_SYSV_ABI sceHttpCreateEpoll();
-int PS4_SYSV_ABI sceHttpCreateRequest();
-int PS4_SYSV_ABI sceHttpCreateRequest2();
+int PS4_SYSV_ABI sceHttpCreateRequest(s32 conn_id, s32 method, const char* path,
+                                      u64 content_length);
+int PS4_SYSV_ABI sceHttpCreateRequest2(s32 conn_id, const char* method, const char* path,
+                                       u64 content_length);
 int PS4_SYSV_ABI sceHttpCreateRequestWithURL(s32 conn_id, s32 method, const char* url,
                                              u64 content_length);
-int PS4_SYSV_ABI sceHttpCreateRequestWithURL2();
+int PS4_SYSV_ABI sceHttpCreateRequestWithURL2(s32 conn_id, const char* method, const char* url,
+                                              u64 content_length);
 int PS4_SYSV_ABI sceHttpCreateTemplate(s32 conn_id, const char* user_agent, s32 http_v, s32 flags);
 int PS4_SYSV_ABI sceHttpDbgEnableProfile();
 int PS4_SYSV_ABI sceHttpDbgGetConnectionStat();

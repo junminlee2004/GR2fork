@@ -210,14 +210,132 @@ int PS4_SYSV_ABI sceHttpCreateEpoll() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpCreateRequest() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+// GR2FORK: the "2" request-create variants pass the HTTP method as a string ("GET", "POST", ...).
+// Map it to the OrbisHttpRequestMethod the RequestObj path expects; an unknown verb maps to
+// INVALID so the method-range guard rejects it.
+static s32 HttpMethodFromString(const char* method) {
+    if (method == nullptr) {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID;
+    }
+    const std::string_view m{method};
+    if (m == "GET") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_GET;
+    }
+    if (m == "POST") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_POST;
+    }
+    if (m == "HEAD") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_HEAD;
+    }
+    if (m == "OPTIONS") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_OPTIONS;
+    }
+    if (m == "PUT") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_PUT;
+    }
+    if (m == "DELETE") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_DELETE;
+    }
+    if (m == "TRACE") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_TRACE;
+    }
+    if (m == "CONNECT") {
+        return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_CONNECT;
+    }
+    return ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID;
 }
 
-int PS4_SYSV_ABI sceHttpCreateRequest2() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+// GR2FORK: the fork stores no connection objects, so a connection-based request has no known
+// host. ReplaceHost forces every request to the restoration server anyway, so binding the path
+// to the override host reproduces the real route; only the path identifies the endpoint.
+static std::string BuildOverrideUrlFromPath(const char* path) {
+    std::string url = "http://" + host_override;
+    if (path != nullptr && path[0] != '\0') {
+        if (path[0] != '/') {
+            url.push_back('/');
+        }
+        url.append(path);
+    }
+    return url;
+}
+
+// GR2FORK: shared body for the request-create entry points. Builds a host-overridden RequestObj
+// bound to template `tmpl_id` (connection ids alias template ids -- the fork stores no connections)
+// and returns its request id. Only sceHttpCreateRequestWithURL runs the one-shot avatar upload.
+static s32 CreateRequestWithURLInternal(s32 tmpl_id, s32 method, const char* url,
+                                        u64 content_length) {
+    if (!g_isHttpInitialized) {
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+
+    if (method >= ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID) {
+        return ORBIS_HTTP_ERROR_UNKNOWN_METHOD;
+    }
+
+    if (url == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    static s32 request_id_counter = 0;
+    s32 request_id = request_id_counter++;
+
+    std::string url_str = ReplaceHost(std::string(url), host_override);
+
+    std::lock_guard<std::mutex> lock_t(g_templates_map_mutex);
+
+    auto it = g_templates.find(tmpl_id);
+    if (it == g_templates.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+
+    auto new_request = RequestObj(request_id, &it->second, method, url_str, content_length);
+
+    std::lock_guard<std::mutex> lock_r(g_requests_map_mutex);
+    g_requests.emplace(request_id, std::move(new_request));
+
+    return request_id;
+}
+
+int PS4_SYSV_ABI sceHttpCreateRequest(s32 conn_id, s32 method, const char* path,
+                                      u64 content_length) {
+    LOG_INFO(Lib_Http, "called conn id = '{}' method = '{}' path = '{}', content length = '{}'",
+             conn_id, method, SafeCStr(path), content_length);
+
+    if (!g_isHttpInitialized) {
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+
+    if (path == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    std::string url = BuildOverrideUrlFromPath(path);
+
+    return CreateRequestWithURLInternal(conn_id, method, url.c_str(), content_length);
+}
+
+int PS4_SYSV_ABI sceHttpCreateRequest2(s32 conn_id, const char* method, const char* path,
+                                       u64 content_length) {
+    LOG_INFO(Lib_Http, "called conn id = '{}' method = '{}' path = '{}', content length = '{}'",
+             conn_id, SafeCStr(method), SafeCStr(path), content_length);
+
+    if (!g_isHttpInitialized) {
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+
+    if (method == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    if (path == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    const s32 int_method = HttpMethodFromString(method);
+
+    std::string url = BuildOverrideUrlFromPath(path);
+
+    return CreateRequestWithURLInternal(conn_id, int_method, url.c_str(), content_length);
 }
 
 // GR2FORK: fork-side profile avatar upload. The restoration server stores each player's avatar
@@ -319,30 +437,29 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(s32 tmpl_id, s32 method, const char
         Gr2UploadAvatarOnce();
     }
 
-    static s32 request_id_counter = 0;
-    s32 request_id = request_id_counter++;
-
-    std::string url_str = ReplaceHost(std::string(url), host_override);
-
-    std::lock_guard<std::mutex> lock_t(g_templates_map_mutex);
-
-    auto it = g_templates.find(tmpl_id);
-    if (it == g_templates.end()) {
-
-        return ORBIS_HTTP_ERROR_INVALID_ID;
-    }
-
-    auto new_request = RequestObj(request_id, &it->second, method, url_str, content_length);
-
-    std::lock_guard<std::mutex> lock_r(g_requests_map_mutex);
-    g_requests.emplace(request_id, std::move(new_request));
-
-    return request_id;
+    return CreateRequestWithURLInternal(tmpl_id, method, url, content_length);
 }
 
-int PS4_SYSV_ABI sceHttpCreateRequestWithURL2() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpCreateRequestWithURL2(s32 conn_id, const char* method, const char* url,
+                                              u64 content_length) {
+    LOG_INFO(Lib_Http, "called conn id = '{}' method = '{}' url = '{}', content length = '{}'",
+             conn_id, SafeCStr(method), SafeCStr(url), content_length);
+
+    if (!g_isHttpInitialized) {
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+
+    if (method == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    if (url == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_URL;
+    }
+
+    const s32 int_method = HttpMethodFromString(method);
+
+    return CreateRequestWithURLInternal(conn_id, int_method, url, content_length);
 }
 
 int PS4_SYSV_ABI sceHttpCreateTemplate(s32 conn_id, const char* user_agent, s32 http_v, s32 flags) {
