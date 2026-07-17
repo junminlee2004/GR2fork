@@ -127,7 +127,12 @@ jobs:
     - name: Print CPU Info
       run: bash -c "cat /proc/cpuinfo"
 
-
+    - name: Clean Build Directory
+      shell: pwsh
+      run: |
+        if (Test-Path ${{github.workspace}}/build) {
+          Remove-Item -Recurse -Force ${{github.workspace}}/build
+        }
     - name: Configure CMake
       # GR2FORK CI FIX (profdata/ccache consistency): the profile is passed as
       # /clang:-fprofile-use=<path>; ccache hashes the command-line PATH but not the profdata
@@ -258,7 +263,12 @@ jobs:
 
     - name: Print CPU Info
       run: bash -c "cat /proc/cpuinfo"
-
+    - name: Clean Build Directory
+      shell: pwsh
+      run: |
+        if (Test-Path ${{github.workspace}}/build) {
+          Remove-Item -Recurse -Force ${{github.workspace}}/build
+        }
     - name: Configure CMake
       run: |
         # Compiler/linker dir resolved by the Locate Clang 19 step (VS-bundled or downloaded).
