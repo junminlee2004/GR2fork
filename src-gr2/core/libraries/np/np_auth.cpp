@@ -321,6 +321,49 @@ static void Gr2NeutralizeChGhostFree(u64 base) {
              stuck ? "PATCHED" : "WRITE-DROPPED");
 }
 
+// GR2FORK FIX: the Announcements/Notice view singleton (DAT_01bf5d60) caches a NON-OWNING pointer to
+// a served cap_response envelope in field +0x90. The net/mail layer frees that envelope first; then
+// the view teardown FUN_00feb5a0 frees the same pointer a second time via the SceLibc free thunk at
+// 0xfebba5, and SceLibc's heap checker aborts on Announcements open. NOP that duplicate free CALL;
+// the following instruction (MOV [R14+0x90],0) still nulls the stale pointer, so no re-free occurs.
+// The crash is card-agnostic (every served card shares the envelope), so this is required regardless
+// of which card populated the view. Verify a leading E8 first so a base-mapping error on a variant
+// eboot logs a mismatch instead of corrupting an unrelated instruction.
+static void Gr2NeutralizeNoticeEnvelopeFree(u64 base) {
+    static bool done = false;
+    if (done || base == 0) {
+        return;
+    }
+    done = true;
+    const u64 site = base + (0xfebba5 - 0x107BF0);
+    u8 orig[5];
+    for (u32 i = 0; i < 5; ++i) {
+        orig[i] = *reinterpret_cast<volatile u8*>(site + i);
+    }
+    if (orig[0] != 0xe8) {
+        LOG_ERROR(Lib_NpAuth,
+                  "GR2-NOTICEFREE: FUN_00feb5a0 @{:#x} orig {:02x}{:02x}{:02x}{:02x}{:02x} not a "
+                  "rel32 CALL (E8) -- MISMATCH, not patched",
+                  site, orig[0], orig[1], orig[2], orig[3], orig[4]);
+        return;
+    }
+    for (u32 i = 0; i < 5; ++i) {
+        *reinterpret_cast<volatile u8*>(site + i) = 0x90;  // nop
+    }
+    bool stuck = true;
+    for (u32 i = 0; i < 5; ++i) {
+        if (*reinterpret_cast<volatile u8*>(site + i) != 0x90) {
+            stuck = false;
+        }
+    }
+    LOG_INFO(Lib_NpAuth,
+             "GR2-NOTICEFREE: FUN_00feb5a0 notice-envelope free CALL @{:#x} orig "
+             "{:02x}{:02x}{:02x}{:02x}{:02x} -> 5x nop (skips the view's duplicate free of the shared "
+             "cap_response envelope; the +0x90 pointer is still nulled next instr)  [{}]",
+             site, orig[0], orig[1], orig[2], orig[3], orig[4],
+             stuck ? "PATCHED" : "WRITE-DROPPED");
+}
+
 // GR2FORK FIX: suppress the overworld challenge puppet. Challenges are reached from a marker access
 // point and have no overworld ghost (the only overworld figures are the gold treasure and blue photo
 // Kats); the ghost path otherwise spawns a replay-playing puppet at the challenge marker. The puppet
@@ -1797,6 +1840,7 @@ void Gr2ArcProbe(const char* where) {
     // never the save; needed for mines to render) and read-only watchers run here.
     Gr2OpenGate(base);                 // code-patch only; opens the render gate (mines + all categories)
     Gr2NeutralizeChGhostFree(base);    // code-patch only; NOPs the challenger-name deferred free
+    Gr2NeutralizeNoticeEnvelopeFree(base);  // code-patch only; NOPs the Announcements-open double-free
     Gr2HideChallengePuppet(base);      // code-patch only; suppresses the inaccurate overworld puppet
     Gr2InstallFreeGuard(base);         // redirects the SceLibc free thunk; skips already-free chunks
     // cm12 injection hooks disabled: with empty challenge data the game resolves the sender, then
