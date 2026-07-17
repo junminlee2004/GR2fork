@@ -1160,6 +1160,17 @@ void Translator::V_MOVRELSD_B32(const GcnInst& inst) {
 
 // VOPC
 
+void Translator::WriteVopcResult(const GcnInst& inst, const IR::U1& result, bool set_exec) {
+    // VOPC compares evaluate on active lanes only; the destination mask receives
+    // exec & result, so inactive lanes' bits read zero regardless of the compare result.
+    // V_CMPX writes the same masked value to EXEC.
+    const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
+    if (set_exec) {
+        ir.SetExec(masked);
+    }
+    SetDst1(inst.dst[1], masked);
+}
+
 void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
     const IR::F32 src0{GetSrc<IR::F32>(inst.src[0])};
     const IR::F32 src1{GetSrc<IR::F32>(inst.src[1])};
@@ -1185,15 +1196,7 @@ void Translator::V_CMP_F32(ConditionOp op, bool set_exec, const GcnInst& inst) {
             UNREACHABLE();
         }
     }();
-    if (set_exec) {
-        // V_CMPX evaluates on active lanes only; hardware writes exec & result to both EXEC
-        // and the VCC/SDST destination, zeroing inactive lanes' bits.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
-        ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
-    }
-    SetDst1(inst.dst[1], result);
+    WriteVopcResult(inst, result, set_exec);
 }
 
 void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
@@ -1221,14 +1224,7 @@ void Translator::V_CMP_F64(ConditionOp op, bool set_exec, const GcnInst& inst) {
             UNREACHABLE();
         }
     }();
-    if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
-        ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
-    }
-    SetDst1(inst.dst[1], result);
+    WriteVopcResult(inst, result, set_exec);
 }
 
 void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
@@ -1256,14 +1252,7 @@ void Translator::V_CMP_U32(ConditionOp op, bool is_signed, bool set_exec, const 
             UNREACHABLE();
         }
     }();
-    if (set_exec) {
-        // See the V_CMPX note in V_CMP_F32.
-        const IR::U1 masked{ir.LogicalAnd(ir.GetExec(), result)};
-        ir.SetExec(masked);
-        SetDst1(inst.dst[1], masked);
-        return;
-    }
-    SetDst1(inst.dst[1], result);
+    WriteVopcResult(inst, result, set_exec);
 }
 
 void Translator::V_CMP_U64(ConditionOp op, bool is_signed, bool set_exec, const GcnInst& inst) {
