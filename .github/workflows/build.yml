@@ -120,6 +120,7 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1.2.21
       env:
           cache-name: ${{ runner.os }}-sdl-cache-cmake-build
+          CCACHE_SLOPPINESS: pch_defines,time_macros
       with:
         append-timestamp: false
         key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**', 'packaging/gr2.prof', 'packaging/gr2win.profdata') }}
@@ -257,6 +258,7 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1.2.21
       env:
           cache-name: ${{ runner.os }}-sdl-relwithdebinfo-cache-cmake-build
+          CCACHE_SLOPPINESS: pch_defines,time_macros 
       with:
         append-timestamp: false
         key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**', 'packaging/gr2.prof', 'packaging/gr2win.profdata') }}
