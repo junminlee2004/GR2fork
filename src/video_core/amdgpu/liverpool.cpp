@@ -952,6 +952,27 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             continue;
         }
 
+        if (header->type == 0) {
+            // Type-0 packet: write NumWords consecutive registers starting at the base DWORD
+            // offset. The libSceVideodec2 software slice decoder programs its dispatch state this
+            // way before issuing the DispatchDirect that runs the decode shader.
+            const u32 reg_base = header->type0.base;
+            const u32 num_regs = header->type0.NumWords();
+            const auto* payload = reinterpret_cast<const u32*>(header) + 1;
+            for (u32 i = 0; i < num_regs; ++i) {
+                const u32 reg_offset = reg_base + i;
+                if (reg_offset < Regs::NumRegs) {
+                    regs.reg_array[reg_offset] = payload[i];
+                }
+            }
+            acb = NextPacket(acb, next_dw_off);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            continue;
+        }
+
         if (header->type != 3) {
             // No other types of packets were spotted so far
             UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
