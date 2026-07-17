@@ -25,7 +25,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <xxhash.h>
 
 #ifdef MemoryBarrier
 #undef MemoryBarrier
@@ -992,8 +991,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
         ++slow_stages_bound_;
         uses_dma |= stage->uses_dma;
         stage->PushUd(binding, push_data);
-        BindBuffers(*stage, binding, push_data, regs);
-        BindTextures(*stage, binding, regs);
+        const auto* resolved = pipeline_cache.GetResolvedStageResources(*stage);
+        BindBuffers(*stage, resolved, binding, push_data, regs);
+        BindTextures(*stage, resolved, binding, regs);
     }
 
     // No post-iteration null-descriptor coverage pass: under primary-CB direct recording the
@@ -1006,16 +1006,29 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     GR2_INSTR_ON_BR_SLOW(slow_timer_.ElapsedNs(), slow_stages_bound_);
 
     if (uses_dma) {
-        // GpuComm instrumentation: SynchronizeBuffersInRange traversal of
-        // the mapped-ranges interval set, where any CPU-dirty pages get
-        // uploaded to staging buffers.
-        GR2_INSTR_TIMER_DECL(sync_timer_);
-        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        for (auto& range : mapped_ranges) {
-            buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
+        const auto dma_sync_state = buffer_cache.GetDmaSyncState();
+        const u64 mapped_ranges_gen = mapped_ranges_gen_.load(std::memory_order_acquire);
+        const bool needs_sync =
+            !dma_sync_state_valid_ ||
+            dma_sync_state.cpu_dirty_generation != last_dma_sync_state_.cpu_dirty_generation ||
+            dma_sync_state.buffer_registry_generation !=
+                last_dma_sync_state_.buffer_registry_generation ||
+            mapped_ranges_gen != last_dma_mapped_ranges_gen_;
+        if (needs_sync) {
+            // A pre-sweep snapshot leaves mutations that race the traversal visible to the next
+            // draw instead of treating them as synchronized.
+            GR2_INSTR_TIMER_DECL(sync_timer_);
+            Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+            for (auto& range : mapped_ranges) {
+                buffer_cache.SynchronizeBuffersInRange(range.lower(),
+                                                       range.upper() - range.lower());
+            }
+            last_dma_sync_state_ = dma_sync_state;
+            last_dma_mapped_ranges_gen_ = mapped_ranges_gen;
+            dma_sync_state_valid_ = true;
+            GR2_INSTR_ON_SYNC_BUFFER(sync_timer_.ElapsedNs());
         }
         fault_process_pending = true;
-        GR2_INSTR_ON_SYNC_BUFFER(sync_timer_.ElapsedNs());
     }
 
     return true;
@@ -1202,8 +1215,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline,
     return true;
 }
 
-void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                             Shader::PushData& push_data,
+void Rasterizer::BindBuffers(const Shader::Info& stage,
+                             const Shader::ResolvedStageResources* resolved,
+                             Shader::Backend::Bindings& binding, Shader::PushData& push_data,
                              const AmdGpu::LiverpoolRegsSnapshot& regs) {
     // GR2FORK PERF: register-held write count; stored back once at exit.
     u32 dw_n = set_write_count;
@@ -1223,7 +1237,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // Eliminates the buffer_bindings intermediate vector (clear + emplace_back + read-back).
     for (u32 i = 0; i < stage.buffers.size(); i++) {
         const auto& desc = stage.buffers[i];
-        const auto vsharp = desc.GetSharp(stage);
+        const auto vsharp = resolved ? resolved->buffers[i] : desc.GetSharp(stage);
 
         VideoCore::BufferId buffer_id{};
         u64 size = 0;
@@ -1258,105 +1272,46 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
                 struct FlatbufCacheEntry {
                     u64 stage_key = 0;
-                    vk::CommandBuffer cmdbuf{};
-                    u64 hash = 0;
+                    u64 tick = 0;
                     u64 offset = 0;
                     u32 size = 0;
-                    // GR2FORK PERF: saturating count of consecutive verify-hash misses; at
-                    // >= kFlatHashOffStreak the verify hash is skipped and the payload
-                    // re-staged unconditionally. Fits in the struct's tail padding.
-                    u8 miss_streak = 0;
-                    u8 probe_ctr = 0;
+                    u32 alignment = 0;
+                    vk::Buffer buffer{};
                     bool valid = false;
                 };
                 static thread_local std::array<FlatbufCacheEntry, 32> flatbuf_cache{};
 
-                // GR2FORK PERF: adaptive verify-hash. GR2 rewrites user_data between most
-                // draws, so 8 straight hash misses disable hashing per entry; a probe hash each
-                // 128th hit re-enables when stable. Kill switch: GR2_NOFLATSTREAK=1.
-                static const bool flat_streak_enabled = []() noexcept {
-                    const char* e = std::getenv("GR2_NOFLATSTREAK");
-                    return !(e && e[0] == '1');
-                }();
-                constexpr u8 kFlatHashOffStreak = 8;
-
-                const auto cmdbuf = scheduler.PrimaryCommandBuffer();
-                const u64 stage_key = static_cast<u64>(stage.pgm_hash) ^ (static_cast<u64>(desc.sharp_idx) << 1);
+                const u64 tick = scheduler.CurrentTick();
+                const u64 stage_key = static_cast<u64>(stage.pgm_hash) ^
+                                      (static_cast<u64>(desc.sharp_idx) << 1);
 
                 FlatbufCacheEntry& e = flatbuf_cache[stage_key & (flatbuf_cache.size() - 1)];
 
-                // GR2FORK PERF: defer the XXH3 hash until the cheap identity checks pass -
-                // skipping XXH3_64bits when a validator fails saves ~80-300 cycles per
-                // Flatbuf binding.
                 const bool identity_match =
                     e.valid && e.stage_key == stage_key &&
-                    e.cmdbuf == cmdbuf && e.size == ubo_size;
+                    e.tick == tick && e.size == ubo_size && e.alignment == alignment &&
+                    e.buffer == vk_buffer.Handle();
 
                 u64 offset;
-                // GR2FORK PERF: once the 32-entry thread-local cache is warm, identity_match
-                // dominates - stage_key hashes distribute ~uniformly, so slot collisions are rare.
-                if (identity_match) [[likely]] {
-                    if (flat_streak_enabled && e.miss_streak >= kFlatHashOffStreak) {
-                        // Hashing is disabled for this entry (payload churned 8 binds in a
-                        // row): stage unconditionally, probing every 128th hit against the
-                        // hash stored at the previous probe to detect the payload settling.
-                        if ((++e.probe_ctr & 127) == 0) [[unlikely]] {
-                            const u64 payload_hash = (ubo_size == 0) ? 0
-                                : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
-                            if (e.hash == payload_hash) {
-                                // Stable across the whole probe window -
-                                // re-enable verify hashing.
-                                e.miss_streak = 0;
-                                offset = e.offset;
-                            } else {
-                                offset = vk_buffer.Copy(stage.flattened_ud_buf.data(),
-                                                        ubo_size, alignment);
-                                e.hash = payload_hash;
-                                e.offset = offset;
-                            }
-                        } else {
-                            offset = vk_buffer.Copy(stage.flattened_ud_buf.data(),
-                                                    ubo_size, alignment);
-                            e.offset = offset;
-                        }
-                    } else {
-                        // Same shader, same cmdbuf, same payload size - content
-                        // *might* be unchanged. Hash to verify.
-                        const u64 payload_hash = (ubo_size == 0) ? 0
-                            : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
-                        // GR2FORK PERF: UD content typically changes per parameter set (camera/
-                        // view constants), not per draw, so hashes match across consecutive
-                        // same-pipeline draws sharing the flat-buf payload.
-                        if (e.hash == payload_hash) [[likely]] {
-                            // Full hit - reuse the prior staging-buffer offset.
-                            offset = e.offset;
-                            e.miss_streak = 0;
-                        } else {
-                            // Content changed - re-stage and update hash only.
-                            offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                            e.hash = payload_hash;
-                            e.offset = offset;
-                            if (e.miss_streak < kFlatHashOffStreak) {
-                                ++e.miss_streak;
-                                e.probe_ctr = 0;
-                            }
-                        }
-                    }
+                // GR2FORK PERF: the cached stream bytes are the exact prior payload. memcmp
+                // exits on the first changed dword and avoids hashing the full flat buffer.
+                if (identity_match &&
+                    (ubo_size == 0 ||
+                     std::memcmp(vk_buffer.mapped_data.data() + e.offset,
+                                 stage.flattened_ud_buf.data(), ubo_size) == 0)) [[likely]] {
+                    offset = e.offset;
                 } else {
-                    // Slot miss - full populate. Hash on the way in.
                     offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                     e.stage_key = stage_key;
-                    e.cmdbuf = cmdbuf;
-                    e.hash = (ubo_size == 0) ? 0
-                        : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                    e.tick = scheduler.CurrentTick();
                     e.offset = offset;
                     e.size = ubo_size;
-                    e.miss_streak = 0; // a new identity starts with hashing on
-                    e.probe_ctr = 0;
+                    e.alignment = alignment;
+                    e.buffer = vk_buffer.Handle();
                     e.valid = true;
                 }
 
-                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) [[unlikely]] {
                 // GR2FORK PERF: BdaPagetable is used only by
                 // shaders performing buffer-device-address pointer-walks -
@@ -1518,7 +1473,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     set_write_count = dw_n;
 }
 
-void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+void Rasterizer::BindTextures(const Shader::Info& stage,
+                              const Shader::ResolvedStageResources* resolved,
+                              Shader::Backend::Bindings& binding,
                               const AmdGpu::LiverpoolRegsSnapshot& regs) {
     // GR2FORK PERF: register-held write count; stored back once at exit.
     u32 dw_n = set_write_count;
@@ -1613,8 +1570,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                      return v;
                                  };
 
-                                 for (const auto& image_res : stage.images) {
-                                     auto tsharp = image_res.GetSharp(stage);
+                                 for (u32 image_index = 0; image_index < stage.images.size();
+                                      ++image_index) {
+                                     const auto& image_res = stage.images[image_index];
+                                     auto tsharp = resolved ? resolved->images[image_index]
+                                                            : image_res.GetSharp(stage);
+                                     const u8 num_bindings = static_cast<u8>(
+                                         std::min<u32>(255u, image_res.NumBindings(tsharp)));
+                                     const bool single_mip =
+                                         tsharp.base_level == 0 && tsharp.last_level == 0;
 
                                      if (texture_cache.IsMeta(tsharp.Address())) [[unlikely]] {
             // GR2FORK PERF: defensive sanity log; never expected to
@@ -1628,9 +1592,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ImageBindingInfo& nb = image_bindings.emplace_back();
             // GR2FORK FIX: the layout always reserves NumBindings() slots for this ImageResource;
             // preserve num_bindings so the second-pass null emission writes the full array.
-            nb.num_bindings =
-                static_cast<u8>(std::min<u32>(255u, image_res.NumBindings(stage)));
+            nb.num_bindings = num_bindings;
             nb.is_written = image_res.is_written;
+            nb.single_mip = single_mip;
             continue;
         }
 
@@ -1648,9 +1612,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                             "treating as null binding (slot {})",
                             image_bindings.size());
                 ImageBindingInfo& nb = image_bindings.emplace_back();
-                nb.num_bindings =
-                    static_cast<u8>(std::min<u32>(255u, image_res.NumBindings(stage)));
+                nb.num_bindings = num_bindings;
                 nb.is_written = image_res.is_written;
+                nb.single_mip = single_mip;
                 continue;
             }
         }
@@ -1708,9 +1672,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                              tex_base, tex_size);
                 }
                 ImageBindingInfo& nb = image_bindings.emplace_back();
-                nb.num_bindings =
-                    static_cast<u8>(std::min<u32>(255u, image_res.NumBindings(stage)));
+                nb.num_bindings = num_bindings;
                 nb.is_written = image_res.is_written;
+                nb.single_mip = single_mip;
                 continue;
             }
         }
@@ -1807,11 +1771,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         b.image_id = image_id;
         b.desc = base_desc;
         b.is_written = image_res.is_written;
+        b.single_mip = single_mip;
         b.view_mip = static_cast<s16>(found.view_mip);
         b.view_slice = static_cast<s16>(found.view_slice);
         // GR2FORK FIX: capture NumBindings for the 2nd-loop mip-fallback
         // expansion. DynamicIndex images want >1 consecutive descriptor slots.
-        b.num_bindings = static_cast<u8>(std::min<u32>(255u, image_res.NumBindings(stage)));
+        b.num_bindings = num_bindings;
     }
 
     // GR2FORK PERF: second pass rebinds images updated after binding; the first pass tracks
@@ -1854,7 +1819,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 // GR2FORK FIX: a writable storage image that didn't resolve takes the real
                 // NULL_IMAGE sink (robustImageAccess2 discards the store) instead of faulting
                 // at GPU VA 0x0 on NVIDIA / AMD Windows; sampled nulls keep the null descriptor.
-                const bool redirect_storage_null = is_storage && NullWriteSinkEnabled();
+                const bool redirect_storage_null = is_storage && null_write_sink_ok;
                 if (null_descriptors_supported && !redirect_storage_null) {
                     image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
                 } else {
@@ -1893,20 +1858,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
             }
         } else {
+            auto* image_ptr = &texture_cache.GetImageUntouched(b.image_id);
             // GR2FORK PERF: Only check needs_rebind when we know at least one image needs it.
-            if (any_needs_rebind) {
-                if (auto& old_image = texture_cache.GetImage(b.image_id); old_image.binding.needs_rebind) {
-                    old_image.binding = {};
-                    const auto rebound = texture_cache.FindImageWithView(*base_desc, false, false);
-                    b.image_id = rebound.image_id;
-                    b.view_mip = static_cast<s16>(rebound.view_mip);
-                    b.view_slice = static_cast<s16>(rebound.view_slice);
-                }
+            if (any_needs_rebind && image_ptr->binding.needs_rebind) {
+                image_ptr->binding = {};
+                const auto replacement =
+                    texture_cache.FindImageWithView(*base_desc, false, false);
+                b.image_id = replacement.image_id;
+                b.view_mip = static_cast<s16>(replacement.view_mip);
+                b.view_slice = static_cast<s16>(replacement.view_slice);
+                image_ptr = &texture_cache.GetImage(b.image_id);
             }
 
             bound_images.emplace_back(b.image_id);
 
-            auto& image = texture_cache.GetImage(b.image_id);
+            // GR2FORK PERF: the first pass already touched this image. Only a replacement id
+            // needs the LRU update above.
+            auto& image = *image_ptr;
 
             // GR2FORK PERF: the common path binds base_desc->view_info by reference - copying
             // through two stack structs stalls store-to-load forwarding (~0.9% sys); overrides
@@ -2069,11 +2037,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // GR2FORK PERF: sampler fast-path cache - samplers are immutable, so a direct-mapped cache
     // safely skips GetSampler()'s S# hash + map lookup on hit (>90% steady-state GR2). The 2x-u64
     // S# probes via raw mul-xor + exact compare - no XXH3 call, no collision false-hits.
-    for (const auto& sampler : stage.samplers) {
-        auto ssharp = sampler.GetSharp(stage);
+    for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
+        const auto& sampler = stage.samplers[sampler_index];
+        auto ssharp = resolved ? resolved->samplers[sampler_index] : sampler.GetSharp(stage);
         if (sampler.disable_aniso) {
-            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
-            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
+            if (image_bindings[sampler.associated_image].single_mip) {
                 ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
         }

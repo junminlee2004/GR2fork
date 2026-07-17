@@ -161,6 +161,17 @@ public:
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
                       const AmdGpu::LiverpoolRegsSnapshot& regs, bool ctx_stable = false);
 
+    const Shader::ResolvedStageResources* GetResolvedStageResources(
+        const Shader::Info& info) const noexcept {
+        const u32 index = static_cast<u32>(info.l_stage);
+        if (index >= resolved_stage_resources_.size() ||
+            (resolved_stage_mask_ & (1u << index)) == 0) {
+            return nullptr;
+        }
+        const auto& resolved = resolved_stage_resources_[index];
+        return resolved.Matches(info) ? &resolved : nullptr;
+    }
+
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
 
@@ -284,6 +295,7 @@ private:
     const bool spec_fp_lru_enabled_;
 
     // Fast path: if only shader user data changes, the graphics pipeline key does not.
+    u32 resolved_stage_mask_{};
     u64 last_gfx_stamp{};
     const GraphicsPipeline* last_gfx_pipeline{};
     // GR2FORK PERF: compact copy of the three narrow-compared key fields,
@@ -311,6 +323,7 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+    std::array<Shader::ResolvedStageResources, MaxShaderStages> resolved_stage_resources_{};
 };
 
 } // namespace Vulkan

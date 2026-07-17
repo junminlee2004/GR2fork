@@ -121,7 +121,7 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 
 // GR2FORK PERF: non-temporal upload copy. CopySparseMemory's memcpy is ~2.7%sys of GpuAssembler
 // (~14.4M copies / ~18GB per session) and staging data is never re-read, so SSE2 streaming stores
-// skip RFO and cache fill; one sfence per call. GR2_NONTCOPY=1 disables, GR2_NTCOPY_MIN=N (2048).
+// skip RFO and cache fill. GR2_NONTCOPY=1 disables, GR2_NTCOPY_MIN=N (2048).
 namespace {
 
 bool NtCopyEnabled() noexcept {
@@ -145,8 +145,7 @@ u64 NtCopyMinBytes() noexcept {
     return min_bytes;
 }
 
-// Returns true if streaming stores were used; the caller issues one
-// _mm_sfence() per CopySparseMemory call after its run loop.
+// Returns true if streaming stores were used; the publishing caller issues an sfence.
 bool CopyMaybeNT(u8* dest, const u8* src, u64 size) noexcept {
     if (!NtCopyEnabled() || size < NtCopyMinBytes()) {
         std::memcpy(dest, src, size);
@@ -189,8 +188,7 @@ bool CopyMaybeNT(u8* dest, const u8* src, u64 size) noexcept {
 
 } // namespace
 
-
-void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+bool MemoryManager::CopySparseMemoryUnfenced(VAddr virtual_addr, u8* dest, u64 size) {
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
@@ -220,11 +218,17 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         dest += copy_size;
         ++vma;
     }
-    if (streamed) {
-        // Make the weakly-ordered streaming stores globally visible before
-        // anything downstream (staging Commit, submit) can publish them.
+    return streamed;
+}
+
+void MemoryManager::FinishSparseCopyBatch(bool used_non_temporal_stores) noexcept {
+    if (used_non_temporal_stores) {
         _mm_sfence();
     }
+}
+
+void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
+    FinishSparseCopyBatch(CopySparseMemoryUnfenced(virtual_addr, dest, size));
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u32 num_bytes) {

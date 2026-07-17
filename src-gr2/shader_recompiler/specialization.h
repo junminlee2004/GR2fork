@@ -10,6 +10,7 @@
 
 #include <xxhash.h>
 
+#include "common/debug.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -111,8 +112,32 @@ struct StageSpecialization {
     StageSpecialization() = default;
 
     StageSpecialization(const Info& info_, const RuntimeInfo& runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+                        Backend::Bindings start_,
+                        const ResolvedStageResources* resolved = nullptr,
+                        ResolvedStageResources* capture = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
+        ASSERT(!resolved || !capture);
+        // GR2FORK PERF: binding reuses core sharps already decoded for specialization.
+        if (capture) {
+            capture->valid = false;
+            capture->buffers.clear();
+            capture->images.clear();
+            capture->fmasks.clear();
+            capture->samplers.clear();
+            capture->pgm_hash = info_.pgm_hash;
+            capture->pgm_base = info_.pgm_base;
+            capture->stage = static_cast<u32>(info_.stage);
+            capture->l_stage = static_cast<u32>(info_.l_stage);
+        }
+        const bool use_resolved = resolved && resolved->Matches(info_);
+        const auto* resolved_buffers = use_resolved ? &resolved->buffers : nullptr;
+        const auto* resolved_images = use_resolved ? &resolved->images : nullptr;
+        const auto* resolved_fmasks = use_resolved ? &resolved->fmasks : nullptr;
+        const auto* resolved_samplers = use_resolved ? &resolved->samplers : nullptr;
+        auto* captured_buffers = capture ? &capture->buffers : nullptr;
+        auto* captured_images = capture ? &capture->images : nullptr;
+        auto* captured_fmasks = capture ? &capture->fmasks : nullptr;
+        auto* captured_samplers = capture ? &capture->samplers : nullptr;
         // NOGLITCH: unconditional parse for ALL stages.
         fetch_shader_data = Gcn::ParseFetchShader(info_);
         if (info_.stage == Stage::Vertex && fetch_shader_data) {
@@ -135,7 +160,7 @@ struct StageSpecialization {
                          });
         }
         u32 binding{};
-        ForEachSharp(binding, buffers, info->buffers,
+        ForEachSharp(binding, buffers, info->buffers, resolved_buffers, captured_buffers,
                      [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
                          spec.is_storage = desc.IsStorage(sharp);
@@ -152,7 +177,7 @@ struct StageSpecialization {
                              spec.element_size = sharp.element_size;
                          }
                      });
-        ForEachSharp(binding, images, info->images,
+        ForEachSharp(binding, images, info->images, resolved_images, captured_images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.type = sharp.GetViewType(desc.is_array, desc.is_raw_access);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
@@ -166,14 +191,14 @@ struct StageSpecialization {
                          spec.num_conversion = sharp.GetNumberConversion();
                          // PORT(upstream #4075): consecutive descriptor count
                          // for mip fallback (1 otherwise).
-                         spec.num_bindings = desc.NumBindings(*info);
+                         spec.num_bindings = desc.NumBindings(sharp);
                      });
-        ForEachSharp(binding, fmasks, info->fmasks,
+        ForEachSharp(binding, fmasks, info->fmasks, resolved_fmasks, captured_fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;
                          spec.height = sharp.height;
                      });
-        ForEachSharp(samplers, info->samplers,
+        ForEachSharp(samplers, info->samplers, resolved_samplers, captured_samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
                          spec.force_unnormalized = sharp.force_unnormalized;
                          spec.force_degamma = sharp.force_degamma;
@@ -191,6 +216,9 @@ struct StageSpecialization {
             }
         }
         ComputeSig();
+        if (capture) {
+            capture->valid = true;
+        }
     }
 
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
@@ -204,10 +232,31 @@ struct StageSpecialization {
         }
     }
 
-    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
-        for (const auto& desc : desc_list) {
+    void ForEachSharp(auto& spec_list, auto& desc_list, const auto* resolved, auto* captured,
+                      auto&& func) {
+        for (u32 i = 0; i < desc_list.size(); ++i) {
+            const auto& desc = desc_list[i];
             auto& spec = spec_list.emplace_back();
-            const auto sharp = desc.GetSharp(*info);
+            const auto sharp = resolved ? (*resolved)[i] : desc.GetSharp(*info);
+            if (captured) {
+                captured->emplace_back(sharp);
+            }
+            if (!sharp) {
+                continue;
+            }
+            func(spec, desc, sharp);
+        }
+    }
+
+    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, const auto* resolved,
+                      auto* captured, auto&& func) {
+        for (u32 i = 0; i < desc_list.size(); ++i) {
+            const auto& desc = desc_list[i];
+            auto& spec = spec_list.emplace_back();
+            const auto sharp = resolved ? (*resolved)[i] : desc.GetSharp(*info);
+            if (captured) {
+                captured->emplace_back(sharp);
+            }
             if (!sharp) {
                 binding++;
                 continue;

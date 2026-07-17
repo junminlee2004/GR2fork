@@ -17,6 +17,10 @@ namespace Vulkan {
 class Rasterizer;
 }
 
+namespace VideoCore {
+class BufferCache;
+}
+
 namespace Libraries::Kernel {
 struct OrbisQueryInfo;
 }
@@ -363,6 +367,10 @@ private:
     s32 UnmapMemoryImpl(VAddr virtual_addr, u64 size);
 
 private:
+    [[nodiscard]] bool CopySparseMemoryUnfenced(VAddr source, u8* dest, u64 size);
+
+    void FinishSparseCopyBatch(bool used_non_temporal_stores) noexcept;
+
     AddressSpace impl;
     DMemMap dmem_map;
     FMemMap fmem_map;
@@ -386,6 +394,7 @@ private:
     };
     std::array<PrtArea, 3> prt_areas{};
 
+    friend class VideoCore::BufferCache;
     friend class ::Core::Devtools::Widget::MemoryMapViewer;
 };
 

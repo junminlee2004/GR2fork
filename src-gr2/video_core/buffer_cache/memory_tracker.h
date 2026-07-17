@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdlib>
 #include <deque>
 #include <type_traits>
@@ -23,6 +24,10 @@ public:
 public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
+
+    [[nodiscard]] u64 CpuDirtyGeneration() const noexcept {
+        return cpu_dirty_generation.load(std::memory_order_acquire);
+    }
 
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
@@ -53,12 +58,14 @@ public:
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        BeginCpuDirtyMutation();
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
                                 manager->template ChangeRegionState<Type::CPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                             });
+        EndCpuDirtyMutation();
     }
 
     /// Unmark region as modified from the host GPU
@@ -82,6 +89,7 @@ public:
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
+        BeginCpuDirtyMutation();
         IteratePages<false>(
             cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {
                 const bool should_flush = [&] {
@@ -102,6 +110,7 @@ public:
                     on_flush();
                 }
             });
+        EndCpuDirtyMutation();
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
@@ -202,6 +211,14 @@ void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, 
     }
 
 private:
+    void BeginCpuDirtyMutation() noexcept {
+        cpu_dirty_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void EndCpuDirtyMutation() noexcept {
+        cpu_dirty_generation.fetch_add(1, std::memory_order_release);
+    }
+
     /**
      * @brief IteratePages Iterates L2 word manager page table.
      * @param cpu_address Start byte cpu address
@@ -265,9 +282,13 @@ private:
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
+        cpu_dirty_generation.fetch_add(1, std::memory_order_release);
     }
 
     PageManager* tracker;
+    // Dirty mutations bracket bit changes, while new managers publish after installation. A sweep
+    // records its initial value so a racing publication invalidates the next sweep.
+    std::atomic<u64> cpu_dirty_generation{0};
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};

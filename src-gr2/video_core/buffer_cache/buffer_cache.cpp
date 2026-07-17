@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 // Needs the full Rasterizer type for PushPresenterRecord template
 // instantiation in BufferCache::ReadMemory.
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -27,6 +28,23 @@ namespace VideoCore {
 // pipeline (immutable fetch_shader) and stamp-tracked regs, so an unchanged pipeline+stamp can
 // reuse them, skipping the GetVertexInputs walk and both hash loops.
 struct VbbResolveCache {
+    struct VertexShapeElement {
+        u32 stride{};
+        u32 divisor{};
+        u8 semantic{};
+        u8 data_format{};
+        u8 number_format{};
+        u8 instance_rate{};
+
+        bool operator==(const VertexShapeElement&) const = default;
+    };
+
+    Vulkan::VertexInputs<VertexShapeElement> legacy_shape;
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> legacy_attributes;
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> legacy_bindings;
+    u64 legacy_shape_generation{};
+    bool legacy_shape_valid{};
+
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
@@ -76,6 +94,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    vbb_resolve_ = std::make_unique<VbbResolveCache>();
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -105,7 +124,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     critical_gc_memory = static_cast<u64>(
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
-    vbb_resolve_ = std::make_unique<VbbResolveCache>();
 }
 
 BufferCache::~BufferCache() = default;
@@ -237,84 +255,107 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
 
 void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeline,
                                           const AmdGpu::LiverpoolRegsSnapshot& regs) {
-    // GR2FORK PERF: unchanged pipeline pointer + stamp (snapshot-sourced) means every input read
-    // here is unchanged (immutable fetch_shader; step rates and sharps are stamp-tracked regs), so
-    // the recorded cmdbuf state is still exact; last_vertex_bind_sig_valid gates the first bind.
     const u64 cur_stamp = regs.gfx_pipeline_stamp;
-    // GR2FORK PERF: pipeline+stamp invariance is the same condition GetGraphicsPipeline's tier-1
-    // cache hit rides, so cache-resolved draws also take this skip; hint it as the dominant exit.
+    const u64 vbb_tick = scheduler.CurrentTick();
+    // GR2FORK PERF: pipeline, stamp, and command-buffer identity cover the recorded vertex state.
     if (last_vbb_pipeline_ == &pipeline && last_vbb_stamp_ == cur_stamp &&
-        last_vertex_bind_sig_valid) [[likely]] {
+        last_vertex_bind_sig_valid && last_vbb_tick_ == vbb_tick) [[likely]] {
         return;
     }
 
-    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+    Vulkan::VertexInputs<VbbResolveCache::VertexShapeElement> shape;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
-    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
-                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
-    // Hot-path: split "vertex input state" from "guest buffer binds".
-    // - setVertexInputEXT depends only on bindings/attributes/divisors (+ step rates), NOT buffer addresses.
-    // - bindVertexBuffers depends on guest buffer addresses/offsets and can change every draw.
+    const auto& fetch_shader = pipeline.GetFetchShader();
+    if (fetch_shader) {
+        const auto& vs_info = pipeline.GetStage(Shader::LogicalStage::Vertex);
+        for (const auto& attrib : fetch_shader->attributes) {
+            const auto step_rate = attrib.GetStepRate();
+            const auto buffer = attrib.GetSharp(vs_info);
+            const u32 divisor = step_rate == InstanceIdType::OverStepRate0
+                                    ? regs.vgt_instance_step_rate_0
+                                    : (step_rate == InstanceIdType::OverStepRate1
+                                           ? regs.vgt_instance_step_rate_1
+                                           : 1);
+            guest_buffers.emplace_back(buffer);
+            shape.emplace_back(VbbResolveCache::VertexShapeElement{
+                .stride = buffer.GetStride(),
+                .divisor = divisor,
+                .semantic = static_cast<u8>(attrib.semantic),
+                .data_format = static_cast<u8>(buffer.GetDataFmt()),
+                .number_format = static_cast<u8>(buffer.GetNumberFmt()),
+                .instance_rate = static_cast<u8>(step_rate != InstanceIdType::None),
+            });
+        }
+    }
+
+    const bool shape_hit = vbb_resolve_->legacy_shape_valid &&
+                           vbb_resolve_->legacy_shape == shape;
+    if (!shape_hit) {
+        vbb_resolve_->legacy_attributes.clear();
+        vbb_resolve_->legacy_bindings.clear();
+        for (u32 i = 0; i < shape.size(); ++i) {
+            const auto& element = shape[i];
+            const auto& buffer = guest_buffers[i];
+            vbb_resolve_->legacy_attributes.push_back(
+                vk::VertexInputAttributeDescription2EXT{
+                    .location = element.semantic,
+                    .binding = element.semantic,
+                    .format = Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(),
+                                                                   buffer.GetNumberFmt()),
+                    .offset = 0,
+                });
+            vbb_resolve_->legacy_bindings.push_back(vk::VertexInputBindingDescription2EXT{
+                .binding = element.semantic,
+                .stride = element.stride,
+                .inputRate = element.instance_rate ? vk::VertexInputRate::eInstance
+                                                   : vk::VertexInputRate::eVertex,
+                .divisor = element.divisor,
+            });
+        }
+        vbb_resolve_->legacy_shape = shape;
+        ++vbb_resolve_->legacy_shape_generation;
+        vbb_resolve_->legacy_shape_valid = true;
+    }
+
+    const auto& attributes = vbb_resolve_->legacy_attributes;
+    const auto& bindings = vbb_resolve_->legacy_bindings;
+    const u64 input_sig = vbb_resolve_->legacy_shape_generation;
+
     auto mix = [](u64& h, u64 v) {
         h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     };
 
-    u64 input_sig = 0xcbf29ce484222325ULL; // arbitrary non-zero seed
-    mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
-    mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
-    mix(input_sig, static_cast<u64>(instance.IsVertexInputDynamicState() ? 1 : 0));
-    mix(input_sig, reinterpret_cast<u64>(&pipeline));
-
-    for (const auto& b : bindings) {
-        mix(input_sig, (static_cast<u64>(b.binding) << 32) | static_cast<u64>(b.stride));
-        mix(input_sig, static_cast<u64>(static_cast<u32>(b.inputRate)));
-    }
-    for (const auto& a : attributes) {
-        mix(input_sig, (static_cast<u64>(a.location) << 32) | static_cast<u64>(a.binding));
-        mix(input_sig, (static_cast<u64>(static_cast<u32>(a.format)) << 32) | static_cast<u64>(a.offset));
-    }
-    for (const auto& d : divisors) {
-        mix(input_sig, (static_cast<u64>(d.binding) << 32) | static_cast<u64>(d.divisor));
-    }
-
-    // Full bind signature includes guest buffers (addresses/sizes/strides).
-    u64 bind_sig = input_sig;
+    u64 bind_sig = 0xcbf29ce484222325ULL;
+    mix(bind_sig, input_sig);
     for (const auto& gb : guest_buffers) {
         mix(bind_sig, static_cast<u64>(gb.base_address));
         mix(bind_sig, static_cast<u64>(gb.GetSize()));
         mix(bind_sig, static_cast<u64>(gb.GetStride()));
     }
 
-    // If NOTHING changed (vertex input + guest buffers), skip ALL rebinding work.
-    if (last_vertex_bind_sig_valid && bind_sig == last_vertex_bind_sig) {
-        // GR2FORK PERF: cmdbuf state is still valid - record stamp so the next
-        // call can take the ultra-fast skip without the hash loops.
+    if (last_vertex_bind_sig_valid && bind_sig == last_vertex_bind_sig &&
+        last_vertex_input_sig_valid && input_sig == last_vertex_input_sig &&
+        last_vbb_tick_ == vbb_tick) {
         last_vbb_pipeline_ = &pipeline;
         last_vbb_stamp_ = cur_stamp;
         return;
     }
 
-    // Only call setVertexInputEXT when vertex INPUT state changed.
-    if (instance.IsVertexInputDynamicState()) {
-        if (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig) {
-            const auto cmdbuf = scheduler.PrimaryCommandBuffer();
-            cmdbuf.setVertexInputEXT(bindings, attributes);
-            last_vertex_input_sig = input_sig;
-            last_vertex_input_sig_valid = true;
-        }
-    }
-
-    last_vertex_bind_sig = bind_sig;
-    last_vertex_bind_sig_valid = true;
-    // GR2FORK PERF: publish for ultra-fast skip on next call.
-    last_vbb_pipeline_ = &pipeline;
-    last_vbb_stamp_ = cur_stamp;
-
-
     if (bindings.empty()) {
-        // If there are no bindings, there is nothing further to do.
+        const u64 final_tick = scheduler.CurrentTick();
+        if (instance.IsVertexInputDynamicState() &&
+            (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig ||
+             last_vbb_tick_ != final_tick)) {
+            scheduler.PrimaryCommandBuffer().setVertexInputEXT(bindings, attributes);
+        }
+        last_vertex_input_sig = input_sig;
+        last_vertex_input_sig_valid = true;
+        last_vertex_bind_sig = bind_sig;
+        last_vertex_bind_sig_valid = true;
+        last_vbb_pipeline_ = &pipeline;
+        last_vbb_stamp_ = cur_stamp;
+        last_vbb_tick_ = final_tick;
         return;
     }
 
@@ -425,7 +466,13 @@ void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeli
         }
     }
 
+    const u64 final_tick = scheduler.CurrentTick();
     const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+    if (instance.IsVertexInputDynamicState() &&
+        (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig ||
+         last_vbb_tick_ != final_tick)) {
+        cmdbuf.setVertexInputEXT(bindings, attributes);
+    }
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
@@ -433,6 +480,13 @@ void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeli
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+    last_vertex_input_sig = input_sig;
+    last_vertex_input_sig_valid = true;
+    last_vertex_bind_sig = bind_sig;
+    last_vertex_bind_sig_valid = true;
+    last_vbb_pipeline_ = &pipeline;
+    last_vbb_stamp_ = cur_stamp;
+    last_vbb_tick_ = final_tick;
 }
 
 void BufferCache::BindVertexBuffersFixed(const Vulkan::GraphicsPipeline& pipeline,
@@ -1365,29 +1419,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
-            copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
+            const vk::DeviceSize dst_offset = device_addr_out - buffer_start;
+            if (!copies.empty()) {
+                auto& previous = copies.back();
+                const bool contiguous_src =
+                    previous.srcOffset + previous.size == total_size_bytes;
+                const bool contiguous_dst = previous.dstOffset + previous.size == dst_offset;
+                if (contiguous_src && contiguous_dst) {
+                    previous.size += range_size;
+                    total_size_bytes += range_size;
+                    return;
+                }
+            }
+            copies.emplace_back(total_size_bytes, dst_offset, range_size);
             total_size_bytes += range_size;
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
-    // Coalesce adjacent upload ranges to reduce CopySparseMemory/memmove calls.
-    // Safe because copies are constructed with contiguous srcOffset (total_size_bytes accumulator).
-    if (copies.size() > 1) {
-        size_t out = 0;
-        for (size_t i = 0; i < copies.size(); ++i) {
-            const auto cur = copies[i];
-            if (out > 0) {
-                auto& prev = copies[out - 1];
-                const bool contiguous_src = (cur.srcOffset == prev.srcOffset + prev.size);
-                const bool contiguous_dst = (cur.dstOffset == prev.dstOffset + prev.size);
-                if (contiguous_src && contiguous_dst) {
-                    prev.size += cur.size;
-                    continue;
-                }
-            }
-            copies[out++] = cur;
-        }
-        copies.resize(out);
-    }
     if (src_buffer) {
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.PrimaryCommandBuffer();
@@ -1441,13 +1488,16 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     }
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
     if (staging) {
+        bool used_non_temporal_stores = false;
         for (auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            used_non_temporal_stores |=
+                memory->CopySparseMemoryUnfenced(device_addr, src_pointer, copy.size);
             // Apply the staging offset
             copy.srcOffset += offset;
         }
+        memory->FinishSparseCopyBatch(used_non_temporal_stores);
         staging_buffer.Commit();
         return staging_buffer.Handle();
     } else {
@@ -1457,11 +1507,14 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                                      vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
         const vk::Buffer src_buffer = temp_buffer->Handle();
         u8* const staging = temp_buffer->mapped_data.data();
+        bool used_non_temporal_stores = false;
         for (const auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            used_non_temporal_stores |=
+                memory->CopySparseMemoryUnfenced(device_addr, src_pointer, copy.size);
         }
+        memory->FinishSparseCopyBatch(used_non_temporal_stores);
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;
     }
@@ -1519,6 +1572,13 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
         u32 size = static_cast<u32>(end - start);
         SynchronizeBuffer(buffer, start, size, false, false);
     });
+}
+
+BufferCache::DmaSyncState BufferCache::GetDmaSyncState() const noexcept {
+    return {
+        .cpu_dirty_generation = memory_tracker->CpuDirtyGeneration(),
+        .buffer_registry_generation = BufferRegistryGeneration(),
+    };
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {

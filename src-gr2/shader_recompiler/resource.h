@@ -126,11 +126,14 @@ struct ImageResource {
     // PORT(upstream #4075): how many consecutive descriptor slots this image
     // consumes. DynamicIndex mode binds one slot per mip level so the shader
     // can index with a runtime lod value; everything else uses a single slot.
-    u32 NumBindings(const auto& info) const {
-        const AmdGpu::Image tsharp = GetSharp(info);
+    constexpr u32 NumBindings(const AmdGpu::Image& tsharp) const noexcept {
         return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
+    }
+
+    u32 NumBindings(const auto& info) const {
+        return NumBindings(GetSharp(info));
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
@@ -157,6 +160,26 @@ struct FMaskResource {
     }
 };
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
+
+struct ResolvedStageResources {
+    boost::container::static_vector<AmdGpu::Buffer, NUM_BUFFERS> buffers;
+    boost::container::static_vector<AmdGpu::Image, NUM_IMAGES> images;
+    boost::container::static_vector<AmdGpu::Image, NUM_FMASKS> fmasks;
+    boost::container::static_vector<AmdGpu::Sampler, NUM_SAMPLERS> samplers;
+    u64 pgm_hash{};
+    VAddr pgm_base{};
+    u32 stage{};
+    u32 l_stage{};
+    bool valid{};
+
+    bool Matches(const auto& info) const noexcept {
+        return valid && pgm_hash == info.pgm_hash && pgm_base == info.pgm_base &&
+               stage == static_cast<u32>(info.stage) &&
+               l_stage == static_cast<u32>(info.l_stage) && buffers.size() == info.buffers.size() &&
+               images.size() == info.images.size() && fmasks.size() == info.fmasks.size() &&
+               samplers.size() == info.samplers.size();
+    }
+};
 
 struct PushData {
     static constexpr u32 XOffsetIndex = 0;

@@ -174,10 +174,13 @@ private:
 
     bool FilterDraw(const AmdGpu::LiverpoolRegsSnapshot& regs);
 
-    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data,
+    void BindBuffers(const Shader::Info& stage,
+                     const Shader::ResolvedStageResources* resolved,
+                     Shader::Backend::Bindings& binding, Shader::PushData& push_data,
                      const AmdGpu::LiverpoolRegsSnapshot& regs);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+    void BindTextures(const Shader::Info& stage,
+                      const Shader::ResolvedStageResources* resolved,
+                      Shader::Backend::Bindings& binding,
                       const AmdGpu::LiverpoolRegsSnapshot& regs);
     bool BindResources(const Pipeline* pipeline,
                        const AmdGpu::LiverpoolRegsSnapshot& regs);
@@ -218,6 +221,9 @@ private:
     // MapMemory/UnmapMemory bump it under release order after mutating mapped_ranges; the
     // per-thread cache invalidates when it changes.
     std::atomic<u64> mapped_ranges_gen_{0};
+    VideoCore::BufferCache::DmaSyncState last_dma_sync_state_{};
+    u64 last_dma_mapped_ranges_gen_{};
+    bool dma_sync_state_valid_{};
     PipelineCache pipeline_cache;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
@@ -302,6 +308,7 @@ private:
         // garbage-T# bails leave desc null). The pipeline layout types slots eStorageImage from
         // the same flag, so descriptor typing and null-write-sink routing must follow it.
         bool is_written{false};
+        bool single_mip{false};
     };
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
 
