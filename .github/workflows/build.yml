@@ -108,7 +108,7 @@ jobs:
     - name: Cache CMake Configuration
       uses: actions/cache@v5
       env:
-          cache-name: ${{ runner.os }}-sdl-ninja-cache-cmake-configuration
+          cache-name: ${{ runner.os }}-sdl-ninja-cache-cmake-configuration-v2
       with:
           path: |
             ${{github.workspace}}/build
@@ -159,7 +159,10 @@ jobs:
         $clbin = "${{ steps.clang19.outputs.bin }}".Replace('\','/')
         $prof = "${{github.workspace}}/packaging/gr2win.profdata".Replace('\','/')
         $phash = (Get-FileHash -Algorithm SHA256 "$prof").Hash
-        $pgo = "/clang:-fprofile-use=$prof /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin /DGR2_PGO_HASH=$phash"
+        # -fno-pch-timestamp: clang PCHs embed the source mtime and hard-error when a
+        # cache-restored build dir pairs an old .pch with a freshly regenerated cmake_pch.c;
+        # ninja's dependency edges already rebuild the PCH on real content changes.
+        $pgo = "/clang:-fprofile-use=$prof /clang:-Wno-profile-instr-unprofiled /clang:-Wno-profile-instr-out-of-date /clang:-Wno-backend-plugin /clang:-Xclang /clang:-fno-pch-timestamp /DGR2_PGO_HASH=$phash"
         cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON "-DCMAKE_C_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_CXX_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_ASM_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_LINKER=$clbin/lld-link.exe" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS $pgo" "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $pgo" -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
@@ -246,7 +249,7 @@ jobs:
     - name: Cache CMake Configuration
       uses: actions/cache@v5
       env:
-          cache-name: ${{ runner.os }}-sdl-relwithdebinfo-cache-cmake-configuration
+          cache-name: ${{ runner.os }}-sdl-relwithdebinfo-cache-cmake-configuration-v2
       with:
           path: |
             ${{github.workspace}}/build
@@ -276,7 +279,11 @@ jobs:
         # Compiler/linker dir resolved by the Locate Clang 19 step (VS-bundled or downloaded).
         # Forward-slash for CMake; quote every -D that uses it since the VS path has spaces.
         $clbin = "${{ steps.clang19.outputs.bin }}".Replace('\','/')
-        cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMBINED_EMBED_CORES=ON "-DCMAKE_C_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_CXX_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_ASM_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_LINKER=$clbin/lld-link.exe" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        # -fno-pch-timestamp: see the comment in the windows-sdl configure step. Passing
+        # CMAKE_C/CXX_FLAGS replaces CMake's clang-cl defaults, so restate /DWIN32 /D_WINDOWS
+        # (/EHsc for C++) alongside it.
+        $pch = "/clang:-Xclang /clang:-fno-pch-timestamp"
+        cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCOMBINED_EMBED_CORES=ON "-DCMAKE_C_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_CXX_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_ASM_COMPILER=$clbin/clang-cl.exe" "-DCMAKE_LINKER=$clbin/lld-link.exe" -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS $pch" "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $pch" -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config RelWithDebInfo --parallel $env:NUMBER_OF_PROCESSORS
@@ -315,7 +322,7 @@ jobs:
     - name: Cache CMake Configuration
       uses: actions/cache@v5
       env:
-          cache-name: ${{ runner.os }}-sdl-ninja-cache-cmake-configuration
+          cache-name: ${{ runner.os }}-sdl-ninja-cache-cmake-configuration-v2
       with:
           path: |
             ${{github.workspace}}/build
@@ -336,7 +343,8 @@ jobs:
 
 
     - name: Configure CMake
-      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_C_FLAGS="-O3 -DNDEBUG -flto=thin" -DCMAKE_CXX_FLAGS="-O3 -DNDEBUG -flto=thin" -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DGR2_SAMPLE_PROFILE=${{github.workspace}}/packaging/gr2.prof -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      # -Xclang -fno-pch-timestamp: see the comment in the windows-sdl configure step.
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCOMBINED_EMBED_CORES=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_C_FLAGS="-O3 -DNDEBUG -flto=thin -Xclang -fno-pch-timestamp" -DCMAKE_CXX_FLAGS="-O3 -DNDEBUG -flto=thin -Xclang -fno-pch-timestamp" -DCMAKE_EXE_LINKER_FLAGS="-flto=thin -fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" -DGR2_SAMPLE_PROFILE=${{github.workspace}}/packaging/gr2.prof -DCMAKE_JOB_POOLS=link=1 -DCMAKE_JOB_POOL_LINK=link -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
