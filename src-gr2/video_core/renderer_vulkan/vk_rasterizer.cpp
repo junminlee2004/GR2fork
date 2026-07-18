@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef MemoryBarrier
 #undef MemoryBarrier
@@ -104,6 +105,42 @@ static bool RenderTargetReadyEnabled() noexcept {
 static bool BogusBufferSinkEnabled() noexcept {
     static const bool enabled = []() noexcept {
         const char* e = std::getenv("GR2_NOBOGUSSINK");
+        return !(e && e[0] == '1');
+    }();
+    return enabled;
+}
+
+// GR2FORK PERF: generation-gated DMA sweeps. GR2_NODMAGENGATE=1 sweeps every DMA draw.
+static bool DmaGenerationGateEnabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* e = std::getenv("GR2_NODMAGENGATE");
+        return !(e && e[0] == '1');
+    }();
+    return enabled;
+}
+
+// GR2FORK PERF: same-draw sharp reuse. GR2_NOSHARPREUSE=1 decodes resources at each consumer.
+static bool SharpReuseEnabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* e = std::getenv("GR2_NOSHARPREUSE");
+        return !(e && e[0] == '1');
+    }();
+    return enabled;
+}
+
+// GR2FORK PERF: exact mapped-byte Flatbuf reuse. GR2_NOFLATEXACT=1 uses adaptive XXH3 reuse.
+static bool FlatbufExactCacheEnabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* e = std::getenv("GR2_NOFLATEXACT");
+        return !(e && e[0] == '1');
+    }();
+    return enabled;
+}
+
+// GR2FORK PERF: skip repeated texture LRU touches. GR2_NOTEXLRUSKIP=1 performs both touches.
+static bool TextureLruSkipEnabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* e = std::getenv("GR2_NOTEXLRUSKIP");
         return !(e && e[0] == '1');
     }();
     return enabled;
@@ -986,12 +1023,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     uint32_t slow_stages_bound_ = 0;
 
     bool uses_dma = false;
+    const bool sharp_reuse_enabled = SharpReuseEnabled();
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) continue;
         ++slow_stages_bound_;
         uses_dma |= stage->uses_dma;
         stage->PushUd(binding, push_data);
-        const auto* resolved = pipeline_cache.GetResolvedStageResources(*stage);
+        const auto* resolved =
+            sharp_reuse_enabled ? pipeline_cache.GetResolvedStageResources(*stage) : nullptr;
         BindBuffers(*stage, resolved, binding, push_data, regs);
         BindTextures(*stage, resolved, binding, regs);
     }
@@ -1006,29 +1045,41 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     GR2_INSTR_ON_BR_SLOW(slow_timer_.ElapsedNs(), slow_stages_bound_);
 
     if (uses_dma) {
-        const auto dma_sync_state = buffer_cache.GetDmaSyncState();
-        const u64 mapped_ranges_gen = mapped_ranges_gen_.load(std::memory_order_acquire);
-        const bool needs_sync =
-            !dma_sync_state_valid_ ||
-            dma_sync_state.cpu_dirty_generation != last_dma_sync_state_.cpu_dirty_generation ||
-            dma_sync_state.buffer_registry_generation !=
-                last_dma_sync_state_.buffer_registry_generation ||
-            mapped_ranges_gen != last_dma_mapped_ranges_gen_;
-        if (needs_sync) {
-            // A pre-sweep snapshot leaves mutations that race the traversal visible to the next
-            // draw instead of treating them as synchronized.
+        if (!DmaGenerationGateEnabled()) {
+            // GR2FORK PERF: GR2_NODMAGENGATE=1 sweeps all mapped ranges on every DMA draw.
             GR2_INSTR_TIMER_DECL(sync_timer_);
             Common::RecursiveSharedLock lock{mapped_ranges_mutex};
             for (auto& range : mapped_ranges) {
                 buffer_cache.SynchronizeBuffersInRange(range.lower(),
                                                        range.upper() - range.lower());
             }
-            last_dma_sync_state_ = dma_sync_state;
-            last_dma_mapped_ranges_gen_ = mapped_ranges_gen;
-            dma_sync_state_valid_ = true;
+            fault_process_pending = true;
             GR2_INSTR_ON_SYNC_BUFFER(sync_timer_.ElapsedNs());
+        } else {
+            const auto dma_sync_state = buffer_cache.GetDmaSyncState();
+            const u64 mapped_ranges_gen = mapped_ranges_gen_.load(std::memory_order_acquire);
+            const bool needs_sync =
+                !dma_sync_state_valid_ ||
+                dma_sync_state.cpu_dirty_generation !=
+                    last_dma_sync_state_.cpu_dirty_generation ||
+                dma_sync_state.buffer_registry_generation !=
+                    last_dma_sync_state_.buffer_registry_generation ||
+                mapped_ranges_gen != last_dma_mapped_ranges_gen_;
+            if (needs_sync) {
+                // A pre-sweep snapshot leaves racing mutations visible to the next draw.
+                GR2_INSTR_TIMER_DECL(sync_timer_);
+                Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+                for (auto& range : mapped_ranges) {
+                    buffer_cache.SynchronizeBuffersInRange(range.lower(),
+                                                           range.upper() - range.lower());
+                }
+                GR2_INSTR_ON_SYNC_BUFFER(sync_timer_.ElapsedNs());
+                last_dma_sync_state_ = dma_sync_state;
+                last_dma_mapped_ranges_gen_ = mapped_ranges_gen;
+                dma_sync_state_valid_ = true;
+            }
+            fault_process_pending = true;
         }
-        fault_process_pending = true;
     }
 
     return true;
@@ -1270,45 +1321,125 @@ void Rasterizer::BindBuffers(const Shader::Info& stage,
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
 
-                struct FlatbufCacheEntry {
-                    u64 stage_key = 0;
-                    u64 tick = 0;
-                    u64 offset = 0;
-                    u32 size = 0;
-                    u32 alignment = 0;
-                    vk::Buffer buffer{};
-                    bool valid = false;
-                };
-                static thread_local std::array<FlatbufCacheEntry, 32> flatbuf_cache{};
-
-                const u64 tick = scheduler.CurrentTick();
-                const u64 stage_key = static_cast<u64>(stage.pgm_hash) ^
-                                      (static_cast<u64>(desc.sharp_idx) << 1);
-
-                FlatbufCacheEntry& e = flatbuf_cache[stage_key & (flatbuf_cache.size() - 1)];
-
-                const bool identity_match =
-                    e.valid && e.stage_key == stage_key &&
-                    e.tick == tick && e.size == ubo_size && e.alignment == alignment &&
-                    e.buffer == vk_buffer.Handle();
-
                 u64 offset;
-                // GR2FORK PERF: the cached stream bytes are the exact prior payload. memcmp
-                // exits on the first changed dword and avoids hashing the full flat buffer.
-                if (identity_match &&
-                    (ubo_size == 0 ||
-                     std::memcmp(vk_buffer.mapped_data.data() + e.offset,
-                                 stage.flattened_ud_buf.data(), ubo_size) == 0)) [[likely]] {
-                    offset = e.offset;
+                if (FlatbufExactCacheEnabled()) [[likely]] {
+                    struct ExactFlatbufCacheEntry {
+                        u64 stage_key = 0;
+                        u64 tick = 0;
+                        u64 offset = 0;
+                        u32 size = 0;
+                        u32 alignment = 0;
+                        vk::Buffer buffer{};
+                        bool valid = false;
+                    };
+                    static thread_local std::array<ExactFlatbufCacheEntry, 32> flatbuf_cache{};
+
+                    const u64 tick = scheduler.CurrentTick();
+                    const u64 stage_key = static_cast<u64>(stage.pgm_hash) ^
+                                          (static_cast<u64>(desc.sharp_idx) << 1);
+                    auto& e = flatbuf_cache[stage_key & (flatbuf_cache.size() - 1)];
+                    const bool identity_match =
+                        e.valid && e.stage_key == stage_key && e.tick == tick &&
+                        e.size == ubo_size && e.alignment == alignment &&
+                        e.buffer == vk_buffer.Handle();
+
+                    // GR2FORK PERF: the cached stream bytes are the exact prior payload. memcmp
+                    // exits on the first changed dword and avoids hashing the full flat buffer.
+                    if (identity_match &&
+                        (ubo_size == 0 ||
+                         std::memcmp(vk_buffer.mapped_data.data() + e.offset,
+                                     stage.flattened_ud_buf.data(), ubo_size) == 0)) [[likely]] {
+                        offset = e.offset;
+                    } else {
+                        offset =
+                            vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                        e.stage_key = stage_key;
+                        e.tick = scheduler.CurrentTick();
+                        e.offset = offset;
+                        e.size = ubo_size;
+                        e.alignment = alignment;
+                        e.buffer = vk_buffer.Handle();
+                        e.valid = true;
+                    }
                 } else {
-                    offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                    e.stage_key = stage_key;
-                    e.tick = scheduler.CurrentTick();
-                    e.offset = offset;
-                    e.size = ubo_size;
-                    e.alignment = alignment;
-                    e.buffer = vk_buffer.Handle();
-                    e.valid = true;
+                    struct AdaptiveFlatbufCacheEntry {
+                        u64 stage_key = 0;
+                        vk::CommandBuffer cmdbuf{};
+                        u64 hash = 0;
+                        u64 offset = 0;
+                        u32 size = 0;
+                        u8 miss_streak = 0;
+                        u8 probe_ctr = 0;
+                        bool valid = false;
+                    };
+                    static thread_local std::array<AdaptiveFlatbufCacheEntry, 32> flatbuf_cache{};
+                    static const bool flat_streak_enabled = []() noexcept {
+                        const char* e = std::getenv("GR2_NOFLATSTREAK");
+                        return !(e && e[0] == '1');
+                    }();
+                    constexpr u8 kFlatHashOffStreak = 8;
+
+                    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+                    const u64 stage_key = static_cast<u64>(stage.pgm_hash) ^
+                                          (static_cast<u64>(desc.sharp_idx) << 1);
+                    auto& e = flatbuf_cache[stage_key & (flatbuf_cache.size() - 1)];
+                    const bool identity_match = e.valid && e.stage_key == stage_key &&
+                                                e.cmdbuf == cmdbuf && e.size == ubo_size;
+
+                    if (identity_match) [[likely]] {
+                        if (flat_streak_enabled && e.miss_streak >= kFlatHashOffStreak) {
+                            if ((++e.probe_ctr & 127) == 0) [[unlikely]] {
+                                const u64 payload_hash =
+                                    ubo_size == 0
+                                        ? 0
+                                        : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                                if (e.hash == payload_hash) {
+                                    e.miss_streak = 0;
+                                    offset = e.offset;
+                                } else {
+                                    offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                            alignment);
+                                    e.hash = payload_hash;
+                                    e.offset = offset;
+                                }
+                            } else {
+                                offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                        alignment);
+                                e.offset = offset;
+                            }
+                        } else {
+                            const u64 payload_hash =
+                                ubo_size == 0
+                                    ? 0
+                                    : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                            if (e.hash == payload_hash) [[likely]] {
+                                offset = e.offset;
+                                e.miss_streak = 0;
+                            } else {
+                                offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                        alignment);
+                                e.hash = payload_hash;
+                                e.offset = offset;
+                                if (e.miss_streak < kFlatHashOffStreak) {
+                                    ++e.miss_streak;
+                                    e.probe_ctr = 0;
+                                }
+                            }
+                        }
+                    } else {
+                        offset =
+                            vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                        e.stage_key = stage_key;
+                        e.cmdbuf = cmdbuf;
+                        e.hash = ubo_size == 0
+                                     ? 0
+                                     : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                        e.offset = offset;
+                        e.size = ubo_size;
+                        e.miss_streak = 0;
+                        e.probe_ctr = 0;
+                        e.valid = true;
+                    }
                 }
 
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
@@ -1481,6 +1612,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
     u32 dw_n = set_write_count;
     image_bindings.clear();
     bool any_needs_rebind = false; // OPT: Track during first pass instead of separate scan
+    const bool sharp_reuse_enabled = SharpReuseEnabled();
 
     // GR2FORK PERF: caches live on the Rasterizer instance - large thread_local arrays inflate
     // TLS and can hit pthread_create() EINVAL (22) on shadPS4's custom stacks. No intra-call
@@ -1575,8 +1707,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
                                      const auto& image_res = stage.images[image_index];
                                      auto tsharp = resolved ? resolved->images[image_index]
                                                             : image_res.GetSharp(stage);
-                                     const u8 num_bindings = static_cast<u8>(
-                                         std::min<u32>(255u, image_res.NumBindings(tsharp)));
+                                     const u8 reused_num_bindings =
+                                         sharp_reuse_enabled
+                                             ? static_cast<u8>(std::min<u32>(
+                                                   255u, image_res.NumBindings(tsharp)))
+                                             : 0;
+                                     const auto resolve_num_bindings = [&] {
+                                         return sharp_reuse_enabled
+                                                    ? reused_num_bindings
+                                                    : static_cast<u8>(std::min<u32>(
+                                                          255u, image_res.NumBindings(stage)));
+                                     };
                                      const bool single_mip =
                                          tsharp.base_level == 0 && tsharp.last_level == 0;
 
@@ -1592,7 +1733,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
             ImageBindingInfo& nb = image_bindings.emplace_back();
             // GR2FORK FIX: the layout always reserves NumBindings() slots for this ImageResource;
             // preserve num_bindings so the second-pass null emission writes the full array.
-            nb.num_bindings = num_bindings;
+            nb.num_bindings = resolve_num_bindings();
             nb.is_written = image_res.is_written;
             nb.single_mip = single_mip;
             continue;
@@ -1612,7 +1753,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
                             "treating as null binding (slot {})",
                             image_bindings.size());
                 ImageBindingInfo& nb = image_bindings.emplace_back();
-                nb.num_bindings = num_bindings;
+                nb.num_bindings = resolve_num_bindings();
                 nb.is_written = image_res.is_written;
                 nb.single_mip = single_mip;
                 continue;
@@ -1672,7 +1813,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
                              tex_base, tex_size);
                 }
                 ImageBindingInfo& nb = image_bindings.emplace_back();
-                nb.num_bindings = num_bindings;
+                nb.num_bindings = resolve_num_bindings();
                 nb.is_written = image_res.is_written;
                 nb.single_mip = single_mip;
                 continue;
@@ -1776,7 +1917,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
         b.view_slice = static_cast<s16>(found.view_slice);
         // GR2FORK FIX: capture NumBindings for the 2nd-loop mip-fallback
         // expansion. DynamicIndex images want >1 consecutive descriptor slots.
-        b.num_bindings = num_bindings;
+        b.num_bindings = resolve_num_bindings();
     }
 
     // GR2FORK PERF: second pass rebinds images updated after binding; the first pass tracks
@@ -1803,6 +1944,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
     // measured); one consult per call collapses the per-binding test to a precomputed byte.
     const bool view_ref_ok = ViewRefFastPathEnabled();
     const bool null_write_sink_ok = NullWriteSinkEnabled();
+    const bool texture_lru_skip_enabled = TextureLruSkipEnabled();
     for (auto& b : image_bindings) {
         const auto* base_desc = b.desc;
         // GR2FORK FIX: storage-ness comes from the carried is_written flag, never from desc: the
@@ -1819,7 +1961,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
                 // GR2FORK FIX: a writable storage image that didn't resolve takes the real
                 // NULL_IMAGE sink (robustImageAccess2 discards the store) instead of faulting
                 // at GPU VA 0x0 on NVIDIA / AMD Windows; sampled nulls keep the null descriptor.
-                const bool redirect_storage_null = is_storage && null_write_sink_ok;
+                const bool redirect_storage_null =
+                    is_storage && (texture_lru_skip_enabled ? null_write_sink_ok
+                                                           : NullWriteSinkEnabled());
                 if (null_descriptors_supported && !redirect_storage_null) {
                     image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
                 } else {
@@ -1858,22 +2002,40 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
                 }
             }
         } else {
-            auto* image_ptr = &texture_cache.GetImageUntouched(b.image_id);
-            // GR2FORK PERF: Only check needs_rebind when we know at least one image needs it.
-            if (any_needs_rebind && image_ptr->binding.needs_rebind) {
-                image_ptr->binding = {};
-                const auto replacement =
-                    texture_cache.FindImageWithView(*base_desc, false, false);
-                b.image_id = replacement.image_id;
-                b.view_mip = static_cast<s16>(replacement.view_mip);
-                b.view_slice = static_cast<s16>(replacement.view_slice);
-                image_ptr = &texture_cache.GetImage(b.image_id);
+            VideoCore::Image* image_ptr;
+            if (texture_lru_skip_enabled) {
+                image_ptr = &texture_cache.GetImageUntouched(b.image_id);
+                // GR2FORK PERF: Only check needs_rebind when at least one image needs it.
+                if (any_needs_rebind && image_ptr->binding.needs_rebind) {
+                    image_ptr->binding = {};
+                    const auto replacement =
+                        texture_cache.FindImageWithView(*base_desc, false, false);
+                    b.image_id = replacement.image_id;
+                    b.view_mip = static_cast<s16>(replacement.view_mip);
+                    b.view_slice = static_cast<s16>(replacement.view_slice);
+                    image_ptr = &texture_cache.GetImage(b.image_id);
+                }
+            } else {
+                // GR2FORK PERF: GR2_NOTEXLRUSKIP=1 performs both image LRU touches.
+                if (any_needs_rebind) {
+                    auto& old_image = texture_cache.GetImage(b.image_id);
+                    if (old_image.binding.needs_rebind) {
+                        old_image.binding = {};
+                        const auto replacement =
+                            texture_cache.FindImageWithView(*base_desc, false, false);
+                        b.image_id = replacement.image_id;
+                        b.view_mip = static_cast<s16>(replacement.view_mip);
+                        b.view_slice = static_cast<s16>(replacement.view_slice);
+                    }
+                }
             }
 
             bound_images.emplace_back(b.image_id);
 
-            // GR2FORK PERF: the first pass already touched this image. Only a replacement id
-            // needs the LRU update above.
+            if (!texture_lru_skip_enabled) {
+                image_ptr = &texture_cache.GetImage(b.image_id);
+            }
+            // GR2FORK PERF: the default path avoids repeating the first pass's LRU touch.
             auto& image = *image_ptr;
 
             // GR2FORK PERF: the common path binds base_desc->view_info by reference - copying
@@ -2041,7 +2203,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage,
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp = resolved ? resolved->samplers[sampler_index] : sampler.GetSharp(stage);
         if (sampler.disable_aniso) {
-            if (image_bindings[sampler.associated_image].single_mip) {
+            const bool single_mip = [&] {
+                if (sharp_reuse_enabled) {
+                    return image_bindings[sampler.associated_image].single_mip;
+                }
+                const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
+                return tsharp.base_level == 0 && tsharp.last_level == 0;
+            }();
+            if (single_mip) {
                 ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
         }

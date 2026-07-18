@@ -130,6 +130,7 @@ struct StageSpecialization {
             capture->l_stage = static_cast<u32>(info_.l_stage);
         }
         const bool use_resolved = resolved && resolved->Matches(info_);
+        const bool reuse_core_sharps = use_resolved || capture;
         const auto* resolved_buffers = use_resolved ? &resolved->buffers : nullptr;
         const auto* resolved_images = use_resolved ? &resolved->images : nullptr;
         const auto* resolved_fmasks = use_resolved ? &resolved->fmasks : nullptr;
@@ -191,7 +192,8 @@ struct StageSpecialization {
                          spec.num_conversion = sharp.GetNumberConversion();
                          // PORT(upstream #4075): consecutive descriptor count
                          // for mip fallback (1 otherwise).
-                         spec.num_bindings = desc.NumBindings(sharp);
+                         spec.num_bindings = reuse_core_sharps ? desc.NumBindings(sharp)
+                                                              : desc.NumBindings(*info);
                      });
         ForEachSharp(binding, fmasks, info->fmasks, resolved_fmasks, captured_fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {

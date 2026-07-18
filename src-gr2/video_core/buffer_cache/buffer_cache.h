@@ -277,9 +277,7 @@ private:
     u64 last_vertex_input_sig = 0;
     bool last_vertex_input_sig_valid = false;
 
-    // GR2FORK: BindVertexBuffers dispatches on Config::accurateVertexBufferCacheEnabled() (forced
-    // on for Gravity Rush Remastered in emulator.cpp): Fixed = cmdbuf-rotation-aware + resolve
-    // cache; Legacy = verbatim upstream. An unchanged pipeline+stamp skip saves ~0.76% of GpuComm.
+    // GR2FORK: BindVertexBuffers dispatches through Config::accurateVertexBufferCacheEnabled().
     void BindVertexBuffersFixed(const Vulkan::GraphicsPipeline& pipeline,
                                 const AmdGpu::LiverpoolRegsSnapshot& regs);
     void BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeline,
