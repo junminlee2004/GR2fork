@@ -30,8 +30,8 @@ s32 PS4_SYSV_ABI sceLibSecureCryptographyDecrypt(void* ctx, void* dst, u64 dst_s
     // the game's "decrypt" step. The ARC decode entry FUN_011972A0 also calls this speculatively
     // before a response body is framed - e.g. a poison src (0xDEADBEEF........) with a GB-range
     // dst_size, where the memcpy faults and the null-page absorber spins (boot hang). Legitimate
-    // rkg* TLV bodies are KB-scale, so implausible pointers or lengths become a no-op
-    // (return OK, processed = 0, same as the empty-body case).
+    // rkg* TLV bodies are KB-scale, so implausible pointers or lengths become a no-op that
+    // returns OK and touches no memory (the empty-body case the game already tolerates).
     constexpr u64 kMaxPayload = 64ull * 1024 * 1024; // 64 MiB; any real rkg TLV is far smaller
     const u64 n = std::min(dst_size, src_size);
     const bool ok = PlausiblePtr(dst) && PlausiblePtr(src) && n > 0 && n <= kMaxPayload;
@@ -44,14 +44,18 @@ s32 PS4_SYSV_ABI sceLibSecureCryptographyDecrypt(void* ctx, void* dst, u64 dst_s
              reinterpret_cast<std::uintptr_t>(processed), n,
              ok ? "(passthrough)" : "(SKIPPED: implausible/unframed call)");
 
-    // Unframed calls pass scalar garbage as the out-pointer too; write it only when plausible.
+    // A skipped call did no work and must write NOTHING. The 3-arg in-place ARC decrypt form
+    // (FUN_014ff120) leaves this 6-arg signature's "processed" slot as a leftover register that
+    // can hold a live guest stack address (observed local-0x60, i.e. inside the caller's own
+    // frame). A PlausiblePtr floor rejects scalar garbage (0x1, 0x50) but not a stack pointer, so
+    // writing 0 through it corrupts the caller's frame - nulling a saved register that becomes the
+    // getuploadinfo TLV-walk cursor, crashing the treasure-photo upload. Only the real streaming
+    // form (ok == true, an actual copy) is trusted enough to report a count.
     if (ok) {
         std::memcpy(dst, src, n);
         if (PlausiblePtr(processed)) {
             *processed = n;
         }
-    } else if (PlausiblePtr(processed)) {
-        *processed = 0;
     }
     return ORBIS_OK;
 }
