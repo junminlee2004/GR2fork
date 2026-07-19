@@ -1781,6 +1781,28 @@ void Gr2ArcProbe(const char* where) {
         last_cfg58 = cfg58;
     }
 
+    // getuploadinfo S3-descriptor decoder globals. The decoder FUN_011a7c00 and the upload builder
+    // FUN_0117ffb0 read: DAT_01c28160 crypto ctx (FUN_014ff120 in-place decrypt uses +8/+0x28),
+    // DAT_01c281e0 access key (0x7040), DAT_01c281e8 S3 policy (fed by the ss.info upload_baseurl
+    // extraction), DAT_01c281d8 HMAC signature (0x7050), and the response envelopes DAT_01c28180 /
+    // DAT_01c28188. A null envelope pointer during the 0x7050 walk is the treasure-photo-upload
+    // crash. Reads only these module .data scalars; logged on change.
+    const u64 cx_ctx = Gr2ReadGlobal<u64>(0x1c28160);
+    const u64 cx_sig = Gr2ReadGlobal<u64>(0x1c281d8);
+    const u64 cx_key = Gr2ReadGlobal<u64>(0x1c281e0);
+    const u64 cx_pol = Gr2ReadGlobal<u64>(0x1c281e8);
+    const u64 cx_env0 = Gr2ReadGlobal<u64>(0x1c28180);
+    const u64 cx_env1 = Gr2ReadGlobal<u64>(0x1c28188);
+    static u64 last_cx = 0xFFFFFFFFFFFFFFFFull;
+    const u64 cx_sig2 = cx_ctx ^ (cx_sig << 1) ^ (cx_key << 2) ^ (cx_pol << 3) ^ cx_env0 ^ cx_env1;
+    if (cx_sig2 != last_cx) {
+        last_cx = cx_sig2;
+        LOG_INFO(Lib_NpAuth,
+                 "GR2-UPLOADCRYPTO ctx(0x1c28160)={:#x} policy(0x1c281e8)={:#x} key(0x1c281e0)={:#x} "
+                 "sig(0x1c281d8)={:#x} env0(0x1c28180)={:#x} env1(0x1c28188)={:#x}",
+                 cx_ctx, cx_pol, cx_key, cx_sig, cx_env0, cx_env1);
+    }
+
     // Upload host/port snapshot: both FUN_010422b0 pipelines (0xa challenge-ghost, 0x1a photo/
     // treasure) connect via FUN_010bd3c0(obj, DAT_01bf6260 host (SSO; inline when DAT_01bf6278 <
     // 0x10), _, DAT_01bf62a0 port) - ss.info-fed ranking-service globals; empty = init never ran.
