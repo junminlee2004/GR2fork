@@ -88,7 +88,8 @@ static u32 Gr2ReadCStr(u64 va, char* out) {
     return n;
 }
 
-// One-time dump of the active env block. Safe: env table is a mapped module global.
+// One-time dump of the active env block. The slot and ASCII stages read only the block itself,
+// a mapped module global.
 static void Gr2DumpEnvBlock(u64 base, s32 env) {
     const u64 envblk = base + (0x1c26520 - 0x107BF0) + static_cast<u64>(env) * 0x4b0;
     LOG_INFO(Lib_NpAuth, "GR2-ENVDUMP env={} block={:#x} size=0x4b0", env, envblk);
@@ -110,7 +111,11 @@ static void Gr2DumpEnvBlock(u64 base, s32 env) {
         row[48] = 0;
         LOG_INFO(Lib_NpAuth, "GR2-ENVDUMP  ascii +{:#05x}: {}", off, row);
     }
-    // (c) follow heap-range pointers -> reveals strings stored BY POINTER (std::string/char*)
+#if !defined(_WIN32)
+    // (c) follow heap-range pointers -> reveals strings stored BY POINTER (std::string/char*).
+    // Linux-only: the range filter also passes non-pointer slot values (flag words), and chasing
+    // one reads harmless garbage on Linux's fully-readable guest arena but faults fatally on a
+    // Windows placeholder page - outside the null window the access-violation absorber claims.
     for (u32 off = 0; off < 0x4b0; off += 8) {
         const u64 p = *reinterpret_cast<volatile u64*>(envblk + off);
         if (p >= 0x100000000ull && p < 0x1000000000ull) {
@@ -121,6 +126,7 @@ static void Gr2DumpEnvBlock(u64 base, s32 env) {
             }
         }
     }
+#endif
 }
 
 // GR2 challenge cat-0 catalog dump (read-only). DAT_01bea890 -> catalog; FUN_00e829a0 places
@@ -148,6 +154,12 @@ static void Gr2DumpCatalogHex(u64 addr, u32 len, const char* tag) {
 // and a pass of gate FUN_00e827a0 (tags +0x18..+0x1f vs catalog+0x25f98). Dumps active slots.
 static void Gr2DumpMasterList(u64 base) {
     (void)base;
+#if defined(_WIN32)
+    // Linux-only telemetry: the slot walk dereferences heap pointers behind range filters only,
+    // and a partially-initialized entry turns that into a fatal fault on a Windows placeholder
+    // page, outside the null window the access-violation absorber claims.
+    return;
+#endif
     // Scan the master pool for active slots (st != 0) every ~1200 ticks, catching what the MAIL
     // receive populates after boot: cat / state / tag / mission-FNV(+0xb4) / name bytes(+0xa0).
     // cat=0 is a received Challenge; cat=10 a mine notification.
@@ -948,6 +960,12 @@ static void Gr2CallEnumerate(u64 base) {
 // filters (st!=0&&!=3, (b16&1)==0, cat!=7; gate patched to 1) and binning (DAT_015ba4d0[cat])
 // over the live master list every ~600 ticks, showing when the cm12 slot stops enrolling.
 static void Gr2WatchBuckets(u64 base) {
+#if defined(_WIN32)
+    // Linux-only telemetry: per-frame name-table and bucket walks chase heap pointers behind
+    // range filters only; see Gr2DumpMasterList for why that is fatal on Windows.
+    (void)base;
+    return;
+#endif
     static u32 tk = 0;
     ++tk;
     // Sample the challenge-name table (catalog+0x26460) EVERY frame (not tied to receive
@@ -1830,8 +1848,8 @@ void Gr2ArcProbe(const char* where) {
     static u32 cat0_calls = 0;
     ++cat0_calls;
     // Catalog scan disabled: Gr2DumpCatalog's name hunt reads 160KB byte-by-byte, and a read into
-    // an unmapped page is an access violation - Linux absorbs it in the signal handler, Windows
-    // has no absorber and crashes silently shortly after boot.
+    // an unmapped page is an access violation at a non-null address - outside the null window the
+    // signal-handler absorber claims, so it is fatal on both hosts.
     (void)base;
     (void)cat0_calls;
     (void)&Gr2DumpCatalog;
