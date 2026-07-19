@@ -13,11 +13,15 @@
 
 namespace Libraries::LibSecure {
 
-// A plausible user-space guest pointer lives in the canonical low half: no bits set at or above
-// bit 47. Poison fills (e.g. 0xDEADBEEF........) and size/scalar values mistaken for a pointer
-// all fail this, so it cheaply rejects an unframed call without touching the memory manager.
+// A plausible guest pointer sits in the canonical low half at or above 4 GiB: guest heap, stack,
+// and module mappings all live above that line, while unframed calls pass scalar garbage below it
+// (sizes and flags - observed 0x1, 0x50, 0x9c) and poison fills above it (0xDEADBEEF........).
+// Rejecting both cheaply, without touching the memory manager, keeps every deref and store in
+// this file off unmapped pages - a store to a low scalar lands outside the null window on hosts
+// that reserve guest space with placeholder pages, where the fault absorber cannot claim it.
 static inline bool PlausiblePtr(const void* p) {
-    return p != nullptr && (reinterpret_cast<std::uintptr_t>(p) >> 47) == 0;
+    const auto v = reinterpret_cast<std::uintptr_t>(p);
+    return v >= 0x100000000ull && (v >> 47) == 0;
 }
 
 s32 PS4_SYSV_ABI sceLibSecureCryptographyDecrypt(void* ctx, void* dst, u64 dst_size,
@@ -34,17 +38,19 @@ s32 PS4_SYSV_ABI sceLibSecureCryptographyDecrypt(void* ctx, void* dst, u64 dst_s
 
     LOG_INFO(Lib_Ssl,
              "sceLibSecureCryptographyDecrypt: ctx={:#x} dst={:#x} dst_size={} src={:#x} "
-             "src_size={} copy={} {}",
+             "src_size={} processed={:#x} copy={} {}",
              reinterpret_cast<std::uintptr_t>(ctx), reinterpret_cast<std::uintptr_t>(dst),
-             dst_size, reinterpret_cast<std::uintptr_t>(src), src_size, n,
+             dst_size, reinterpret_cast<std::uintptr_t>(src), src_size,
+             reinterpret_cast<std::uintptr_t>(processed), n,
              ok ? "(passthrough)" : "(SKIPPED: implausible/unframed call)");
 
+    // Unframed calls pass scalar garbage as the out-pointer too; write it only when plausible.
     if (ok) {
         std::memcpy(dst, src, n);
-        if (processed != nullptr) {
+        if (PlausiblePtr(processed)) {
             *processed = n;
         }
-    } else if (processed != nullptr) {
+    } else if (PlausiblePtr(processed)) {
         *processed = 0;
     }
     return ORBIS_OK;
