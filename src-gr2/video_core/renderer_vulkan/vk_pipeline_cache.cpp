@@ -46,21 +46,11 @@ u64 ComputeSpecProxyFp(
     const Shader::Info& info,
     const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
     u64 ri_bytes_hash,
-    const Shader::Backend::Bindings& start,
-    Shader::ResolvedStageResources& resolved) noexcept {
+    const Shader::Backend::Bindings& start) noexcept {
     static const bool batch_enabled = []() noexcept {
         const char* e = std::getenv("GR2_NOFPBATCH");
         return !(e && e[0] == '1');
     }();
-    resolved.valid = false;
-    resolved.buffers.clear();
-    resolved.images.clear();
-    resolved.fmasks.clear();
-    resolved.samplers.clear();
-    resolved.pgm_hash = info.pgm_hash;
-    resolved.pgm_base = info.pgm_base;
-    resolved.stage = static_cast<u32>(info.stage);
-    resolved.l_stage = static_cast<u32>(info.l_stage);
     u64 h = 0x84222325cbf29ce4ULL;
     const auto mix = [&](u64 v) noexcept {
         h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -86,40 +76,35 @@ u64 ComputeSpecProxyFp(
                               attrib_bytes;
         if (needed <= sizeof(buf)) [[likely]] {
             put(&start, sizeof(start));
-            for (const auto& desc : info.buffers) {
-                AmdGpu::Buffer s = desc.GetSharp(info);
-                resolved.buffers.emplace_back(s);
+            for (const auto& d : info.buffers) {
+                AmdGpu::Buffer s = d.GetSharp(info);
                 s.base_address = 0;
                 put(&s, sizeof(s));
             }
-            for (const auto& desc : info.images) {
-                AmdGpu::Image s = desc.GetSharp(info);
-                resolved.images.emplace_back(s);
+            for (const auto& d : info.images) {
+                AmdGpu::Image s = d.GetSharp(info);
                 s.base_address = 0;
                 put(&s, sizeof(s));
             }
-            for (const auto& desc : info.fmasks) {
-                AmdGpu::Image s = desc.GetSharp(info);
-                resolved.fmasks.emplace_back(s);
+            for (const auto& d : info.fmasks) {
+                AmdGpu::Image s = d.GetSharp(info);
                 s.base_address = 0;
                 put(&s, sizeof(s));
             }
-            for (const auto& desc : info.samplers) {
-                const AmdGpu::Sampler s = desc.GetSharp(info);
-                resolved.samplers.emplace_back(s);
+            for (const auto& d : info.samplers) {
+                AmdGpu::Sampler s = d.GetSharp(info);
                 put(&s, sizeof(s));
             }
             // vs_attribs are specialized only for the Vertex stage (see the
             // StageSpecialization ctor); fold the vertex-buffer sharps that
             // feed them.
             if (attrib_bytes != 0) {
-                for (const auto& attrib : fetch_data->attributes) {
-                    AmdGpu::Buffer s = attrib.GetSharp(info);
+                for (const auto& a : fetch_data->attributes) {
+                    AmdGpu::Buffer s = a.GetSharp(info);
                     s.base_address = 0;
                     put(&s, sizeof(s));
                 }
             }
-            resolved.valid = true;
             mix(ri_bytes_hash);
             mix(XXH3_64bits(buf, len));
             return h ? h : 1ULL;
@@ -130,39 +115,34 @@ u64 ComputeSpecProxyFp(
     // Per-sharp form (GR2_NOFPBATCH=1, or gather-overflow fallback).
     mix(ri_bytes_hash);
     mix(XXH3_64bits(&start, sizeof(start)));
-    for (const auto& desc : info.buffers) {
-        AmdGpu::Buffer s = desc.GetSharp(info);
-        resolved.buffers.emplace_back(s);
+    for (const auto& d : info.buffers) {
+        AmdGpu::Buffer s = d.GetSharp(info);
         s.base_address = 0;
         mix(XXH3_64bits(&s, sizeof(s)));
     }
-    for (const auto& desc : info.images) {
-        AmdGpu::Image s = desc.GetSharp(info);
-        resolved.images.emplace_back(s);
+    for (const auto& d : info.images) {
+        AmdGpu::Image s = d.GetSharp(info);
         s.base_address = 0;
         mix(XXH3_64bits(&s, sizeof(s)));
     }
-    for (const auto& desc : info.fmasks) {
-        AmdGpu::Image s = desc.GetSharp(info);
-        resolved.fmasks.emplace_back(s);
+    for (const auto& d : info.fmasks) {
+        AmdGpu::Image s = d.GetSharp(info);
         s.base_address = 0;
         mix(XXH3_64bits(&s, sizeof(s)));
     }
-    for (const auto& desc : info.samplers) {
-        const AmdGpu::Sampler s = desc.GetSharp(info);
-        resolved.samplers.emplace_back(s);
+    for (const auto& d : info.samplers) {
+        AmdGpu::Sampler s = d.GetSharp(info);
         mix(XXH3_64bits(&s, sizeof(s)));
     }
     // vs_attribs are specialized only for the Vertex stage (see the
     // StageSpecialization ctor); fold the vertex-buffer sharps that feed them.
     if (info.stage == Shader::Stage::Vertex && fetch_data) {
-        for (const auto& attrib : fetch_data->attributes) {
-            AmdGpu::Buffer s = attrib.GetSharp(info);
+        for (const auto& a : fetch_data->attributes) {
+            AmdGpu::Buffer s = a.GetSharp(info);
             s.base_address = 0;
             mix(XXH3_64bits(&s, sizeof(s)));
         }
     }
-    resolved.valid = true;
     return h ? h : 1ULL;
 }
 
@@ -675,11 +655,9 @@ PipelineCache::~PipelineCache() {
     pending_graphics_pipelines.clear();
 }
 
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
     const AmdGpu::LiverpoolRegsSnapshot& regs) {
-    if (resolved_stage_mask_ != 0) [[unlikely]] {
-        resolved_stage_mask_ = 0;
-    }
     // GR2FORK: read the stamp + dirty bit from the captured snapshot, not the live Liverpool;
     // under async execution separate loads could disagree with the regs captured for this intent.
     const u64 stamp = regs.gfx_pipeline_stamp;
@@ -967,9 +945,6 @@ PipelineCache::LaunchAsyncPipelineCompile(const GraphicsPipelineKey& key, u64 pi
 
 const ComputePipeline* PipelineCache::GetComputePipeline(
     const AmdGpu::LiverpoolRegsSnapshot& regs) {
-    if (resolved_stage_mask_ != 0) [[unlikely]] {
-        resolved_stage_mask_ = 0;
-    }
     // GR2FORK PERF: RefreshComputeKey returns false only on
     // unrecognised / invalid compute state - error path. Steady-state
     // dispatches refresh successfully.
@@ -1410,12 +1385,6 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                                                 Shader::Backend::Bindings& binding,
                                                 const AmdGpu::LiverpoolRegsSnapshot& regs,
                                                 bool ctx_stable) {
-    const u32 resolved_index = static_cast<u32>(l_stage);
-    auto& resolved = resolved_stage_resources_[resolved_index];
-    const u32 resolved_bit = 1u << resolved_index;
-    if (resolved_stage_mask_ & resolved_bit) [[unlikely]] {
-        resolved_stage_mask_ &= ~resolved_bit;
-    }
     // GR2FORK PERF: per-stage resolve memo. ctx_stable covers 66.6% of GetProgram calls and the
     // memo hits on 100% of them (15.2M-call sample), skipping BuildRuntimeInfo (the member is
     // still byte-identical; proof on StageResolveMemo), its hash, and the program_cache probe.
@@ -1453,11 +1422,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 // copy; the spec built next sees the mutation, the member stays pristine.
                 Shader::RuntimeInfo ri_compile = runtime_info;
                 const auto module = CompileModule(new_pgm->info, ri_compile, params.code, 0, binding);
-                auto spec = Shader::StageSpecialization(new_pgm->info, ri_compile, profile, start,
-                                                        nullptr, &resolved);
-                if (resolved.Matches(new_pgm->info)) {
-                    resolved_stage_mask_ |= resolved_bit;
-                }
+                auto spec = Shader::StageSpecialization(new_pgm->info, ri_compile, profile, start);
                 const auto perm_hash = HashCombine(params.hash, 0);
 
                 RegisterShaderMeta(new_pgm->info, spec.fetch_shader_data, spec, perm_hash, 0);
@@ -1595,8 +1560,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 }
             }
             spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data,
-                                         ri_fp_hash, binding, resolved);
-            resolved_stage_mask_ |= resolved_bit;
+                                         ri_fp_hash, binding);
             const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
             const auto& fe = program->spec_fp_lru[fp_slot];
             if (fe.valid && fe.fp == spec_fp &&
@@ -1636,14 +1600,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         program->last_result.ri_bind_hash = ri_bind_hash;
     }
 
-    const auto* resolved_source =
-        (resolved_stage_mask_ & resolved_bit) != 0 ? &resolved : nullptr;
-    auto* resolved_capture = !resolved_source ? &resolved : nullptr;
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding, resolved_source,
-                                            resolved_capture);
-    if (resolved_capture && resolved.Matches(info)) {
-        resolved_stage_mask_ |= resolved_bit;
-    }
+    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     // Fast path: look up by specialization signature.
     // We use a *pair* of signatures (sig + sig2) so we can avoid expensive deep comparisons.

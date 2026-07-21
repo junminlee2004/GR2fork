@@ -75,11 +75,6 @@ public:
         bool has_stream_leap = false;
     };
 
-    struct DmaSyncState {
-        u64 cpu_dirty_generation{};
-        u64 buffer_registry_generation{};
-    };
-
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          AmdGpu::Liverpool* liverpool, TextureCache& texture_cache,
@@ -174,9 +169,6 @@ public:
 
     /// Synchronizes all buffers in the specified range.
     void SynchronizeBuffersInRange(VAddr device_addr, u64 size);
-
-    /// Returns the generations that invalidate a DMA-wide upload sweep.
-    [[nodiscard]] DmaSyncState GetDmaSyncState() const noexcept;
 
     /// Synchronizes all buffers neede for DMA.
     void SynchronizeDmaBuffers();
