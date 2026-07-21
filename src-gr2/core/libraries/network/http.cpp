@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string_view>
 #include <thread>
+#include <vector>
 #include "common/config.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -409,6 +412,132 @@ static void Gr2UploadAvatarOnce() {
     }).detach();
 }
 
+// GR2FORK: server-authoritative Dusty Token enforcement. The restoration server's ledger is the
+// sole source of truth -- every Dusty Token is earned through an online reward it grants -- so a
+// tampered ggdL save that inflates the count would let a player unlock cosmetics never earned. The
+// in-game count is monotonic (the sync mail can only RAISE it), so a hacked-high value can only be
+// corrected by a direct save write. On boot the fork fetches the authoritative total and rewrites
+// the DustyToken field of the ggdL save slots to match -- up or down. This runs before the game
+// loads the save (first game HTTP request precedes the Continue/load), so the corrected value is
+// what the game reads; each boot re-enforces, so a hacked save cannot persist.
+static void Gr2EnforceDustyTokenOnce() {
+    static constexpr const char* kGr2Serials[] = {
+        "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+        "PCJS50010", "PCAS00079", "CUSA04935",
+    };
+    const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
+    bool is_gr2 = false;
+    for (const char* s : kGr2Serials) {
+        if (serial == s) {
+            is_gr2 = true;
+            break;
+        }
+    }
+    if (!is_gr2) {
+        return;
+    }
+
+    const std::string host = Config::GetHttpHostOverride();
+    if (host.empty()) {
+        return;  // no restoration server configured -- nothing to enforce against
+    }
+    const int port = Config::GetHttpHostOverridePort();
+    const std::string player = UserManagement.GetDefaultUser().user_name;
+    const std::filesystem::path save_root =
+        Common::FS::GetUserPath(Common::FS::PathType::HomeDir) / "1000" / "savedata";
+
+    std::thread([host, port, player, save_root] {
+        std::string safe;
+        safe.reserve(player.size());
+        for (unsigned char c : player) {
+            if (c >= 0x20 && c != 0x7f) {
+                safe.push_back(static_cast<char>(c));
+            }
+        }
+        if (safe.empty()) {
+            return;
+        }
+
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(5, 0);
+        cli.set_write_timeout(5, 0);
+        httplib::Headers headers;
+        headers.emplace("X-GR2-Player", safe);
+        auto res = cli.Get("/gr2token", headers);
+        if (!res || res->status != 200) {
+            return;  // server unreachable -- leave the save untouched rather than guess
+        }
+        long long authoritative = -1;
+        try {
+            authoritative = std::stoll(res->body);
+        } catch (...) {
+            return;
+        }
+        if (authoritative < 0) {
+            return;
+        }
+        const float want = static_cast<float>(authoritative);
+
+        // ggdL save layout: 'ggdL' magic @0, entry count u32 @12, entries @16 each 16 bytes with the
+        // value f32 at +8 and the FNV-1a key u32 at +12. GR2's slots are data0000.bin / data0001.bin.
+        static constexpr std::uint32_t kDustyTokenFnv = 0x8492dbd1u;
+        std::error_code ec;
+        if (!std::filesystem::exists(save_root, ec)) {
+            return;
+        }
+        for (auto& de : std::filesystem::recursive_directory_iterator(save_root, ec)) {
+            if (ec) {
+                break;
+            }
+            if (!de.is_regular_file(ec)) {
+                continue;
+            }
+            const std::string fn = de.path().filename().string();
+            if (fn != "data0000.bin" && fn != "data0001.bin") {
+                continue;
+            }
+            std::vector<char> data;
+            {
+                std::ifstream in(de.path(), std::ios::binary);
+                if (!in) {
+                    continue;
+                }
+                data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            if (data.size() < 16 || std::memcmp(data.data(), "ggdL", 4) != 0) {
+                continue;
+            }
+            std::uint32_t count = 0;
+            std::memcpy(&count, data.data() + 12, 4);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                const std::size_t off = 16 + static_cast<std::size_t>(i) * 16;
+                if (off + 16 > data.size()) {
+                    break;
+                }
+                std::uint32_t fnv = 0;
+                std::memcpy(&fnv, data.data() + off + 12, 4);
+                if (fnv != kDustyTokenFnv) {
+                    continue;
+                }
+                float cur = 0.0f;
+                std::memcpy(&cur, data.data() + off + 8, 4);
+                if (cur != want) {
+                    std::memcpy(data.data() + off + 8, &want, 4);
+                    std::ofstream out(de.path(), std::ios::binary | std::ios::trunc);
+                    if (out) {
+                        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+                        LOG_INFO(Lib_Http,
+                                 "[GR2FORK] DustyToken enforced in {}: {} -> {} (server authoritative)",
+                                 fn, cur, want);
+                    }
+                }
+                break;
+            }
+        }
+    }).detach();
+}
+
 int PS4_SYSV_ABI sceHttpCreateRequestWithURL(s32 tmpl_id, s32 method, const char* url,
                                              u64 content_length) {
     LOG_INFO(Lib_Http, "called template id = '{}' method = '{}' url = '{}', content length = '{}'",
@@ -435,6 +564,13 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(s32 tmpl_id, s32 method, const char
     static std::atomic<bool> avatar_upload_started{false};
     if (!avatar_upload_started.exchange(true)) {
         Gr2UploadAvatarOnce();
+    }
+
+    // GR2FORK: enforce the server-authoritative Dusty Token total onto the local ggdL save once per
+    // boot, at this same pre-load point, so a tampered count is corrected before the game reads it.
+    static std::atomic<bool> dusty_enforce_started{false};
+    if (!dusty_enforce_started.exchange(true)) {
+        Gr2EnforceDustyTokenOnce();
     }
 
     return CreateRequestWithURLInternal(tmpl_id, method, url, content_length);
