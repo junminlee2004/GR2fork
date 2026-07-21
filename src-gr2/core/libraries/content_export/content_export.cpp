@@ -29,6 +29,96 @@ void DumpProbe(const char* fn, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u
               fn, a1, a2, a3, a4, a5, a6, a7, a8);
 }
 
+// TEMP-DIAG(GR2FORK): locate the photo-ghost "comment" placement blob. The upload's NPDB
+// builder aborts when the exported content carries an empty comment; find which arg/offset
+// the game passes it in so the fork can round-trip it back at GetMetadataValue time.
+void ProbeMem(const char* tag, u64 ptr, size_t n, bool hex) {
+    if (ptr < 0x10000 || ptr >= 0x10000000000ull) {
+        LOG_ERROR(Core, "[GR2PhotoProbe] {} ptr={:#x} (skip: out of range)", tag, ptr);
+        return;
+    }
+    const u8* p = reinterpret_cast<const u8*>(ptr);
+    size_t best_start = 0, best_len = 0, cur_start = 0, cur_len = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (p[i] >= 0x20 && p[i] < 0x7f) {
+            if (cur_len == 0) {
+                cur_start = i;
+            }
+            if (++cur_len > best_len) {
+                best_len = cur_len;
+                best_start = cur_start;
+            }
+        } else {
+            cur_len = 0;
+        }
+    }
+    if (hex) {
+        for (size_t off = 0; off < n; off += 32) {
+            std::string line;
+            std::string asc;
+            for (size_t i = off; i < off + 32 && i < n; ++i) {
+                char hb[4];
+                std::snprintf(hb, sizeof(hb), "%02x ", p[i]);
+                line += hb;
+                asc += (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
+            }
+            LOG_ERROR(Core, "[GR2PhotoProbe] {} +{:#05x}: {}|{}|", tag, off, line, asc);
+        }
+    }
+    if (best_len >= 8) {
+        std::string run(reinterpret_cast<const char*>(p + best_start), best_len);
+        LOG_ERROR(Core, "[GR2PhotoProbe] {} longest-printable @+{:#x} len={}: '{}'", tag,
+                  best_start, best_len, run);
+    }
+}
+
+// GR2FORK: extract the longest printable run (the encoded placement "comment") from an export
+// argument region, offset-agnostically. Returns "" if no run of at least minlen is present.
+std::string LongestRun(u64 ptr, size_t n, size_t minlen) {
+    if (ptr < 0x10000 || ptr >= 0x10000000000ull) {
+        return {};
+    }
+    const u8* p = reinterpret_cast<const u8*>(ptr);
+    size_t best_start = 0, best_len = 0, cur_start = 0, cur_len = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (p[i] >= 0x20 && p[i] < 0x7f) {
+            if (cur_len == 0) {
+                cur_start = i;
+            }
+            if (++cur_len > best_len) {
+                best_len = cur_len;
+                best_start = cur_start;
+            }
+        } else {
+            cur_len = 0;
+        }
+    }
+    if (best_len < minlen) {
+        return {};
+    }
+    return std::string(reinterpret_cast<const char*>(p + best_start), best_len);
+}
+
+// GR2FORK: capture the placement comment from the export payload and key it by content id.
+// The data buffer (a2) carries a header before the JPEG: title C-str at +0x00 and the 256-char
+// encoded placement comment at +0x101; the a4/a5 param regions only alias a truncated view of
+// it, so scan the data header first and keep the longest printable run.
+void CaptureComment(const std::string& content_id, u64 a2, u64 a3, u64 a4, u64 a5) {
+    std::string c = LongestRun(a2, std::min<u64>(a3, 0x400), 48);
+    if (c.empty()) {
+        c = LongestRun(a5, 0x2b0, 48);
+    }
+    if (c.empty()) {
+        c = LongestRun(a4, 0x2b0, 48);
+    }
+    if (!c.empty()) {
+        Libraries::ContentSearch::SetStoredComment(content_id, c);
+    } else {
+        LOG_ERROR(Core, "[GR2PhotoProbe] CaptureComment: no printable run >=48 for '{}'",
+                  content_id);
+    }
+}
+
 static std::string s_last_content_id;
 
 static std::string GenerateContentId() {
@@ -99,6 +189,9 @@ int PS4_SYSV_ABI sceContentExportStart(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 int PS4_SYSV_ABI sceContentExportFromData(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7,
                                           u64 a8) {
     DumpProbe(__func__, a1, a2, a3, a4, a5, a6, a7, a8);
+    ProbeMem("FromData.a4", a4, 0x160, true);
+    ProbeMem("FromData.a5", a5, 0x160, true);
+    ProbeMem("FromData.jpeg", a2, a3 < 0x1000 ? a3 : 0x1000, false);
 
     // Use the content ID that was already saved by sceJpegEncEncode
     s_last_content_id = Libraries::ContentSearch::GetLastSavedContentId();
@@ -126,6 +219,7 @@ int PS4_SYSV_ABI sceContentExportFromData(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5
 
     // Notify ContentSearch so gallery can list this photo
     Libraries::ContentSearch::NotifyExportedContentId(s_last_content_id);
+    CaptureComment(s_last_content_id, a2, a3, a4, a5);
 
     // Write content_id to output buffer
     if (a6 != 0 && a7 >= 48) {
@@ -142,6 +236,9 @@ int PS4_SYSV_ABI sceContentExportFromData(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5
 int PS4_SYSV_ABI sceContentExportFromDataWithThumbnail(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
                                                        u64 a6, u64 a7, u64 a8) {
     DumpProbe(__func__, a1, a2, a3, a4, a5, a6, a7, a8);
+    ProbeMem("Thumb.a4", a4, 0x160, true);
+    ProbeMem("Thumb.a5", a5, 0x160, true);
+    ProbeMem("Thumb.a2", a2, 0x160, true);
 
     s_last_content_id = Libraries::ContentSearch::GetLastSavedContentId();
     if (s_last_content_id.empty()) {
@@ -150,6 +247,7 @@ int PS4_SYSV_ABI sceContentExportFromDataWithThumbnail(u64 a1, u64 a2, u64 a3, u
 
     // Don't save - file already saved by encoder
     Libraries::ContentSearch::NotifyExportedContentId(s_last_content_id);
+    CaptureComment(s_last_content_id, a2, a3, a4, a5);
 
     if (a6 != 0 && a7 >= 48) {
         char* out = reinterpret_cast<char*>(a6);

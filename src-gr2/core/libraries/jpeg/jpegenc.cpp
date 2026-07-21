@@ -699,16 +699,11 @@ s32 PS4_SYSV_ABI sceJpegEncEncode(OrbisJpegEncHandle handle, const OrbisJpegEncE
         SaveGR2PhotoJpegToHost(jpg.data(), jpg.size(), width, height);
     }
 
-    // GR2: after a successful photo encode, update the game's internal photo context - the PS4
-    // hardware encoder bumps the scene node version and sets the result-ready flag as
-    // side-effects. Without them the state machine stalls at state=1 (red-square preview).
+    // On a full-size photo capture, start the read-only observer of the upload state machine
+    // so a stalled post logs which worker-completion gate never clears.
     if (width == 1024 && height == 1024 && jpg.size() >= 30000) {
-        const bool ctx_ok = GR2PhotoContextFinder::Instance().OnEncodeComplete(
-            static_cast<u32>(jpg.size()), width, height);
-        LOG_INFO(Lib_Jpeg, "[GR2PhotoHLE] Context finder post-encode: {}",
-                 ctx_ok ? "SUCCESS — game state updated"
-                        : "FAILED — could not locate photo context");
-        GR2PhotoContextFinder::Instance().DumpState();
+        GR2PhotoContextFinder::Instance().OnEncodeComplete(static_cast<u32>(jpg.size()), width,
+                                                           height);
     }
 
     LOG_INFO(Lib_Jpeg, "sceJpegEncEncode: [GR2PhotoHLE] stb encoded {} bytes ({}x{}, fmt={}, sampling={})",

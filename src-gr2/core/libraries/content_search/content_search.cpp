@@ -276,6 +276,32 @@ std::string GetContentIdByHandle(u64 handle) {
     return (it == s_handle_to_id.end()) ? std::string{} : it->second;
 }
 
+// GR2FORK: content-id -> "comment" placement blob, captured at export, returned at read.
+static std::mutex s_comment_mutex;
+static std::unordered_map<std::string, std::string> s_content_comments;
+static std::string s_last_comment_cid;
+
+void SetStoredComment(const std::string& content_id, const std::string& comment) {
+    if (content_id.empty() || comment.empty()) {
+        return;
+    }
+    std::lock_guard lock(s_comment_mutex);
+    s_content_comments[content_id] = comment;
+    s_last_comment_cid = content_id;
+    LOG_INFO(Core, "[GR2PhotoHLE] stored comment for '{}' ({} bytes)", content_id, comment.size());
+}
+
+std::string GetStoredComment(const std::string& content_id) {
+    std::lock_guard lock(s_comment_mutex);
+    auto it = s_content_comments.find(content_id);
+    return (it == s_content_comments.end()) ? std::string{} : it->second;
+}
+
+std::string GetLastStoredCommentCid() {
+    std::lock_guard lock(s_comment_mutex);
+    return s_last_comment_cid;
+}
+
 bool DeleteContentById(const std::string& content_id) {
     {
         std::lock_guard lock(s_ids_mutex);
@@ -424,8 +450,22 @@ int PS4_SYSV_ABI sceContentSearchOpenMetadata(u64 a1, u64 a2, u64 a3, u64 a4, u6
 
 int PS4_SYSV_ABI sceContentSearchOpenMetadataByContentId(u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
                                                          u64 a6, u64 a7, u64 a8) {
-    u32 handle = AllocMetadataHandle(0);
+    // a1 is the stable content handle the search wrote to SceContentSearchContentInfo+0x00
+    // (= GetOrAssignHandle(cid)). Keep it on the session so GetMetadataValue can resolve the cid
+    // and return the photo's stored placement comment instead of an empty buffer. a1 may be that
+    // handle by value or a pointer to it, so resolve whichever maps to a known content id.
+    u64 content_handle = a1;
+    if (GetContentIdByHandle(content_handle).empty() && a1 >= 0x10000 &&
+        a1 < 0x10000000000ull) {
+        u64 deref = *reinterpret_cast<u64*>(a1);
+        if (!GetContentIdByHandle(deref).empty()) {
+            content_handle = deref;
+        }
+    }
+    u32 handle = AllocMetadataHandle(content_handle);
     if (a2 != 0) *reinterpret_cast<u32*>(a2) = handle;
+    LOG_INFO(Core, "[GR2PhotoHLE] OpenMetadataByContentId a1={:#x} handle={:#x} -> '{}' meta={:#x}",
+             a1, content_handle, GetContentIdByHandle(content_handle), handle);
     return ORBIS_OK;
 }
 
@@ -440,7 +480,41 @@ int PS4_SYSV_ABI sceContentSearchGetMetadataValue(u64 a1, u64 a2, u64 a3, u64 a4
     if (buf_ptr == 0 || buf_size == 0) return -1;
 
     char* dest = reinterpret_cast<char*>(buf_ptr);
-    std::memset(dest, 0, std::min(buf_size, 0x101u));
+    const u32 cap = std::min(buf_size, 0x101u);
+
+    // a2 is the key string pointer (the upload's metadata fiber passes "comment"). Resolve the
+    // photo's cid from the session handle and hand back the placement blob the game embedded at
+    // save time, so the NPDB builder does not abort on an empty comment.
+    const char* key = (a2 >= 0x10000 && a2 < 0x10000000000ull)
+                          ? reinterpret_cast<const char*>(a2)
+                          : "";
+    if (std::strncmp(key, "comment", 8) == 0) {
+        u64 rec = LookupMetadataRecordId(static_cast<u32>(a1));
+        std::string cid = GetContentIdByHandle(rec);
+        std::string blob = GetStoredComment(cid);
+        if (blob.empty()) {
+            // The search HLE ignores the game's filter, so the metadata session can resolve to
+            // the wrong catalog entry. The upload always reads the comment right after an
+            // export, so the just-exported photo's blob is the correct one.
+            std::string last = GetLastStoredCommentCid();
+            blob = GetStoredComment(last);
+            if (!blob.empty()) {
+                cid = last + " (last-export fallback)";
+            }
+        }
+        LOG_INFO(Core, "[GR2PhotoHLE] GetMetadataValue key='comment' cid='{}' stored={} bytes",
+                 cid, blob.size());
+        if (!blob.empty()) {
+            u32 n = std::min<u32>(static_cast<u32>(blob.size()), cap);
+            std::memcpy(dest, blob.data(), n);
+            if (n < cap) {
+                dest[n] = '\0';
+            }
+            return ORBIS_OK;
+        }
+    }
+
+    std::memset(dest, 0, cap);
     return ORBIS_OK;
 }
 

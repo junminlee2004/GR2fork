@@ -43,6 +43,13 @@ namespace Libraries::ContentSearch {
     // never assigned. Used by sceContentDeleteById.
     std::string GetContentIdByHandle(u64 handle);
 
+    // GR2FORK: photo-ghost placement round-trip. sceContentExport* stores the "comment"
+    // metadata the game embeds at save; sceContentSearchGetMetadataValue("comment") returns it
+    // so the upload's NPDB builder (FUN_00ebb930) sees a non-empty placement blob and proceeds.
+    void SetStoredComment(const std::string& content_id, const std::string& comment);
+    std::string GetStoredComment(const std::string& content_id);
+    std::string GetLastStoredCommentCid();
+
     int PS4_SYSV_ABI sceContentSearchInit(u64 a1 = 0, u64 a2 = 0, u64 a3 = 0, u64 a4 = 0,
                                           u64 a5 = 0, u64 a6 = 0, u64 a7 = 0, u64 a8 = 0);
     int PS4_SYSV_ABI sceContentSearchSearchContent(u64 a1 = 0, u64 a2 = 0, u64 a3 = 0, u64 a4 = 0,

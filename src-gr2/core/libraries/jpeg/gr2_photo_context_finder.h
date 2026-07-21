@@ -7,11 +7,14 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -46,45 +49,11 @@ public:
     }
 
     bool OnEncodeComplete(u32 jpeg_size, u32 width, u32 height) {
-        std::lock_guard lock(mutex_);
-
-        if (handle_addr_ == 0)
-            return false;
-
-        if (context_addr_ == 0)
-            context_addr_ = ScanAllMappedMemory();
-
-        if (context_addr_ == 0) {
-            LOG_WARNING(Lib_Jpeg, "[GR2CtxFinder] Could not find photo context");
-            return false;
-        }
-
-        const u32 state = ReadU32(context_addr_ + 0x960);
-        const u64 scene_node = ReadU64(context_addr_ + 0x988);
-        const u64 result_obj = ReadU64(context_addr_ + 0x9a0);
-
-        LOG_INFO(Lib_Jpeg,
-                 "[GR2CtxFinder] Context @{:#x}: state={:#x} scene={:#x} result={:#x}",
-                 context_addr_, state, scene_node, result_obj);
-
-        // Bump scene node version
-        if (scene_node != 0) {
-            const u32 ver = ReadU32(scene_node + 0x30);
-            WriteU32(scene_node + 0x30, ver + 1);
-            LOG_INFO(Lib_Jpeg, "[GR2CtxFinder] scene_node version {} -> {}", ver, ver + 1);
-        }
-
-        // Set result ready flag
-        if (result_obj != 0) {
-            const u8 old = ReadU8(result_obj + 0x30);
-            WriteU8(result_obj + 0x30, 1);
-            const s32 count = ReadS32(result_obj + 0x18);
-            LOG_INFO(Lib_Jpeg,
-                     "[GR2CtxFinder] result ready: {} -> 1, item_count={}",
-                     old, count);
-        }
-
-        return true;
+        // The +0x960/+0x988/+0x9a0 fields belong to a Havok hkpWorld object, not the photo
+        // context; writing a ready flag into them corrupts physics. Observe the real upload
+        // object, anchored by a fixed singleton, read-only instead of scanning.
+        StartUploadStatePoller();
+        return false;
     }
 
     void DumpState() const {
@@ -514,6 +483,66 @@ private:
     static void WriteU8 (uintptr_t a, u8  v) { *reinterpret_cast<volatile u8*>(a)  = v; }
     static void WriteU32(uintptr_t a, u32 v) { *reinterpret_cast<volatile u32*>(a) = v; }
 
+    // Read-only observer of the photo-upload state machine. The upload object (IMPL) is reached
+    // through a fixed singleton: the manager pointer lives at eboot+0x1AED278 and its +0x8 field
+    // is IMPL. A background poller logs IMPL's phase and the worker-completion gates on change so
+    // a stalled post shows which gate never clears. Field offsets are from the photo tick
+    // FUN_00eb2090: result +0x354, phase +0x358, metadata-ready +0x35c, JPEG readback buffer
+    // +0x370, JPEG length +0x378, async-op status +0x3a8/+0x3c8, capture trigger +0x3590; the
+    // content-export job-status global is eboot+0x1B20758. Guest pointers are range-checked
+    // before use; freed guest heap stays mapped, so a read never faults.
+    void StartUploadStatePoller() {
+        if (poller_started_.exchange(true)) {
+            return;
+        }
+        std::thread([] {
+            const uintptr_t base = MemoryPatcher::g_eboot_address;
+            if (base == 0) {
+                return;
+            }
+            const uintptr_t mgr_slot = base + 0x1AED278;
+            const uintptr_t job_slot = base + 0x1B20758;
+            const auto plausible = [](uintptr_t p) {
+                return (p >= 0x200000000ull && p < 0x300000000ull) ||
+                       (p >= 0x800000000ull && p < 0x900000000ull);
+            };
+            s32 lp = 0, lr = 0, lmeta = 0, ljlen = 0, la = 0;
+            u64 ljbuf = 0;
+            bool first = true;
+            // ~5 minutes at 5 ms: fine enough to catch the fast readback/upload transitions the
+            // 150 ms poll collapsed. Logs on any tracked-field change, bounded so the thread ends.
+            for (int i = 0; i < 60000; ++i) {
+                const u64 mgr = ReadU64(mgr_slot);
+                if (plausible(mgr)) {
+                    const u64 impl = ReadU64(mgr + 0x8);
+                    if (plausible(impl)) {
+                        const s32 phase = ReadS32(impl + 0x358);
+                        const s32 result = ReadS32(impl + 0x354);
+                        const s32 meta = ReadS32(impl + 0x35c);
+                        const u64 jbuf = ReadU64(impl + 0x370);
+                        const s32 jlen = ReadS32(impl + 0x378);
+                        const s32 a3a8 = ReadS32(impl + 0x3a8);
+                        if (first || phase != lp || result != lr || meta != lmeta ||
+                            jbuf != ljbuf || jlen != ljlen || a3a8 != la) {
+                            first = false;
+                            lp = phase, lr = result, lmeta = meta, ljbuf = jbuf, ljlen = jlen,
+                            la = a3a8;
+                            LOG_INFO(Lib_Jpeg,
+                                     "[GR2PhotoState] phase={} result={} meta+0x35c={} "
+                                     "jpegbuf+0x370={:#x} jpeglen+0x378={} async+0x3a8={:#x} "
+                                     "async+0x3c8={:#x} trig+0x3590={} job={:#x}",
+                                     phase, result, meta, jbuf, jlen, static_cast<u32>(a3a8),
+                                     static_cast<u32>(ReadS32(impl + 0x3c8)),
+                                     static_cast<u32>(ReadU8(impl + 0x3590)),
+                                     ReadU32(job_slot));
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }).detach();
+    }
+
     mutable std::mutex mutex_;
     uintptr_t handle_addr_{0};
     uintptr_t memory_addr_{0};
@@ -521,6 +550,7 @@ private:
     uintptr_t context_addr_{0};
     uintptr_t vtable_ptr_{0};
     bool patches_applied_{false};
+    std::atomic<bool> poller_started_{false};
 };
 
 } // namespace Libraries::JpegEnc

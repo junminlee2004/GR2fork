@@ -561,6 +561,11 @@ s64 PS4_SYSV_ABI posix_lseek(s32 fd, s64 offset, s32 whence) {
         origin = Common::FS::SeekOrigin::CurrentPosition;
     } else if (whence == 2) {
         origin = Common::FS::SeekOrigin::End;
+        // TEMP-DIAG: trace lseek-to-end sizing of a screenshot readback.
+        if (const auto hn = file->m_host_name.string(); hn.find(".jpg") != std::string::npos) {
+            LOG_INFO(Kernel_Fs, "[GR2sizeprobe] lseek(SEEK_END) fd={} '{}' size={}", fd, hn,
+                     file->f.GetSize());
+        }
     } else if (whence == 3 || whence == 4) {
         // whence parameter belongs to an unsupported POSIX extension
         *__Error() = POSIX_ENOTTY;
@@ -781,6 +786,11 @@ s32 PS4_SYSV_ABI posix_stat(const char* path, OrbisKernelStat* sb) {
         // TODO incomplete
     }
 
+    // TEMP-DIAG: trace the size the photo-review readback receives for a screenshot path.
+    if (std::string_view{path}.find("screenshot") != std::string_view::npos ||
+        std::string_view{path}.find(".jpg") != std::string_view::npos) {
+        LOG_INFO(Kernel_Fs, "[GR2sizeprobe] posix_stat '{}' -> st_size={}", path, sb->st_size);
+    }
     return ORBIS_OK;
 }
 
@@ -841,6 +851,11 @@ s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
         sb->st_blksize = 512;
         sb->st_blocks = (sb->st_size + 511) / 512;
         // TODO incomplete
+        // TEMP-DIAG: trace fd-based sizing of a screenshot readback.
+        if (const auto hn = file->m_host_name.string(); hn.find(".jpg") != std::string::npos) {
+            LOG_INFO(Kernel_Fs, "[GR2sizeprobe] fstat fd={} '{}' -> st_size={}", fd, hn,
+                     sb->st_size);
+        }
         break;
     }
     case Core::FileSys::FileType::Directory: {
@@ -877,6 +892,17 @@ s32 PS4_SYSV_ABI sceKernelFstat(s32 fd, OrbisKernelStat* sb) {
         return ErrnoToSceKernelError(*__Error());
     }
     return result;
+}
+
+// GR2FORK: upstream leaves lstat/fstatat as aerolib STUBs that never fill st_size (readers get 0).
+// GR2's photo-review upload sizes the exported JPEG via lstat, and a zero size aborts the post.
+// Route to the real stat: no guest symlinks, and guest paths are absolute so dirfd/flags are unused.
+s32 PS4_SYSV_ABI posix_lstat(const char* path, OrbisKernelStat* sb) {
+    return posix_stat(path, sb);
+}
+
+s32 PS4_SYSV_ABI posix_fstatat(s32 dirfd, const char* path, OrbisKernelStat* sb, s32 flags) {
+    return posix_stat(path, sb);
 }
 
 s32 PS4_SYSV_ABI posix_ftruncate(s32 fd, s64 length) {
@@ -1598,6 +1624,12 @@ void RegisterFileSystem(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("mqQMh1zPPT8", "libScePosix", 1, "libkernel", posix_fstat);
     LIB_FUNCTION("mqQMh1zPPT8", "libkernel", 1, "libkernel", posix_fstat);
     LIB_FUNCTION("kBwCPsYX-m4", "libkernel", 1, "libkernel", sceKernelFstat);
+    // GR2FORK: register real lstat/fstatat/_fstat; upstream stubs leave st_size 0.
+    LIB_FUNCTION("DRGXpDDh8Ng", "libScePosix", 1, "libkernel", posix_lstat);
+    LIB_FUNCTION("DRGXpDDh8Ng", "libkernel", 1, "libkernel", posix_lstat);
+    LIB_FUNCTION("t6haf4s-eE0", "libScePosix", 1, "libkernel", posix_fstatat);
+    LIB_FUNCTION("t6haf4s-eE0", "libkernel", 1, "libkernel", posix_fstatat);
+    LIB_FUNCTION("A0O5kF5x4LQ", "libkernel", 1, "libkernel", posix_fstat);
     LIB_FUNCTION("ih4CD9-gghM", "libkernel", 1, "libkernel", posix_ftruncate);
     LIB_FUNCTION("VW3TVZiM4-E", "libkernel", 1, "libkernel", sceKernelFtruncate);
     LIB_FUNCTION("NN01qLRhiqU", "libScePosix", 1, "libkernel", posix_rename);
