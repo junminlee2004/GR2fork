@@ -15,6 +15,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 // Needs the full Rasterizer type for PushPresenterRecord template
 // instantiation in BufferCache::ReadMemory.
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -27,6 +28,23 @@ namespace VideoCore {
 // pipeline (immutable fetch_shader) and stamp-tracked regs, so an unchanged pipeline+stamp can
 // reuse them, skipping the GetVertexInputs walk and both hash loops.
 struct VbbResolveCache {
+    struct VertexShapeElement {
+        u32 stride{};
+        u32 divisor{};
+        u8 semantic{};
+        u8 data_format{};
+        u8 number_format{};
+        u8 instance_rate{};
+
+        bool operator==(const VertexShapeElement&) const = default;
+    };
+
+    Vulkan::VertexInputs<VertexShapeElement> legacy_shape;
+    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> legacy_attributes;
+    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> legacy_bindings;
+    u64 legacy_shape_generation{};
+    bool legacy_shape_valid{};
+
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
@@ -237,86 +255,107 @@ void BufferCache::BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
 
 void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeline,
                                           const AmdGpu::LiverpoolRegsSnapshot& regs) {
-    // GR2FORK PERF: unchanged pipeline pointer + stamp (snapshot-sourced) means every input read
-    // here is unchanged (immutable fetch_shader; step rates and sharps are stamp-tracked regs), so
-    // the recorded cmdbuf state is still exact; last_vertex_bind_sig_valid gates the first bind.
     const u64 cur_stamp = regs.gfx_pipeline_stamp;
-    // GR2FORK PERF: pipeline+stamp invariance is the same condition GetGraphicsPipeline's tier-1
-    // cache hit rides, so cache-resolved draws also take this skip; hint it as the dominant exit.
+    const u64 vbb_tick = scheduler.CurrentTick();
+    // GR2FORK PERF: pipeline, stamp, and command-buffer identity cover the recorded vertex state.
     if (last_vbb_pipeline_ == &pipeline && last_vbb_stamp_ == cur_stamp &&
-        last_vertex_bind_sig_valid) [[likely]] {
+        last_vertex_bind_sig_valid && last_vbb_tick_ == vbb_tick) [[likely]] {
         return;
     }
 
-    Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-    Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
+    Vulkan::VertexInputs<VbbResolveCache::VertexShapeElement> shape;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
-    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
-                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
-    // Hot-path: split "vertex input state" from "guest buffer binds".
-    // - setVertexInputEXT depends only on bindings/attributes/divisors (+ step rates), not buffer
-    // addresses.
-    // - bindVertexBuffers depends on guest buffer addresses/offsets and can change every draw.
+    const auto& fetch_shader = pipeline.GetFetchShader();
+    if (fetch_shader) {
+        const auto& vs_info = pipeline.GetStage(Shader::LogicalStage::Vertex);
+        for (const auto& attrib : fetch_shader->attributes) {
+            const auto step_rate = attrib.GetStepRate();
+            const auto buffer = attrib.GetSharp(vs_info);
+            const u32 divisor = step_rate == InstanceIdType::OverStepRate0
+                                    ? regs.vgt_instance_step_rate_0
+                                    : (step_rate == InstanceIdType::OverStepRate1
+                                           ? regs.vgt_instance_step_rate_1
+                                           : 1);
+            guest_buffers.emplace_back(buffer);
+            shape.emplace_back(VbbResolveCache::VertexShapeElement{
+                .stride = buffer.GetStride(),
+                .divisor = divisor,
+                .semantic = static_cast<u8>(attrib.semantic),
+                .data_format = static_cast<u8>(buffer.GetDataFmt()),
+                .number_format = static_cast<u8>(buffer.GetNumberFmt()),
+                .instance_rate = static_cast<u8>(step_rate != InstanceIdType::None),
+            });
+        }
+    }
+
+    const bool shape_hit = vbb_resolve_->legacy_shape_valid &&
+                           vbb_resolve_->legacy_shape == shape;
+    if (!shape_hit) {
+        vbb_resolve_->legacy_attributes.clear();
+        vbb_resolve_->legacy_bindings.clear();
+        for (u32 i = 0; i < shape.size(); ++i) {
+            const auto& element = shape[i];
+            const auto& buffer = guest_buffers[i];
+            vbb_resolve_->legacy_attributes.push_back(
+                vk::VertexInputAttributeDescription2EXT{
+                    .location = element.semantic,
+                    .binding = element.semantic,
+                    .format = Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(),
+                                                                   buffer.GetNumberFmt()),
+                    .offset = 0,
+                });
+            vbb_resolve_->legacy_bindings.push_back(vk::VertexInputBindingDescription2EXT{
+                .binding = element.semantic,
+                .stride = element.stride,
+                .inputRate = element.instance_rate ? vk::VertexInputRate::eInstance
+                                                   : vk::VertexInputRate::eVertex,
+                .divisor = element.divisor,
+            });
+        }
+        vbb_resolve_->legacy_shape = shape;
+        ++vbb_resolve_->legacy_shape_generation;
+        vbb_resolve_->legacy_shape_valid = true;
+    }
+
+    const auto& attributes = vbb_resolve_->legacy_attributes;
+    const auto& bindings = vbb_resolve_->legacy_bindings;
+    const u64 input_sig = vbb_resolve_->legacy_shape_generation;
+
     auto mix = [](u64& h, u64 v) {
         h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     };
 
-    u64 input_sig = 0xcbf29ce484222325ULL; // arbitrary non-zero seed
-    mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
-    mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
-    mix(input_sig, static_cast<u64>(instance.IsVertexInputDynamicState() ? 1 : 0));
-    mix(input_sig, reinterpret_cast<u64>(&pipeline));
-
-    for (const auto& b : bindings) {
-        mix(input_sig, (static_cast<u64>(b.binding) << 32) | static_cast<u64>(b.stride));
-        mix(input_sig, static_cast<u64>(static_cast<u32>(b.inputRate)));
-    }
-    for (const auto& a : attributes) {
-        mix(input_sig, (static_cast<u64>(a.location) << 32) | static_cast<u64>(a.binding));
-        mix(input_sig, (static_cast<u64>(static_cast<u32>(a.format)) << 32) |
-                           static_cast<u64>(a.offset));
-    }
-    for (const auto& d : divisors) {
-        mix(input_sig, (static_cast<u64>(d.binding) << 32) | static_cast<u64>(d.divisor));
-    }
-
-    // Full bind signature includes guest buffers (addresses/sizes/strides).
-    u64 bind_sig = input_sig;
+    u64 bind_sig = 0xcbf29ce484222325ULL;
+    mix(bind_sig, input_sig);
     for (const auto& gb : guest_buffers) {
         mix(bind_sig, static_cast<u64>(gb.base_address));
         mix(bind_sig, static_cast<u64>(gb.GetSize()));
         mix(bind_sig, static_cast<u64>(gb.GetStride()));
     }
 
-    // If NOTHING changed (vertex input + guest buffers), skip ALL rebinding work.
-    if (last_vertex_bind_sig_valid && bind_sig == last_vertex_bind_sig) {
-        // GR2FORK PERF: cmdbuf state is still valid - record stamp so the next
-        // call can take the ultra-fast skip without the hash loops.
+    if (last_vertex_bind_sig_valid && bind_sig == last_vertex_bind_sig &&
+        last_vertex_input_sig_valid && input_sig == last_vertex_input_sig &&
+        last_vbb_tick_ == vbb_tick) {
         last_vbb_pipeline_ = &pipeline;
         last_vbb_stamp_ = cur_stamp;
         return;
     }
 
-    // Only call setVertexInputEXT when vertex INPUT state changed.
-    if (instance.IsVertexInputDynamicState()) {
-        if (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig) {
-            const auto cmdbuf = scheduler.PrimaryCommandBuffer();
-            cmdbuf.setVertexInputEXT(bindings, attributes);
-            last_vertex_input_sig = input_sig;
-            last_vertex_input_sig_valid = true;
-        }
-    }
-
-    last_vertex_bind_sig = bind_sig;
-    last_vertex_bind_sig_valid = true;
-    // GR2FORK PERF: publish for ultra-fast skip on next call.
-    last_vbb_pipeline_ = &pipeline;
-    last_vbb_stamp_ = cur_stamp;
-
-
     if (bindings.empty()) {
-        // If there are no bindings, there is nothing further to do.
+        const u64 final_tick = scheduler.CurrentTick();
+        if (instance.IsVertexInputDynamicState() &&
+            (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig ||
+             last_vbb_tick_ != final_tick)) {
+            scheduler.PrimaryCommandBuffer().setVertexInputEXT(bindings, attributes);
+        }
+        last_vertex_input_sig = input_sig;
+        last_vertex_input_sig_valid = true;
+        last_vertex_bind_sig = bind_sig;
+        last_vertex_bind_sig_valid = true;
+        last_vbb_pipeline_ = &pipeline;
+        last_vbb_stamp_ = cur_stamp;
+        last_vbb_tick_ = final_tick;
         return;
     }
 
@@ -427,7 +466,13 @@ void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeli
         }
     }
 
+    const u64 final_tick = scheduler.CurrentTick();
     const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+    if (instance.IsVertexInputDynamicState() &&
+        (!last_vertex_input_sig_valid || input_sig != last_vertex_input_sig ||
+         last_vbb_tick_ != final_tick)) {
+        cmdbuf.setVertexInputEXT(bindings, attributes);
+    }
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
@@ -435,6 +480,13 @@ void BufferCache::BindVertexBuffersLegacy(const Vulkan::GraphicsPipeline& pipeli
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+    last_vertex_input_sig = input_sig;
+    last_vertex_input_sig_valid = true;
+    last_vertex_bind_sig = bind_sig;
+    last_vertex_bind_sig_valid = true;
+    last_vbb_pipeline_ = &pipeline;
+    last_vbb_stamp_ = cur_stamp;
+    last_vbb_tick_ = final_tick;
 }
 
 void BufferCache::BindVertexBuffersFixed(const Vulkan::GraphicsPipeline& pipeline,

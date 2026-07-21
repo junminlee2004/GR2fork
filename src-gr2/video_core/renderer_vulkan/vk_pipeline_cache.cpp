@@ -35,16 +35,6 @@ namespace Vulkan {
 
 namespace {
 
-// GR2FORK PERF: current-draw sharp reuse is default-on. GR2_NOSHARPREUSE=1 keeps
-// specialization and binding descriptor reads independent.
-bool SharpReuseEnabled() noexcept {
-    static const bool enabled = []() noexcept {
-        const char* e = std::getenv("GR2_NOSHARPREUSE");
-        return !(e && e[0] == '1');
-    }();
-    return enabled;
-}
-
 // GR2FORK: address-independent specialization fingerprint - hashes ComputeSig's per-draw inputs
 // (runtime_info, binding start, every bound sharp) with base_address zeroed so pointer re-emits
 // hash identically. A superset of ComputeSig, it can only over-discriminate, never wrongly reuse.
@@ -57,22 +47,20 @@ u64 ComputeSpecProxyFp(
     const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
     u64 ri_bytes_hash,
     const Shader::Backend::Bindings& start,
-    Shader::ResolvedStageResources* resolved) noexcept {
+    Shader::ResolvedStageResources& resolved) noexcept {
     static const bool batch_enabled = []() noexcept {
         const char* e = std::getenv("GR2_NOFPBATCH");
         return !(e && e[0] == '1');
     }();
-    if (resolved) {
-        resolved->valid = false;
-        resolved->buffers.clear();
-        resolved->images.clear();
-        resolved->fmasks.clear();
-        resolved->samplers.clear();
-        resolved->pgm_hash = info.pgm_hash;
-        resolved->pgm_base = info.pgm_base;
-        resolved->stage = static_cast<u32>(info.stage);
-        resolved->l_stage = static_cast<u32>(info.l_stage);
-    }
+    resolved.valid = false;
+    resolved.buffers.clear();
+    resolved.images.clear();
+    resolved.fmasks.clear();
+    resolved.samplers.clear();
+    resolved.pgm_hash = info.pgm_hash;
+    resolved.pgm_base = info.pgm_base;
+    resolved.stage = static_cast<u32>(info.stage);
+    resolved.l_stage = static_cast<u32>(info.l_stage);
     u64 h = 0x84222325cbf29ce4ULL;
     const auto mix = [&](u64 v) noexcept {
         h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -100,33 +88,25 @@ u64 ComputeSpecProxyFp(
             put(&start, sizeof(start));
             for (const auto& desc : info.buffers) {
                 AmdGpu::Buffer s = desc.GetSharp(info);
-                if (resolved) {
-                    resolved->buffers.emplace_back(s);
-                }
+                resolved.buffers.emplace_back(s);
                 s.base_address = 0;
                 put(&s, sizeof(s));
             }
             for (const auto& desc : info.images) {
                 AmdGpu::Image s = desc.GetSharp(info);
-                if (resolved) {
-                    resolved->images.emplace_back(s);
-                }
+                resolved.images.emplace_back(s);
                 s.base_address = 0;
                 put(&s, sizeof(s));
             }
             for (const auto& desc : info.fmasks) {
                 AmdGpu::Image s = desc.GetSharp(info);
-                if (resolved) {
-                    resolved->fmasks.emplace_back(s);
-                }
+                resolved.fmasks.emplace_back(s);
                 s.base_address = 0;
                 put(&s, sizeof(s));
             }
             for (const auto& desc : info.samplers) {
                 const AmdGpu::Sampler s = desc.GetSharp(info);
-                if (resolved) {
-                    resolved->samplers.emplace_back(s);
-                }
+                resolved.samplers.emplace_back(s);
                 put(&s, sizeof(s));
             }
             // vs_attribs are specialized only for the Vertex stage (see the
@@ -139,9 +119,7 @@ u64 ComputeSpecProxyFp(
                     put(&s, sizeof(s));
                 }
             }
-            if (resolved) {
-                resolved->valid = true;
-            }
+            resolved.valid = true;
             mix(ri_bytes_hash);
             mix(XXH3_64bits(buf, len));
             return h ? h : 1ULL;
@@ -154,33 +132,25 @@ u64 ComputeSpecProxyFp(
     mix(XXH3_64bits(&start, sizeof(start)));
     for (const auto& desc : info.buffers) {
         AmdGpu::Buffer s = desc.GetSharp(info);
-        if (resolved) {
-            resolved->buffers.emplace_back(s);
-        }
+        resolved.buffers.emplace_back(s);
         s.base_address = 0;
         mix(XXH3_64bits(&s, sizeof(s)));
     }
     for (const auto& desc : info.images) {
         AmdGpu::Image s = desc.GetSharp(info);
-        if (resolved) {
-            resolved->images.emplace_back(s);
-        }
+        resolved.images.emplace_back(s);
         s.base_address = 0;
         mix(XXH3_64bits(&s, sizeof(s)));
     }
     for (const auto& desc : info.fmasks) {
         AmdGpu::Image s = desc.GetSharp(info);
-        if (resolved) {
-            resolved->fmasks.emplace_back(s);
-        }
+        resolved.fmasks.emplace_back(s);
         s.base_address = 0;
         mix(XXH3_64bits(&s, sizeof(s)));
     }
     for (const auto& desc : info.samplers) {
         const AmdGpu::Sampler s = desc.GetSharp(info);
-        if (resolved) {
-            resolved->samplers.emplace_back(s);
-        }
+        resolved.samplers.emplace_back(s);
         mix(XXH3_64bits(&s, sizeof(s)));
     }
     // vs_attribs are specialized only for the Vertex stage (see the
@@ -192,9 +162,7 @@ u64 ComputeSpecProxyFp(
             mix(XXH3_64bits(&s, sizeof(s)));
         }
     }
-    if (resolved) {
-        resolved->valid = true;
-    }
+    resolved.valid = true;
     return h ? h : 1ULL;
 }
 
@@ -1442,11 +1410,10 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                                                 Shader::Backend::Bindings& binding,
                                                 const AmdGpu::LiverpoolRegsSnapshot& regs,
                                                 bool ctx_stable) {
-    const bool sharp_reuse_enabled = SharpReuseEnabled();
     const u32 resolved_index = static_cast<u32>(l_stage);
     auto& resolved = resolved_stage_resources_[resolved_index];
     const u32 resolved_bit = 1u << resolved_index;
-    if (sharp_reuse_enabled && (resolved_stage_mask_ & resolved_bit)) [[unlikely]] {
+    if (resolved_stage_mask_ & resolved_bit) [[unlikely]] {
         resolved_stage_mask_ &= ~resolved_bit;
     }
     // GR2FORK PERF: per-stage resolve memo. ctx_stable covers 66.6% of GetProgram calls and the
@@ -1486,10 +1453,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 // copy; the spec built next sees the mutation, the member stays pristine.
                 Shader::RuntimeInfo ri_compile = runtime_info;
                 const auto module = CompileModule(new_pgm->info, ri_compile, params.code, 0, binding);
-                auto* resolved_capture = sharp_reuse_enabled ? &resolved : nullptr;
                 auto spec = Shader::StageSpecialization(new_pgm->info, ri_compile, profile, start,
-                                                        nullptr, resolved_capture);
-                if (resolved_capture && resolved.Matches(new_pgm->info)) {
+                                                        nullptr, &resolved);
+                if (resolved.Matches(new_pgm->info)) {
                     resolved_stage_mask_ |= resolved_bit;
                 }
                 const auto perm_hash = HashCombine(params.hash, 0);
@@ -1629,11 +1595,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 }
             }
             spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data,
-                                         ri_fp_hash, binding,
-                                         sharp_reuse_enabled ? &resolved : nullptr);
-            if (sharp_reuse_enabled) {
-                resolved_stage_mask_ |= resolved_bit;
-            }
+                                         ri_fp_hash, binding, resolved);
+            resolved_stage_mask_ |= resolved_bit;
             const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
             const auto& fe = program->spec_fp_lru[fp_slot];
             if (fe.valid && fe.fp == spec_fp &&
@@ -1673,10 +1636,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         program->last_result.ri_bind_hash = ri_bind_hash;
     }
 
-    const auto* resolved_source = sharp_reuse_enabled && (resolved_stage_mask_ & resolved_bit) != 0
-                                      ? &resolved
-                                      : nullptr;
-    auto* resolved_capture = sharp_reuse_enabled && !resolved_source ? &resolved : nullptr;
+    const auto* resolved_source =
+        (resolved_stage_mask_ & resolved_bit) != 0 ? &resolved : nullptr;
+    auto* resolved_capture = !resolved_source ? &resolved : nullptr;
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding, resolved_source,
                                             resolved_capture);
     if (resolved_capture && resolved.Matches(info)) {
