@@ -11,6 +11,9 @@
 #include "core/libraries/np/np_manager.h"
 #include "core/tls.h"
 
+#include "common/singleton.h"
+#include "core/linker.h"
+
 namespace Libraries::Np::NpManager {
 
 static bool g_signed_in = false;
@@ -638,11 +641,15 @@ s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId
     if (online_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
+    // GR2FORK: Gravity Rush 2's user-object constructor calls this at user-service login, before PSN
+    // sign-in completes, and reads online_id->data even when the call returns SIGNED_OUT, then uses it
+    // verbatim as the online-ghost nameplate. The buffer is filled before the sign-in gate so the name
+    // is always valid; the return code is unchanged, so the sign-in state machine still sees SIGNED_OUT.
+    memset(online_id, 0, sizeof(OrbisNpOnlineId));
+    strncpy(online_id->data, Config::getUserName().c_str(), sizeof(online_id->data));
     if (!g_signed_in) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
-    memset(online_id, 0, sizeof(OrbisNpOnlineId));
-    strncpy(online_id->data, Config::getUserName().c_str(), sizeof(online_id->data));
     LOG_INFO(Lib_NpManager, "GR2: sceNpGetOnlineId user_id = {} -> online_id = '{}'", user_id,
              online_id->data);
     return ORBIS_OK;
@@ -774,6 +781,77 @@ s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback(
     return ORBIS_OK;
 }
 
+// GR2FORK FIX: NpToolkit resolves each in-race rank-list row and overworld ghost-nameplate avatar by
+// calling UserProfile::Interface::getAvatarUrl(Future<string>* out, request, async), then GETs the
+// returned URL and draws it into the icon slot (a placeholder Kat when the URL is empty). The bundled
+// PRX's getAvatarUrl never yields a URL on the emulator, so every icon stays the placeholder. HLE
+// symbols resolve ahead of a loaded PRX, so this shadow is called instead and hands back a ready Future
+// holding the restoration server's per-onlineId avatar URL; the game's own loader fetches and decodes
+// it (ReplaceHost reroutes gr2.local to the server). Future<string> PRX ABI: state s32 @ out+0x18
+// (0 = done+success); result std::string @ out+0x230 (data @ +0x08, size @ +0x18, capacity @ +0x20;
+// capacity > 0xf means the data union holds a heap pointer, which the PRX dtor frees through the
+// allocator object at PRX_base+0xb0258 -- so a long URL must be allocated through that same allocator).
+static u64 Gr2NpToolkitModuleBase() {
+    auto* linker = Common::Singleton<Core::Linker>::Instance();
+    if (linker == nullptr) {
+        return 0;
+    }
+    for (s32 i = 0; i < 512; ++i) {
+        auto* m = linker->GetModule(i);
+        if (m == nullptr) {
+            break;
+        }
+        if (m->name.contains("libSceNpToolkit")) {
+            return m->GetBaseAddress();
+        }
+    }
+    return 0;
+}
+
+s32 PS4_SYSV_ABI sceToolkitUserProfileGetAvatarUrl(u64 future, const u8* request, bool async) {
+    if (future == 0) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // request+0x30 is a const char* to the target onlineId (null on the self-request form).
+    const char* oid = request ? *reinterpret_cast<const char* const*>(request + 0x30) : nullptr;
+    char who[17] = {0};
+    if (oid != nullptr && oid[0] != '\0') {
+        strncpy(who, oid, sizeof(who) - 1);
+    } else {
+        strncpy(who, Config::getUserName().c_str(), sizeof(who) - 1);
+    }
+    const std::string url = std::string("http://gr2.local:8443/avatar.png?u=") + who;
+    const u64 len = url.size();
+
+    auto* out = reinterpret_cast<u8*>(future);
+    u8* str = out + 0x230; // the result std::string
+    if (len <= 15) {       // SSO (short-string): data is inline
+        memcpy(str + 0x08, url.c_str(), len + 1);
+        *reinterpret_cast<u64*>(str + 0x18) = len;
+        *reinterpret_cast<u64*>(str + 0x20) = 0x0f;
+    } else { // heap: allocate through the PRX allocator so its own dtor frees the buffer correctly
+        const u64 base = Gr2NpToolkitModuleBase();
+        void* alloc_obj = base ? *reinterpret_cast<void**>(base + 0xb0258) : nullptr;
+        if (alloc_obj == nullptr) {
+            return ORBIS_NP_ERROR_INVALID_ARGUMENT; // leave the Future pending -> row keeps default
+        }
+        using AllocFn = PS4_SYSV_ABI void* (*)(void* self, u64 size);
+        auto** vtable = *reinterpret_cast<void***>(alloc_obj);
+        char* buf = reinterpret_cast<char*>(
+            Core::ExecuteGuest(reinterpret_cast<AllocFn>(vtable[0]), alloc_obj, len + 1));
+        if (buf == nullptr) {
+            return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+        }
+        memcpy(buf, url.c_str(), len + 1);
+        *reinterpret_cast<char**>(str + 0x08) = buf;
+        *reinterpret_cast<u64*>(str + 0x18) = len;
+        *reinterpret_cast<u64*>(str + 0x20) = len; // > 0xf -> consumer dereferences str+0x08
+    }
+    *reinterpret_cast<volatile s32*>(out + 0x18) = 0; // state = done + success
+    LOG_INFO(Lib_NpManager, "GR2: getAvatarUrl('{}') -> {}", who, url);
+    return ORBIS_OK;
+}
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     g_signed_in = Config::getPSNSignedIn();
 
@@ -821,6 +899,11 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpRegisterStateCallbackForToolkit);
     LIB_FUNCTION("hw5KNqAAels", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterNpReachabilityStateCallback);
+
+    // GR2FORK: shadow NpToolkit UserProfile::getAvatarUrl (3-arg form the game imports) so the in-race
+    // rank-list rows and ghost nameplates resolve a per-player avatar URL instead of the placeholder.
+    LIB_FUNCTION("3jeBu0QFXWU", "libSceNpToolkit", 1, "libSceNpToolkit",
+                 sceToolkitUserProfileGetAvatarUrl);
 
     LIB_FUNCTION("2rsFmlGWleQ", "libSceNpManagerCompat", 1, "libSceNpManager",
                  sceNpCheckNpAvailability);

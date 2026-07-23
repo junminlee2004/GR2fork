@@ -376,6 +376,66 @@ static void Gr2NeutralizeNoticeEnvelopeFree(u64 base) {
              stuck ? "PATCHED" : "WRITE-DROPPED");
 }
 
+// GR2FORK FIX: the in-race challenge rank-list renders the local player's OWN row from a UserService
+// participant name buffer (participant+0x23) that the game fills only while processing a UserService
+// Login event. The fork delivers one Login event at boot, so the participant the race creates later is
+// never filled and the row draws uninitialized bytes (a glyph). FUN_00ed2b20's own-row path (index ==
+// -1) funnels through a single tail-called copy strncpy(child+0x40, name, 0x10) at 0xed2ca2, reached
+// only by the own row (the rival branch has its own copy + epilogue at 0xed2bf9/0xed2c02), arriving
+// with the destination already in RDI and the size in EDX. Redirect that copy's source (RSI) to the
+// config user name via a stub so the own row always renders the local name regardless of participant
+// lifecycle. Rival rows (named from the server online-id) are untouched.
+alignas(16) static u8 g_ownname_stub[64];
+static char g_ownname_buf[17] = {0};
+static void Gr2FixChallengeOwnName(u64 base) {
+    static bool done = false;
+    if (done || base == 0) {
+        return;
+    }
+    done = true;
+    const u64 site = base + (0xed2ca2 - 0x107BF0);  // own-row epilogue: pop rbx/r14/rbp; jmp strncpy
+    u8 orig[5];
+    for (u32 i = 0; i < 5; ++i) {
+        orig[i] = *reinterpret_cast<volatile u8*>(site + i);
+    }
+    // expect 5b 41 5e 5d e9 = pop rbx; pop r14; pop rbp; jmp rel32 (FUN_014fd320)
+    if (orig[0] != 0x5b || orig[1] != 0x41 || orig[2] != 0x5e || orig[3] != 0x5d || orig[4] != 0xe9) {
+        LOG_ERROR(Lib_NpAuth,
+                  "GR2-OWNNAME: FUN_00ed2b20 epilogue @{:#x} orig {:02x}{:02x}{:02x}{:02x}{:02x} "
+                  "unexpected -- MISMATCH, not patched",
+                  site, orig[0], orig[1], orig[2], orig[3], orig[4]);
+        return;
+    }
+    std::memset(g_ownname_buf, 0, sizeof(g_ownname_buf));
+    std::strncpy(g_ownname_buf, Config::getUserName().c_str(), sizeof(g_ownname_buf) - 1);
+    const u64 strncpy_rt = base + (0x14fd320 - 0x107BF0);  // FUN_014fd320 (the tail-called copy)
+    u8* s = g_ownname_stub;
+    u32 p = 0;
+    auto e = [&](u8 b) { s[p++] = b; };
+    auto e64 = [&](u64 v) { for (int i = 0; i < 8; ++i) e(static_cast<u8>(v >> (i * 8))); };
+    // replay the displaced epilogue, override the copy source (RSI = the name), tail-call the copy.
+    // RDI (child+0x40) and EDX (0x10) are already set by both own-row sub-paths and are preserved.
+    e(0x5b);                                                     // pop rbx
+    e(0x41); e(0x5e);                                            // pop r14
+    e(0x5d);                                                     // pop rbp
+    e(0x48); e(0xbe); e64(reinterpret_cast<u64>(g_ownname_buf)); // movabs rsi, &name
+    e(0x48); e(0xb8); e64(strncpy_rt); e(0xff); e(0xe0);         // movabs rax, strncpy; jmp rax
+    const u64 pg = reinterpret_cast<u64>(g_ownname_stub) & ~static_cast<u64>(0xfff);
+    const int mp = Gr2MakeRWX(reinterpret_cast<void*>(pg), 0x2000);
+    // patch the epilogue: movabs rax, stub; jmp rax (12 bytes; next function starts at 0xed2cb0)
+    const u64 sa = reinterpret_cast<u64>(g_ownname_stub);
+    u8 patch[12] = {0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe0};
+    for (int i = 0; i < 8; ++i) {
+        patch[2 + i] = static_cast<u8>(sa >> (i * 8));
+    }
+    for (u32 i = 0; i < 12; ++i) {
+        *reinterpret_cast<volatile u8*>(site + i) = patch[i];
+    }
+    LOG_INFO(Lib_NpAuth,
+             "GR2-OWNNAME: FUN_00ed2b20 own-row copy @{:#x} -> stub@{:#x} ({}B) mprotect={} name='{}'",
+             site, sa, p, mp, g_ownname_buf);
+}
+
 // GR2FORK FIX: suppress the overworld challenge puppet. Challenges are reached from a marker access
 // point and have no overworld ghost (the only overworld figures are the gold treasure and blue photo
 // Kats); the ghost path otherwise spawns a replay-playing puppet at the challenge marker. The puppet
@@ -1881,6 +1941,7 @@ void Gr2ArcProbe(const char* where) {
     Gr2OpenGate(base);                 // code-patch only; opens the render gate (mines + all categories)
     Gr2NeutralizeChGhostFree(base);    // code-patch only; NOPs the challenger-name deferred free
     Gr2NeutralizeNoticeEnvelopeFree(base);  // code-patch only; NOPs the Announcements-open double-free
+    Gr2FixChallengeOwnName(base);      // code-patch only; own-row name in the in-race challenge list
     Gr2HideChallengePuppet(base);      // code-patch only; suppresses the inaccurate overworld puppet
     Gr2InstallFreeGuard(base);         // redirects the SceLibc free thunk; skips already-free chunks
     // cm12 injection hooks disabled: with empty challenge data the game resolves the sender, then
