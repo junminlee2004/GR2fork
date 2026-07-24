@@ -222,6 +222,8 @@ static ConfigEntry<int> specialPadClass(1);
 static ConfigEntry<bool> isMotionControlsEnabled(true);
 static ConfigEntry<bool> gyroSwapYawRoll(false);
 static ConfigEntry<bool> gyroInvertYaw(false);
+static ConfigEntry<bool> gyroInvertX(false);
+static ConfigEntry<bool> gyroInvertRoll(false);
 static ConfigEntry<bool> useUnifiedInputConfig(true);
 static ConfigEntry<string> defaultControllerID("");
 static ConfigEntry<bool> backgroundControllerInput(false);
@@ -603,6 +605,14 @@ bool getGyroSwapYawRoll() {
 
 bool getGyroInvertYaw() {
     return gyroInvertYaw.get();
+}
+
+bool getGyroInvertX() {
+    return gyroInvertX.get();
+}
+
+bool getGyroInvertRoll() {
+    return gyroInvertRoll.get();
 }
 
 bool debugDump() {
@@ -1118,6 +1128,14 @@ void setGyroInvertYaw(bool enable, bool is_game_specific) {
     gyroInvertYaw.set(enable, is_game_specific);
 }
 
+void setGyroInvertX(bool enable, bool is_game_specific) {
+    gyroInvertX.set(enable, is_game_specific);
+}
+
+void setGyroInvertRoll(bool enable, bool is_game_specific) {
+    gyroInvertRoll.set(enable, is_game_specific);
+}
+
 bool addGameInstallDir(const std::filesystem::path& dir, bool enabled) {
     for (const auto& install_dir : settings_install_dirs) {
         if (install_dir.path == dir) {
@@ -1461,6 +1479,8 @@ static void loadFromToml(const std::filesystem::path& path, bool is_game_specifi
         isMotionControlsEnabled.setFromToml(input, "isMotionControlsEnabled", is_game_specific);
         gyroSwapYawRoll.setFromToml(input, "gyroSwapYawRoll", is_game_specific);
         gyroInvertYaw.setFromToml(input, "gyroInvertYaw", is_game_specific);
+        gyroInvertX.setFromToml(input, "gyroInvertX", is_game_specific);
+        gyroInvertRoll.setFromToml(input, "gyroInvertRoll", is_game_specific);
         useUnifiedInputConfig.setFromToml(input, "useUnifiedInputConfig", is_game_specific);
         backgroundControllerInput.setFromToml(input, "backgroundControllerInput", is_game_specific);
         usbDeviceBackend.setFromToml(input, "usbDeviceBackend", is_game_specific);
@@ -1785,6 +1805,8 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         isFpsColor.setFromJson(g, "fpsColor", is_game_specific);
         gyroSwapYawRoll.setFromJson(g, "gyroSwapYawRoll", is_game_specific);
         gyroInvertYaw.setFromJson(g, "gyroInvertYaw", is_game_specific);
+        gyroInvertX.setFromJson(g, "gyroInvertX", is_game_specific);
+        gyroInvertRoll.setFromJson(g, "gyroInvertRoll", is_game_specific);
         gameplaySyncBudgetMs.setFromJson(g, "gameplaySyncBudgetMs", is_game_specific);
         aspectRatioOverride.setFromJson(g, "aspectRatioOverride", is_game_specific);
         resolutionOverride.setFromJson(g, "resolutionOverride", is_game_specific);
@@ -1953,6 +1975,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     logType.setJsonValue(data, "GR2Fork", "logType", is_game_specific);
     gyroSwapYawRoll.setJsonValue(data, "GR2Fork", "gyroSwapYawRoll", is_game_specific);
     gyroInvertYaw.setJsonValue(data, "GR2Fork", "gyroInvertYaw", is_game_specific);
+    gyroInvertX.setJsonValue(data, "GR2Fork", "gyroInvertX", is_game_specific);
+    gyroInvertRoll.setJsonValue(data, "GR2Fork", "gyroInvertRoll", is_game_specific);
     gameplaySyncBudgetMs.setJsonValue(data, "GR2Fork", "gameplaySyncBudgetMs", is_game_specific);
     aspectRatioOverride.setJsonValue(data, "GR2Fork", "aspectRatioOverride", is_game_specific);
     resolutionOverride.setJsonValue(data, "GR2Fork", "resolutionOverride", is_game_specific);
@@ -2100,6 +2124,8 @@ void setDefaultValues(bool is_game_specific) {
     isMotionControlsEnabled.set(true, is_game_specific);
     gyroSwapYawRoll.set(false, is_game_specific);
     gyroInvertYaw.set(false, is_game_specific);
+    gyroInvertX.set(false, is_game_specific);
+    gyroInvertRoll.set(false, is_game_specific);
     backgroundControllerInput.set(false, is_game_specific);
     usbDeviceBackend.set(UsbBackendType::Real, is_game_specific);
 

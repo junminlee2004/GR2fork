@@ -230,6 +230,14 @@ void setGyroSwapYawRoll(bool enable, bool is_game_specific = false);
 // Auto-enabled by the launcher's Steam Deck preset.
 bool getGyroInvertYaw();
 void setGyroInvertYaw(bool enable, bool is_game_specific = false);
+// gr2fork: optional gyro pitch (X axis) inversion - negates the pitch channel (angularVelocity.x)
+// so vertical motion aiming tilts the opposite way; composes with the yaw/roll swap and the other
+// inversions.
+bool getGyroInvertX();
+void setGyroInvertX(bool enable, bool is_game_specific = false);
+// gr2fork: optional gyro roll inversion - negates the resolved roll channel (angularVelocity.z).
+bool getGyroInvertRoll();
+void setGyroInvertRoll(bool enable, bool is_game_specific = false);
 std::string getDefaultControllerID();
 void setDefaultControllerID(std::string id);
 bool getBackgroundControllerInput();

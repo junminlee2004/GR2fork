@@ -69,6 +69,13 @@ void State::OnGyro(const float gyro[3]) {
     if (Config::getGyroInvertYaw()) {
         angularVelocity.y = -angularVelocity.y;
     }
+    // GR2FORK: optional pitch (X axis) and roll inversions, each negating its resolved channel.
+    if (Config::getGyroInvertX()) {
+        angularVelocity.x = -angularVelocity.x;
+    }
+    if (Config::getGyroInvertRoll()) {
+        angularVelocity.z = -angularVelocity.z;
+    }
 }
 
 void State::OnAccel(const float accel[3]) {
