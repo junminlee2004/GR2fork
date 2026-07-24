@@ -344,8 +344,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     const GR2Fork::LaunchGate gate = GR2Fork::LaunchGateCheck();
     if (gate.status == GR2Fork::LaunchGate::Status::UpdateRequired) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Gravity Rush 2 Online",
-                                 "This GR2fork build is too old for the online server. Update to "
-                                 "the latest release, then relaunch.",
+                                 "Your version of GR2fork is outdated, please update to the "
+                                 "latest version to access network services.",
                                  nullptr);
         std::exit(1);
     } else if (gate.status == GR2Fork::LaunchGate::Status::Banned) {
