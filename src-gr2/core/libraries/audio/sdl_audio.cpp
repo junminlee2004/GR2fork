@@ -40,6 +40,12 @@ public:
         std::string port_name = port.type == OrbisAudioOutPort::PadSpk
                                     ? Config::getPadSpkOutputDevice()
                                     : Config::getMainOutputDevice();
+        // GR2FORK: mute the pad/controller speaker output when disabled in config (default). Skips the
+        // device so the DualShock-speaker mix is not duplicated through PC playback.
+        if (port.type == OrbisAudioOutPort::PadSpk && Config::isPadSpkOutputDisabled()) {
+            stream = nullptr;
+            return;
+        }
         SDL_AudioDeviceID dev_id = SDL_INVALID_AUDIODEVICEID;
         if (port_name == "None") {
             stream = nullptr;

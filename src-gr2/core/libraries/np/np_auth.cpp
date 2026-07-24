@@ -10,6 +10,7 @@
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/gr2_online_auth.h"
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_auth_error.h"
 #include "core/libraries/np/np_error.h"
@@ -407,7 +408,8 @@ static void Gr2FixChallengeOwnName(u64 base) {
         return;
     }
     std::memset(g_ownname_buf, 0, sizeof(g_ownname_buf));
-    std::strncpy(g_ownname_buf, Config::getUserName().c_str(), sizeof(g_ownname_buf) - 1);
+    std::strncpy(g_ownname_buf, GR2Fork::Auth::EffectiveOnlineId().c_str(),
+                 sizeof(g_ownname_buf) - 1);
     const u64 strncpy_rt = base + (0x14fd320 - 0x107BF0);  // FUN_014fd320 (the tail-called copy)
     u8* s = g_ownname_stub;
     u32 p = 0;

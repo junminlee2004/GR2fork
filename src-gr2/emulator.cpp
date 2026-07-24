@@ -45,6 +45,8 @@
 #include "core/libraries/libc_internal/libc_internal.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/ngs2/ngs2.h"
+#include <SDL3/SDL_messagebox.h>
+#include "core/libraries/np/gr2_online_auth.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/user_settings.h"
 #include "core/libraries/rtc/rtc.h"
@@ -324,6 +326,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isDevKit: {}", Config::isDevKitConsole());
     LOG_INFO(Config, "General isConnectedToNetwork: {}", Config::getIsConnectedToNetwork());
     LOG_INFO(Config, "General isPsnSignedIn: {}", Config::getPSNSignedIn());
+
+    // GR2FORK: preflight the shadNet login at launch (before the guest runs). When online is
+    // enabled (network + PSN toggles + an Online ID) but the login fails, surface the reason and
+    // quit rather than booting into a broken online state. Online-off skips this entirely.
+    if (!GR2Fork::Auth::PreflightBlockingLogin()) {
+        const std::string login_error = GR2Fork::Auth::GetLoginErrorMessage();
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Gravity Rush 2 Online", login_error.c_str(),
+                                 nullptr);
+        std::exit(1);
+    }
+
     LOG_INFO(Config, "GPU isNullGpu: {}", Config::nullGpu());
     LOG_INFO(Config, "GPU readbacks: {}", Config::readbacks());
     LOG_INFO(Config, "GPU readbackLinearImages: {}", Config::readbackLinearImages());

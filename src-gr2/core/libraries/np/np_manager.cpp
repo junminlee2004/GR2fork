@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/gr2_online_auth.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/tls.h"
@@ -629,7 +630,8 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     memset(np_id, 0, sizeof(OrbisNpId));
-    strncpy(np_id->handle.data, Config::getUserName().c_str(), sizeof(np_id->handle.data));
+    strncpy(np_id->handle.data, GR2Fork::Auth::EffectiveOnlineId().c_str(),
+            sizeof(np_id->handle.data));
     LOG_INFO(Lib_NpManager, "GR2: sceNpGetNpId user_id = {} -> handle = '{}'", user_id,
              np_id->handle.data);
     return ORBIS_OK;
@@ -646,7 +648,7 @@ s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId
     // verbatim as the online-ghost nameplate. The buffer is filled before the sign-in gate so the name
     // is always valid; the return code is unchanged, so the sign-in state machine still sees SIGNED_OUT.
     memset(online_id, 0, sizeof(OrbisNpOnlineId));
-    strncpy(online_id->data, Config::getUserName().c_str(), sizeof(online_id->data));
+    strncpy(online_id->data, GR2Fork::Auth::EffectiveOnlineId().c_str(), sizeof(online_id->data));
     if (!g_signed_in) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
@@ -808,17 +810,37 @@ static u64 Gr2NpToolkitModuleBase() {
     return 0;
 }
 
+// A PSN Online ID is printable ASCII, at most 16 chars. Distinguishes a real target Online ID
+// from the self-request form, where request+0x30 is null or an uninitialized non-string.
+static bool IsPlausibleOnlineId(const char* s) {
+    if (s == nullptr) {
+        return false;
+    }
+    for (int i = 0; i <= 16; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '\0') {
+            return i > 0;
+        }
+        if (c < 0x21 || c > 0x7e) {
+            return false;
+        }
+    }
+    return false;
+}
+
 s32 PS4_SYSV_ABI sceToolkitUserProfileGetAvatarUrl(u64 future, const u8* request, bool async) {
     if (future == 0) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    // request+0x30 is a const char* to the target onlineId (null on the self-request form).
+    // request+0x30 holds the target Online ID on a targeted request; on the self-request form it is
+    // null or an uninitialized non-string. A non-plausible Online ID resolves to the
+    // authenticated user, so the profile card shows the logged-in avatar, not a garbage lookup.
     const char* oid = request ? *reinterpret_cast<const char* const*>(request + 0x30) : nullptr;
     char who[17] = {0};
-    if (oid != nullptr && oid[0] != '\0') {
+    if (IsPlausibleOnlineId(oid)) {
         strncpy(who, oid, sizeof(who) - 1);
     } else {
-        strncpy(who, Config::getUserName().c_str(), sizeof(who) - 1);
+        strncpy(who, GR2Fork::Auth::EffectiveOnlineId().c_str(), sizeof(who) - 1);
     }
     const std::string url = std::string("http://gr2.local:8443/avatar.png?u=") + who;
     const u64 len = url.size();

@@ -139,6 +139,9 @@ void setGR2TitleThemeMod(bool enable, bool is_game_specific = false);
 // false (motion blur on). Persisted [GR2Fork] disableMotionBlur key.
 bool disableMotionBlur();
 void setDisableMotionBlur(bool enable, bool is_game_specific = false);
+// GR2FORK: mute the pad/controller speaker output (PadSpk). Default true. [GR2Fork] padSpkOutputDisabled.
+bool isPadSpkOutputDisabled();
+void setPadSpkOutputDisabled(bool disabled, bool is_game_specific = false);
 bool accurateRenderTargetCacheEnabled();
 void setAccurateRenderTargetCacheEnabled(bool enable, bool is_game_specific = false);
 bool accurateVertexBufferCacheEnabled();
@@ -302,6 +305,11 @@ std::string getUserName();
 std::string GetHttpHostOverride();
 int GetHttpHostOverridePort();
 bool GetHttpForceHttp();
+// GR2FORK (online restoration): shadnet login credentials (npid = Online ID). Forwarded to the
+// restoration server as the verified identity; empty npid disables auth.
+std::string GetShadnetNpid();
+std::string GetShadnetPassword();
+std::string GetShadnetServer();
 bool GetUseUnifiedInputConfig();
 void SetUseUnifiedInputConfig(bool use);
 bool GetOverrideControllerColor();

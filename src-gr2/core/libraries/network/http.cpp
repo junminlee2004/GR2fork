@@ -374,11 +374,16 @@ static void Gr2UploadAvatarOnce() {
 
     const std::string host = Config::GetHttpHostOverride();
     const int port = Config::GetHttpHostOverridePort();
-    const std::string player = UserManagement.GetDefaultUser().user_name;
+    GR2Fork::Auth::EnsureAuthed();
+    std::string player = GR2Fork::Auth::VerifiedNpid();
+    if (player.empty()) {
+        player = UserManagement.GetDefaultUser().user_name;
+    }
+    const std::string auth_token = GR2Fork::Auth::BearerToken();
 
     // Detached so the game thread never blocks on file I/O or the network round-trip. The thread
     // owns copies of every input and touches no shared state after launch.
-    std::thread([avatar_path, host, port, player] {
+    std::thread([avatar_path, host, port, player, auth_token] {
         std::ifstream f(avatar_path, std::ios::binary);
         if (!f) {
             return;
@@ -408,6 +413,10 @@ static void Gr2UploadAvatarOnce() {
 
         httplib::Headers headers;
         headers.emplace("X-GR2-Player", safe);
+        if (!auth_token.empty()) {
+            headers.emplace("X-GR2-Auth", auth_token);
+        }
+        headers.emplace("X-GR2-Version", std::to_string(GR2Fork::OnlineVersion));
         cli.Post("/uploadavatar", headers, body.data(), body.size(), "application/octet-stream");
     }).detach();
 }
@@ -442,11 +451,16 @@ static void Gr2EnforceDustyTokenOnce() {
         return;  // no restoration server configured -- nothing to enforce against
     }
     const int port = Config::GetHttpHostOverridePort();
-    const std::string player = UserManagement.GetDefaultUser().user_name;
+    GR2Fork::Auth::EnsureAuthed();
+    std::string player = GR2Fork::Auth::VerifiedNpid();
+    if (player.empty()) {
+        player = UserManagement.GetDefaultUser().user_name;
+    }
+    const std::string auth_token = GR2Fork::Auth::BearerToken();
     const std::filesystem::path save_root =
         Common::FS::GetUserPath(Common::FS::PathType::HomeDir) / "1000" / "savedata";
 
-    std::thread([host, port, player, save_root] {
+    std::thread([host, port, player, save_root, auth_token] {
         std::string safe;
         safe.reserve(player.size());
         for (unsigned char c : player) {
@@ -464,6 +478,10 @@ static void Gr2EnforceDustyTokenOnce() {
         cli.set_write_timeout(5, 0);
         httplib::Headers headers;
         headers.emplace("X-GR2-Player", safe);
+        if (!auth_token.empty()) {
+            headers.emplace("X-GR2-Auth", auth_token);
+        }
+        headers.emplace("X-GR2-Version", std::to_string(GR2Fork::OnlineVersion));
         auto res = cli.Get("/gr2token", headers);
         if (!res || res->status != 200) {
             return;  // server unreachable -- leave the save untouched rather than guess

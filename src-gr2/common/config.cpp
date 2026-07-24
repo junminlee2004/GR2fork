@@ -202,6 +202,12 @@ static ConfigEntry<string> httpHostOverride("localhost");
 // https when pointing the override at a public TLS server).
 static ConfigEntry<int> httpHostOverridePort(8443);
 static ConfigEntry<bool> httpForceHttp(true);
+// GR2FORK (online restoration): shadnet login credentials. npid is the Online ID registered at the
+// shadnet account server; the verified identity and bearer token are forwarded to the restoration
+// server. Empty npid disables auth.
+static ConfigEntry<string> shadnetNpid("");
+static ConfigEntry<string> shadnetPassword("");
+static ConfigEntry<string> shadnetServer("srv.shadps4.net:31313");
 static ConfigEntry<bool> isShowSplash(false);
 static ConfigEntry<string> isSideTrophy("right");
 static ConfigEntry<bool> isConnectedToNetwork(false);
@@ -314,6 +320,9 @@ static ConfigEntry<bool> gr2TitleThemeMod(false);           // GR2FORK: title-th
 // rasterizer drops the motion-blur fragment shader (hash 0xf696fe23) draw.
 // Persisted [GR2Fork] key, default false (motion blur on, matching the game).
 static ConfigEntry<bool> disableMotionBlurEnable(false);
+// GR2FORK: mute the DualShock/pad speaker output port (PadSpk). Default true (disabled): PC playback
+// duplicates the controller-speaker audio through the main mix, so it stays off unless re-enabled.
+static ConfigEntry<bool> padSpkOutputDisabled(true);
 
 // GR2FORK: per-session title flags, not persisted - recorded once at startup from emulator.cpp's
 // SKU detection and read by GPU-side code that sizes structures per title (snapshot pool /
@@ -560,6 +569,18 @@ int GetHttpHostOverridePort() {
     return httpHostOverridePort.get();
 }
 
+string GetShadnetNpid() {
+    return shadnetNpid.get();
+}
+
+string GetShadnetPassword() {
+    return shadnetPassword.get();
+}
+
+string GetShadnetServer() {
+    return shadnetServer.get();
+}
+
 bool GetHttpForceHttp() {
     return httpForceHttp.get();
 }
@@ -778,6 +799,14 @@ bool disableMotionBlur() {
 
 void setDisableMotionBlur(bool enable, bool is_game_specific) {
     disableMotionBlurEnable.set(enable, is_game_specific);
+}
+
+bool isPadSpkOutputDisabled() {
+    return padSpkOutputDisabled.get();
+}
+
+void setPadSpkOutputDisabled(bool disabled, bool is_game_specific) {
+    padSpkOutputDisabled.set(disabled, is_game_specific);
 }
 
 bool accurateRenderTargetCacheEnabled() {
@@ -1411,6 +1440,9 @@ static void loadFromToml(const std::filesystem::path& path, bool is_game_specifi
         httpHostOverride.setFromToml(general, "httpHostOverride", is_game_specific);
         httpHostOverridePort.setFromToml(general, "httpHostOverridePort", is_game_specific);
         httpForceHttp.setFromToml(general, "httpForceHttp", is_game_specific);
+        shadnetNpid.setFromToml(general, "shadnetNpid", is_game_specific);
+        shadnetPassword.setFromToml(general, "shadnetPassword", is_game_specific);
+        shadnetServer.setFromToml(general, "shadnetServer", is_game_specific);
         isShowSplash.setFromToml(general, "showSplash", is_game_specific);
         isSideTrophy.setFromToml(general, "sideTrophy", is_game_specific);
 
@@ -1745,6 +1777,9 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         httpHostOverride.setFromJson(g, "httpHostOverride", is_game_specific);
         httpHostOverridePort.setFromJson(g, "httpHostOverridePort", is_game_specific);
         httpForceHttp.setFromJson(g, "httpForceHttp", is_game_specific);
+        shadnetNpid.setFromJson(g, "shadnetNpid", is_game_specific);
+        shadnetPassword.setFromJson(g, "shadnetPassword", is_game_specific);
+        shadnetServer.setFromJson(g, "shadnetServer", is_game_specific);
         // Prefer gr2fork's exact logType string over the Log.sync-derived value above.
         logType.setFromJson(g, "logType", is_game_specific);
         isFpsColor.setFromJson(g, "fpsColor", is_game_specific);
@@ -1760,6 +1795,7 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         gr2FixNativeCubeViewsEnable.setFromJson(g, "gr2FixNativeCubeViews", is_game_specific);
         gr2TitleThemeMod.setFromJson(g, "GR2TitleThemeMod", is_game_specific);
         disableMotionBlurEnable.setFromJson(g, "disableMotionBlur", is_game_specific);
+        padSpkOutputDisabled.setFromJson(g, "padSpkOutputDisabled", is_game_specific);
         vkForcePushDescriptors.setFromJson(g, "vkForcePushDescriptors", is_game_specific);
         vkDisablePushDescriptors.setFromJson(g, "vkDisablePushDescriptors", is_game_specific);
         beginRenderingCacheEnable.setFromJson(g, "beginRenderingCacheEnable", is_game_specific);
@@ -1911,6 +1947,9 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     httpHostOverride.setJsonValue(data, "GR2Fork", "httpHostOverride", is_game_specific);
     httpHostOverridePort.setJsonValue(data, "GR2Fork", "httpHostOverridePort", is_game_specific);
     httpForceHttp.setJsonValue(data, "GR2Fork", "httpForceHttp", is_game_specific);
+    shadnetNpid.setJsonValue(data, "GR2Fork", "shadnetNpid", is_game_specific);
+    shadnetPassword.setJsonValue(data, "GR2Fork", "shadnetPassword", is_game_specific);
+    shadnetServer.setJsonValue(data, "GR2Fork", "shadnetServer", is_game_specific);
     logType.setJsonValue(data, "GR2Fork", "logType", is_game_specific);
     gyroSwapYawRoll.setJsonValue(data, "GR2Fork", "gyroSwapYawRoll", is_game_specific);
     gyroInvertYaw.setJsonValue(data, "GR2Fork", "gyroInvertYaw", is_game_specific);
@@ -1925,6 +1964,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
                                              is_game_specific);
     gr2TitleThemeMod.setJsonValue(data, "GR2Fork", "GR2TitleThemeMod", is_game_specific);
     disableMotionBlurEnable.setJsonValue(data, "GR2Fork", "disableMotionBlur", is_game_specific);
+    padSpkOutputDisabled.setJsonValue(data, "GR2Fork", "padSpkOutputDisabled", is_game_specific);
     vkForcePushDescriptors.setJsonValue(data, "GR2Fork", "vkForcePushDescriptors", is_game_specific);
     vkDisablePushDescriptors.setJsonValue(data, "GR2Fork", "vkDisablePushDescriptors",
                                           is_game_specific);
@@ -2048,6 +2088,9 @@ void setDefaultValues(bool is_game_specific) {
     httpHostOverride.set("localhost", is_game_specific);
     httpHostOverridePort.set(8443, is_game_specific);
     httpForceHttp.set(true, is_game_specific);
+    shadnetNpid.set("", is_game_specific);
+    shadnetPassword.set("", is_game_specific);
+    shadnetServer.set("srv.shadps4.net:31313", is_game_specific);
     isShowSplash.set(false, is_game_specific);
     isSideTrophy.set("right", is_game_specific);
 
@@ -2091,6 +2134,7 @@ void setDefaultValues(bool is_game_specific) {
     gr2FixNativeCubeViewsEnable.set(true, is_game_specific);
     gr2TitleThemeMod.set(false, is_game_specific); // GR2FORK: title-theme replacement off
     disableMotionBlurEnable.set(false, is_game_specific);
+    padSpkOutputDisabled.set(true, is_game_specific);
 
     // GS - Vulkan
     gpuId.set(-1, is_game_specific);

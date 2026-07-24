@@ -10,9 +10,11 @@
 
 #include <httplib.h>
 
+#include "common/gr2_online_version.h"
 #include "common/logging/log.h"
 #include "common/types.h"
 #include "core/libraries/network/ssl.h"
+#include "core/libraries/np/gr2_online_auth.h" // shadnet-verified identity + bearer token
 #include "core/user_settings.h" // UserManagement -> the local player's display name (leaderboard)
 
 namespace Core::Loader {
@@ -340,11 +342,16 @@ private:
             headers.emplace(pair.first, pair.second);
         }
 
-        // GR2 leaderboard: forward the local player's display name (the user-1000 username from
-        // UserManagement) so the restoration server files scores under the right player and
-        // different boxes land as separate entries. Sanitized to a safe header value.
+        // GR2 identity: authenticate to shadnet once, then forward the verified Online ID plus the
+        // bearer token the restoration server validates. Falls back to the local UserManagement
+        // username when shadnet is unconfigured, so an un-set-up player still reaches the server
+        // (which may reject in enforce mode). Sanitized to a safe header value.
         {
-            const std::string player = UserManagement.GetDefaultUser().user_name;
+            GR2Fork::Auth::EnsureAuthed();
+            std::string player = GR2Fork::Auth::VerifiedNpid();
+            if (player.empty()) {
+                player = UserManagement.GetDefaultUser().user_name;
+            }
             std::string safe;
             safe.reserve(player.size());
             for (unsigned char c : player) {
@@ -355,6 +362,11 @@ private:
             if (!safe.empty()) {
                 headers.emplace("X-GR2-Player", safe);
             }
+            const std::string token = GR2Fork::Auth::BearerToken();
+            if (!token.empty()) {
+                headers.emplace("X-GR2-Auth", token);
+            }
+            headers.emplace("X-GR2-Version", std::to_string(GR2Fork::OnlineVersion));
         }
 
         std::string content_type = "application/json";

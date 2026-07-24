@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 
 #include "core/libraries/libs.h"
+#include "core/libraries/np/gr2_online_auth.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/system/userservice_error.h"
 #include "core/user_settings.h"
@@ -1106,6 +1107,11 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
         name = u->user_name;
     } else {
         LOG_ERROR(Lib_UserService, "No user found for user_id = {}", user_id);
+    }
+    // GR2FORK: once shadnet authenticates, the verified Online ID replaces the local user name so the
+    // on-screen name matches the account the restoration server signed in.
+    if (std::string oid = GR2Fork::Auth::VerifiedNpid(); !oid.empty()) {
+        name = oid;
     }
     if (size < name.length()) {
         LOG_ERROR(Lib_UserService, "buffer is too short");
