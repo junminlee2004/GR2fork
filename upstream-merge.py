@@ -1369,6 +1369,12 @@ class Sync:
             REPORT.add("externals", f"submodule removed upstream: {path} "
                                     "(worktree dir deleted; .git/modules left in place)")
         git("add", "-A", "--", "externals")
+        # add -A records each initialized submodule at its checked-out worktree HEAD,
+        # which reverts gitlinks the checkout above just synced to the target. Re-assert
+        # them; the materialize step below follows the index, so it must see the new SHAs.
+        for path in self.new_submodules + [p for p, _, _ in self.moved_submodules]:
+            sha = git_out("rev-parse", f"{self.target}:{path}")
+            git("update-index", "--cacheinfo", f"160000,{sha},{path}")
 
         # ---- .gitmodules : upstream verbatim + local-only sections appended ----
         up_gm = git_out("show", f"{self.target}:.gitmodules") \
