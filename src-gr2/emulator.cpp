@@ -44,6 +44,7 @@
 #include "core/libraries/jpeg/jpegenc.h"
 #include "core/libraries/libc_internal/libc_internal.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/network/gr2_launch_gate.h"
 #include "core/libraries/ngs2/ngs2.h"
 #include <SDL3/SDL_messagebox.h>
 #include "core/libraries/np/gr2_online_auth.h"
@@ -335,6 +336,33 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Gravity Rush 2 Online", login_error.c_str(),
                                  nullptr);
         std::exit(1);
+    }
+
+    // GR2FORK: restoration-server launch gate. One /clientgate GET surfaces an outdated build
+    // (quit), an account ban, or the server's debug lockdown as a dialog here at boot; an
+    // unreachable server reports Ok so offline play never blocks on the network.
+    const GR2Fork::LaunchGate gate = GR2Fork::LaunchGateCheck();
+    if (gate.status == GR2Fork::LaunchGate::Status::UpdateRequired) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Gravity Rush 2 Online",
+                                 "This GR2fork build is too old for the online server. Update to "
+                                 "the latest release, then relaunch.",
+                                 nullptr);
+        std::exit(1);
+    } else if (gate.status == GR2Fork::LaunchGate::Status::Banned) {
+        std::string ban_msg = "You have been banned from the online server.";
+        if (gate.ban_days > 0) {
+            ban_msg += " Time remaining: " + std::to_string(gate.ban_days) +
+                       (gate.ban_days == 1 ? " day." : " days.");
+        }
+        ban_msg += " The game will continue without online features.";
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Gravity Rush 2 Online", ban_msg.c_str(),
+                                 nullptr);
+    } else if (gate.status == GR2Fork::LaunchGate::Status::DebugDenied) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Gravity Rush 2 Online",
+                                 "The online server is temporarily locked for maintenance "
+                                 "testing. Online features are unavailable right now; the game "
+                                 "will continue offline.",
+                                 nullptr);
     }
 
     LOG_INFO(Config, "GPU isNullGpu: {}", Config::nullGpu());

@@ -16,6 +16,7 @@
 #include "common/path_util.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/network/gr2_launch_gate.h"
 #include "core/libraries/network/http.h"
 #include "http_error.h"
 
@@ -2064,3 +2065,91 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 };
 
 } // namespace Libraries::Http
+
+// GR2FORK: launch gate against the restoration server (declared in gr2_launch_gate.h). One
+// /clientgate GET carrying the fork's identity headers lets the server answer "update required"
+// (426), "banned" (403 + X-GR2-Banned: days|perm), or "debug lockdown" (403 + X-GR2-Gate: debug)
+// before the guest runs, instead of degrading into silent per-request failures in-game.
+namespace GR2Fork {
+
+LaunchGate LaunchGateCheck() {
+    LaunchGate gate{};
+    // GR2 SKUs only: core_gr2 also boots GRR and other titles, which have no restoration server.
+    static constexpr const char* kGr2Serials[] = {
+        "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+        "PCJS50010", "PCAS00079", "CUSA04935",
+    };
+    const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
+    bool is_gr2 = false;
+    for (const char* s : kGr2Serials) {
+        if (serial == s) {
+            is_gr2 = true;
+            break;
+        }
+    }
+    if (!is_gr2 || !Auth::IsOnlineEnabled()) {
+        return gate;
+    }
+    const std::string host = Config::GetHttpHostOverride();
+    const int port = Config::GetHttpHostOverridePort();
+    if (host.empty()) {
+        return gate;
+    }
+    Auth::EnsureAuthed();
+    const std::string player = Auth::EffectiveOnlineId();
+    // Same header-value sanitation as the other X-GR2-Player producers (drop control bytes + DEL).
+    std::string safe;
+    safe.reserve(player.size());
+    for (unsigned char c : player) {
+        if (c >= 0x20 && c != 0x7f) {
+            safe.push_back(static_cast<char>(c));
+        }
+    }
+    httplib::Client cli(host, port);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(5, 0);
+    cli.set_write_timeout(5, 0);
+    httplib::Headers headers;
+    if (!safe.empty()) {
+        headers.emplace("X-GR2-Player", safe);
+    }
+    const std::string token = Auth::BearerToken();
+    if (!token.empty()) {
+        headers.emplace("X-GR2-Auth", token);
+    }
+    headers.emplace("X-GR2-Version", std::to_string(OnlineVersion));
+    auto res = cli.Get("/clientgate?v=" + std::to_string(OnlineVersion), headers);
+    if (!res) {
+        return gate; // unreachable server: boot normally, offline play stays available
+    }
+    if (res->status == 426) {
+        gate.status = LaunchGate::Status::UpdateRequired;
+        return gate;
+    }
+    if (res->status == 403) {
+        const std::string banned = res->get_header_value("X-GR2-Banned");
+        if (!banned.empty()) {
+            gate.status = LaunchGate::Status::Banned;
+            int days = 0;
+            for (char c : banned) {
+                if (c < '0' || c > '9') {
+                    days = 0; // "perm" or malformed reports as a permanent ban
+                    break;
+                }
+                days = days * 10 + (c - '0');
+                if (days > 99999) {
+                    break;
+                }
+            }
+            gate.ban_days = days;
+            return gate;
+        }
+        if (res->get_header_value("X-GR2-Gate") == "debug") {
+            gate.status = LaunchGate::Status::DebugDenied;
+            return gate;
+        }
+    }
+    return gate;
+}
+
+} // namespace GR2Fork
