@@ -25,7 +25,11 @@ What one run does, in order:
                  local-only sections appended); git submodule sync/update.
   4. REAPPLY     re-apply each carried patch with a git 3-way merge onto the new
                  upstream code. The branding patch falls back to a regex
-                 transform if the surrounding code moved. Patches are then
+                 transform if the surrounding code moved. A pure-addition patch
+                 that conflicts only because upstream adopted its lines verbatim
+                 while the surrounding context moved is detected and dropped as
+                 absorbed instead of failing; any other conflict blocks the
+                 commit and prints a per-patch recovery recipe. Patches are then
                  regenerated against the NEW base so they never go stale, and
                  fiber_core_main_replacment.cpp (set-version.sh's companion) is
                  refreshed to the newly patched fiber.cpp.
@@ -70,6 +74,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------- config
@@ -1125,6 +1130,67 @@ endif()
 """
 
 
+# ------------------------------------------------------------- absorbed-patch check
+
+
+def resolve_conflicts_ours(text):
+    """Resolves merge-conflict markers by keeping only the 'ours' side.
+
+    Returns the text as a list of lines. Handles the plain merge marker style
+    and the diff3/zdiff3 styles (a '|||||||' base section inside the ours half).
+    """
+    out, mode = [], "keep"
+    for line in text.splitlines():
+        if mode == "keep" and line.startswith("<<<<<<<"):
+            mode = "ours"
+        elif mode == "ours" and line.startswith("|||||||"):
+            mode = "base"
+        elif mode in ("ours", "base") and line == "=======":
+            mode = "theirs"
+        elif mode == "theirs" and line.startswith(">>>>>>>"):
+            mode = "keep"
+        elif mode in ("keep", "ours"):
+            out.append(line)
+    return out
+
+
+def patch_hunk_lines(body, sign):
+    """Hunk payload lines carrying the given sign ('+' or '-'), sign stripped."""
+    lines, in_hunk = [], False
+    for line in body.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+        elif line.startswith("diff --git"):
+            in_hunk = False
+        elif in_hunk and line.startswith(sign):
+            lines.append(line[1:])
+    return lines
+
+
+def absorbed_upstream(body, conflicted, target_text):
+    """Judges whether a conflicted carried patch already exists in the new base.
+
+    A pure-addition patch counts as absorbed when every added line is present
+    in the target with at least the added multiplicity, and resolving every
+    conflict in favor of the incoming upstream side reproduces the target
+    exactly (so each cleanly merged hunk was a textual no-op). Patches with
+    removals are never auto-judged. A fork addition that duplicates an existing
+    target line verbatim could in principle satisfy both conditions, so the
+    conflict dump is kept on disk and the drop is reported explicitly.
+    """
+    if patch_hunk_lines(body, "-"):
+        return False
+    added = patch_hunk_lines(body, "+")
+    if not added:
+        return False
+    target_lines = target_text.splitlines()
+    have = Counter(target_lines)
+    for line, n in Counter(added).items():
+        if have[line] < n:
+            return False
+    return resolve_conflicts_ours(conflicted) == target_lines
+
+
 # ======================================================================== sync logic
 
 
@@ -1134,6 +1200,7 @@ class Sync:
         self.root = os.path.abspath(args.root)
         self.created_paths = []          # for the failure/rollback message
         self.patch_results = []          # (patch, status, detail)
+        self.recovery = []               # (patch, fpath, dump) per FAILED patch
 
     # ---------- phases ----------
 
@@ -1382,12 +1449,33 @@ class Sync:
                                            "3-way merge failed; branding re-applied by transform"))
                 continue
             detail = f"3-way merge failed: {(r.stderr or '').strip()[:300]}"
+            dump = None
             if conflicted and "<<<<<<<" in conflicted:
                 dump = os.path.join(tempfile.gettempdir(),
                                     "upstream-merge-conflict-" + patch.replace(".patch", ""))
                 with open(dump, "w") as f:
                     f.write(conflicted)
                 detail += f"; conflicted version saved to {dump}"
+            # A conflict can also mean upstream adopted the deviation itself while the
+            # surrounding context moved. The file is already restored to the target
+            # above, so dropping the patch completes the absorption.
+            if dump and fpath:
+                target_text = git("show", f"{self.target}:{fpath}", check=False).stdout
+                if target_text and absorbed_upstream(body, conflicted, target_text):
+                    os.remove(ppath)
+                    self.patch_results.append(
+                        (patch, "absorbed upstream (context drift) - dropped",
+                         "every added line already exists in the new base; "
+                         f"conflicted merge kept at {dump}"))
+                    continue
+                if target_text:
+                    added = patch_hunk_lines(body, "+")
+                    have = Counter(target_text.splitlines())
+                    present = sum(1 for ln in added if have[ln] > 0)
+                    if added and present:
+                        detail += (f"; {present}/{len(added)} added lines already exist "
+                                   "in the new base (possible partial absorption)")
+            self.recovery.append((patch, fpath, dump))
             self.patch_results.append((patch, "FAILED", detail))
 
         # refresh the patches against the NEW base + the fiber companion file
@@ -1610,11 +1698,30 @@ class Sync:
                 REPORT.add("verify", "cmake configure OK (full build not run; use --build)")
             shutil.rmtree(scratch, ignore_errors=True)
 
+    def print_recovery(self):
+        """Copy-paste recovery steps for each patch the 3-way merge failed on."""
+        for patch, fpath, dump in self.recovery:
+            ppath = f"{PATCH_DIR}/{patch}"
+            print(f"""
+!! recovery for {ppath}
+   The worktree copy of {fpath} is reset to the pure upstream side; the
+   conflicted merge is saved at {dump or '(no dump)'}.
+   a) If the deviation is fully absorbed upstream, drop the patch:
+        git rm -f {ppath}
+   b) If the deviation is still needed, re-apply it to {fpath} (the dump shows
+      both sides), then refresh the patch against the new base:
+        {{ printf '# carried local patch for the upstream mirror\\n# file: {fpath}\\n# original base: {self.target}\\n'; git diff {self.target} -- {fpath}; }} > {ppath}
+        git add {fpath} {ppath}
+   Then commit the staged sync by hand, or roll back (recipe below) and rerun
+   after the fix.""", file=sys.stderr)
+
     def commit(self):
-        if self.args.no_commit or self.args.dry_run:
-            return
         if REPORT.problems:
-            warn("blocking problems found — NOT committing (worktree left for inspection).")
+            if not (self.args.no_commit or self.args.dry_run):
+                warn("blocking problems found — NOT committing (worktree left for inspection).")
+            self.print_recovery()
+            return
+        if self.args.no_commit or self.args.dry_run:
             return
         staged = git_out("diff", "--cached", "--name-only")
         if not staged:
