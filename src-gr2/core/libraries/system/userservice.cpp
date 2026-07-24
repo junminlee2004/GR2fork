@@ -130,9 +130,6 @@ s32 PS4_SYSV_ABI sceUserServiceGetEvent(OrbisUserServiceEvent* event) {
         event->event = temp.event;
         event->userId = temp.userId;
         user_service_event_queue.pop();
-        // TEMP-DIAG: track when the boot Login event reaches the game and which consumer drains it.
-        LOG_INFO(Lib_UserService, "GR2-DIAG UserEvent delivered type={} user={} (Login=0 Logout=1)",
-                 (u8)temp.event, temp.userId);
         return ORBIS_OK;
     }
 
@@ -1118,10 +1115,6 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
         return ORBIS_USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
     }
     snprintf(user_name, size, "%s", name.c_str());
-    // TEMP-DIAG: the in-race challenge rank-list own row reads a participant name buffer filled by
-    // this call via getName; log the destination and value to confirm whether it fills that buffer.
-    LOG_INFO(Lib_UserService, "GR2-DIAG GetUserName user_id={} dst={} found={} name='{}'", user_id,
-             static_cast<const void*>(user_name), u != nullptr, name);
     return ORBIS_OK;
 }
 

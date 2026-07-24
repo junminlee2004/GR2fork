@@ -561,11 +561,6 @@ s64 PS4_SYSV_ABI posix_lseek(s32 fd, s64 offset, s32 whence) {
         origin = Common::FS::SeekOrigin::CurrentPosition;
     } else if (whence == 2) {
         origin = Common::FS::SeekOrigin::End;
-        // TEMP-DIAG: trace lseek-to-end sizing of a screenshot readback.
-        if (const auto hn = file->m_host_name.string(); hn.find(".jpg") != std::string::npos) {
-            LOG_INFO(Kernel_Fs, "[GR2sizeprobe] lseek(SEEK_END) fd={} '{}' size={}", fd, hn,
-                     file->f.GetSize());
-        }
     } else if (whence == 3 || whence == 4) {
         // whence parameter belongs to an unsupported POSIX extension
         *__Error() = POSIX_ENOTTY;
@@ -786,11 +781,6 @@ s32 PS4_SYSV_ABI posix_stat(const char* path, OrbisKernelStat* sb) {
         // TODO incomplete
     }
 
-    // TEMP-DIAG: trace the size the photo-review readback receives for a screenshot path.
-    if (std::string_view{path}.find("screenshot") != std::string_view::npos ||
-        std::string_view{path}.find(".jpg") != std::string_view::npos) {
-        LOG_INFO(Kernel_Fs, "[GR2sizeprobe] posix_stat '{}' -> st_size={}", path, sb->st_size);
-    }
     return ORBIS_OK;
 }
 
@@ -851,11 +841,6 @@ s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
         sb->st_blksize = 512;
         sb->st_blocks = (sb->st_size + 511) / 512;
         // TODO incomplete
-        // TEMP-DIAG: trace fd-based sizing of a screenshot readback.
-        if (const auto hn = file->m_host_name.string(); hn.find(".jpg") != std::string::npos) {
-            LOG_INFO(Kernel_Fs, "[GR2sizeprobe] fstat fd={} '{}' -> st_size={}", fd, hn,
-                     sb->st_size);
-        }
         break;
     }
     case Core::FileSys::FileType::Directory: {

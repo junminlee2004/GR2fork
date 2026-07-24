@@ -22,19 +22,6 @@
 
 #include "common/config.h"
 
-#include <cstdint>
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
 
 namespace Libraries::Np::NpWebApi {
 
@@ -85,13 +72,6 @@ void CaptureProfileOnlineId(std::string_view path) {
 // TODO: capture + deliver a synthesized challenge push (same pump model np_manager uses).
 std::atomic<s32> g_push_next_id{0x5001};
 
-// Observed ABI: CreatePushEventFilter(userCtxId=RDI, pDataType=RSI, num=RDX);
-// RegisterPushEventCallback(userCtxId=RDI, filterId=RSI, cbFunc=RDX, userArg=RCX). GR2 subscribes
-// one filter (num=2) at boot; the libSceNpToolkit2 callback is captured for a synthesized push.
-std::mutex g_push_cb_mtx;
-u64 g_push_cb_func = 0;    // guest callback fn ptr (RDX at RegisterPushEventCallback)
-u64 g_push_cb_userarg = 0; // its user-arg          (RCX)
-s32 g_push_cb_filter = 0;  // filterId              (RSI)
 
 // Percent-encode any byte outside printable ASCII (0x21..0x7e); structural URL chars pass
 // through. The per-row userProfile path is built from an unset getscorelist entry field, so the
@@ -141,220 +121,6 @@ bool NpOnlineEnabled() {
 }
 
 
-// TEMPORARY DIAGNOSTIC (remove once rankings name resolution is settled): the non-printable
-// {npid} bytes (b0 0a ac 0b 08) reconstruct to 0x80bac0ab0, a guest heap pointer (guest VA ==
-// host VA at base 0x800000000). Guard-read and dump it; the gate still returns 0 bytes.
-
-// Pull the {npid} bytes out of "/v1/users/<npid>/profile?...". Returns the raw bytes
-// between the "/v1/users/" prefix and the following '/'. Empty if the shape does not match.
-std::string ExtractNpidFromPath(const std::string& path) {
-    static const std::string prefix = "/v1/users/";
-    const size_t a = path.find(prefix);
-    if (a == std::string::npos) {
-        return {};
-    }
-    const size_t start = a + prefix.size();
-    size_t end = path.find('/', start);
-    if (end == std::string::npos) {
-        end = path.size();
-    }
-    return path.substr(start, end - start);
-}
-
-// Read up to maxlen bytes from host address `addr`, stopping at the first unmapped page so a
-// bad/short pointer never faults. Returns the number of bytes copied into dst.
-size_t SafeReadHostMax(uintptr_t addr, u8* dst, size_t maxlen) {
-#ifdef _WIN32
-    size_t total = 0;
-    while (total < maxlen) {
-        const uintptr_t cur = addr + total;
-        const size_t to_page = 0x1000 - (cur & 0xfff);
-        const size_t want = (maxlen - total < to_page) ? (maxlen - total) : to_page;
-        SIZE_T got = 0;
-        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(cur), dst + total,
-                               want, &got) ||
-            got == 0) {
-            break;
-        }
-        total += got;
-        if (got < want) {
-            break;
-        }
-    }
-    return total;
-#else
-    const long pl = sysconf(_SC_PAGESIZE);
-    const size_t ps = (pl > 0) ? static_cast<size_t>(pl) : 0x1000;
-    size_t total = 0;
-    while (total < maxlen) {
-        const uintptr_t cur = addr + total;
-        const uintptr_t page = cur & ~(static_cast<uintptr_t>(ps) - 1);
-        // msync returns -1/ENOMEM when the page is not mapped -- the "is it readable" probe.
-        if (msync(reinterpret_cast<void*>(page), ps, MS_ASYNC) != 0) {
-            break;
-        }
-        const size_t to_page = ps - (cur & (ps - 1));
-        const size_t want = (maxlen - total < to_page) ? (maxlen - total) : to_page;
-        std::memcpy(dst + total, reinterpret_cast<const void*>(cur), want);
-        total += want;
-    }
-    return total;
-#endif
-}
-
-void ProbeNpidPointer(const std::string& path) {
-    const std::string npid = ExtractNpidFromPath(path);
-    if (npid.empty()) {
-        LOG_INFO(Lib_NpWebApi, "[GR2-NPWEB-PTR] no /v1/users/<npid>/ in path -- skip probe");
-        return;
-    }
-    // Reconstruct the little-endian integer the toolkit truncated at the first NUL.
-    uintptr_t ptr = 0;
-    for (size_t i = 0; i < npid.size() && i < 8; ++i) {
-        ptr |= static_cast<uintptr_t>(static_cast<unsigned char>(npid[i])) << (8 * i);
-    }
-    const u64 base_off = (ptr >= 0x800000000ull) ? static_cast<u64>(ptr - 0x800000000ull) : 0ull;
-    LOG_INFO(Lib_NpWebApi,
-             "[GR2-NPWEB-PTR] npid raw={} ({} bytes) -> LE u64 = {:#018x} (guest base + {:#x})",
-             ToHex(npid), npid.size(), static_cast<u64>(ptr), base_off);
-
-    u8 buf[256];
-    const size_t got = SafeReadHostMax(ptr, buf, sizeof(buf));
-    if (got == 0) {
-        LOG_INFO(Lib_NpWebApi,
-                 "[GR2-NPWEB-PTR] target {:#018x} is UNMAPPED (page-probe failed) -- the npid is "
-                 "NOT a readable pointer; treat as no-such-player (pursue a tolerated not-found, "
-                 "not an id forward)",
-                 static_cast<u64>(ptr));
-        return;
-    }
-
-    LOG_INFO(Lib_NpWebApi, "[GR2-NPWEB-PTR] target {:#018x} mapped, dumping {} bytes:",
-             static_cast<u64>(ptr), got);
-    // 32 bytes/line so the logger never truncates the dump.
-    for (size_t off = 0; off < got; off += 32) {
-        std::string lh, la;
-        for (size_t i = off; i < off + 32 && i < got; ++i) {
-            lh += fmt::format("{:02x} ", buf[i]);
-            la += (buf[i] >= 0x20 && buf[i] < 0x7f) ? static_cast<char>(buf[i]) : '.';
-        }
-        LOG_INFO(Lib_NpWebApi, "[GR2-NPWEB-PTR]   +{:04x}: {:<96} |{}|", static_cast<unsigned>(off),
-                 lh, la);
-    }
-
-    // Heuristic readout: is there a printable, NUL-terminated id at the front?
-    size_t run = 0;
-    while (run < got && buf[run] >= 0x20 && buf[run] < 0x7f) {
-        ++run;
-    }
-    const bool nul_terminated = (run < got && buf[run] == 0x00);
-    if (run >= 3 && nul_terminated) {
-        LOG_INFO(Lib_NpWebApi,
-                 "[GR2-NPWEB-PTR] >>> RECOVERED candidate id at +0: '{}' (len {}) -- next step: "
-                 "dereference the npid pointer and forward THIS id",
-                 std::string(reinterpret_cast<const char*>(buf), run), run);
-        return;
-    }
-    // Otherwise look for the longest printable run anywhere in the dump (id may sit at an
-    // offset inside a struct the pointer references).
-    size_t best_off = 0, best_len = 0, cur_run = 0, cur_off = 0;
-    for (size_t i = 0; i < got; ++i) {
-        if (buf[i] >= 0x20 && buf[i] < 0x7f) {
-            if (cur_run == 0) {
-                cur_off = i;
-            }
-            ++cur_run;
-            if (cur_run > best_len) {
-                best_len = cur_run;
-                best_off = cur_off;
-            }
-        } else {
-            cur_run = 0;
-        }
-    }
-    if (best_len >= 4) {
-        LOG_INFO(Lib_NpWebApi,
-                 "[GR2-NPWEB-PTR] longest printable run: '{}' at +{:#x} (len {}) -- candidate id "
-                 "field inside the referenced struct",
-                 std::string(reinterpret_cast<const char*>(buf + best_off), best_len),
-                 static_cast<unsigned>(best_off), best_len);
-    } else {
-        LOG_INFO(Lib_NpWebApi,
-                 "[GR2-NPWEB-PTR] no printable id-like run found at the top level -- the target is "
-                 "likely a struct of pointers; following them one level below");
-    }
-
-    // The target is not itself an id string: its leading qwords are guest-heap pointers, so a
-    // real onlineId likely lives one level down. Follow the first non-null guest pointers one
-    // level and dump their targets, bounded to a few slots. Still pure diagnostic.
-    auto qword_at = [&](size_t o) -> u64 {
-        u64 v = 0;
-        for (size_t k = 0; k < 8 && o + k < got; ++k) {
-            v |= static_cast<u64>(buf[o + k]) << (8 * k);
-        }
-        return v;
-    };
-    auto looks_guest = [](u64 v) -> bool { return v >= 0x800000000ull && v < 0x900000000ull; };
-
-    size_t guest_ptrs = 0;
-    for (size_t o = 0; o + 8 <= got && o < 64; o += 8) {
-        if (looks_guest(qword_at(o))) {
-            ++guest_ptrs;
-        }
-    }
-    if (guest_ptrs < 4) {
-        return; // not a pointer table -- the top-level dump above is the evidence
-    }
-
-    LOG_INFO(Lib_NpWebApi,
-             "[GR2-NPWEB-PTR] target is an array of guest pointers ({} of the first 8 slots are "
-             "0x8________); following the first non-null entries one level:",
-             guest_ptrs);
-    size_t followed = 0;
-    for (size_t o = 0; o + 8 <= got && followed < 8; o += 8) {
-        const u64 sub = qword_at(o);
-        if (!looks_guest(sub)) {
-            continue;
-        }
-        ++followed;
-        u8 sb[96];
-        const size_t sgot = SafeReadHostMax(static_cast<uintptr_t>(sub), sb, sizeof(sb));
-        if (sgot == 0) {
-            LOG_INFO(Lib_NpWebApi, "[GR2-NPWEB-PTR]   slot +{:#x} -> {:#018x} UNMAPPED",
-                     static_cast<unsigned>(o), sub);
-            continue;
-        }
-        std::string lh, la;
-        for (size_t i = 0; i < sgot && i < 48; ++i) {
-            lh += fmt::format("{:02x} ", sb[i]);
-            la += (sb[i] >= 0x20 && sb[i] < 0x7f) ? static_cast<char>(sb[i]) : '.';
-        }
-        LOG_INFO(Lib_NpWebApi, "[GR2-NPWEB-PTR]   slot +{:#x} -> {:#018x}: {} |{}|",
-                 static_cast<unsigned>(o), sub, lh, la);
-        size_t b_off = 0, b_len = 0, c_run = 0, c_off = 0;
-        for (size_t i = 0; i < sgot; ++i) {
-            if (sb[i] >= 0x20 && sb[i] < 0x7f) {
-                if (c_run == 0) {
-                    c_off = i;
-                }
-                ++c_run;
-                if (c_run > b_len) {
-                    b_len = c_run;
-                    b_off = c_off;
-                }
-            } else {
-                c_run = 0;
-            }
-        }
-        if (b_len >= 3) {
-            LOG_INFO(Lib_NpWebApi,
-                     "[GR2-NPWEB-PTR]     >>> printable run '{}' at +{:#x} (len {}) -- candidate id",
-                     std::string(reinterpret_cast<const char*>(sb + b_off), b_len),
-                     static_cast<unsigned>(b_off), b_len);
-        }
-    }
-}
-
 } // namespace
 
 s32 PS4_SYSV_ABI sceNpWebApiCreateContext() {
@@ -368,21 +134,6 @@ s32 PS4_SYSV_ABI sceNpWebApiCreatePushEventFilter(u64 a, u64 b, u64 c, u64 d, u6
               "[GR2-CHALLENGE] CreatePushEventFilter raw a={:#x} b={:#x} c={:#x} d={:#x} e={:#x} "
               "f={:#x} -> filter={}",
               a, b, c, d, e, f, id);
-    // b=pDataType array ptr, c=num. Dump the array's printable bytes (don't assume the
-    // per-entry stride -- the '.'-gaps reveal it). GUARDED so a poison/garbage b or c can never
-    // fault: only deref a plausibly-mapped pointer with a tiny, bounded span.
-    if (b >= 0x10000ull && b < 0x10000000000ull && c > 0 && c <= 16) {
-        const unsigned char* p = reinterpret_cast<const unsigned char*>(b);
-        const u64 n = (c <= 8 ? c : 8) * 48; // bounded: <=384 bytes
-        std::string ascii;
-        ascii.reserve(n);
-        for (u64 i = 0; i < n; ++i) {
-            const unsigned char ch = p[i];
-            ascii += (ch >= 0x20 && ch <= 0x7e) ? static_cast<char>(ch) : '.';
-        }
-        LOG_ERROR(Lib_NpWebApi, "[GR2-CHALLENGE]   dataType blob num={} ({} bytes) ascii='{}'", c, n,
-                  ascii);
-    }
     return id;
 }
 
@@ -421,13 +172,6 @@ s32 PS4_SYSV_ABI sceNpWebApiRegisterNotificationCallback(u64 a, u64 b, u64 c, u6
 
 s32 PS4_SYSV_ABI sceNpWebApiRegisterPushEventCallback(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     const s32 id = g_push_next_id++;
-    {
-        // Confirmed ABI: b=filterId, c=cbFunc, d=userArg. Capture for the delivery delta.
-        std::lock_guard<std::mutex> lk(g_push_cb_mtx);
-        g_push_cb_filter = static_cast<s32>(b);
-        g_push_cb_func = c;
-        g_push_cb_userarg = d;
-    }
     LOG_ERROR(Lib_NpWebApi,
               "[GR2-CHALLENGE] RegisterPushEventCallback raw a={:#x} b={:#x} c={:#x} d={:#x} e={:#x} "
               "f={:#x} -> CAPTURED cb={:#x} userArg={:#x} cbId={}",
@@ -532,18 +276,12 @@ s32 PS4_SYSV_ABI sceNpWebApiCreateRequest(s32 handle, const char* apiGroup, cons
         slot.fetched = false;
     }
     CaptureProfileOnlineId(req_path); // remember own-line onlineId for the ParseNpId empty-npId fallback
-    LOG_ERROR(Lib_NpWebApi,
+    LOG_DEBUG(Lib_NpWebApi,
               "[GR2-NPWEB] CreateRequest handle={} apiGroup='{}' path='{}' method={} "
               "contentParam={} -> req={:#x}",
               handle, group.empty() ? "(null)" : group.c_str(),
               req_path.empty() ? "(null)" : req_path.c_str(), method, fmt::ptr(contentParameter),
               id);
-    if (HasNonPrintable(req_path)) {
-        // The path's {npid} segment is non-printable -- log the raw bytes so the exact npid
-        // the game extracted from the getscorelist entry is visible (the printable log line
-        // above truncates at the first control byte).
-        LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB]   path RAW BYTES: {}", ToHex(req_path));
-    }
     if (requestId) {
         *requestId = id;
     }
@@ -570,7 +308,7 @@ s32 PS4_SYSV_ABI sceNpWebApiDeleteRequest(s64 requestId) {
         std::lock_guard<std::mutex> lk(g_np_web_mtx);
         g_np_web_requests.erase(requestId);
     }
-    LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB] DeleteRequest req={:#x} (freed)", requestId);
+    LOG_DEBUG(Lib_NpWebApi, "[GR2-NPWEB] DeleteRequest req={:#x} (freed)", requestId);
     return ORBIS_OK;
 }
 
@@ -649,7 +387,7 @@ s32 PS4_SYSV_ABI sceNpWebApiReadData(s64 requestId, void* data, u64 size) {
     std::lock_guard<std::mutex> lk(g_np_web_mtx);
     auto it = g_np_web_requests.find(requestId);
     if (it == g_np_web_requests.end() || it->second.body.empty()) {
-        LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB] ReadData req={:#x} bufSize={} -> 0 bytes (no body)",
+        LOG_DEBUG(Lib_NpWebApi, "[GR2-NPWEB] ReadData req={:#x} bufSize={} -> 0 bytes (no body)",
                   requestId, size);
         return 0; // 0 bytes => EOF; matches the old stub when there is nothing to return
     }
@@ -660,7 +398,7 @@ s32 PS4_SYSV_ABI sceNpWebApiReadData(s64 requestId, void* data, u64 size) {
         std::memcpy(data, slot.body.data() + slot.offset, n);
         slot.offset += n;
     }
-    LOG_ERROR(Lib_NpWebApi,
+    LOG_DEBUG(Lib_NpWebApi,
               "[GR2-NPWEB] ReadData req={:#x} bufSize={} -> {} bytes ({}/{} delivered)", requestId,
               size, n, slot.offset, slot.body.size());
     return static_cast<s32>(n); // bytes copied this call (0 once fully drained)
@@ -688,7 +426,7 @@ s32 PS4_SYSV_ABI sceNpWebApiSendRequest() {
 
 s32 PS4_SYSV_ABI sceNpWebApiSendRequest2(s64 requestId, const void* data, u64 dataSize,
                                          void* respInfoOption) {
-    LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB] SendRequest2 req={:#x} dataSize={} respInfo={}", requestId,
+    LOG_DEBUG(Lib_NpWebApi, "[GR2-NPWEB] SendRequest2 req={:#x} dataSize={} respInfo={}", requestId,
               dataSize, fmt::ptr(respInfoOption));
 
     if (!NpOnlineEnabled()) {
@@ -699,18 +437,6 @@ s32 PS4_SYSV_ABI sceNpWebApiSendRequest2(s64 requestId, const void* data, u64 da
                   "forwarding; returning 0 bytes (stub)",
                   Config::getPSNSignedIn(), Config::getIsConnectedToNetwork());
         return ORBIS_OK;
-    }
-    if (data && dataSize > 0) {
-        const u8* p = static_cast<const u8*>(data);
-        const u64 n = dataSize < 512 ? dataSize : 512;
-        std::string hex, asc;
-        for (u64 i = 0; i < n; ++i) {
-            hex += fmt::format("{:02x} ", p[i]);
-            asc += (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.';
-        }
-        LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB]   body({} bytes){}: {}", dataSize,
-                  dataSize > n ? " [first 512]" : "", hex);
-        LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB]   ascii: {}", asc);
     }
 
     // Look up the request captured by CreateRequest and forward it to the local server.
@@ -736,7 +462,6 @@ s32 PS4_SYSV_ABI sceNpWebApiSendRequest2(s64 requestId, const void* data, u64 da
                   "[GR2-NPWEB]   non-printable npid in path -- NOT forwarding (garbage/placeholder "
                   "entry, would crash the guest heap); returning 0 bytes. raw npid: {}",
                   ToHex(path));
-        ProbeNpidPointer(path);
         return ORBIS_OK;
     }
 
@@ -773,7 +498,7 @@ s32 PS4_SYSV_ABI sceNpWebApiSendRequest2(s64 requestId, const void* data, u64 da
                   fwd_path, res->status);
     } else {
         body = res->body;
-        LOG_ERROR(Lib_NpWebApi, "[GR2-NPWEB]   forward path='{}' status={} body_size={}", fwd_path,
+        LOG_DEBUG(Lib_NpWebApi, "[GR2-NPWEB]   forward path='{}' status={} body_size={}", fwd_path,
                   res->status, body.size());
     }
 
@@ -853,25 +578,6 @@ static std::string DecodeBase64(std::string_view in) {
 
 s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
                                              Libraries::Np::OrbisNpId* pNpId) {
-    // Temporary input probe: capture the exact bytes the game passes as pJsonNpId. The input can
-    // be base64 or binary and non-printable, so log bounded hex alongside the quoted string.
-    {
-        std::string in_str, in_hex;
-        size_t in_len = 0;
-        if (pJsonNpId == nullptr) {
-            in_str = "(null)";
-        } else {
-            in_len = strnlen(pJsonNpId, 256);
-            in_str = std::string(pJsonNpId, in_len);
-            const size_t hex_n = in_len < 48 ? in_len : 48;
-            in_hex.reserve(hex_n * 3);
-            for (size_t i = 0; i < hex_n; ++i) {
-                in_hex += fmt::format("{:02x} ", static_cast<unsigned char>(pJsonNpId[i]));
-            }
-        }
-        LOG_INFO(Lib_NpWebApi, "ParseNpId input pJsonNpId='{}' strnlen={} hex: {}", in_str, in_len,
-                 in_hex);
-    }
     // Zero the output up front so an early return or empty parse never leaves the
     // caller with an uninitialized OrbisNpId.
     if (pNpId != nullptr) {
@@ -909,7 +615,7 @@ s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
         if (!g_last_profile_online_id.empty()) {
             handle = g_last_profile_online_id;
             opt.clear();
-            LOG_INFO(Lib_NpWebApi, "ParseNpId empty npId -> fallback to profile onlineId '{}'",
+            LOG_DEBUG(Lib_NpWebApi, "ParseNpId empty npId -> fallback to profile onlineId '{}'",
                      handle);
         }
     }
@@ -925,7 +631,7 @@ s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
         std::memcpy(pNpId->opt, opt.data(), std::min<size_t>(opt.size(), sizeof(pNpId->opt)));
         pNpId->reserved[0] = 0x01; // valid-handle flag the PRX sets
     }
-    LOG_INFO(Lib_NpWebApi, "parsed npId -> handle='{}' opt='{}'", handle, opt);
+    LOG_DEBUG(Lib_NpWebApi, "parsed npId -> handle='{}' opt='{}'", handle, opt);
     return ORBIS_OK;
 }
 

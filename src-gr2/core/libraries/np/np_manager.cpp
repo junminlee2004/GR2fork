@@ -594,7 +594,7 @@ s32 PS4_SYSV_ABI sceNpGetGamePresenceStatusA(Libraries::UserService::OrbisUserSe
 }
 
 s32 PS4_SYSV_ABI sceNpGetAccountId(OrbisNpOnlineId* online_id, u64* account_id) {
-    LOG_INFO(Lib_NpManager, "GR2: sceNpGetAccountId called");
+    LOG_DEBUG(Lib_NpManager, "GR2: sceNpGetAccountId called");
     if (online_id == nullptr || account_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
@@ -632,7 +632,7 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
     memset(np_id, 0, sizeof(OrbisNpId));
     strncpy(np_id->handle.data, GR2Fork::Auth::EffectiveOnlineId().c_str(),
             sizeof(np_id->handle.data));
-    LOG_INFO(Lib_NpManager, "GR2: sceNpGetNpId user_id = {} -> handle = '{}'", user_id,
+    LOG_DEBUG(Lib_NpManager, "GR2: sceNpGetNpId user_id = {} -> handle = '{}'", user_id,
              np_id->handle.data);
     return ORBIS_OK;
 }
@@ -652,7 +652,7 @@ s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId
     if (!g_signed_in) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
-    LOG_INFO(Lib_NpManager, "GR2: sceNpGetOnlineId user_id = {} -> online_id = '{}'", user_id,
+    LOG_DEBUG(Lib_NpManager, "GR2: sceNpGetOnlineId user_id = {} -> online_id = '{}'", user_id,
              online_id->data);
     return ORBIS_OK;
 }
@@ -674,7 +674,7 @@ s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId us
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     *state = g_signed_in ? OrbisNpState::SignedIn : OrbisNpState::SignedOut;
-    LOG_INFO(Lib_NpManager, "GR2: sceNpGetState user_id = {} -> Signed {}", user_id,
+    LOG_DEBUG(Lib_NpManager, "GR2: sceNpGetState user_id = {} -> Signed {}", user_id,
              g_signed_in ? "in" : "out");
     return ORBIS_OK;
 }
@@ -870,7 +870,7 @@ s32 PS4_SYSV_ABI sceToolkitUserProfileGetAvatarUrl(u64 future, const u8* request
         *reinterpret_cast<u64*>(str + 0x20) = len; // > 0xf -> consumer dereferences str+0x08
     }
     *reinterpret_cast<volatile s32*>(out + 0x18) = 0; // state = done + success
-    LOG_INFO(Lib_NpManager, "GR2: getAvatarUrl('{}') -> {}", who, url);
+    LOG_DEBUG(Lib_NpManager, "GR2: getAvatarUrl('{}') -> {}", who, url);
     return ORBIS_OK;
 }
 

@@ -115,7 +115,7 @@ public:
 
         current_result_read_offset += bytes_to_copy;
 
-        LOG_INFO(Lib_Http, "ReadData: offset={} req_size={} copied={} body_total={}", start_index,
+        LOG_DEBUG(Lib_Http, "ReadData: offset={} req_size={} copied={} body_total={}", start_index,
                  size, bytes_to_copy, result_body_size);
 
         return static_cast<u32>(bytes_to_copy);
@@ -202,13 +202,13 @@ public:
 
         if (IsBodyComplete()) {
 
-            LOG_INFO(Lib_Http, "sceHttpSendRequest: body complete ({} bytes) -- dispatching request",
+            LOG_DEBUG(Lib_Http, "sceHttpSendRequest: body complete ({} bytes) -- dispatching request",
                      post_data_size);
             SendRequest();
             return true;
         }
 
-        LOG_INFO(Lib_Http,
+        LOG_DEBUG(Lib_Http,
                  "sceHttpSendRequest: buffered streamed chunk (+{} bytes); accumulated {} of {} "
                  "declared -- holding until body is complete",
                  size, post_data_size, content_length);
@@ -240,56 +240,6 @@ public:
         return status_code != -1;
     }
 
-    void DebugPrint() const {
-        LOG_DEBUG(Lib_Http, "===== HTTP Request Debug Info =====");
-
-        LOG_DEBUG(Lib_Http, "Is Sent:        {}", (is_sent ? "true" : "false"));
-        LOG_DEBUG(Lib_Http, "Future Valid:   {}", (request_future.valid() ? "true" : "false"));
-        LOG_DEBUG(Lib_Http, "Status Code:    {}", status_code);
-        LOG_DEBUG(Lib_Http, "Method (Enum):  {}", static_cast<int>(method));
-
-        LOG_DEBUG(Lib_Http, "URL:            {}", (url.empty() ? "[Empty]" : url));
-        LOG_DEBUG(Lib_Http, "Host:           {}", (host.empty() ? "[Empty]" : host));
-        LOG_DEBUG(Lib_Http, "Path:           {}", (path.empty() ? "[Empty]" : path));
-
-        LOG_DEBUG(Lib_Http, "Post Data Size: {} bytes", post_data_size);
-        LOG_DEBUG(Lib_Http, "Post Data Ptr:  {}", post_data);
-
-        if (post_data && post_data_size > 0) {
-            std::string preview_str;
-            const char* preview = static_cast<const char*>(post_data);
-            for (u64 i = 0; i < std::min<u64>(post_data_size, 20); ++i) {
-                char c = preview[i];
-                preview_str += (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
-            }
-            LOG_DEBUG(Lib_Http, "  -> Preview: {}...", preview_str);
-        }
-
-        LOG_DEBUG(Lib_Http, "Content Length: {}", content_length);
-        LOG_DEBUG(Lib_Http, "Body Size:      {} bytes", result_body_size);
-        LOG_DEBUG(Lib_Http, "Read Offset: {}", current_result_read_offset);
-        LOG_DEBUG(Lib_Http, "Body Pointer:   {}", (void*)result_body);
-
-        if (result_body) {
-            std::string body_preview;
-            for (u64 i = 0; i < std::min<u64>(result_body_size, 50); ++i) {
-                char c = result_body[i];
-                body_preview += (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
-            }
-            LOG_DEBUG(Lib_Http, "  -> Body Preview: {}...", body_preview);
-        }
-
-        LOG_DEBUG(Lib_Http, "Request Headers ({})", req_headers.size());
-        if (req_headers.empty()) {
-            LOG_DEBUG(Lib_Http, "  [None]");
-        } else {
-            for (const auto& pair : req_headers) {
-                LOG_DEBUG(Lib_Http, "  [{}] : {}", pair.first, pair.second);
-            }
-        }
-
-        LOG_DEBUG(Lib_Http, "===================================");
-    }
 
     RequestObj()
         : id(0), req_template(nullptr), method(ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID), url(""),
@@ -378,23 +328,9 @@ private:
 
         is_sent = true;
 
-        LOG_INFO(Lib_Http, "Sending HTTP request: method={} host='{}' path='{}' post_size={}",
+        LOG_DEBUG(Lib_Http, "Sending HTTP request: method={} host='{}' path='{}' post_size={}",
                  static_cast<int>(method), host, path, post_data_size);
 
-        // GR2 upload probe: log a printable preview of the outgoing body so the multipart form
-        // fields the game assembled are visible - the only record of the S3 POST fields if an
-        // upload targets a foreign server. Non-printables shown as '.'; capped; body-only.
-        if (post_data != nullptr && post_data_size > 0) {
-            const u64 n = std::min<u64>(post_data_size, 512);
-            std::string preview;
-            preview.reserve(n);
-            const u8* pv = static_cast<const u8*>(post_data);
-            for (u64 i = 0; i < n; ++i) {
-                const u8 c = pv[i];
-                preview.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.');
-            }
-            LOG_INFO(Lib_Http, "  body[{} of {}]: {}", n, post_data_size, preview);
-        }
 
         switch (method) {
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_GET:
@@ -443,7 +379,7 @@ private:
 
         status_code = response->status;
 
-        LOG_INFO(Lib_Http, "HTTP response: host='{}' path='{}' status={} body_size={}", host, path,
+        LOG_DEBUG(Lib_Http, "HTTP response: host='{}' path='{}' status={} body_size={}", host, path,
                  status_code, response->body.size());
 
         if (response && response->status / 100 == 2) {
@@ -455,12 +391,6 @@ private:
     }
 };
 
-struct HttpRequestInternal {
-    int state;          // +0x20
-    int errorCode;      // +0x28
-    int httpStatusCode; // +0x20C
-    std::mutex m_mutex;
-};
 using OrbisHttpsCaList = Libraries::Ssl::OrbisSslCaList;
 
 int PS4_SYSV_ABI sceHttpAbortRequest();

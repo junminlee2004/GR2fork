@@ -31,12 +31,10 @@ static inline int Gr2MakeRWX(void* addr, std::size_t len) {
 }
 #endif
 
-// === GR2 ONLINE PROBE (temporary diagnostic) ================================
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "core/linker.h"
 #include "core/tls.h"  // Core::ExecuteGuest -- call guest functions (the challenge populator)
-// ===========================================================================
 
 namespace Libraries::Np::NpAuth {
 
@@ -44,9 +42,7 @@ static bool g_signed_in = false;
 static s32 g_active_auth_requests = 0;
 static std::mutex g_auth_request_mutex;
 
-// GR2 online-flow runtime probe: dumps the 0x4b0 env block to locate where capone_url lands.
-// DAT_01c02b60 -> heap online-manager, state = *(*global + 0x30); client_ver(+0xc8) parses as 110
-// but login_url(+0x258) and capone_host(+0x348) stay 0. runtime_va = base + (ghidra - 0x107BF0).
+// GR2 eboot globals: runtime_va = base + (ghidra_va - 0x107BF0).
 
 // 0 == use the Linker lookup; a nonzero value overrides it with a fixed eboot base.
 static constexpr u64 GR2_MANUAL_BASE = 0;
@@ -74,61 +70,7 @@ static T Gr2ReadGlobal(u64 ghidra_addr) {
     return *reinterpret_cast<volatile T*>(base + (ghidra_addr - 0x107BF0));
 }
 
-// Read up to 47 printable chars from a guest VA into out (NUL-terminated). Returns length.
-static u32 Gr2ReadCStr(u64 va, char* out) {
-    const volatile char* sp = reinterpret_cast<const volatile char*>(va);
-    u32 n = 0;
-    for (; n < 47; ++n) {
-        const char c = sp[n];
-        if (c == 0) {
-            break;
-        }
-        out[n] = (c >= 0x20 && c < 0x7f) ? c : '.';
-    }
-    out[n] = 0;
-    return n;
-}
 
-// One-time dump of the active env block. The slot and ASCII stages read only the block itself,
-// a mapped module global.
-static void Gr2DumpEnvBlock(u64 base, s32 env) {
-    const u64 envblk = base + (0x1c26520 - 0x107BF0) + static_cast<u64>(env) * 0x4b0;
-    LOG_INFO(Lib_NpAuth, "GR2-ENVDUMP env={} block={:#x} size=0x4b0", env, envblk);
-
-    // (a) non-zero 8-byte slots -> tells us which fields are populated and which look like ptrs
-    for (u32 off = 0; off < 0x4b0; off += 8) {
-        const u64 v = *reinterpret_cast<volatile u64*>(envblk + off);
-        if (v != 0) {
-            LOG_INFO(Lib_NpAuth, "GR2-ENVDUMP  slot +{:#05x} = {:#018x}", off, v);
-        }
-    }
-    // (b) ASCII view -> reveals any INLINE strings stored directly in the block
-    for (u32 off = 0; off < 0x4b0; off += 48) {
-        char row[49];
-        for (u32 j = 0; j < 48; ++j) {
-            const u8 c = *reinterpret_cast<volatile u8*>(envblk + off + j);
-            row[j] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.';
-        }
-        row[48] = 0;
-        LOG_INFO(Lib_NpAuth, "GR2-ENVDUMP  ascii +{:#05x}: {}", off, row);
-    }
-#if !defined(_WIN32)
-    // (c) follow heap-range pointers -> reveals strings stored BY POINTER (std::string/char*).
-    // Linux-only: the range filter also passes non-pointer slot values (flag words), and chasing
-    // one reads harmless garbage on Linux's fully-readable guest arena but faults fatally on a
-    // Windows placeholder page - outside the null window the access-violation absorber claims.
-    for (u32 off = 0; off < 0x4b0; off += 8) {
-        const u64 p = *reinterpret_cast<volatile u64*>(envblk + off);
-        if (p >= 0x100000000ull && p < 0x1000000000ull) {
-            char buf[64];
-            const u32 n = Gr2ReadCStr(p, buf);
-            if (n > 0) {
-                LOG_INFO(Lib_NpAuth, "GR2-ENVDUMP  ptr  +{:#05x} -> {:#x} '{}'", off, p, buf);
-            }
-        }
-    }
-#endif
-}
 
 // GR2 challenge cat-0 catalog dump (read-only). DAT_01bea890 -> catalog; FUN_00e829a0 places
 // per-mission blocks at catalog + m*0xcd0 (cm01=0 .. cm20=19), 10 slots each at +8 + i*0x148,
@@ -150,60 +92,6 @@ static void Gr2DumpCatalogHex(u64 addr, u32 len, const char* tag) {
     }
 }
 
-// Diagnostic: FUN_00e828f0 builds the announcement render list from the master item list at
-// catalog+0x25e60..+0x25e68, keeping items with +0x14 state !=0 && !=3, (+0x16 & 1)==0, cat!=7,
-// and a pass of gate FUN_00e827a0 (tags +0x18..+0x1f vs catalog+0x25f98). Dumps active slots.
-static void Gr2DumpMasterList(u64 base) {
-    (void)base;
-#if defined(_WIN32)
-    // Linux-only telemetry: the slot walk dereferences heap pointers behind range filters only,
-    // and a partially-initialized entry turns that into a fatal fault on a Windows placeholder
-    // page, outside the null window the access-violation absorber claims.
-    return;
-#endif
-    // Scan the master pool for active slots (st != 0) every ~1200 ticks, catching what the MAIL
-    // receive populates after boot: cat / state / tag / mission-FNV(+0xb4) / name bytes(+0xa0).
-    // cat=0 is a received Challenge; cat=10 a mine notification.
-    static u32 tick = 0;
-    if ((tick++ % 1200) != 0) {
-        return;
-    }
-    const u64 mgr = Gr2ReadGlobal<u64>(0x1bea890);
-    if (mgr < 0x10000) {
-        return;
-    }
-    const u64 begin = *reinterpret_cast<volatile u64*>(mgr + 0x25e60);
-    const u64 end = *reinterpret_cast<volatile u64*>(mgr + 0x25e68);
-    if (begin < 0x10000 || end <= begin || (end - begin) > 0x10000) {
-        return;
-    }
-    const u32 n = static_cast<u32>((end - begin) >> 3);
-    u32 active = 0;
-    for (u32 i = 0; i < n; ++i) {
-        const u64 it = *reinterpret_cast<volatile u64*>(begin + i * 8);
-        if (it < 0x10000) {
-            continue;
-        }
-        const u16 st = *reinterpret_cast<volatile u16*>(it + 0x14);
-        if (st == 0) {
-            continue;  // empty slot
-        }
-        ++active;
-        char nm[17];
-        for (u32 j = 0; j < 16; ++j) {
-            const u8 c = *reinterpret_cast<volatile u8*>(it + 0xa0 + j);
-            nm[j] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.';
-        }
-        nm[16] = 0;
-        LOG_INFO(Lib_NpAuth,
-                 "GR2-ACTIVE: [{}] item@{:#x} cat={} st={} tag18={:#x} cmFNV={:#x} name='{}'", i, it,
-                 static_cast<u32>(*reinterpret_cast<volatile u16*>(it + 0x12)), static_cast<u32>(st),
-                 static_cast<u32>(*reinterpret_cast<volatile u8*>(it + 0x18)),
-                 static_cast<u32>(*reinterpret_cast<volatile u32*>(it + 0xb4)), nm);
-    }
-    LOG_INFO(Lib_NpAuth, "GR2-ACTIVE: scan n={} active(st!=0)={} flag25fba={:#x}", n, active,
-             static_cast<u32>(*reinterpret_cast<volatile u8*>(mgr + 0x25fba)));
-}
 
 static u64 g_hook_catg = 0;  // runtime address of DAT_01bea890 (holds the catalog ptr)
 static volatile u64 g_refill_count = 0;   // # times the gate trampoline (Gr2RefillSlot) ran
@@ -255,7 +143,6 @@ extern "C" __attribute__((no_stack_protector)) void Gr2RefillSlot() {
     g_refill_idx = idx;
     g_refill_n = nn;
 }
-alignas(16) static u8 g_gate_stub[96];
 
 // FUN_00e81ac0 sets each enable byte (catalog+0x25f98..) to (DAT_015ca5b8 < prop[9]) with
 // DAT_015ca5b8 = FLT_EPSILON; with no envtable prop=0, so every pool tag is disabled and the
@@ -595,7 +482,7 @@ extern "C" __attribute__((no_stack_protector)) void Gr2HookFill(u64 screen) {
         *reinterpret_cast<volatile u8*>(S + 0xa0 + i) = (i < sizeof(nm)) ? static_cast<u8>(nm[i]) : 0;
     }
     // Only CAPTURE the screen ptr; its +0xb8 buckets are uninitialized at entry (poison) --
-    // they get built DURING FUN_00fdf150. Gr2WatchBuckets reads them POST-build.
+    // they get built DURING FUN_00fdf150.
     if (screen >= 0x10000 && screen < 0x800000000000ull) {
         g_last_screen = screen;
     }
@@ -932,228 +819,7 @@ static void Gr2InstallE8cc30Hook(u64 base) {
              fn, sa, p, mp);
 }
 
-// Diagnostic: CALL FUN_00e828f0(catalog, tempvec) directly via ExecuteGuest and read its
-// actual output to check whether the cm12 slot enrolls. Vector is {+8=begin,+0x10=end,
-// +0x18=cap}; an empty {0,0,0} is safe (first push reallocs via the game allocator). Runs once.
-static void Gr2CallEnumerate(u64 base) {
-    static u32 tk = 0;
-    static bool done = false;
-    if (done) {
-        return;
-    }
-    if (++tk != 800) {
-        return;  // fire EXACTLY once at tick 800 (gate already patched by then)
-    }
-    done = true;
-    const u64 cat = Gr2ReadGlobal<u64>(0x1bea890);
-    LOG_INFO(Lib_NpAuth, "GR2-ENUM: fired @tick800 cat={:#x}", cat);
-    if (cat < 0x10000) {
-        LOG_INFO(Lib_NpAuth, "GR2-ENUM: catalog not ready");
-        return;
-    }
-    // The vector OBJECT lives in fork memory (only its data buffer needs the game allocator, which
-    // the push allocates). Layout for FUN_00e828f0/FUN_014e6be0: +8 begin, +0x10 end, +0x18 cap.
-    static volatile u64 vecobj[4];
-    vecobj[0] = 0;
-    vecobj[1] = 0;
-    vecobj[2] = 0;
-    vecobj[3] = 0;
-    const u64 vec = reinterpret_cast<u64>(const_cast<u64*>(&vecobj[0]));
-    using EnumFn = PS4_SYSV_ABI void (*)(u64, u64);
-    const u64 fn = base + (0xe828f0 - 0x107BF0);
-    LOG_INFO(Lib_NpAuth, "GR2-ENUM: calling FUN_00e828f0 @{:#x} cat={:#x} vec={:#x} ...", fn, cat, vec);
-    Core::ExecuteGuest(reinterpret_cast<EnumFn>(fn), cat, vec);
-    LOG_INFO(Lib_NpAuth, "GR2-ENUM: returned from FUN_00e828f0");
-    const u64 vec_dummy = vec;  // (vb/ve below read from vecobj)
-    (void)vec_dummy;
-    const u64 vb = *reinterpret_cast<volatile u64*>(vec + 8);
-    const u64 ve = *reinterpret_cast<volatile u64*>(vec + 0x10);
-    if (vb < 0x10000 || ve < vb || (ve - vb) > 0x20000) {
-        LOG_INFO(Lib_NpAuth, "GR2-ENUM: FUN_00e828f0 vec begin={:#x} end={:#x} (empty/bad)", vb, ve);
-        return;
-    }
-    const u32 n = static_cast<u32>((ve - vb) >> 3);
-    const u64 myslot = cat + 8 + 11 * 0xcd0;
-    const u64 dat = base + (0x15ba4d0 - 0x107BF0);  // category -> bucket table
-    bool found = false;
-    int myslot_bucket = -2;
-    u32 c0 = 0, c8 = 0, cother = 0;
-    u32 bucket[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    for (u32 i = 0; i < n; ++i) {
-        const u64 it = *reinterpret_cast<volatile u64*>(vb + i * 8);
-        if (it < 0x10000) {
-            continue;
-        }
-        const u16 c = *reinterpret_cast<volatile u16*>(it + 0x12);
-        if (it == myslot) {
-            found = true;
-        }
-        if (c == 0) {
-            ++c0;
-        } else if (c == 8) {
-            ++c8;
-        } else {
-            ++cother;
-        }
-        // replicate FUN_00fdf150 binning: include if c != 0xffff && (u64)(c - 0xb) >= 3
-        if (c != 0xffff && (static_cast<u64>(c) - 0xb) >= 3) {
-            const s32 b = *reinterpret_cast<volatile s32*>(dat + static_cast<u64>(c) * 4);
-            if (b >= 0 && b < 8) {
-                ++bucket[b];
-            }
-            if (it == myslot) {
-                myslot_bucket = b;
-            }
-        } else if (it == myslot) {
-            myslot_bucket = -1;  // excluded by the binning condition
-        }
-    }
-    LOG_INFO(Lib_NpAuth,
-             "GR2-ENUM: output n={} | MY SLOT ENROLLED={} -> bucket {} (2=Challenges) | cat0={} "
-             "cat8={} other={}",
-             n, found, myslot_bucket, c0, c8, cother);
-    LOG_INFO(Lib_NpAuth,
-             "GR2-ENUM: bucket sizes [0=All]={} [1=News]={} [2=Challenges]={} [3=TH]={} [4=Mining]={} "
-             "[5=Photo]={} [6=Tut]={}",
-             bucket[0], bucket[1], bucket[2], bucket[3], bucket[4], bucket[5], bucket[6]);
-}
 
-// Read-only bucket watch (no guest call, safe while the menu is open): replicates FUN_00e828f0's
-// filters (st!=0&&!=3, (b16&1)==0, cat!=7; gate patched to 1) and binning (DAT_015ba4d0[cat])
-// over the live master list every ~600 ticks, showing when the cm12 slot stops enrolling.
-static void Gr2WatchBuckets(u64 base) {
-#if defined(_WIN32)
-    // Linux-only telemetry: per-frame name-table and bucket walks chase heap pointers behind
-    // range filters only; see Gr2DumpMasterList for why that is fatal on Windows.
-    (void)base;
-    return;
-#endif
-    static u32 tk = 0;
-    ++tk;
-    // Sample the challenge-name table (catalog+0x26460) EVERY frame (not tied to receive
-    // activity or the 600-tick throttle) -- it may only populate while the Challenges/mission
-    // screen is open. Log + dump whenever its span CHANGES to catch the moment it fills.
-    {
-        const u64 cat = Gr2ReadGlobal<u64>(0x1bea890);
-        const u64 ntb = (cat >= 0x10000) ? *reinterpret_cast<volatile u64*>(cat + 0x26460) : 0;
-        const u64 nte = (cat >= 0x10000) ? *reinterpret_cast<volatile u64*>(cat + 0x26468) : 0;
-        const u64 nspan = (nte > ntb) ? (nte - ntb) : 0;
-        static u64 g_last_nspan = 0xffffffffffffffffull;
-        if (nspan != g_last_nspan) {
-            g_last_nspan = nspan;
-            const u32 ncnt = (ntb >= 0x10000 && nspan && nspan <= 0x100000)
-                                 ? static_cast<u32>(nspan / 0x30)
-                                 : 0;
-            LOG_INFO(Lib_NpAuth, "GR2-NAMETBL: begin={:#x} end={:#x} span={:#x} count={}", ntb, nte,
-                     nspan, ncnt);
-            for (u32 i = 0; i < ncnt && i < 60; ++i) {
-                const u64 ent = ntb + i * 0x30;
-                const u32 efnv = *reinterpret_cast<volatile u32*>(ent + 0);
-                const u64 elen = *reinterpret_cast<volatile u64*>(ent + 0x28);
-                u64 sp = (elen >= 0x10) ? *reinterpret_cast<volatile u64*>(ent + 0x10) : (ent + 0x10);
-                char nm[0x28] = {0};
-                if (sp >= 0x10000 && sp < 0x800000000000ull) {
-                    for (u32 j = 0; j < 0x27; ++j) {
-                        const u8 c = *reinterpret_cast<volatile u8*>(sp + j);
-                        if (c == 0) {
-                            break;
-                        }
-                        nm[j] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.';
-                    }
-                }
-                LOG_INFO(Lib_NpAuth, "GR2-NAMETBL[{}] FNV={:#x} len={} name='{}'", i, efnv, elen, nm);
-            }
-        }
-    }
-    // The bucket replication below stays throttled to every 600 ticks (it's verbose).
-    if ((tk % 600) != 0) {
-        return;
-    }
-    const u64 cat = Gr2ReadGlobal<u64>(0x1bea890);
-    if (cat < 0x10000) {
-        return;
-    }
-    const u64 lb = *reinterpret_cast<volatile u64*>(cat + 0x25e60);
-    const u64 le = *reinterpret_cast<volatile u64*>(cat + 0x25e68);
-    if (lb < 0x10000 || le <= lb || (le - lb) > 0x10000) {
-        return;
-    }
-    const u32 n = static_cast<u32>((le - lb) >> 3);
-    const u64 dat = base + (0x15ba4d0 - 0x107BF0);
-    const u64 myslot = cat + 8 + 11 * 0xcd0;
-    u32 bucket[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int myb = -2;
-    bool my_enroll = false;
-    u16 my_st = 0xffff, my_cat = 0xffff;
-    u8 my_b16 = 0xff;
-    for (u32 i = 0; i < n; ++i) {
-        const u64 it = *reinterpret_cast<volatile u64*>(lb + i * 8);
-        if (it < 0x10000) {
-            continue;
-        }
-        const u16 st = *reinterpret_cast<volatile u16*>(it + 0x14);
-        const u8 b16 = *reinterpret_cast<volatile u8*>(it + 0x16);
-        const u16 c = *reinterpret_cast<volatile u16*>(it + 0x12);
-        const bool enroll = (st != 0 && st != 3) && ((b16 & 1) == 0) &&
-                            (c != 7 || *reinterpret_cast<volatile u8*>(it + 0x2a4) == 0);
-        if (it == myslot) {
-            my_enroll = enroll;
-            my_st = st;
-            my_cat = c;
-            my_b16 = b16;
-        }
-        if (!enroll) {
-            continue;
-        }
-        if (c != 0xffff && (static_cast<u64>(c) - 0xb) >= 3) {
-            const s32 bk = *reinterpret_cast<volatile s32*>(dat + static_cast<u64>(c) * 4);
-            if (bk >= 0 && bk < 8) {
-                ++bucket[bk];
-            }
-            if (it == myslot) {
-                myb = bk;
-            }
-        }
-    }
-    LOG_INFO(Lib_NpAuth,
-             "GR2-WATCH: MY slot st={} cat={} b16={:#x} enroll={} bucket={} | sizes News[1]={} "
-             "Chal[2]={} Mining[4]={} (n={}) | refill ran={} inlist@enroll={} idx={} n={}",
-             my_st, my_cat, my_b16, my_enroll, myb, bucket[1], bucket[2], bucket[4], n,
-             g_refill_count, g_refill_inlist, g_refill_idx, g_refill_n);
-    // Read the LIVE screen's actual per-category buckets POST-build (captured by the hook).
-    const u64 scr = g_last_screen;
-    if (scr >= 0x10000 && scr < 0x800000000000ull) {
-        auto sz = [&](u32 idx) -> long {
-            const u64 v = scr + 0xb8 + static_cast<u64>(idx) * 0x20;
-            const u64 bb = *reinterpret_cast<volatile u64*>(v + 8);
-            const u64 be = *reinterpret_cast<volatile u64*>(v + 0x10);
-            if (bb < 0x10000 || be < bb || (be - bb) > 0x8000) {
-                return -1;
-            }
-            return static_cast<long>((be - bb) >> 3);
-        };
-        // Scan ALL 7 buckets for the slot pointer -> which bucket (if any) actually holds it.
-        int foundbk = -1;
-        for (u32 idx = 0; idx < 7 && foundbk < 0; ++idx) {
-            const u64 vb = scr + 0xb8 + static_cast<u64>(idx) * 0x20;
-            const u64 bb = *reinterpret_cast<volatile u64*>(vb + 8);
-            const u64 be = *reinterpret_cast<volatile u64*>(vb + 0x10);
-            if (bb < 0x10000 || be < bb || (be - bb) > 0x8000) {
-                continue;
-            }
-            for (u64 q = bb; q < be; q += 8) {
-                if (*reinterpret_cast<volatile u64*>(q) == myslot) {
-                    foundbk = static_cast<int>(idx);
-                    break;
-                }
-            }
-        }
-        LOG_INFO(Lib_NpAuth,
-                 "GR2-LIVEBUCKET: screen@{:#x} All[0]={} News[1]={} Chal[2]={} TH[3]={} Mine[4]={} "
-                 "Photo[5]={} Tut[6]={} | OUR slot found in bucket {} (-1=NONE; 2=Challenges)",
-                 scr, sz(0), sz(1), sz(2), sz(3), sz(4), sz(5), sz(6), foundbk);
-    }
-}
 
 // The Challenges tab renders the cat-0 POOL slots, not the master/news list. Fill the real cm12
 // pool slot (catalog+8+11*0xcd0) every tick to out-race the "force empty" maintenance (+0x10 ->
@@ -1404,183 +1070,8 @@ static void Gr2InstallF00de0Hook(u64 base) {
              fn, sa, p, mp);
 }
 
-// Read-only recv_time hunt: recv_time is unset (0), so scan the catalog/manager for date-valued
-// u16 (years 2016..2037 = 0x7e0..0x7f5, the getinfodetail decoder's form) and absolute-timestamp
-// u32/u64 (Unix s/us, sceRtc us) to find any date/time field the game did set.
-static void Gr2RecvTimeProbe(u64 base) {
-    (void)base;
-    static u32 tk = 0;
-    if ((++tk % 600) != 0) {
-        return;
-    }
-    const u64 cat = Gr2ReadGlobal<u64>(0x1bea890);
-    if (cat < 0x10000) {
-        return;
-    }
-    const auto now = std::chrono::system_clock::now();
-    const u64 uus =
-        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch())
-                             .count());
-    const u64 us = uus / 1000000ull;
-    const u64 rtc = uus + 62135596800000000ull;
-    LOG_INFO(Lib_NpAuth,
-             "GR2-RECVPROBE now: unix_s={} unix_us={} rtc_us={} | scanning catalog for date(yr "
-             "2016..2037)/timestamp fields",
-             us, uus, rtc);
-    u32 found = 0;
-    for (u32 o = 0; o + 8 <= 0x28000 && found < 80; o += 4) {
-        const u32 v32 = *reinterpret_cast<volatile u32*>(cat + o);
-        const u64 v64 = *reinterpret_cast<volatile u64*>(cat + o);
-        const u16 lo16 = static_cast<u16>(v32 & 0xffff);
-        const bool isyear = (lo16 >= 2016 && lo16 <= 2037);
-        const bool ts32 = (v32 > us - 31536000u && v32 < us + 31536000u);
-        const bool ts64 = (v64 > uus - 31536000000000ull && v64 < uus + 31536000000000ull) ||
-                          (v64 > rtc - 31536000000000ull && v64 < rtc + 31536000000000ull);
-        // Only the u64 sceRtc/unix_us matches are real timestamps; unix_s-u32 and most year-u16
-        // hits are ASCII false positives. Each real ts-u64 gets 0x50 bytes of hex+ascii context
-        // to identify the record and pin the challenge received-time offset.
-        if (ts64) {
-            static u64 g_last_cluster = 0;
-            const u64 cluster = o & ~0x1ffull;  // dedup within a 0x200 window
-            LOG_INFO(Lib_NpAuth, "  RECVPROBE-TS +{:#07x} u64={:#018x} (unix_us~{}? rtc~{}?)", o, v64,
-                     (v64 > uus - 31536000000000ull && v64 < uus + 31536000000000ull) ? 1 : 0,
-                     (v64 > rtc - 31536000000000ull && v64 < rtc + 31536000000000ull) ? 1 : 0);
-            if (cluster != g_last_cluster) {
-                g_last_cluster = cluster;
-                const u64 base_o = (o >= 0x30) ? (o - 0x30) : 0;
-                for (u32 r = 0; r < 0x50; r += 16) {
-                    const u64 a = cat + base_o + r;
-                    char asc[17] = {0};
-                    for (u32 k = 0; k < 16; ++k) {
-                        const u8 c = *reinterpret_cast<volatile u8*>(a + k);
-                        asc[k] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.';
-                    }
-                    LOG_INFO(Lib_NpAuth, "     CTX +{:#07x}: {:016x} {:016x}  {}", base_o + r,
-                             *reinterpret_cast<volatile u64*>(a),
-                             *reinterpret_cast<volatile u64*>(a + 8), asc);
-                }
-            }
-            ++found;
-        } else if (isyear) {
-            ++found;
-        }
-    }
-    LOG_INFO(Lib_NpAuth, "GR2-RECVPROBE done: {} date/timestamp fields found", found);
-}
 
-// Read-only field map of the game-populated cm12 slot: the accept screen's "TIME'S UP" comes
-// from a wrong/unset value, not a missing field. Classifies each 8-byte field (zero/magic/
-// heap-ptr/small-int/ts candidate); current time printed as Unix us and sceRtc us.
-static void Gr2DumpSlotMap(u64 base) {
-    (void)base;
-    static u32 tk = 0;
-    if ((++tk % 300) != 0) {
-        return;
-    }
-    const u64 cat = Gr2ReadGlobal<u64>(0x1bea890);
-    if (cat < 0x10000) {
-        return;
-    }
-    const u64 S = cat + 8 + 11 * 0xcd0;  // cm12 slot 0 (fork seed target)
-    const auto now = std::chrono::system_clock::now();
-    const u64 unix_us =
-        static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch())
-                             .count());
-    const u64 unix_s = unix_us / 1000000ull;
-    const u64 rtc_us = unix_us + 62135596800000000ull;  // sceRtc epoch (0001-01-01) offset
-    LOG_INFO(Lib_NpAuth,
-             "GR2-SLOTMAP cm12 @{:#x} | now: unix_s={} unix_us={} rtc_us={} (match a field to one of "
-             "these = the recv_time/deadline)",
-             S, unix_s, unix_us, rtc_us);
-    for (u32 o = 0; o < 0x148; o += 8) {
-        const u64 v = *reinterpret_cast<volatile u64*>(S + o);
-        const u32 lo = static_cast<u32>(v & 0xffffffff);
-        const u32 hi = static_cast<u32>(v >> 32);
-        const char* tag = "int";
-        if (v == 0) {
-            tag = "ZERO";
-        } else if (lo == 0x54321abc || lo == 0xdeadbeef || hi == 0x54321abc || hi == 0xdeadbeef) {
-            tag = "MAGIC";
-        } else if (v >= 0x100000000ull && v < 0x1000000000ull) {
-            tag = "HEAPPTR";
-        } else if (v >= 0x7f0000000000ull && v < 0x800000000000ull) {
-            tag = "HOSTPTR";
-        } else if ((v > unix_s - 31536000ull && v < unix_s + 31536000ull) ||
-                   (v > unix_us - 31536000000000ull && v < unix_us + 31536000000000ull) ||
-                   (v > rtc_us - 31536000000000ull && v < rtc_us + 31536000000000ull)) {
-            tag = "*** TIMESTAMP? ***";
-        }
-        LOG_INFO(Lib_NpAuth, "  SLOTMAP +{:#05x} = {:#018x}  [{}]", o, v, tag);
-    }
-}
 
-// The cm FNVs are not pre-baked at the assumed slot offset (catalog+8+m*0xcd0+i*0x148, +0xb4),
-// so scan the catalog object (via DAT_01bea890) and the static-data interpretation for the
-// cm-mission FNV markers instead. Read-only; bounded to the ~155KB mapped catalog.
-static void Gr2DumpCatalog(u64 base) {
-    const u64 ptr_catalog = Gr2ReadGlobal<u64>(0x1bea890);
-    const u64 static_catalog = base + (0x1bea890 - 0x107BF0);
-    LOG_INFO(Lib_NpAuth, "GR2-CAT0 DAT_01bea890: ptr={:#x} static={:#x}", ptr_catalog,
-             static_catalog);
-    // full cm-FNV table (cm01..cm20), index = mission-1
-    static const u32 kCmFnv[20] = {0x79f34222, 0x78f3408f, 0x77f33efc, 0x76f33d69, 0x75f33bd6,
-                                   0x74f33a43, 0x73f338b0, 0x82f3504d, 0x81f34eba, 0x74f0fbac,
-                                   0x75f0fd3f, 0x76f0fed2, 0x77f10065, 0x70f0f560, 0x71f0f6f3,
-                                   0x72f0f886, 0x73f0fa19, 0x7cf10844, 0x7df109d7, 0x06f89d47};
-    (void)kCmFnv;
-    const u64 cat = ptr_catalog;  // DAT_01bea890 points at the catalog object
-    if (cat < 0x10000) {
-        LOG_INFO(Lib_NpAuth, "GR2-CAT0 catalog ptr not ready");
-        return;
-    }
-    constexpr u32 kScan = 0x28000;  // ~160KB, covers the 155KB catalog
-
-    // (1) The EMPTY cm12 cat-0 target slot (catalog + 8 + 11*0xcd0). Slots are constructed-empty
-    // (id 0xffff) and the cm-FNV at +0xb4 is NOT baked at boot, so the slot cannot be anchored
-    // by FNV -- dump it raw.
-    const u64 cm12_slot = cat + 8 + 11 * 0xcd0;
-    LOG_INFO(Lib_NpAuth, "GR2-CAT0 cm12 empty slot @ {:#x} (= catalog+{:#x}):", cm12_slot,
-             cm12_slot - cat);
-    Gr2DumpCatalogHex(cm12_slot, 0x148, "cm12empty");
-
-    // (2) Find an ACTIVE oshirase item by locating the challenger name ("junmin...") anywhere in the
-    // catalog -- inline OR via a heap pointer. An active item (even the Special-News one) reveals the
-    // name offset + the state/id fields that make a row SHOW, which we replicate for the cat-0 slot.
-    int inline_hits = 0, ptr_hits = 0;
-    for (u32 off = 0; off + 6 <= kScan; off += 1) {
-        const volatile char* p = reinterpret_cast<const volatile char*>(cat + off);
-        if (p[0] == 'j' && p[1] == 'u' && p[2] == 'n' && p[3] == 'm' && p[4] == 'i' && p[5] == 'n') {
-            char s[49];
-            Gr2ReadCStr(cat + off, s);
-            LOG_INFO(Lib_NpAuth, "GR2-CAT0 INLINE name @ catalog+{:#x}: '{}'", off, s);
-            if (++inline_hits >= 12) {
-                break;
-            }
-        }
-    }
-    for (u32 off = 0; off + 8 <= kScan; off += 8) {
-        const u64 v = *reinterpret_cast<volatile u64*>(cat + off);
-        if (v >= 0x100000000ull && v < 0x1000000000ull) {
-            const volatile char* p = reinterpret_cast<const volatile char*>(v);
-            // read carefully; only check the first 6 bytes for the name prefix
-            char c0 = p[0], c1 = p[1], c2 = p[2], c3 = p[3], c4 = p[4], c5 = p[5];
-            if (c0 == 'j' && c1 == 'u' && c2 == 'n' && c3 == 'm' && c4 == 'i' && c5 == 'n') {
-                char s[49];
-                Gr2ReadCStr(v, s);
-                LOG_INFO(Lib_NpAuth, "GR2-CAT0 PTR name @ catalog+{:#x} -> {:#x}: '{}'", off, v, s);
-                // dump 0x60 bytes around this pointer slot (back up to a 0x10-aligned base) to show
-                // the item fields surrounding the name pointer.
-                const u64 itembase = cat + (off & ~0x3full);
-                Gr2DumpCatalogHex(itembase, 0xc0, "activeitem");
-                if (++ptr_hits >= 6) {
-                    break;
-                }
-            }
-        }
-    }
-    LOG_INFO(Lib_NpAuth, "GR2-CAT0 name search done: inline_hits={} ptr_hits={}", inline_hits,
-             ptr_hits);
-}
 
 // GR2: drive the game's own receive path: one-shot FUN_00e7f3d0(list, mgr=DAT_01bea890) via
 // ExecuteGuest with {count=1,[id=0,name]}. id selects FUN_00e8cc30's category: 0 = caseD_0 builds
@@ -1783,65 +1274,7 @@ void Gr2ArcProbe(const char* where) {
         return;
     }
 
-    // DAT_01c02b60 is a pointer to the online-manager; deref then +0x30.
-    const u64 ommgr = Gr2ReadGlobal<u64>(0x1c02b60);
-    u32 state = 0xFFFFFFFFu;
-    if (ommgr >= 0x100000ull) {
-        state = *reinterpret_cast<volatile u32*>(ommgr + 0x30);
-    }
 
-    const s32 ss = Gr2ReadGlobal<s32>(0x1c26520);
-    const s32 env = Gr2ReadGlobal<s32>(0x1c28178);
-    const u64 envoff = static_cast<u64>(env) * 0x4b0;
-    const s32 client_ver = Gr2ReadGlobal<s32>(0x1c26520 + envoff + 0xc8);
-    const u64 login_url = Gr2ReadGlobal<u64>(0x1c26520 + envoff + 0x258);
-    const u64 capone_host = Gr2ReadGlobal<u64>(0x1c26868 + envoff);
-    const u64 ctx = Gr2ReadGlobal<u64>(0x1c25e88);
-
-    u32 inflight = 0, session = 0;
-    if (ctx != 0) {
-        inflight = *reinterpret_cast<volatile u32*>(ctx + 0x10);
-        session = *reinterpret_cast<volatile u32*>(ctx + 0x78);
-    }
-
-    static u32 last_state = 0xFFFFFFFEu;
-    static u64 last_url = 0xFFFFFFFFFFFFFFFFull;
-    static u32 last_session = 0xFFFFFFFFu;
-    if (state != last_state || login_url != last_url || session != last_session) {
-        LOG_INFO(Lib_NpAuth,
-                 "GR2-PROBE [{}] state={:#x} omgr={:#x} ss={} env={} client_ver={} "
-                 "login_url(+0x258)={:#x} capone_host(+0x348)={:#x} ctx={:#x} inflight={} SESSION={}",
-                 where, state, ommgr, ss, env, client_ver, login_url, capone_host, ctx, inflight,
-                 session);
-        last_state = state;
-        last_url = login_url;
-        last_session = session;
-    }
-
-    // Upload gate snapshot: FUN_010422b0 bails to its network-error state unless DAT_01bf6270 !=
-    // 0 && *(DAT_01bf62f8+0x50) && *(DAT_01bf62f8+0x58). DAT_01bf62f8 = the 0x88-byte upload
-    // config (created empty on event 0x504af044); the getgamepropertyinfo blob likely fills it.
-    const u64 up_cfg = Gr2ReadGlobal<u64>(0x1bf62f8);
-    const u64 up_gate2 = Gr2ReadGlobal<u64>(0x1bf6270);
-    u64 cfg50 = 0;
-    u32 cfg58 = 0;
-    if (up_cfg >= 0x100000ull) {
-        cfg50 = *reinterpret_cast<volatile u64*>(up_cfg + 0x50);
-        cfg58 = *reinterpret_cast<volatile u32*>(up_cfg + 0x58);
-    }
-    static u64 last_cfg = 0xFFFFFFFFFFFFFFFFull;
-    static u64 last_cfg50 = 0xFFFFFFFFFFFFFFFFull;
-    static u32 last_cfg58 = 0xFFFFFFFFu;
-    if (up_cfg != last_cfg || cfg50 != last_cfg50 || cfg58 != last_cfg58) {
-        const bool gate_ok = (up_gate2 != 0) && (cfg50 != 0) && (cfg58 != 0);
-        LOG_INFO(Lib_NpAuth,
-                 "GR2-UPLOADGATE cfg(0x1bf62f8)={:#x} +0x50={:#x} +0x58={:#x} "
-                 "gate2(0x1bf6270)={:#x} => upload {}",
-                 up_cfg, cfg50, cfg58, up_gate2, gate_ok ? "ALLOWED" : "BLOCKED(gate-null)");
-        last_cfg = up_cfg;
-        last_cfg50 = cfg50;
-        last_cfg58 = cfg58;
-    }
 
     // getuploadinfo S3-descriptor decoder globals. The decoder FUN_011a7c00 and the upload builder
     // FUN_0117ffb0 read: DAT_01c28160 crypto ctx (FUN_014ff120 in-place decrypt uses +8/+0x28),
@@ -1865,81 +1298,12 @@ void Gr2ArcProbe(const char* where) {
                  cx_ctx, cx_pol, cx_key, cx_sig, cx_env0, cx_env1);
     }
 
-    // Upload host/port snapshot: both FUN_010422b0 pipelines (0xa challenge-ghost, 0x1a photo/
-    // treasure) connect via FUN_010bd3c0(obj, DAT_01bf6260 host (SSO; inline when DAT_01bf6278 <
-    // 0x10), _, DAT_01bf62a0 port) - ss.info-fed ranking-service globals; empty = init never ran.
-    const u64 up_host_field0 = Gr2ReadGlobal<u64>(0x1bf6260);   // inline-data start OR heap ptr
-    const u64 up_host_size   = Gr2ReadGlobal<u64>(0x1bf6278);   // size; < 0x10 => SSO inline
-    const u32 up_port        = Gr2ReadGlobal<u32>(0x1bf62a0);
-    const u64 up_port_raw    = Gr2ReadGlobal<u64>(0x1bf62a0);
-    char up_host[48];
-    up_host[0] = 0;
-    {
-        const u64 base2 = Gr2ModuleBase();
-        if (base2 != 0) {
-            u64 data_va = base2 + (0x1bf6260 - 0x107BF0);  // &DAT_01bf6260 (inline / SSO case)
-            if (up_host_size >= 0x10) {
-                data_va = up_host_field0;                  // long string -> heap ptr
-            }
-            if (data_va >= 0x10000ull) {
-                Gr2ReadCStr(data_va, up_host);
-            }
-        }
-    }
-    static u64 last_uhost0 = 0xFFFFFFFFFFFFFFFFull;
-    static u64 last_uhsize = 0xFFFFFFFFFFFFFFFFull;
-    static u32 last_uport  = 0xFFFFFFFFu;
-    if (up_host_field0 != last_uhost0 || up_host_size != last_uhsize || up_port != last_uport) {
-        LOG_INFO(Lib_NpAuth,
-                 "GR2-UPLOADHOST host(0x1bf6260)=\"{}\" size={:#x} field0={:#x} "
-                 "port(0x1bf62a0)={} (raw={:#x}) => host {}",
-                 up_host, up_host_size, up_host_field0, up_port, up_port_raw,
-                 (up_host[0] != 0) ? "SET" : "EMPTY");
-        last_uhost0 = up_host_field0;
-        last_uhsize = up_host_size;
-        last_uport  = up_port;
-    }
 
-    // Hexdump the upload-config object whenever its content changes, showing which of the 0x88
-    // bytes are populated and which look like heap pointers into the property blob. An FNV-1a
-    // hash over the 0x88 bytes gates the re-dump so steady state stays quiet.
-    static u64 last_cfg_hash = 0;
-    if (up_cfg >= 0x100000ull) {
-        u64 h = 0xcbf29ce484222325ull;
-        for (u32 off = 0; off < 0x88; off += 8) {
-            h = (h ^ *reinterpret_cast<volatile u64*>(up_cfg + off)) * 0x100000001b3ull;
-        }
-        if (h != last_cfg_hash) {
-            last_cfg_hash = h;
-            LOG_INFO(Lib_NpAuth, "GR2-UPLOADCFG object @ {:#x} (0x88 bytes, content changed):",
-                     up_cfg);
-            for (u32 off = 0; off < 0x88; off += 8) {
-                const u64 v = *reinterpret_cast<volatile u64*>(up_cfg + off);
-                if (v != 0) {
-                    LOG_INFO(Lib_NpAuth, "GR2-UPLOADCFG  +{:#04x} = {:#018x}", off, v);
-                }
-            }
-        }
-    }
 
-    // One-time env-block dump, once the env table is populated (client_ver parsed).
-    static bool dumped = false;
-    if (!dumped && client_ver == 110) {
-        dumped = true;
-        Gr2DumpEnvBlock(base, env);
-    }
 
-    static u32 cat0_calls = 0;
-    ++cat0_calls;
-    // Catalog scan disabled: Gr2DumpCatalog's name hunt reads 160KB byte-by-byte, and a read into
-    // an unmapped page is an access violation at a non-null address - outside the null window the
-    // signal-handler absorber claims, so it is fatal on both hosts.
-    (void)base;
-    (void)cat0_calls;
-    (void)&Gr2DumpCatalog;
     // The announcement pool is save-backed: catalog slot writes are serialized into the save and
     // corrupt it (mining rows stop repopulating on reload). Only Gr2OpenGate (patches eboot code,
-    // never the save; needed for mines to render) and read-only watchers run here.
+    // never the save; needed for mines to render) runs here.
     Gr2OpenGate(base);                 // code-patch only; opens the render gate (mines + all categories)
     Gr2NeutralizeChGhostFree(base);    // code-patch only; NOPs the challenger-name deferred free
     Gr2NeutralizeNoticeEnvelopeFree(base);  // code-patch only; NOPs the Announcements-open double-free
@@ -1951,15 +1315,10 @@ void Gr2ArcProbe(const char* where) {
     // NpToolkit write-back -> heap double-free. Re-enable only with matching challenge data.
     (void)&Gr2InstallFdf150Hook;       // disabled: cm12 slot hook (challenge popup)
     (void)&Gr2FillPoolSlot;            // disabled: per-flip cm12 slot fill
-    (void)&Gr2CallEnumerate;           // disabled: one-shot enrollment call
-    Gr2WatchBuckets(base);             // read-only periodic bucket watch (no writes)
-    Gr2DumpMasterList(base);           // read-only dump
     // Countdown kick-start disabled: its loose guard (mode==0 && cur==0 && max in range) can match
     // non-countdown objects and write obj+0x30 = obj+0x38, aliasing two pointer fields into a
     // SceLibc double-free (ud2 crash on menu open).
     (void)&Gr2InstallF00de0Hook;       // disabled: kick-start can double-free on menu open
-    (void)&Gr2DumpSlotMap;             // disabled: noisy
-    (void)&Gr2RecvTimeProbe;           // disabled: noisy
     (void)&Gr2ForceChallengeCategory;
     (void)&Gr2CaptureRecord;
     (void)&Gr2RefillSlot;
@@ -2051,9 +1410,6 @@ void Gr2ArcProbe(const char* where) {
     }
 #endif
 }
-// =============================================================================
-// END GR2 PROBE
-// =============================================================================
 
 // Internal types for storing request-related information
 enum class NpAuthRequestState {
@@ -2129,8 +1485,6 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
         return ORBIS_NP_AUTH_ERROR_INVALID_ARGUMENT;
     }
 
-    // GR2 PROBE: sample online state + dump the env block once. Read-only.
-    Gr2ArcProbe("GetAuthCode");
 
     std::scoped_lock lk{g_auth_request_mutex};
 

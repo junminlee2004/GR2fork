@@ -36,7 +36,7 @@ s32 PS4_SYSV_ABI sceLibSecureCryptographyDecrypt(void* ctx, void* dst, u64 dst_s
     const u64 n = std::min(dst_size, src_size);
     const bool ok = PlausiblePtr(dst) && PlausiblePtr(src) && n > 0 && n <= kMaxPayload;
 
-    LOG_INFO(Lib_Ssl,
+    LOG_DEBUG(Lib_Ssl,
              "sceLibSecureCryptographyDecrypt: ctx={:#x} dst={:#x} dst_size={} src={:#x} "
              "src_size={} processed={:#x} copy={} {}",
              reinterpret_cast<std::uintptr_t>(ctx), reinterpret_cast<std::uintptr_t>(dst),
@@ -92,12 +92,12 @@ s32 PS4_SYSV_ABI sceLibSecureCryptographyEncrypt([[maybe_unused]] void* ctx_a, A
             hex.push_back(' ');
             asc.push_back((p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '.');
         }
-        LOG_INFO(Lib_Ssl,
+        LOG_DEBUG(Lib_Ssl,
                  "sceLibSecureCryptographyEncrypt: NO-OP plaintext-passthrough, size={} "
                  "first {}B hex: {} | ascii: {}",
                  buf->size, n, hex, asc);
     } else {
-        LOG_INFO(Lib_Ssl, "sceLibSecureCryptographyEncrypt: NO-OP (no/implausible buffer {:#x})",
+        LOG_DEBUG(Lib_Ssl, "sceLibSecureCryptographyEncrypt: NO-OP (no/implausible buffer {:#x})",
                  reinterpret_cast<std::uintptr_t>(buf));
     }
     return ORBIS_OK; // leave buf->data untouched -> plaintext survives
