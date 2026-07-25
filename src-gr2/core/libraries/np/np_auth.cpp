@@ -76,24 +76,59 @@ static u64 Gr2GhidraBias() {
     if (base == 0) {
         return 0;  // module not mapped yet; resolve on a later flip
     }
-    static constexpr u64 kBiases[] = {0x107BF0ull, 0x100000ull};
-    static constexpr u8 kGatePrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    for (const u64 bias : kBiases) {
-        const u64 gate = base + (0xe827a0ull - bias);
-        bool match = true;
-        for (u32 i = 0; i < sizeof(kGatePrologue); ++i) {
-            if (*reinterpret_cast<volatile u8*>(gate + i) != kGatePrologue[i]) {
-                match = false;
-                break;
+    // A 6-byte prologue occurs ~14k times in the image, so the signatures are 32 bytes: that is
+    // long enough to be unique across the whole code segment. Both hold RIP-relative operands,
+    // which survive relocation because code and data shift together.
+    static constexpr u8 kSigGate[32] = {
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83,
+        0xec, 0x18, 0x4c, 0x8b, 0x3d, 0x14, 0x7a, 0x98, 0x00, 0x48, 0x89,
+        0xf3, 0x49, 0x89, 0xfe, 0x49, 0x8b, 0x07, 0x48, 0x89, 0x45,
+    };
+    static constexpr u8 kSigOwnName[32] = {
+        0x5b, 0x41, 0x5e, 0x5d, 0xe9, 0x75, 0xa6, 0x62, 0x00, 0x0f, 0x1f,
+        0x44, 0x00, 0x00, 0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+        0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28, 0x48,
+    };
+    constexpr u64 kSigGateVa = 0xe827a0ull;     // ghidra VA the gate signature starts at
+    constexpr u64 kSigOwnNameVa = 0xed2ca2ull;  // ghidra VA the second signature starts at
+
+    const auto match_at = [](u64 addr, const u8* sig, u64 n) {
+        for (u64 i = 0; i < n; ++i) {
+            if (*reinterpret_cast<volatile u8*>(addr + i) != sig[i]) {
+                return false;
             }
         }
-        if (match) {
-            cached = bias;
-            LOG_INFO(Lib_NpAuth, "GR2-IMAGEBIAS: ghidra bias {:#x} (FUN_00e827a0 @{:#x})", bias,
-                     gate);
+        return true;
+    };
+    // A bias is accepted only when both signatures land, so a chance hit cannot select one.
+    const auto accept = [&](u64 bias, const char* how) {
+        if (!match_at(base + (kSigGateVa - bias), kSigGate, sizeof(kSigGate)) ||
+            !match_at(base + (kSigOwnNameVa - bias), kSigOwnName, sizeof(kSigOwnName))) {
+            return false;
+        }
+        cached = bias;
+        LOG_INFO(Lib_NpAuth, "GR2-IMAGEBIAS: ghidra bias {:#x} via {} (gate @{:#x})", bias, how,
+                 base + (kSigGateVa - bias));
+        return true;
+    };
+
+    // Fast path: the two shipped image layouts.
+    for (const u64 bias : {0x107BF0ull, 0x100000ull}) {
+        if (accept(bias, "known layout")) {
             return cached;
         }
     }
+
+    // Any other build: locate the gate signature directly. The window is centred on the known
+    // layouts and stays well inside the code segment, so the scan never leaves mapped memory.
+    constexpr u64 kKnownVa = kSigGateVa - 0x107BF0ull;
+    constexpr u64 kWindow = 0x100000ull;
+    for (u64 va = kKnownVa - kWindow; va <= kKnownVa + kWindow; ++va) {
+        if (match_at(base + va, kSigGate, sizeof(kSigGate)) && accept(kSigGateVa - va, "scan")) {
+            return cached;
+        }
+    }
+
     cached = 0;
     LOG_ERROR(Lib_NpAuth,
               "GR2-IMAGEBIAS: unrecognized eboot build -- native patches and global reads disabled");
