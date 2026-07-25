@@ -356,8 +356,11 @@ bool EnsureAuthed() {
     }
     std::call_once(g_once, [] { std::thread(LoginThread).detach(); });
     // Bounded wait (~2.5s) so the first online request already carries the token; a slow or absent
-    // server just proceeds unauthenticated and the request retries later.
-    for (int i = 0; i < 50 && !g_authed.load(); ++i) {
+    // server just proceeds unauthenticated and the request retries later. A settled login has
+    // nothing left to wait for, so an unreachable server costs the delay once, not once per
+    // request - every caller here is on a guest thread that blocks for the whole send.
+    for (int i = 0; i < 50 && !g_authed.load() && g_login_result.load() == LoginResult::Pending;
+         ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return g_authed.load();

@@ -3,10 +3,13 @@
 
 #pragma once
 
-#include <future>
+#include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <httplib.h>
 
@@ -65,32 +68,52 @@ public:
         : id(tmpl_id), user_agent(user_agent) {}
 };
 
-class RequestObj {
+// A request outlives the guest id that names it: the send runs on a worker thread that keeps its
+// own reference, so sceHttpDeleteRequest during a round trip drops the map entry without destroying
+// the object. Every field the worker touches is guarded by state_mutex, which is always the
+// innermost lock - never acquired while holding g_requests_map_mutex across a blocking call.
+class RequestObj : public std::enable_shared_from_this<RequestObj> {
 public:
     int id;
     RequestTemplate* req_template = nullptr;
 
-    void SendRequest() {
-        request_future = std::async(std::launch::async, [this] { _SendRequest(); });
+    // Callers must have released g_requests_map_mutex: a synchronous send blocks for the whole
+    // round trip, and holding the request map across it stalls every other HTTP entry point,
+    // including the guest main thread creating its next request.
+    void SendRequest(httplib::Headers tmpl_headers, bool is_async) {
+        auto self = shared_from_this();
+        {
+            std::lock_guard<std::mutex> lk(state_mutex);
+            finished = false;
+        }
 
-        if (!req_template->is_async) {
+        std::thread([self, headers = std::move(tmpl_headers)]() mutable {
+            self->_SendRequest(std::move(headers));
+            {
+                std::lock_guard<std::mutex> lk(self->state_mutex);
+                self->finished = true;
+            }
+            self->finished_cv.notify_all();
+        }).detach();
+
+        if (!is_async) {
             WaitForRequest();
         }
     }
 
     bool IsRequestComplete() {
-        if (!request_future.valid())
-            return true;
-        return request_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        std::lock_guard<std::mutex> lk(state_mutex);
+        return finished;
     }
 
+    // Waiting releases state_mutex, so the guest can keep polling status and length meanwhile.
     void WaitForRequest() {
-        if (request_future.valid()) {
-            request_future.get();
-        }
+        std::unique_lock<std::mutex> lk(state_mutex);
+        finished_cv.wait(lk, [this] { return finished; });
     }
 
     u32 ReadData(char* dest, u32 size) {
+        std::lock_guard<std::mutex> lk(state_mutex);
 
         if (result_body == nullptr || dest == nullptr || size == 0 || result_body_size == 0) {
 
@@ -151,6 +174,7 @@ public:
     }
 
     void SetPostData(const void* data, u64 size) {
+        std::lock_guard<std::mutex> lk(state_mutex);
 
         if (data == nullptr || size == 0) {
 
@@ -165,10 +189,112 @@ public:
         std::memcpy(post_data, data, post_data_size);
     }
 
+    // Append one body chunk and dispatch the request only once the full declared body has
+    // arrived. Returns true if the request was actually sent on this call.
+    bool AccumulateAndSend(const void* data, u64 size, httplib::Headers tmpl_headers,
+                           bool is_async) {
+        {
+            std::lock_guard<std::mutex> lk(state_mutex);
+
+            AppendPostDataLocked(data, size);
+
+            if (!IsBodyCompleteLocked()) {
+                LOG_DEBUG(Lib_Http,
+                          "sceHttpSendRequest: buffered streamed chunk (+{} bytes); accumulated {} "
+                          "of {} declared -- holding until body is complete",
+                          size, post_data_size, content_length);
+                return false;
+            }
+
+            LOG_DEBUG(Lib_Http,
+                      "sceHttpSendRequest: body complete ({} bytes) -- dispatching request",
+                      post_data_size);
+        }
+
+        SendRequest(std::move(tmpl_headers), is_async);
+        return true;
+    }
+
+    void AddHeader(const char* name, const char* value) {
+        std::lock_guard<std::mutex> lk(state_mutex);
+        req_headers[std::string(name)] = std::string(value);
+    }
+
+    bool IsSuccessful() const {
+        std::lock_guard<std::mutex> lk(state_mutex);
+        return status_code / 100 == 2;
+    }
+
+    u32 GetStatusCode() const {
+        std::lock_guard<std::mutex> lk(state_mutex);
+        return status_code;
+    }
+
+    u64 GetContentLength() const {
+        std::lock_guard<std::mutex> lk(state_mutex);
+        return static_cast<u64>(result_body_size);
+    }
+
+    bool IsSent() const {
+        std::lock_guard<std::mutex> lk(state_mutex);
+        return is_sent;
+    }
+
+    // The worker publishes the body before the status code, so a status other than the -1 sentinel
+    // guarantees result_body and result_body_size are the ones that belong to it.
+    bool IsCompleted() {
+        std::lock_guard<std::mutex> lk(state_mutex);
+        return status_code != -1;
+    }
+
+    RequestObj()
+        : id(0), req_template(nullptr), method(ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID), url(""),
+          content_length(0), status_code(-1), result_body(nullptr), result_body_size(0),
+          current_result_read_offset(0), post_data(nullptr), is_sent(false) {}
+    explicit RequestObj(s32 req_id, RequestTemplate* req_template, s32 method, std::string url_str,
+                        u64 cntLen)
+        : id(req_id), req_template(req_template),
+          method(static_cast<OrbisHttpRequestMethod>(method)), content_length(cntLen),
+          status_code(-1), result_body(nullptr), result_body_size(0),
+          current_result_read_offset(0), post_data(nullptr), is_sent(false) {
+
+        SetUrl(url_str);
+    }
+
+    ~RequestObj() {
+        delete[] result_body;
+        delete[] static_cast<u8*>(post_data);
+    }
+
+    RequestObj(const RequestObj&) = delete;
+    RequestObj& operator=(const RequestObj&) = delete;
+
+private:
+    mutable std::mutex state_mutex;
+    std::condition_variable finished_cv;
+    bool finished = true;
+
+    char* result_body = nullptr;
+    u64 current_result_read_offset = 0;
+    u32 result_body_size = 0;
+
+    OrbisHttpRequestMethod method = ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID;
+    std::string host = {};
+    std::string path = {};
+    u64 content_length = 0;
+
+    u32 status_code = -1; // check
+    bool is_sent = false;
+
+    std::map<std::string, std::string> req_headers;
+    std::string url = {};
+    void* post_data = nullptr;
+    u64 post_data_size = 0;
+
     // Streaming-body accumulation: the game can deliver one request body across multiple
     // sceHttpSendRequest calls (the ARC login multipart streams as 78 + 152 + 38 = 268 bytes);
     // append each chunk to post_data so the whole body goes out as one request, not fragments.
-    void AppendPostData(const void* data, u64 size) {
+    void AppendPostDataLocked(const void* data, u64 size) {
 
         if (data == nullptr || size == 0) {
 
@@ -189,108 +315,37 @@ public:
 
     // True once the accumulated body has reached the content_length declared at create time.
     // content_length == 0 (a GET, or a request with no declared body) means "send immediately".
-    bool IsBodyComplete() const {
+    bool IsBodyCompleteLocked() const {
 
         return content_length == 0 || post_data_size >= content_length;
     }
 
-    // Append one body chunk and dispatch the request only once the full declared body has
-    // arrived. Returns true if the request was actually sent on this call.
-    bool AccumulateAndSend(const void* data, u64 size) {
+    void _SendRequest(httplib::Headers headers) {
 
-        AppendPostData(data, size);
-
-        if (IsBodyComplete()) {
-
-            LOG_DEBUG(Lib_Http, "sceHttpSendRequest: body complete ({} bytes) -- dispatching request",
-                     post_data_size);
-            SendRequest();
-            return true;
+        // Copy out everything the round trip needs so no shared field is read while the socket
+        // work runs; host, path and method are fixed at construction and never change.
+        std::vector<u8> body;
+        {
+            std::lock_guard<std::mutex> lk(state_mutex);
+            for (const auto& pair : req_headers) {
+                headers.emplace(pair.first, pair.second);
+            }
+            if (post_data != nullptr && post_data_size > 0) {
+                const u8* first = static_cast<const u8*>(post_data);
+                body.assign(first, first + post_data_size);
+            }
+            is_sent = true;
         }
-
-        LOG_DEBUG(Lib_Http,
-                 "sceHttpSendRequest: buffered streamed chunk (+{} bytes); accumulated {} of {} "
-                 "declared -- holding until body is complete",
-                 size, post_data_size, content_length);
-        return false;
-    }
-
-    void AddHeader(const char* name, const char* value) {
-
-        req_headers[std::string(name)] = std::string(value);
-    }
-
-    bool IsSuccessful() const {
-        return status_code / 100 == 2;
-    }
-
-    u32 GetStatusCode() const {
-        return status_code;
-    }
-
-    u64 GetContentLength() const {
-        return static_cast<u64>(result_body_size);
-    }
-
-    bool IsSent() const {
-        return is_sent;
-    }
-
-    bool IsCompleted() {
-        return status_code != -1;
-    }
-
-
-    RequestObj()
-        : id(0), req_template(nullptr), method(ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID), url(""),
-          content_length(0), status_code(-1), result_body(nullptr), result_body_size(-1),
-          current_result_read_offset(0), post_data(nullptr), is_sent(false) {}
-    explicit RequestObj(s32 req_id, RequestTemplate* req_template, s32 method, std::string url_str,
-                        u64 cntLen)
-        : id(req_id), req_template(req_template),
-          method(static_cast<OrbisHttpRequestMethod>(method)), content_length(cntLen),
-          status_code(-1), result_body(nullptr), result_body_size(-1),
-          current_result_read_offset(0), post_data(nullptr), is_sent(false) {
-
-        SetUrl(url_str);
-    }
-
-private:
-    std::future<void> request_future = {};
-
-    char* result_body = nullptr;
-    u64 current_result_read_offset = 0;
-    u32 result_body_size = 0;
-
-    OrbisHttpRequestMethod method = ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID;
-    std::string host = {};
-    std::string path = {};
-    u64 content_length = 0;
-
-    u32 status_code = -1; // check
-    bool is_sent = false;
-
-    std::map<std::string, std::string> req_headers;
-    std::string url = {};
-    void* post_data = nullptr;
-    u64 post_data_size = 0;
-
-    void _SendRequest() {
 
         httplib::Client cli(host);
 
+        // httplib defaults to a 300s connection timeout, long enough for one unreachable host to
+        // hold a synchronous guest thread past any watchdog. The restoration server is local.
+        cli.set_connection_timeout(5, 0);
+        cli.set_read_timeout(10, 0);
+        cli.set_write_timeout(10, 0);
+
         httplib::Result response = {};
-
-        auto templ_headers = req_template->headers;
-
-        httplib::Headers headers;
-        for (const auto& pair : templ_headers) {
-            headers.emplace(pair.first, pair.second);
-        }
-
-        for (const auto& pair : req_headers) {
-            headers.emplace(pair.first, pair.second);
-        }
 
         // GR2 identity: authenticate to shadnet once, then forward the verified Online ID plus the
         // bearer token the restoration server validates. Falls back to the local UserManagement
@@ -326,10 +381,8 @@ private:
             content_type = it->second;
         }
 
-        is_sent = true;
-
         LOG_DEBUG(Lib_Http, "Sending HTTP request: method={} host='{}' path='{}' post_size={}",
-                 static_cast<int>(method), host, path, post_data_size);
+                 static_cast<int>(method), host, path, body.size());
 
 
         switch (method) {
@@ -339,8 +392,8 @@ private:
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_POST:
 
-            response = cli.Post(path, headers, static_cast<char*>(post_data),
-                                static_cast<u64>(post_data_size), content_type);
+            response = cli.Post(path, headers, reinterpret_cast<const char*>(body.data()),
+                                body.size(), content_type);
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_HEAD:
             response = cli.Head(path, headers);
@@ -349,8 +402,8 @@ private:
             response = cli.Options(path, headers);
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_PUT:
-            response = cli.Put(path, headers, static_cast<char*>(post_data),
-                               static_cast<u64>(post_data_size), content_type);
+            response = cli.Put(path, headers, reinterpret_cast<const char*>(body.data()),
+                               body.size(), content_type);
             break;
         case ORBIS_INTERNAL_HTTP_REQUEST_METHOD_DELETE:
             response = cli.Delete(path, headers);
@@ -377,17 +430,23 @@ private:
             return;
         }
 
-        status_code = response->status;
-
         LOG_DEBUG(Lib_Http, "HTTP response: host='{}' path='{}' status={} body_size={}", host, path,
-                 status_code, response->body.size());
+                 response->status, response->body.size());
 
-        if (response && response->status / 100 == 2) {
+        // The body has to be in place before the status code leaves its -1 sentinel: the guest
+        // polls the status to decide the response is readable, then asks for its length.
+        std::lock_guard<std::mutex> lk(state_mutex);
 
+        if (response->status / 100 == 2) {
+
+            delete[] result_body;
             result_body_size = static_cast<u32>(response->body.size());
             result_body = new char[result_body_size];
             std::memcpy(result_body, response->body.data(), result_body_size);
+            current_result_read_offset = 0;
         }
+
+        status_code = response->status;
     }
 };
 

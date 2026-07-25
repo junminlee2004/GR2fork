@@ -26,7 +26,7 @@ static bool g_isHttpInitialized = true; // TODO temp always inited
 static bool g_isConnectedToNetwork = false;
 
 static std::map<s32, RequestTemplate> g_templates;
-static std::map<s32, RequestObj> g_requests;
+static std::map<s32, std::shared_ptr<RequestObj>> g_requests;
 static std::mutex g_templates_map_mutex;
 static std::mutex g_requests_map_mutex;
 
@@ -286,7 +286,8 @@ static s32 CreateRequestWithURLInternal(s32 tmpl_id, s32 method, const char* url
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
 
-    auto new_request = RequestObj(request_id, &it->second, method, url_str, content_length);
+    auto new_request =
+        std::make_shared<RequestObj>(request_id, &it->second, method, url_str, content_length);
 
     std::lock_guard<std::mutex> lock_r(g_requests_map_mutex);
     g_requests.emplace(request_id, std::move(new_request));
@@ -818,18 +819,18 @@ int PS4_SYSV_ABI sceHttpGetResponseContentLength(u32 req_id, s32* result, u64* c
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
 
-    if (!it->second.IsSent() && !it->second.req_template->is_async) {
+    if (!it->second->IsSent() && !it->second->req_template->is_async) {
 
         return ORBIS_HTTP_ERROR_BEFORE_SEND;
     }
 
-    if (!it->second.IsCompleted()) {
+    if (!it->second->IsCompleted()) {
 
         return ORBIS_HTTP_ERROR_EAGAIN;
     }
 
     *result = 0; // ORBIS_HTTP_CONTENTLEN_EXIST -- a concrete Content-Length is available
-    *content_length = it->second.GetContentLength();
+    *content_length = it->second->GetContentLength();
 
     LOG_DEBUG(Lib_Http, "result={} content_length={}", *result, *content_length);
 
@@ -851,17 +852,17 @@ int PS4_SYSV_ABI sceHttpGetStatusCode(s32 req_id, s32* status_code) {
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
 
-    if (!it->second.IsSent() && !it->second.req_template->is_async) {
+    if (!it->second->IsSent() && !it->second->req_template->is_async) {
 
         return ORBIS_HTTP_ERROR_BEFORE_SEND;
     }
 
-    if (!it->second.IsCompleted()) {
+    if (!it->second->IsCompleted()) {
 
         return ORBIS_HTTP_ERROR_EAGAIN;
     }
 
-    *status_code = it->second.GetStatusCode();
+    *status_code = it->second->GetStatusCode();
 
     return ORBIS_OK;
 }
@@ -998,17 +999,17 @@ int PS4_SYSV_ABI sceHttpReadData(u32 req_id, char* dest, u32 size) {
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
 
-    if (!it->second.IsSent() && !it->second.req_template->is_async) {
+    if (!it->second->IsSent() && !it->second->req_template->is_async) {
 
         return ORBIS_HTTP_ERROR_BEFORE_SEND;
     }
 
-    if (!it->second.IsCompleted()) {
+    if (!it->second->IsCompleted()) {
 
         return ORBIS_HTTP_ERROR_EAGAIN;
     }
 
-    auto read_len = it->second.ReadData(dest, size);
+    auto read_len = it->second->ReadData(dest, size);
 
     return read_len;
 }
@@ -1057,12 +1058,32 @@ int PS4_SYSV_ABI sceHttpSendRequest(int req_id, const void* post_data, u64 size)
         return ORBIS_HTTP_ERROR_BEFORE_INIT;
     }
 
-    std::lock_guard<std::mutex> lock(g_requests_map_mutex);
-    auto it = g_requests.find(req_id);
+    // Take a reference to the request and a copy of its template headers, then drop both map
+    // locks before dispatching: a synchronous send blocks until the round trip finishes, and
+    // holding g_requests_map_mutex across that stalls every other HTTP entry point - the guest
+    // main thread creating its next request included. Lock order matches
+    // CreateRequestWithURLInternal: templates before requests.
+    std::shared_ptr<RequestObj> request;
+    httplib::Headers tmpl_headers;
+    bool is_async = false;
+    {
+        std::lock_guard<std::mutex> lock_t(g_templates_map_mutex);
+        std::lock_guard<std::mutex> lock_r(g_requests_map_mutex);
 
-    if (it == g_requests.end()) {
+        auto it = g_requests.find(req_id);
 
-        return ORBIS_HTTP_ERROR_INVALID_ID;
+        if (it == g_requests.end()) {
+
+            return ORBIS_HTTP_ERROR_INVALID_ID;
+        }
+
+        request = it->second;
+        if (request->req_template != nullptr) {
+            for (const auto& pair : request->req_template->headers) {
+                tmpl_headers.emplace(pair.first, pair.second);
+            }
+            is_async = request->req_template->is_async;
+        }
     }
 
     // Hard offline gate: with the emulator set offline (isConnectedToNetwork), no guest HTTP
@@ -1080,7 +1101,7 @@ int PS4_SYSV_ABI sceHttpSendRequest(int req_id, const void* post_data, u64 size)
     // SendRequest() blocks for sync requests and returns immediately for async ones, so no
     // pre-send gate belongs here. The body is dispatched only once the declared content_length
     // arrives - the ARC login streams its multipart body over three calls (78 + 152 + 38 = 268).
-    it->second.AccumulateAndSend(post_data, size);
+    request->AccumulateAndSend(post_data, size, std::move(tmpl_headers), is_async);
 
     return ORBIS_OK;
 }
