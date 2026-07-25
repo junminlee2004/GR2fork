@@ -535,15 +535,26 @@ static void Gr2EnforceDustyTokenOnce() {
                 }
                 float cur = 0.0f;
                 std::memcpy(&cur, data.data() + off + 8, 4);
-                if (cur != want) {
+                // Clamp DOWN only. A save above the server total is tampered and is corrected here,
+                // but a save below it is left alone so the server's own token mail can raise it: the
+                // reward cascade only runs while the catalog progress cursor is under the total, and
+                // writing the total in first closes that gap and skips every threshold unlock the
+                // account is owed. Raising the save buys no protection, since the mail is the
+                // legitimate path the count grows by.
+                if (cur > want) {
                     std::memcpy(data.data() + off + 8, &want, 4);
                     std::ofstream out(de.path(), std::ios::binary | std::ios::trunc);
                     if (out) {
                         out.write(data.data(), static_cast<std::streamsize>(data.size()));
                         LOG_INFO(Lib_Http,
-                                 "[GR2FORK] DustyToken enforced in {}: {} -> {} (server authoritative)",
+                                 "[GR2FORK] DustyToken clamped in {}: {} -> {} (server authoritative)",
                                  fn, cur, want);
                     }
+                } else if (cur < want) {
+                    LOG_INFO(Lib_Http,
+                             "[GR2FORK] DustyToken in {} is {}, server has {}: left for the token "
+                             "mail to raise so the reward thresholds cascade",
+                             fn, cur, want);
                 }
                 break;
             }
