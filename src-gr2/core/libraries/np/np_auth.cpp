@@ -42,8 +42,7 @@ static bool g_signed_in = false;
 static s32 g_active_auth_requests = 0;
 static std::mutex g_auth_request_mutex;
 
-// GR2 eboot globals: runtime_va = base + (ghidra_va - image_bias), where image_bias comes from
-// Gr2GhidraBias() because the shipped builds place the same code at different image offsets.
+// GR2 eboot globals: runtime_va = base + (ghidra_va - 0x107BF0).
 
 // 0 == use the Linker lookup; a nonzero value overrides it with a fixed eboot base.
 static constexpr u64 GR2_MANUAL_BASE = 0;
@@ -62,58 +61,13 @@ static u64 Gr2ModuleBase() {
     return 0;
 }
 
-// The shipped eboot builds hold the same code at different image offsets: the CUSA04934 image sits
-// 0x7bf0 below the CUSA03694 one, so a single hardcoded Ghidra bias fits only one of them and every
-// address derived from the other lands in unrelated code. Probe FUN_00e827a0's prologue at each
-// known bias once and keep whichever matches. 0 means an unrecognized build; callers then decline
-// rather than reading or patching at a wrong address.
-static u64 Gr2GhidraBias() {
-    static u64 cached = ~0ull;
-    if (cached != ~0ull) {
-        return cached;
-    }
-    const u64 base = Gr2ModuleBase();
-    if (base == 0) {
-        return 0;  // module not mapped yet; resolve on a later flip
-    }
-    static constexpr u64 kBiases[] = {0x107BF0ull, 0x100000ull};
-    static constexpr u8 kGatePrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
-    for (const u64 bias : kBiases) {
-        const u64 gate = base + (0xe827a0ull - bias);
-        bool match = true;
-        for (u32 i = 0; i < sizeof(kGatePrologue); ++i) {
-            if (*reinterpret_cast<volatile u8*>(gate + i) != kGatePrologue[i]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            cached = bias;
-            LOG_INFO(Lib_NpAuth, "GR2-IMAGEBIAS: ghidra bias {:#x} (FUN_00e827a0 @{:#x})", bias,
-                     gate);
-            return cached;
-        }
-    }
-    cached = 0;
-    LOG_ERROR(Lib_NpAuth,
-              "GR2-IMAGEBIAS: unrecognized eboot build -- native patches and global reads disabled");
-    return cached;
-}
-
-// Runtime address of a Ghidra address, or 0 when the build is unrecognized.
-static u64 Gr2Rt(u64 base, u64 ghidra_addr) {
-    const u64 bias = Gr2GhidraBias();
-    return bias == 0 ? 0 : base + (ghidra_addr - bias);
-}
-
 template <typename T>
 static T Gr2ReadGlobal(u64 ghidra_addr) {
     const u64 base = Gr2ModuleBase();
-    const u64 addr = base == 0 ? 0 : Gr2Rt(base, ghidra_addr);
-    if (addr == 0) {
+    if (base == 0) {
         return T{};
     }
-    return *reinterpret_cast<volatile T*>(addr);
+    return *reinterpret_cast<volatile T*>(base + (ghidra_addr - 0x107BF0));
 }
 
 
@@ -195,14 +149,14 @@ extern "C" __attribute__((no_stack_protector)) void Gr2RefillSlot() {
 // Challenges section + mine notifications are gated off. Bypass: patch FUN_00e827a0 to return 1.
 static void Gr2OpenGate(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    g_hook_catg = Gr2Rt(base, 0x1bea890);
+    g_hook_catg = base + (0x1bea890 - 0x107BF0);
     // Plain code-patch: FUN_00e827a0 -> `mov eax,1; ret`. No stub, no per-call side effects
     // (routing this gate through a refill trampoline breaks the mining notifications).
-    const u64 gate = Gr2Rt(base, 0xe827a0);
+    const u64 gate = base + (0xe827a0 - 0x107BF0);
     static const u8 patch[6] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};  // mov eax,1 ; ret
     // FUN_00e827a0's prologue: push rbp; mov rbp,rsp; push r15. The gate address is hardcoded
     // against one eboot build, so on any other build these bytes are unrelated mid-function code
@@ -244,14 +198,14 @@ static void Gr2OpenGate(u64 base) {
 // consistent and the tiny name string (<=40 bytes) leaks instead of aborting.
 static void Gr2NeutralizeChGhostFree(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
     // Plain code-patch: overwrite the SceLibc free-thunk CALL with five NOPs. No stub, no per-call
     // side effects. Verify the original is a rel32 CALL (leading E8) first, so a base-mapping error
     // logs a mismatch instead of corrupting an unrelated instruction.
-    const u64 site = Gr2Rt(base, 0xfa2317);
+    const u64 site = base + (0xfa2317 - 0x107BF0);
     u8 orig[5];
     for (u32 i = 0; i < 5; ++i) {
         orig[i] = *reinterpret_cast<volatile u8*>(site + i);
@@ -289,11 +243,11 @@ static void Gr2NeutralizeChGhostFree(u64 base) {
 // eboot logs a mismatch instead of corrupting an unrelated instruction.
 static void Gr2NeutralizeNoticeEnvelopeFree(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 site = Gr2Rt(base, 0xfebba5);
+    const u64 site = base + (0xfebba5 - 0x107BF0);
     u8 orig[5];
     for (u32 i = 0; i < 5; ++i) {
         orig[i] = *reinterpret_cast<volatile u8*>(site + i);
@@ -335,11 +289,11 @@ alignas(16) static u8 g_ownname_stub[64];
 static char g_ownname_buf[17] = {0};
 static void Gr2FixChallengeOwnName(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 site = Gr2Rt(base, 0xed2ca2);  // own-row epilogue: pop rbx/r14/rbp; jmp strncpy
+    const u64 site = base + (0xed2ca2 - 0x107BF0);  // own-row epilogue: pop rbx/r14/rbp; jmp strncpy
     u8 orig[5];
     for (u32 i = 0; i < 5; ++i) {
         orig[i] = *reinterpret_cast<volatile u8*>(site + i);
@@ -355,7 +309,7 @@ static void Gr2FixChallengeOwnName(u64 base) {
     std::memset(g_ownname_buf, 0, sizeof(g_ownname_buf));
     std::strncpy(g_ownname_buf, GR2Fork::Auth::EffectiveOnlineId().c_str(),
                  sizeof(g_ownname_buf) - 1);
-    const u64 strncpy_rt = Gr2Rt(base, 0x14fd320);  // FUN_014fd320 (the tail-called copy)
+    const u64 strncpy_rt = base + (0x14fd320 - 0x107BF0);  // FUN_014fd320 (the tail-called copy)
     u8* s = g_ownname_stub;
     u32 p = 0;
     auto e = [&](u8 b) { s[p++] = b; };
@@ -393,11 +347,11 @@ static void Gr2FixChallengeOwnName(u64 base) {
 // native; the +0x14 visibility gate is untouched, so the row and race are unaffected.
 static void Gr2HideChallengePuppet(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 site = Gr2Rt(base, 0xe99759);  // MOV R15,RAX in Ugc:findShowGhost (FUN_00e995a0)
+    const u64 site = base + (0xe99759 - 0x107BF0);  // MOV R15,RAX in Ugc:findShowGhost (FUN_00e995a0)
     u8 orig[3];
     for (u32 i = 0; i < 3; ++i) {
         orig[i] = *reinterpret_cast<volatile u8*>(site + i);
@@ -478,10 +432,10 @@ static PS4_SYSV_ABI void Gr2FreeGuard(void* mspace, void* ptr) {
 // untouched.
 static void Gr2InstallFreeGuard(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
-    const u64 slot = Gr2Rt(base, 0x180c8a0);
+    const u64 slot = base + (0x180c8a0 - 0x107BF0);
     const u64 orig = *reinterpret_cast<volatile u64*>(slot);
     if (orig < 0x10000 || orig >= 0x800000000000ull) {
         static bool deferred = false;
@@ -586,12 +540,12 @@ extern "C" __attribute__((no_stack_protector)) void Gr2HookFill(u64 screen) {
 alignas(16) static u8 g_fdf_stub[160];
 static void Gr2InstallFdf150Hook(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    g_hook_catg = Gr2Rt(base, 0x1bea890);
-    const u64 fn = Gr2Rt(base, 0xfdf150);
+    g_hook_catg = base + (0x1bea890 - 0x107BF0);
+    const u64 fn = base + (0xfdf150 - 0x107BF0);
     u8 disp[13];
     for (u32 i = 0; i < 13; ++i) {
         disp[i] = *reinterpret_cast<volatile u8*>(fn + i);
@@ -634,11 +588,11 @@ static void Gr2InstallFdf150Hook(u64 base) {
 alignas(16) static u8 g_e828_stub[160];
 static void Gr2InstallE828f0Hook(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 fn = Gr2Rt(base, 0xe828f0);
+    const u64 fn = base + (0xe828f0 - 0x107BF0);
     u8 disp[16];
     for (u32 i = 0; i < 16; ++i) {
         disp[i] = *reinterpret_cast<volatile u8*>(fn + i);
@@ -836,11 +790,11 @@ extern "C" __attribute__((no_stack_protector)) void Gr2CaptureRecord(u64 mgr) {
 alignas(16) static u8 g_e8cc_stub[160];
 static void Gr2InstallE8cc30Hook(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 fn = Gr2Rt(base, 0xe8cc30);
+    const u64 fn = base + (0xe8cc30 - 0x107BF0);
     u8 disp[20];
     for (u32 i = 0; i < 20; ++i) {
         disp[i] = *reinterpret_cast<volatile u8*>(fn + i);
@@ -1091,11 +1045,11 @@ extern "C" __attribute__((no_stack_protector)) void Gr2CountdownHook(u64 obj) {
 alignas(16) static u8 g_cd_stub[160];
 static void Gr2InstallF00de0Hook(u64 base) {
     static bool done = false;
-    if (done || base == 0 || Gr2GhidraBias() == 0) {
+    if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 fn = Gr2Rt(base, 0xf00de0);
+    const u64 fn = base + (0xf00de0 - 0x107BF0);
     u8 disp[17];
     for (u32 i = 0; i < 17; ++i) {
         disp[i] = *reinterpret_cast<volatile u8*>(fn + i);
@@ -1135,9 +1089,6 @@ static void Gr2InstallF00de0Hook(u64 base) {
 // ExecuteGuest with {count=1,[id=0,name]}. id selects FUN_00e8cc30's category: 0 = caseD_0 builds
 // the slot from getmaildetail (0x7809 mission, 0x7816 validity -> +0x140); 1 reads the save pool.
 static void Gr2InjectChallenge(u64 base) {
-    if (Gr2GhidraBias() == 0) {
-        return;  // unrecognized build: the populator addresses below would be bogus
-    }
     const u64 mgr = Gr2ReadGlobal<u64>(0x1bea890);  // catalog == populator's mgr arg
     if (mgr < 0x10000) {
         return;
@@ -1170,7 +1121,7 @@ static void Gr2InjectChallenge(u64 base) {
     *reinterpret_cast<volatile u32*>(buf + 0x0c) = 0;
     *reinterpret_cast<volatile u64*>(buf + 0x10) = buf + 0x20; // entry[0].name ptr
 
-    const u64 pop_va = Gr2Rt(base, 0xe7f3d0);
+    const u64 pop_va = base + (0xe7f3d0 - 0x107BF0);
     const u64 cm12 = mgr + 8 + 11 * 0xcd0;
     LOG_INFO(Lib_NpAuth, "GR2-INJECT: populator={:#x} list={:#x} mgr={:#x} cm12slot={:#x}", pop_va, buf,
              mgr, cm12);
@@ -1210,7 +1161,7 @@ static void Gr2InjectChallenge(u64 base) {
         static bool rebuilt_once = false;  // the rebuild re-inits + takes locks -> call it AT MOST ONCE
         if (!rebuilt_once) {
             rebuilt_once = true;
-            const u64 rebuild_va = Gr2Rt(base, 0x12decf0);
+            const u64 rebuild_va = base + (0x12decf0 - 0x107BF0);
             LOG_INFO(Lib_NpAuth, "GR2-INJECT: calling rebuild FUN_012decf0 @ {:#x}", rebuild_va);
             using RebuildFn = PS4_SYSV_ABI void (*)();
             Core::ExecuteGuest(reinterpret_cast<RebuildFn>(rebuild_va));
@@ -1315,7 +1266,7 @@ void Gr2ArcProbe(const char* where) {
         return;
     }
 
-    // GR2-only gate: the probes resolve GR2-eboot Ghidra globals (base + ghidra - the resolved image bias) and
+    // GR2-only gate: the probes resolve GR2-eboot Ghidra globals (base + ghidra - 0x107BF0) and
     // chase them as heap pointers; on other titles (GRR: CUSA01130) the offsets hold garbage, and
     // Windows has no SIGSEGV absorber. Queried lazily - the serial is known before the first use.
     static const bool probe_is_gr2 = [] {
