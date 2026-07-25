@@ -855,7 +855,14 @@ s32 PS4_SYSV_ABI sceToolkitUserProfileGetAvatarUrl(u64 future, const u8* request
         const u64 base = Gr2NpToolkitModuleBase();
         void* alloc_obj = base ? *reinterpret_cast<void**>(base + 0xb0258) : nullptr;
         if (alloc_obj == nullptr) {
-            return ORBIS_NP_ERROR_INVALID_ARGUMENT; // leave the Future pending -> row keeps default
+            // The Future is left pending, so the consumer draws an EMPTY icon rather than the
+            // server's default image. Report it: an icon that is blank instead of the fallback
+            // picture is this path, not a missing avatar file or a failed download.
+            LOG_ERROR(Lib_NpManager,
+                      "GR2: getAvatarUrl('{}') -> NpToolkit allocator unavailable (module base "
+                      "{:#x}); Future left pending, icon stays blank",
+                      who, base);
+            return ORBIS_NP_ERROR_INVALID_ARGUMENT;
         }
         using AllocFn = PS4_SYSV_ABI void* (*)(void* self, u64 size);
         auto** vtable = *reinterpret_cast<void***>(alloc_obj);
@@ -870,7 +877,8 @@ s32 PS4_SYSV_ABI sceToolkitUserProfileGetAvatarUrl(u64 future, const u8* request
         *reinterpret_cast<u64*>(str + 0x20) = len; // > 0xf -> consumer dereferences str+0x08
     }
     *reinterpret_cast<volatile s32*>(out + 0x18) = 0; // state = done + success
-    LOG_DEBUG(Lib_NpManager, "GR2: getAvatarUrl('{}') -> {}", who, url);
+    LOG_INFO(Lib_NpManager, "GR2: getAvatarUrl('{}') -> {} [oid={} {}]", who, url,
+             oid ? oid : "(null)", IsPlausibleOnlineId(oid) ? "targeted" : "self/fallback");
     return ORBIS_OK;
 }
 
