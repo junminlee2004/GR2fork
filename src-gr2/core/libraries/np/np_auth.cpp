@@ -158,9 +158,21 @@ static void Gr2OpenGate(u64 base) {
     // (routing this gate through a refill trampoline breaks the mining notifications).
     const u64 gate = base + (0xe827a0 - 0x107BF0);
     static const u8 patch[6] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};  // mov eax,1 ; ret
+    // FUN_00e827a0's prologue: push rbp; mov rbp,rsp; push r15. The gate address is hardcoded
+    // against one eboot build, so on any other build these bytes are unrelated mid-function code
+    // and writing the stub silently corrupts it (the clobber faults later, far from here). Verify
+    // before writing, as the other code patches do.
+    static const u8 expect[6] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
     u8 orig[6];
     for (u32 i = 0; i < 6; ++i) {
         orig[i] = *reinterpret_cast<volatile u8*>(gate + i);
+    }
+    if (std::memcmp(orig, expect, sizeof(orig)) != 0) {
+        LOG_ERROR(Lib_NpAuth,
+                  "GR2-OPENGATE: FUN_00e827a0 @{:#x} orig {:02x}{:02x}{:02x}{:02x}{:02x}{:02x} "
+                  "not the expected prologue -- MISMATCH, not patched (unsupported game build)",
+                  gate, orig[0], orig[1], orig[2], orig[3], orig[4], orig[5]);
+        return;
     }
     for (u32 i = 0; i < 6; ++i) {
         *reinterpret_cast<volatile u8*>(gate + i) = patch[i];
