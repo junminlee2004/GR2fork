@@ -2,9 +2,31 @@
 SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
+**Set up GR2fork with the Following Playlist:**
+https://www.youtube.com/watch?v=O8z6QPOaGDg&list=PLOgHncbXc__M&pp=sAgC
+
+**Play GR2fork Online With the Following Servers:**
+(Atlanta server)
+45.76.253.42
+
 **Join the GR2fork discord server** (new) here for extended support. Anyone who wants to lurk for general game discussion surrounding gravity rush 1 and 2 are also welcome -> https://discord.gg/hnHRpzxGzG
 
 **Support My Project Here** for Restored Online and New Features in the Future: https://gofund.me/3340f1576
+
+-------
+
+
+**System Requirements**
+
+@ 720p 30fps(locked) @ 1080p 30fps(locked) @ 4k 60fps(locked) @ 4k 120fps(locked)
+
+ryzen 5 3600-------------ryzen 5 3600------------ryzen 7 5800x---------ryzen 9 9950x3D2
+
+gtx 1650 4GB ------------- rx 570 4gb----------- rtx 3060 8gb----------- rtx 3080ti 12gb
+
+12 gb ram------------------12 gb ram--------------12 gb ram------------12 gb ram
+
+SSD-------------------------SSD----------------------SSD-------------------SSD
 
 <h1 align="center">
   <br>
