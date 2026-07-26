@@ -56,19 +56,22 @@ constexpr std::array<AspectSite, 45> kGr2AspectSites = {{
 
 // GRR (CUSA01130/01112/01113/02318): the remaster hard-codes 1.7777778f in only 4 places (vs GR2's
 // 45), so most projection aspect is derived from the render resolution, not a baked constant. Of
-// the four, three are patched here; the writable-.data occurrence at VA 0x0169e588 (adjacent to a
+// the four, three are patched here; the writable-.data occurrence at VA 0x1693978 (adjacent to a
 // -3.5555556f) is deliberately excluded - it may be a live GPU/matrix structure that runtime writes
 // would clobber, and a stray aspect edit there risks corrupting rendering.
+// Offsets are LOADED VAs (eboot_base + offset), matching kGrrResSites: the GRR SELF stores ph[0]
+// (p_vaddr=0) at payload offset 0xB710, not at its declared ELF p_offset 0x4000, so sites map as
+// va = file_offset - 0xB710. A 0x4000-based value lands 0x7710 high and never applies.
 constexpr std::array<AspectSite, 3> kGrrAspectSites = {{
     // Camera FOV+aspect: MOVABS RAX, imm64 {0.87266f (FOV), 1.7777778f (aspect)}; MOV [R13+0x138],
     // RAX. The aspect is the high dword of the immediate; rewriting it keeps the FOV. High
     // confidence - a struct-init write like GR2 Group A.
-    {0x00271a47, "G1.cam_movabs[+0x138]"},
+    {0x0026a337, "G1.cam_movabs[+0x138]"},
     // rodata float constants (read-only segment). 1.7777778f is aspect-specific, so these are game
     // constants the linker placed near C-runtime rodata, not stdlib values. Byte-guarded and
     // read-only-safe, but their consumer is unconfirmed - verify visually per aspect.
-    {0x0102d298, "G2.rodata"},
-    {0x01053c34, "G3.rodata"},
+    {0x01025b88, "G2.rodata"},
+    {0x0104c524, "G3.rodata"},
 }};
 
 // Expected pre-patch bytes: 1.7777778f LE = 39 8E E3 3F
