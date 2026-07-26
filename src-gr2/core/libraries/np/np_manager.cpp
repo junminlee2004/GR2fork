@@ -626,12 +626,20 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
     if (np_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_signed_in) {
-        return ORBIS_NP_ERROR_SIGNED_OUT;
-    }
+    // GR2FORK: same pre-sign-in read as sceNpGetOnlineId below, on the other half of the pair.
+    // Gravity Rush 2's user-object constructor calls this at user-service login (right after
+    // sceUserServiceGetUserName) to fill the object's SceNpId, ignores the return code, and hands
+    // that field out through the getOnlineId accessor. The object is not zeroed on allocation, so
+    // returning early leaves stale heap that surfaces as a glyph wherever the local player names
+    // himself - and worse, it is stamped into uploaded ghost/photo metadata and compared with
+    // sceNpCmpOnlineId for "is this me" checks. Fill before the gate; the return code is unchanged,
+    // so the sign-in state machine still sees SIGNED_OUT.
     memset(np_id, 0, sizeof(OrbisNpId));
     strncpy(np_id->handle.data, GR2Fork::Auth::EffectiveOnlineId().c_str(),
             sizeof(np_id->handle.data));
+    if (!g_signed_in) {
+        return ORBIS_NP_ERROR_SIGNED_OUT;
+    }
     LOG_DEBUG(Lib_NpManager, "GR2: sceNpGetNpId user_id = {} -> handle = '{}'", user_id,
              np_id->handle.data);
     return ORBIS_OK;
