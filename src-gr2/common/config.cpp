@@ -257,8 +257,8 @@ static ConfigEntry<bool> fsrEnabled(false);
 static ConfigEntry<bool> rcasEnabled(true);
 static ConfigEntry<int> rcasAttenuation(250);
 // GR2FORK: pipeline-compile sync-wait budget in ms (see config.h). Default
-// 50; user-tunable from the Qt launcher.
-static ConfigEntry<int> gameplaySyncBudgetMs(50);
+// 100; user-tunable from the Qt launcher.
+static ConfigEntry<int> gameplaySyncBudgetMs(100);
 static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<string> resolutionPatchGroups("recommended");
@@ -2146,7 +2146,7 @@ void setDefaultValues(bool is_game_specific) {
     fsrEnabled.set(true, is_game_specific);
     rcasEnabled.set(true, is_game_specific);
     rcasAttenuation.set(250, is_game_specific);
-    gameplaySyncBudgetMs.set(50, is_game_specific);
+    gameplaySyncBudgetMs.set(100, is_game_specific);
     aspectRatioOverride.set("16:9", is_game_specific);
     resolutionOverride.set("Off", is_game_specific);
     resolutionPatchGroups.set("recommended", is_game_specific);

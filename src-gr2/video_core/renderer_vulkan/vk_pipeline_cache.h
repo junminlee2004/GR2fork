@@ -214,7 +214,7 @@ private:
         bool permafailed{false};
     };
 
-    // GR2FORK: the inline wait budget is the [GPU] gameplaySyncBudgetMs config key (default 10000,
+    // GR2FORK: the inline wait budget is the [GR2Fork] gameplaySyncBudgetMs config key (default 100,
     // launcher slider 0..50000 ms), read fresh at the cold-compile wait site. A low budget is safe
     // (a skip costs 1-3 frames of pop-in) and keeps the assembler draining draws during loads.
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
