@@ -18,7 +18,7 @@ https://www.youtube.com/watch?v=O8z6QPOaGDg&list=PLOgHncbXc__M&pp=sAgC
 
 **System Requirements**
 
-@ 720p 30fps(locked) @ 1080p 30fps(locked) @ 4k 60fps(locked) @ 4k 120fps(locked)
+@ 1080p 30fps(locked) @ 1080p 30fps(locked) @ 4k 60fps(locked) @ 4k 120fps(locked)
 
 ryzen 5 3600-------------ryzen 5 3600------------ryzen 7 5800x---------ryzen 9 9950x3D2
 
