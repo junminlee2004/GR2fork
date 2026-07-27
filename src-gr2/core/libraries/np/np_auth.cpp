@@ -338,73 +338,92 @@ static void Gr2FixChallengeOwnName(u64 base) {
 }
 
 // GR2FORK FIX: the Treasure Send confirmation dialog (shown after photographing a found treasure,
-// before uploading the hint) draws its online-id line from the global SceNpOnlineId buffer at
-// 0x1bf64e8. FUN_00ee3ec0 (Lua treasureSendOpen) zeroes that buffer, then the widget update
-// FUN_01092540 refills it in state 4 with strncpy(&buf, hintTable[area] + 0x20, 0x10) at 0x1092966.
-// hintTable rows are parsed from the treasure_hint savedata records, whose online-id names the hint's
-// POSTER - correct for the accept dialog, wrong for the send dialog, where the line is the local
-// player and the field holds whatever the slot last carried (uninitialized bytes -> a glyph). The
-// widget class is shared, with the mode at this+8: 0 = TreasureStart, 1 = TreasureSend,
-// 2 = PhotoReview (branched away before this site), 3 = collection. Gate the substitution on mode 1
-// so only the send dialog names the local player; the accept and collection screens keep the served
-// name byte for byte. RAX still feeds the pending CMOVC and EDX carries the size, so the trampoline
-// scratches RCX (dead here, reloaded at 0x109297a) and replays the CMOVC while the carry flag from
-// CMP RCX,0x8 is still live.
-alignas(16) static u8 g_tsendname_stub[96];
-static char g_tsendname_buf[24] = {0};
+// before uploading the hint) shows the local player's online id, but renders uninitialized bytes as a
+// glyph. Its name child is built by FUN_0108f270(child, parent, flag, name, avatarFlag), whose name
+// argument is loaded as LEA RCX,[0x1bf64e8] - the global SceNpOnlineId the widget refills from the
+// treasure_hint savedata rows, which carry the hint POSTER, not the local player. Override the
+// argument at the two call sites the build switch reaches only for TreasureSend (the accept, photo
+// review and collection screens construct the same child from their own sites and are untouched), so
+// no runtime mode test is involved: the sites themselves are the discriminator. RCX is free at both -
+// the displaced LEA writes it - and RAX is dead there (zeroed for the CMOVNZ, then reloaded by the
+// call), so it carries the resume address. The first site's CMOVNZ is replayed before anything that
+// writes flags, since it consumes the ZF set by the earlier TEST EBX,EBX.
+alignas(16) static u8 g_tsendname_stub[128];
+static char g_tsendname_buf[20] = {0};
 static void Gr2FixTreasureSendOwnName(u64 base) {
     static bool done = false;
     if (done || base == 0) {
         return;
     }
     done = true;
-    const u64 site = base + (0x1092966 - 0x107BF0);  // CMOVC RSI,RAX; ADD RSI,0x20; CALL strncpy
-    u8 orig[13];
-    for (u32 i = 0; i < sizeof(orig); ++i) {
-        orig[i] = *reinterpret_cast<volatile u8*>(site + i);
-    }
-    // expect 48 0f 42 f0 | 48 83 c6 20 | e8 ad a9 46 00
-    static constexpr u8 kOrig[13] = {0x48, 0x0f, 0x42, 0xf0, 0x48, 0x83, 0xc6,
-                                     0x20, 0xe8, 0xad, 0xa9, 0x46, 0x00};
-    if (std::memcmp(orig, kOrig, sizeof(kOrig)) != 0) {
-        LOG_ERROR(Lib_NpAuth,
-                  "GR2-TSENDNAME: FUN_01092540 fill @{:#x} orig {:02x}{:02x}{:02x}{:02x}... "
-                  "unexpected -- MISMATCH, not patched",
-                  site, orig[0], orig[1], orig[2], orig[3]);
-        return;
-    }
     std::memset(g_tsendname_buf, 0, sizeof(g_tsendname_buf));
     std::strncpy(g_tsendname_buf, GR2Fork::Auth::EffectiveOnlineId().c_str(),
                  sizeof(g_tsendname_buf) - 1);
-    const u64 strncpy_rt = base + (0x14fd320 - 0x107BF0);  // the copy the site tail-calls
-    const u64 resume_rt = base + (0x1092973 - 0x107BF0);   // instruction after the displaced call
-    u8* s = g_tsendname_stub;
-    u32 p = 0;
-    auto e = [&](u8 b) { s[p++] = b; };
-    auto e64 = [&](u64 v) { for (int i = 0; i < 8; ++i) e(static_cast<u8>(v >> (i * 8))); };
-    // Replay the displaced source select FIRST, while the carry flag still holds.
-    e(0x48); e(0x0f); e(0x42); e(0xf0);                            // cmovc rsi, rax
-    e(0x48); e(0x83); e(0xc6); e(0x20);                            // add rsi, 0x20
-    e(0x41); e(0x83); e(0x7d); e(0x08); e(0x01);                   // cmp dword [r13+8], 1
-    e(0x75); e(0x0a);                                              // jne +10 (keep served name)
-    e(0x48); e(0xbe); e64(reinterpret_cast<u64>(g_tsendname_buf)); // movabs rsi, &name
-    // RDI (the global buffer) and EDX (0x10) are already set; call the copy, then resume in place.
-    e(0x48); e(0xb8); e64(strncpy_rt); e(0xff); e(0xd0);           // movabs rax, strncpy; call rax
-    e(0x48); e(0xb8); e64(resume_rt); e(0xff); e(0xe0);            // movabs rax, resume; jmp rax
     const u64 pg = reinterpret_cast<u64>(g_tsendname_stub) & ~static_cast<u64>(0xfff);
     const int mp = Gr2MakeRWX(reinterpret_cast<void*>(pg), 0x2000);
-    const u64 sa = reinterpret_cast<u64>(g_tsendname_stub);
-    // 12 bytes of patch + one NOP to cover the 13 displaced bytes.
-    u8 patch[13] = {0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe1, 0x90};
-    for (int i = 0; i < 8; ++i) {
-        patch[2 + i] = static_cast<u8>(sa >> (i * 8));
+
+    // Both sites: displaced bytes, then the tail that reloads RCX with the fork buffer and resumes.
+    // site 0 = 0x109468c (13 displaced: LEA RCX; CMOVNZ RBX,RAX; XOR EDX,EDX)
+    // site 1 = 0x1095387 (12 displaced: LEA RCX; XOR EDX,EDX; MOV RDI,RBX)
+    struct Site {
+        u64 va;             // patch address (ghidra)
+        u64 resume;         // first instruction after the displaced range
+        u32 len;            // displaced byte count
+        const u8* orig;     // expected original bytes
+        const u8* replay;   // displaced instructions minus the LEA, in order
+        u32 replay_len;
+    };
+    static constexpr u8 kOrig0[13] = {0x48, 0x8d, 0x0d, 0x55, 0x1e, 0xb6, 0x00,
+                                      0x48, 0x0f, 0x45, 0xd8, 0x31, 0xd2};
+    static constexpr u8 kReplay0[6] = {0x48, 0x0f, 0x45, 0xd8,   // cmovnz rbx, rax
+                                       0x31, 0xd2};              // xor edx, edx
+    static constexpr u8 kOrig1[12] = {0x48, 0x8d, 0x0d, 0x5a, 0x11, 0xb6,
+                                      0x00, 0x31, 0xd2, 0x48, 0x89, 0xdf};
+    static constexpr u8 kReplay1[5] = {0x31, 0xd2,               // xor edx, edx
+                                       0x48, 0x89, 0xdf};        // mov rdi, rbx
+    const Site sites[2] = {
+        {0x109468c, 0x1094699, 13, kOrig0, kReplay0, sizeof(kReplay0)},
+        {0x1095387, 0x1095393, 12, kOrig1, kReplay1, sizeof(kReplay1)},
+    };
+
+    u32 stub_off = 0;
+    for (u32 i = 0; i < 2; ++i) {
+        const Site& st = sites[i];
+        const u64 site = base + (st.va - 0x107BF0);
+        u8 orig[13];
+        for (u32 k = 0; k < st.len; ++k) {
+            orig[k] = *reinterpret_cast<volatile u8*>(site + k);
+        }
+        if (std::memcmp(orig, st.orig, st.len) != 0) {
+            LOG_ERROR(Lib_NpAuth,
+                      "GR2-TSENDNAME: ctor name arg @{:#x} orig {:02x}{:02x}{:02x}{:02x}... "
+                      "unexpected -- MISMATCH, not patched",
+                      site, orig[0], orig[1], orig[2], orig[3]);
+            continue;
+        }
+        u8* s = g_tsendname_stub + stub_off;
+        u32 p = 0;
+        auto e = [&](u8 b) { s[p++] = b; };
+        auto e64 = [&](u64 v) { for (int k = 0; k < 8; ++k) e(static_cast<u8>(v >> (k * 8))); };
+        for (u32 k = 0; k < st.replay_len; ++k) {
+            e(st.replay[k]);
+        }
+        e(0x48); e(0xb9); e64(reinterpret_cast<u64>(g_tsendname_buf));  // movabs rcx, &name
+        e(0x48); e(0xb8); e64(base + (st.resume - 0x107BF0));           // movabs rax, resume
+        e(0xff); e(0xe0);                                               // jmp rax
+        const u64 sa = reinterpret_cast<u64>(s);
+        u8 patch[13] = {0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe1, 0x90};
+        for (int k = 0; k < 8; ++k) {
+            patch[2 + k] = static_cast<u8>(sa >> (k * 8));
+        }
+        for (u32 k = 0; k < st.len; ++k) {   // 12 bytes of patch, plus a NOP when 13 are displaced
+            *reinterpret_cast<volatile u8*>(site + k) = patch[k];
+        }
+        stub_off += (p + 15) & ~15u;
+        LOG_INFO(Lib_NpAuth,
+                 "GR2-TSENDNAME: ctor name arg @{:#x} -> stub@{:#x} ({}B) mprotect={} name='{}'",
+                 site, sa, p, mp, g_tsendname_buf);
     }
-    for (u32 i = 0; i < sizeof(patch); ++i) {
-        *reinterpret_cast<volatile u8*>(site + i) = patch[i];
-    }
-    LOG_INFO(Lib_NpAuth,
-             "GR2-TSENDNAME: FUN_01092540 fill @{:#x} -> stub@{:#x} ({}B) mprotect={} name='{}'",
-             site, sa, p, mp, g_tsendname_buf);
 }
 
 // GR2FORK FIX: suppress the overworld challenge puppet. Challenges are reached from a marker access
