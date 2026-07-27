@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <span>
 #include <thread>
 #include <vector>
@@ -315,6 +316,172 @@ static std::string g_game_serial;
 static u32 g_fw_ver;
 static std::array<std::optional<SaveInstance>, 16> g_mount_slots;
 
+// GR2FORK: Gravity Rush 2 persists every server-served Announcements item - challenges, treasure
+// hints, treasure and challenge results, photo reviews, notices - under News/ in system0020.bin,
+// and restores those slots on the next boot. A restored card never re-requests its sender's
+// profile, so it draws with no avatar, and the set only ever grows because a slot is cleared by
+// completing the item rather than by the server withdrawing it. The live server is the authority
+// on what a player currently has, so clear the served set at mount time and let the session
+// repopulate it: this is the targeted form of wiping the save, which is what restores the cards.
+//
+// The file is a ggdL tree: a 16-byte header ("ggdL", hash, size, entry count) then `count` 16-byte
+// entries {u32 name_off; u32 packed; u32 n; u32 fnv}, where packed is (value_off << 4) | type, and
+// finally a blob in which each entry's NUL-terminated name is followed by its value bytes. Entries
+// are depth-first, so an object's descendants are the contiguous run after it. Values are rewritten
+// in place, never resized, so every offset in the file stays valid; the header hash is left alone,
+// matching the token enforcement in http.cpp, which the game accepts.
+namespace {
+
+constexpr u32 kGgdlTypeObject = 0x8;  // n = child count, no bytes in the blob
+constexpr u32 kGgdlTypeScalar = 0x9;  // n IS the value
+constexpr u32 kGgdlTypeString = 0xB;  // n = byte length at value_off
+
+// The text an unused slot carries, by field name. Unused slots are not blank: they hold these
+// placeholders, so restoring them exactly keeps a cleared slot indistinguishable from one the
+// game has never filled.
+std::string_view Gr2UnusedSlotText(std::string_view field) {
+    if (field == "onlineID" || field == "missionID") {
+        return "None";
+    }
+    if (field == "last_update") {
+        return "yyyymmddhhmmss";
+    }
+    if (field == "limit" || field == "scoreId" || field == "get_time" || field == "recv_time") {
+        return "0";
+    }
+    return "";
+}
+
+bool Gr2IsGravityRush2(std::string_view serial) {
+    static constexpr std::string_view kSerials[] = {
+        "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+        "PCJS50010", "PCAS00079", "CUSA04935",
+    };
+    for (const auto& s : kSerials) {
+        if (serial == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Gr2ClearServedNewsSlots(const fs::path& save_dir) {
+    if (!Gr2IsGravityRush2(Common::ElfInfo::Instance().GameSerial())) {
+        return;
+    }
+    const fs::path file = save_dir / "system0020.bin";
+    std::error_code ec;
+    if (!fs::exists(file, ec)) {
+        return;
+    }
+    std::vector<char> data;
+    {
+        Common::FS::IOFile in(file, Common::FS::FileAccessMode::Read);
+        if (!in.IsOpen()) {
+            return;
+        }
+        data.resize(in.GetSize());
+        if (data.size() < 16 || in.Read(data) != data.size()) {
+            return;
+        }
+    }
+    if (std::memcmp(data.data(), "ggdL", 4) != 0) {
+        return;
+    }
+    u32 count = 0;
+    std::memcpy(&count, data.data() + 12, 4);
+    const std::size_t entries_end = 16 + static_cast<std::size_t>(count) * 16;
+    if (entries_end > data.size()) {
+        return;
+    }
+
+    const auto entry_at = [&](std::size_t i, u32& name_off, u32& value_off, u32& type, u32& n) {
+        const std::size_t off = 16 + i * 16;
+        u32 packed = 0;
+        std::memcpy(&name_off, data.data() + off, 4);
+        std::memcpy(&packed, data.data() + off + 4, 4);
+        std::memcpy(&n, data.data() + off + 8, 4);
+        value_off = packed >> 4;
+        type = packed & 0xF;
+    };
+    const auto name_of = [&](u32 name_off) -> std::string_view {
+        if (name_off >= data.size()) {
+            return {};
+        }
+        const char* p = data.data() + name_off;
+        const std::size_t max = data.size() - name_off;
+        const std::size_t len = ::strnlen(p, max);
+        return std::string_view{p, len};
+    };
+
+    // Locate the News object, then walk its depth-first run: each object seen adds its children to
+    // the outstanding count, so the walk ends exactly at the end of the subtree.
+    std::size_t news = count;
+    for (std::size_t i = 0; i < count; ++i) {
+        u32 name_off = 0, value_off = 0, type = 0, n = 0;
+        entry_at(i, name_off, value_off, type, n);
+        if (type == kGgdlTypeObject && name_of(name_off) == "News") {
+            news = i;
+            break;
+        }
+    }
+    if (news == count) {
+        return;
+    }
+
+    u32 cleared = 0;
+    std::size_t outstanding = 1;
+    for (std::size_t i = news; i < count && outstanding > 0; ++i) {
+        u32 name_off = 0, value_off = 0, type = 0, n = 0;
+        entry_at(i, name_off, value_off, type, n);
+        --outstanding;
+        if (type == kGgdlTypeObject) {
+            outstanding += n;
+            continue;
+        }
+        if (type == kGgdlTypeScalar) {
+            if (n != 0) {
+                const u32 zero = 0;
+                std::memcpy(data.data() + 16 + i * 16 + 8, &zero, 4);
+                ++cleared;
+            }
+            continue;
+        }
+        // Widened before the bounds test: both fields come off disk, and u32 arithmetic here could
+        // wrap past it.
+        if (type != kGgdlTypeString || n == 0 ||
+            static_cast<std::size_t>(value_off) + n > data.size()) {
+            continue;
+        }
+        // Only ever narrows the value: the placeholder is written into the existing field and the
+        // remainder NUL-filled, so the reserved length is unchanged. A field too short to hold its
+        // placeholder is emptied instead, which is still a cleared slot.
+        std::string_view want = Gr2UnusedSlotText(name_of(name_off));
+        if (want.size() + 1 > n) {
+            want = {};
+        }
+        char* dst = data.data() + value_off;
+        if (std::string_view{dst, ::strnlen(dst, n)} == want) {
+            continue;
+        }
+        std::memset(dst, 0, n);
+        std::memcpy(dst, want.data(), want.size());
+        ++cleared;
+    }
+    if (cleared == 0) {
+        return;
+    }
+    Common::FS::IOFile out(file, Common::FS::FileAccessMode::ReadWrite);
+    if (!out.IsOpen() || out.Write(data) != data.size()) {
+        LOG_ERROR(Lib_SaveData, "GR2-NEWSCLEAR: could not rewrite {}", fmt::UTF(file.u8string()));
+        return;
+    }
+    LOG_INFO(Lib_SaveData, "GR2-NEWSCLEAR: cleared {} served News field(s) in system0020.bin",
+             cleared);
+}
+
+} // namespace
+
 static void initialize() {
     g_initialized = true;
     g_game_serial = Common::Singleton<PSF>::Instance()
@@ -451,6 +618,11 @@ static Error saveDataMount(const OrbisSaveDataMount2* mount_info,
             mount_result->required_blocks = (requested_size - available) / OrbisSaveDataBlockSize;
             return Error::NO_SPACE_FS;
         }
+    }
+
+    // GR2FORK: drop the persisted server-served Announcements set before the game can read it back.
+    if (dir_name == "system0020") {
+        Gr2ClearServedNewsSlots(save_instance.GetSavePath());
     }
 
     try {
