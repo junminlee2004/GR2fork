@@ -1657,10 +1657,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         const u32 flags = make_flags(image_res);
         const u64 key = make_key(image_res, flags);
+        // GR2FORK PERF: fold the T# base address into the SLOT index only - make_key
+        // identifies a shader slot with no texture identity, so one material drawn across
+        // many objects thrashed a single slot and rebuilt the ~400B ImageDesc on ~37% of
+        // bindings (measured; ImageInfo ctor alone was 3.1% of the thread). The tag and
+        // 32-byte memcmp below stay byte-identical, so a remapped slot can only MISS,
+        // never wrong-hit. Mirrors the pcache pkey fold. GR2_NODESCSLOT=1 restores the
+        // slot-blind index.
+        static const bool desc_slot_addr_enabled = []() noexcept {
+            const char* e = std::getenv("GR2_NODESCSLOT");
+            return !(e && e[0] == '1');
+        }();
+        const u64 skey = desc_slot_addr_enabled ? key ^ (tsharp.Address() >> 8) : key;
         // GR2FORK PERF: Mix the key with a multiplicative hash before slot
         // selection - plain key & (size-1) uses low bits, which cluster
         // when pgm_hash is stable.
-        const u64 mixed_key = (key ^ (key >> 16)) * 0x9e3779b97f4a7c15ULL;
+        const u64 mixed_key = (skey ^ (skey >> 16)) * 0x9e3779b97f4a7c15ULL;
         CachedImageDescEntry& ce = image_desc_cache_[static_cast<u32>(mixed_key >> 20) & (image_desc_cache_.size() - 1)];
 
         // GR2FORK PERF: image_desc_cache hits are dominant in steady state (same-pipeline
