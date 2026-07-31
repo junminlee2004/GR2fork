@@ -253,8 +253,21 @@ int main(int argc, char* argv[]) {
     // Check if the game path or ID exists
     std::filesystem::path eboot_path(game_path);
 
+    // An eboot inside a ".zar" has no host path of its own, so accept the path when the archive
+    // component itself is a real file.
+    const auto archive_component_exists = [](const std::filesystem::path& p) -> bool {
+        std::filesystem::path accum;
+        for (const auto& comp : p) {
+            accum /= comp;
+            if (comp.extension() == ".zar") {
+                return std::filesystem::is_regular_file(accum);
+            }
+        }
+        return false;
+    };
+
     // Check if the provided path is a valid file
-    if (!std::filesystem::exists(eboot_path)) {
+    if (!std::filesystem::exists(eboot_path) && !archive_component_exists(eboot_path)) {
         // If not a file, treat it as a game ID and search in install directories recursively
         bool game_found = false;
         const int max_depth = 5;
