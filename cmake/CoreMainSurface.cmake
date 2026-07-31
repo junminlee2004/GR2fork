@@ -5,10 +5,10 @@
 # no tests). The umbrella includes this file; Combine.cmake consumes the
 # CORE_MAIN_* lists via add_core(NAME main ...).
 #
-#   upstream commit : 26f42701 2026-07-24
-#   emulator version: 0.16.1
+#   upstream commit : bf4809fe 2026-07-31
+#   emulator version: 0.17.1
 
-set(CORE_MAIN_UPSTREAM_SHA "26f4270174a0a0de9eb5c26fdd99d84ddf9fa2ab")
+set(CORE_MAIN_UPSTREAM_SHA "bf4809fed2865da53ede58723965635e514e2ef5")
 
 # --- find_package mirror. Gated on ENABLE_SYSTEM_LIBRARIES exactly like upstream
 #     (default OFF): with it off, the vendored externals/ provide every target and
@@ -60,7 +60,8 @@ set(CORE_MAIN_LIBS
     Cpp_Httplib
     miniupnpc::miniupnpc
     Freetype::Freetype
-    libprotobuf)
+    libprotobuf
+    ZArchive::zarchive)
 
 # --- compile definitions beyond the shared base ---
 set(CORE_MAIN_DEFINES "")
