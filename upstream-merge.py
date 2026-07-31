@@ -1191,6 +1191,43 @@ def absorbed_upstream(body, conflicted, target_text):
     return resolve_conflicts_ours(conflicted) == target_lines
 
 
+_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|0[xX][0-9a-fA-F]+|\d+")
+
+
+def patch_hunk_tokens(body, sign):
+    """Token multiset over the hunk payload lines carrying the given sign."""
+    toks = Counter()
+    for line in patch_hunk_lines(body, sign):
+        toks.update(_TOKEN_RE.findall(line))
+    return toks
+
+
+def absorbed_by_rename(body, conflicted, target_text):
+    """Judges whether a conflicted patch that edits lines is already satisfied upstream.
+
+    Covers what absorbed_upstream cannot: upstream made the same change but reworded
+    the surrounding statement, so no added line survives verbatim. The patch counts as
+    absorbed when every token it introduces is present in the new base, every token it
+    retires is gone from that file entirely, and resolving each conflict toward upstream
+    reproduces the base exactly (so the cleanly merged hunks were textual no-ops).
+
+    Demanding that the retired tokens have vanished is what protects a still-needed
+    deviation: a value tweak like 64 -> 128 retires a token that remains all over the
+    file, so it is refused and left to block the sync.
+    """
+    plus = patch_hunk_tokens(body, "+")
+    minus = patch_hunk_tokens(body, "-")
+    retired, introduced = minus - plus, plus - minus
+    if not retired:
+        return False
+    target_tokens = Counter(_TOKEN_RE.findall(target_text))
+    if any(target_tokens[t] for t in retired):
+        return False
+    if any(not target_tokens[t] for t in introduced):
+        return False
+    return resolve_conflicts_ours(conflicted) == target_text.splitlines()
+
+
 # ======================================================================== sync logic
 
 
@@ -1474,6 +1511,14 @@ class Sync:
                          "every added line already exists in the new base; "
                          f"conflicted merge kept at {dump}"))
                     continue
+                if target_text and absorbed_by_rename(body, conflicted, target_text):
+                    os.remove(ppath)
+                    self.patch_results.append(
+                        (patch, "absorbed upstream (restructured) - dropped",
+                         "the new base already uses every symbol the patch introduces and "
+                         "none it retires; conflicted merge kept at "
+                         f"{dump}"))
+                    continue
                 if target_text:
                     added = patch_hunk_lines(body, "+")
                     have = Counter(target_text.splitlines())
@@ -1481,6 +1526,18 @@ class Sync:
                     if added and present:
                         detail += (f"; {present}/{len(added)} added lines already exist "
                                    "in the new base (possible partial absorption)")
+                    # Name the tokens that still tell the deviation apart from the new base:
+                    # with both lists empty the hunks are semantically equivalent and only the
+                    # structure conflicts, which is the fast tell for a hand merge.
+                    tgt_toks = Counter(_TOKEN_RE.findall(target_text))
+                    plus = patch_hunk_tokens(body, "+")
+                    minus = patch_hunk_tokens(body, "-")
+                    stale = sorted(t for t in (minus - plus) if tgt_toks[t])
+                    missing = sorted(t for t in (plus - minus) if not tgt_toks[t])
+                    if stale:
+                        detail += f"; retires but base still uses: {', '.join(stale[:5])}"
+                    if missing:
+                        detail += f"; introduces but base lacks: {', '.join(missing[:5])}"
             self.recovery.append((patch, fpath, dump))
             self.patch_results.append((patch, "FAILED", detail))
 
