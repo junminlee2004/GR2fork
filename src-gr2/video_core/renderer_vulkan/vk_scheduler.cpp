@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
 #include <cstring>
 #include <string_view>
 #include <vector>
@@ -104,20 +103,6 @@ void Scheduler::Wait(u64 tick) {
 
 void Scheduler::PopPendingOperations() {
     if (pending_ops.empty()) [[likely]] {
-        return;
-    }
-    // GR2FORK PERF: consult the already-known GPU tick before paying Refresh's counter
-    // query (a drmSyncobjQuery ioctl on RADV; this call site was measured issuing ~6k/s =
-    // 1.36% of the assembler's wall). If the oldest pending op's tick is not yet known
-    // complete, skip the query - the GPU may have just passed it, but discovering that can
-    // wait for the next call or any other Refresh path. The cost is bounded reclaim
-    // latency; deferred ops are frees, so late is the safe direction. Refresh() itself is
-    // untouched. GR2_NOPOPGATE=1 restores the unconditional query.
-    static const bool pop_gate_enabled = []() noexcept {
-        const char* e = std::getenv("GR2_NOPOPGATE");
-        return !(e && e[0] == '1');
-    }();
-    if (pop_gate_enabled && !master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         return;
     }
     master_semaphore.Refresh();
