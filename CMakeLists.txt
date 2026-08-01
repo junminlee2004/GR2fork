@@ -241,6 +241,9 @@ add_core(
     SRC      ${SRC_GR2}
     EXCLUDES core/libraries/screenshot_service/screenshot_service2.cpp
              shader_recompiler/frontend/translate/emit_spirv.cpp
+             # Upstream excludes this too (CORE_MAIN_EXCLUDES): its File::Open definitions
+             # predate the IFile backend refactor and no longer match fs.h.
+             core/file_sys/file.cpp
     LIBS     SDL3_mixer::SDL3_mixer miniz Cpp_Httplib ZArchive::zarchive)
 
 # GR2FORK PERF: inline xxhash in the gr2 core. The GpuAssembler hot path makes
