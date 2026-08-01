@@ -5,10 +5,10 @@
 # no tests). The umbrella includes this file; Combine.cmake consumes the
 # CORE_MAIN_* lists via add_core(NAME main ...).
 #
-#   upstream commit : bf4809fe 2026-07-31
+#   upstream commit : f0c6ffe1 2026-08-01
 #   emulator version: 0.17.1
 
-set(CORE_MAIN_UPSTREAM_SHA "bf4809fed2865da53ede58723965635e514e2ef5")
+set(CORE_MAIN_UPSTREAM_SHA "f0c6ffe15b79b34af5406b9f5930c5437f38177a")
 
 # --- find_package mirror. Gated on ENABLE_SYSTEM_LIBRARIES exactly like upstream
 #     (default OFF): with it off, the vendored externals/ provide every target and
@@ -38,6 +38,7 @@ if(ENABLE_SYSTEM_LIBRARIES)
     find_package(VulkanMemoryAllocator 3.1.0 CONFIG)
     find_package(xbyak 7.07 CONFIG)
     find_package(xxHash 0.8.2 MODULE)
+    find_package(ZArchive 0.1.2 MODULE)
     find_package(ZLIB 1.3 MODULE)
     find_package(Zydis 5.0.0 MODULE)
     find_package(pugixml 1.14 CONFIG)

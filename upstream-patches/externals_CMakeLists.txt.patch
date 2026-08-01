@@ -1,8 +1,8 @@
 # carried local patch for the upstream mirror
 # file: externals/CMakeLists.txt
-# original base: bf4809fed2865da53ede58723965635e514e2ef5
+# original base: f0c6ffe15b79b34af5406b9f5930c5437f38177a
 diff --git a/externals/CMakeLists.txt b/externals/CMakeLists.txt
-index 159ce9c6..e0171d6f 100644
+index 1dc6fc65..370237af 100644
 --- a/externals/CMakeLists.txt
 +++ b/externals/CMakeLists.txt
 @@ -391,7 +391,17 @@ set(protobuf_WITH_ZLIB                OFF CACHE INTERNAL "")

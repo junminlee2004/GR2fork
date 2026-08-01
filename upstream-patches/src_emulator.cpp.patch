@@ -1,6 +1,6 @@
 # carried local patch for the upstream mirror
 # file: src/emulator.cpp
-# original base: bf4809fed2865da53ede58723965635e514e2ef5
+# original base: f0c6ffe15b79b34af5406b9f5930c5437f38177a
 diff --git a/src/emulator.cpp b/src/emulator.cpp
 index d90c2381..14256657 100644
 --- a/src/emulator.cpp
