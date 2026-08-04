@@ -791,6 +791,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_writte
     case BufferType::Flatbuf:
         Name(id, "srt_flatbuf");
         break;
+    case BufferType::ClipPlanes:
+        Name(id, "clip_planes");
+        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
