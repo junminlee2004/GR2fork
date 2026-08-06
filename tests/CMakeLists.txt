@@ -31,6 +31,8 @@ set(SETTINGS_TEST_SOURCES
 
     # Tests
     test_emulator_settings.cpp
+    # Windows static guest red-zone protection
+    test_windows_guest_red_zone_protection_settings.cpp
 )
 
 set(GCN_TEST_SOURCES
