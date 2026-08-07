@@ -773,6 +773,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+    LOG_WARNING(Render, "Refresh image");
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,

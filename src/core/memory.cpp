@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-
+#pragma clang optimize off
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -129,7 +129,7 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 
     // Pretend the entire PRT area is mapped to avoid GPU tracking errors.
     // The caches will use CopySparseMemory to fetch data which avoids unmapped areas.
-    rasterizer->MapMemory(address, size);
+    rasterizer->MapMemory(address, size, false);
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
@@ -189,6 +189,15 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     }
 
     return true;
+}
+
+bool MemoryManager::EnsureBackingIsHost(void* address, u64 size) {
+    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    std::shared_lock lk{mutex};
+    auto& vma = FindVMA(virtual_addr)->second;
+    ASSERT(vma.Overlaps(virtual_addr, size));
+    auto& phys_area = vma.phys_areas.begin()->second;
+    return phys_area.memory_type == 0;
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
@@ -266,6 +275,7 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
     auto& area = CarvePhysArea(dmem_map, mapping_start, size)->second;
     area.memory_type = memory_type;
     area.dma_type = PhysicalMemoryType::Allocated;
+    //area.gpu_mem = rasterizer->CreateGpuMem(mapping_start, size, memory_type == 3);
     MergeAdjacent(dmem_map, dmem_area);
 
     return mapping_start;
@@ -335,7 +345,7 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
 
     // Early unmap from GPU to avoid deadlocking.
     for (auto& [addr, unmap_size] : remove_list) {
-        if (IsValidGpuMapping(addr, unmap_size)) {
+        if (IsValidGpuMapping(addr, unmap_size, MemoryProt::GpuReadWrite)) {
             rasterizer->UnmapMemory(addr, unmap_size);
         }
     }
@@ -451,8 +461,8 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     MergeAdjacent(vma_map, new_vma_handle);
 
     lk2.unlock();
-    if (IsValidGpuMapping(mapped_addr, size)) {
-        rasterizer->MapMemory(mapped_addr, size);
+    if (IsValidGpuMapping(mapped_addr, size, prot)) {
+        rasterizer->MapMemory(mapped_addr, size, mtype == 3);
     }
 
     return ORBIS_OK;
@@ -513,7 +523,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
     std::scoped_lock lk{unmap_mutex};
 
-    PhysHandle dmem_area;
+    if (out_addr && VAddr(*out_addr) == 0x3000000000ULL){
+        printf("bad\n");
+    }
+
     // Validate the requested physical address range
     if (phys_addr != -1) {
         if (total_direct_size < phys_addr + size) {
@@ -569,7 +582,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
+    if (IsValidGpuMapping(virtual_addr, size, prot)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
@@ -609,7 +622,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
             MergeAdjacent(new_vma.phys_areas, new_vma.phys_areas.find(current_addr - mapped_addr));
 
             // Perform an address space mapping for each physical area
-            void* out_addr = impl.Map(current_addr, size_to_map, new_fmem_area.base, is_exec);
+            void* out_addr = impl.Map(current_addr, size_to_map, /*new_fmem_area.base*/-1, is_exec);
             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
             // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
 
@@ -665,7 +678,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
         // Flexible address space mappings were performed while finding direct memory areas.
         if (type != VMAType::Flexible) {
-            impl.Map(mapped_addr, size, phys_addr, is_exec);
+            impl.Map(mapped_addr, size, /*phys_addr*/-1, is_exec);
             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
             // TRACK_ALLOC(mapped_addr, size, "VMEM");
         }
@@ -673,8 +686,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         lk2.unlock();
 
         // If this is not a reservation, then map to GPU and address space
-        if (IsValidGpuMapping(mapped_addr, size)) {
-            rasterizer->MapMemory(mapped_addr, size);
+        if (IsValidGpuMapping(mapped_addr, size, prot)) {
+            auto dmem_area = FindDmemArea(phys_addr);
+            ASSERT(dmem_area != dmem_map.end());
+            rasterizer->MapMemory(mapped_addr, size, dmem_area->second.memory_type == 3);
         }
     }
 
@@ -755,7 +770,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
+    if (IsValidGpuMapping(virtual_addr, size, prot)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
@@ -819,7 +834,7 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     }
 
     // Perform early GPU unmap to avoid potential deadlocks
-    if (IsValidGpuMapping(virtual_addr, size)) {
+    if (IsValidGpuMapping(virtual_addr, size, it->second.prot)) {
         rasterizer->UnmapMemory(virtual_addr, size);
     }
 
@@ -901,11 +916,6 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    // If the requested range has GPU access, unmap from GPU.
-    if (IsValidGpuMapping(virtual_addr, size)) {
-        rasterizer->UnmapMemory(virtual_addr, size);
-    }
-
     // Acquire writer lock.
     std::scoped_lock lk2{mutex};
     return UnmapMemoryImpl(virtual_addr, size);
@@ -985,6 +995,9 @@ s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
     do {
         auto it = FindVMA(virtual_addr + unmapped_bytes);
         auto& vma_base = it->second;
+        if (IsValidGpuMapping(virtual_addr, size, vma_base.prot)) {
+            rasterizer->UnmapMemory(virtual_addr, size);
+        }
         auto unmapped =
             UnmapBytesFromEntry(virtual_addr + unmapped_bytes, vma_base, size - unmapped_bytes);
         ASSERT_MSG(unmapped > 0, "Failed to unmap memory, progress is impossible");

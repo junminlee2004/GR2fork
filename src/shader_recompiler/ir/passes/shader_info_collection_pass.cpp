@@ -168,7 +168,7 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     }
 
     if (info.uses_dma) {
-        info.buffers.push_back({
+        /*info.buffers.push_back({
             .used_types = IR::Type::U64,
             .inline_cbuf = AmdGpu::Buffer::Placeholder(VideoCore::BufferCache::BDA_PAGETABLE_SIZE),
             .buffer_type = BufferType::BdaPagetable,
@@ -179,7 +179,7 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             .inline_cbuf = AmdGpu::Buffer::Placeholder(std::numeric_limits<u32>::max()),
             .buffer_type = BufferType::FaultBuffer,
             .is_written = true,
-        });
+        });*/
     }
 }
 

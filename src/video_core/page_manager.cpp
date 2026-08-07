@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-
+//#define ENABLE_USERFAULTFD
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -21,6 +21,7 @@
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include "common/error.h"
 #endif
 #else
@@ -33,6 +34,8 @@
 #else
 #include "common/spin_lock.h"
 #endif
+
+bool allow_prot = false;
 
 namespace VideoCore {
 
@@ -91,7 +94,7 @@ struct PageManager::Impl {
 #ifdef ENABLE_USERFAULTFD
     Impl(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
-        uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
         ASSERT_MSG(uffd != -1, "{}", Common::GetLastErrorMsg());
 
         // Request uffdio features from kernel.
@@ -105,7 +108,10 @@ struct PageManager::Impl {
         ufd_thread = std::jthread([&](std::stop_token token) { UffdHandler(token); });
     }
 
-    void OnMap(VAddr address, size_t size) {
+    void OnMap(VAddr address, size_t size, bool device_mem) {
+        if (!device_mem) {
+            return;
+        }
         uffdio_register reg;
         reg.range.start = address;
         reg.range.len = size;
@@ -129,8 +135,8 @@ struct PageManager::Impl {
         wp.range.len = size;
         wp.mode = allow_write ? 0 : UFFDIO_WRITEPROTECT_MODE_WP;
         const int ret = ioctl(uffd, UFFDIO_WRITEPROTECT, &wp);
-        ASSERT_MSG(ret != -1, "Uffdio writeprotect failed with error: {}",
-                   Common::GetLastErrorMsg());
+        ASSERT_MSG(ret != -1, "Uffdio writeprotect failed {} with error: {}",
+                   ret, Common::GetLastErrorMsg());
     }
 
     void UffdHandler(std::stop_token token) {
@@ -190,7 +196,7 @@ struct PageManager::Impl {
                                                                   priority);
     }
 
-    void OnMap(VAddr address, size_t size) {
+    void OnMap(VAddr address, size_t size, bool device_mem) {
         // No-op
     }
 
@@ -204,6 +210,10 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        auto it = rasterizer->mapped_ranges.find(address);
+        auto it2 = rasterizer->mapped_ranges.find(address + size - 1);
+        ASSERT(it != rasterizer->mapped_ranges.end() && it2 != rasterizer->mapped_ranges.end());
+        if (it->second && it2->second)
         impl.Protect(address, size, perms);
     }
 
@@ -369,8 +379,8 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
 
 PageManager::~PageManager() = default;
 
-void PageManager::OnGpuMap(VAddr address, size_t size) {
-    impl->OnMap(address, size);
+void PageManager::OnGpuMap(VAddr address, size_t size, bool device_mem) {
+    impl->OnMap(address, size, device_mem);
 }
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {

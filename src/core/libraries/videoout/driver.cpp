@@ -283,6 +283,7 @@ void VideoOutDriver::DrawBlankFrame() {
 }
 
 void VideoOutDriver::DrawLastFrame() {
+    return;
     const auto frame = presenter->PrepareLastFrame();
     if (frame != nullptr) {
         presenter->Present(frame, true);

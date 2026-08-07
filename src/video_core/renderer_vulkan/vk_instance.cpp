@@ -209,12 +209,15 @@ bool Instance::CreateDevice() {
     const vk::StructureChain properties_chain = physical_device.getProperties2<
         vk::PhysicalDeviceProperties2, vk::PhysicalDeviceVulkan11Properties,
         vk::PhysicalDeviceVulkan12Properties, vk::PhysicalDeviceVulkan13Properties,
-        vk::PhysicalDevicePushDescriptorPropertiesKHR>();
+        vk::PhysicalDevicePushDescriptorPropertiesKHR,
+        vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
     vk11_props = properties_chain.get<vk::PhysicalDeviceVulkan11Properties>();
     vk12_props = properties_chain.get<vk::PhysicalDeviceVulkan12Properties>();
     vk13_props = properties_chain.get<vk::PhysicalDeviceVulkan13Properties>();
     push_descriptor_props = properties_chain.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>();
+    auto host_props = properties_chain.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
     LOG_INFO(Render_Vulkan, "Physical device subgroup size {}", vk11_props.subgroupSize);
+    LOG_INFO(Render_Vulkan, "Physical device host import alignment {}", host_props.minImportedHostPointerAlignment);
 
     if (available_extensions.empty()) {
         LOG_CRITICAL(Render_Vulkan, "No extensions supported by device.");
@@ -335,6 +338,8 @@ bool Instance::CreateDevice() {
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    add_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
@@ -403,6 +408,8 @@ bool Instance::CreateDevice() {
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
                 .shaderInt16 = features.shaderInt16,
+                .sparseBinding = features.sparseBinding,
+                .sparseResidencyBuffer = features.sparseResidencyBuffer,
             },
         },
         vk::PhysicalDeviceVulkan11Features{

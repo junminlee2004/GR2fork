@@ -4,7 +4,6 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -100,6 +99,9 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     }
 }
 
+Buffer::Buffer(const Vulkan::Instance& instance_, u64 size_bytes_)
+    : size_bytes{size_bytes_}, instance{&instance_}, buffer{instance->GetDevice(), instance->GetAllocator()} {}
+
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
@@ -158,6 +160,48 @@ void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &post_barrier,
     });
+}
+
+AddressSpaceBuffer::AddressSpaceBuffer(const Vulkan::Instance& instance_, u64 size_bytes_)
+    : Buffer{instance_, size_bytes_} {
+    const auto device = instance->GetDevice();
+    const auto sparse_budget = instance->SparseAddressSpaceSize();
+    ASSERT_MSG(size_bytes <= sparse_budget, "Address space size exceeds sparseAddressSpaceSize {:#x}", sparse_budget);
+
+    const vk::ExternalMemoryBufferCreateInfo external_mem_info = {
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+    };
+    const vk::BufferCreateInfo bci = {
+        .pNext = &external_mem_info,
+        .flags = vk::BufferCreateFlagBits::eSparseBinding |
+                 vk::BufferCreateFlagBits::eSparseResidency,
+        .size = size_bytes,
+        .usage = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+        .sharingMode = vk::SharingMode::eExclusive,
+    };
+    buffer.buffer = Vulkan::Check(device.createBuffer(bci));
+
+    const vk::BufferDeviceAddressInfo bda_info{
+        .buffer = buffer,
+    };
+    buffer.bda_addr = device.getBufferAddress(bda_info);
+    ASSERT_MSG(buffer.bda_addr != 0, "Failed to get buffer device address");
+    LOG_WARNING(Render, "Sparse VA BDA bo_addr={:#x}, end={:#x}", VAddr(buffer.bda_addr), VAddr(buffer.bda_addr) + size_bytes_);
+
+    const auto mem_req = device.getBufferMemoryRequirements(buffer.buffer);
+    sparse_alignment = mem_req.alignment;
+    mem_type = -1;
+
+    const auto mem_props = instance->GetPhysicalDevice().getMemoryProperties();
+    constexpr auto want = vk::MemoryPropertyFlagBits::eDeviceLocal;
+
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if ((mem_req.memoryTypeBits & (1u << i)) && (mem_props.memoryTypes[i].propertyFlags & want) == want) {
+            mem_type = i;
+            break;
+        }
+    }
+    ASSERT_MSG(mem_type != -1, "Suitable memory type not found");
 }
 
 constexpr u64 WATCHES_INITIAL_RESERVE = 0x4000;

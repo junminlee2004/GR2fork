@@ -72,6 +72,7 @@ struct PhysicalMemoryArea {
     u64 size = 0;
     s32 memory_type = 0;
     PhysicalMemoryType dma_type = PhysicalMemoryType::Free;
+    uintptr_t gpu_mem{};
 
     PAddr GetEnd() const {
         return base + size;
@@ -191,10 +192,10 @@ public:
         return impl.SystemReservedVirtualBase();
     }
 
-    bool IsValidGpuMapping(VAddr virtual_addr, u64 size) {
+    bool IsValidGpuMapping(VAddr virtual_addr, u64 size, MemoryProt prot) {
         // The PS4's GPU can only handle 40 bit addresses.
         const VAddr max_gpu_address{0x10000000000};
-        return virtual_addr + size < max_gpu_address;
+        return virtual_addr + size < max_gpu_address && True(prot & MemoryProt::GpuReadWrite);
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
@@ -241,6 +242,8 @@ public:
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
+
+    bool EnsureBackingIsHost(void* address, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

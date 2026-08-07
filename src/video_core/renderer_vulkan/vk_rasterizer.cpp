@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-
+//#pragma clang optimize off
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -19,6 +19,8 @@
 #undef MemoryBarrier
 #endif
 
+extern bool allow_prot;
+
 namespace Vulkan {
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -35,7 +37,7 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
-      buffer_cache{instance, scheduler, liverpool_, texture_cache, page_manager},
+      buffer_cache{instance, scheduler, liverpool_, texture_cache, page_manager, mapped_ranges},
       texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool} {
@@ -43,9 +45,122 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    scheduler.SetOnSubmitCallback([this](SubmitInfo& info) { FlushGpuMemoryMaps(info); });
+    pending_mapped_ranges.clear();
 }
 
 Rasterizer::~Rasterizer() = default;
+
+void Rasterizer::FlushGpuMemoryMaps(SubmitInfo& info) {
+    std::scoped_lock lock{mapped_ranges_mutex};
+    if (pending_mapped_ranges.empty()) {
+        return;
+    }
+    instance.GetDevice().waitIdle();
+    boost::container::small_vector<vk::SparseMemoryBind, 8> binds;
+    const auto& address_space = buffer_cache.GetAddressSpace();
+    auto* master_semaphore = scheduler.GetMasterSemaphore();
+    for (auto& range : pending_mapped_ranges) {
+        auto interval = range.first;
+        VAddr start = interval.lower();
+        VAddr end = interval.upper();
+        bool device_mem = range.second;
+        LOG_WARNING(Render, "Binding backing sparse bo_addr={:#x}, end={:#x}, offset={:#x} size={:#x}",
+                    VAddr(address_space.buffer.bda_addr) + start, VAddr(address_space.buffer.bda_addr) + end, start, end - start);
+        //if (start == 0xa000000000ULL) allow_prot = true;
+        const u64 size = end - start;
+        vk::DeviceMemory mem;
+        if (device_mem) {
+            const vk::MemoryAllocateInfo allocate_info = {
+                .allocationSize = size,
+                .memoryTypeIndex = buffer_cache.GetAddressSpace().mem_type,
+            };
+            mem = Check(instance.GetDevice().allocateMemory(allocate_info));
+        } else {
+            const vk::Device device = instance.GetDevice();
+            const auto memory_props = instance.GetPhysicalDevice().getMemoryProperties();
+            auto& impl = memory->GetAddressSpace();
+
+            void* host_pointer = reinterpret_cast<void*>(start);
+            const auto host_mem_props = Check(device.getMemoryHostPointerPropertiesEXT(
+                vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, host_pointer));
+            ASSERT(host_mem_props.memoryTypeBits != 0);
+
+            int mapped_memory_type = -1;
+            auto find_mem_type_with_flag = [&](const vk::MemoryPropertyFlags flags) {
+                u32 host_mem_types = host_mem_props.memoryTypeBits;
+                while (host_mem_types != 0) {
+                    // Try to find a cached memory type
+                    mapped_memory_type = std::countr_zero(host_mem_types);
+                    host_mem_types -= (1 << mapped_memory_type);
+
+                    if ((memory_props.memoryTypes[mapped_memory_type].propertyFlags & flags) == flags) {
+                        return;
+                    }
+                }
+
+                mapped_memory_type = -1;
+            };
+
+            // First try to find a memory that is both coherent and cached
+            find_mem_type_with_flag(vk::MemoryPropertyFlagBits::eHostCoherent |
+                                    vk::MemoryPropertyFlagBits::eHostCached);
+            if (mapped_memory_type == -1)
+                // Then only coherent (lower performance)
+                find_mem_type_with_flag(vk::MemoryPropertyFlagBits::eHostCoherent);
+
+            if (mapped_memory_type == -1) {
+                    UNREACHABLE();
+                LOG_CRITICAL(Render_Vulkan, "No coherent memory available for memory mapping");
+                mapped_memory_type = std::countr_zero(host_mem_props.memoryTypeBits);
+            }
+
+            const vk::ImportMemoryHostPointerInfoEXT host_pointer_info = {
+                .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+                    .pHostPointer = host_pointer,
+            };
+            const vk::MemoryAllocateInfo allocate_info = {
+                .pNext = &host_pointer_info,
+                .allocationSize = size,
+                .memoryTypeIndex = static_cast<u32>(mapped_memory_type),
+            };
+            mem = Check(device.allocateMemory(allocate_info));
+        }
+        auto& bind = binds.emplace_back();
+        bind.resourceOffset = start;
+        bind.size = size;
+        bind.memory = mem;
+        bind.memoryOffset = 0;
+    }
+    pending_mapped_ranges.clear();
+    const vk::SparseBufferMemoryBindInfo buf_bind = {
+        .buffer = address_space.Handle(),
+        .bindCount = static_cast<u32>(binds.size()),
+        .pBinds = binds.data(),
+    };
+    //const auto signal_sema = master_semaphore->Handle();
+    //const u64 signal_value = master_semaphore->NextTick();
+    //const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+    //    .waitSemaphoreValueCount = 0u,
+    //    .pWaitSemaphoreValues = nullptr,
+    //    .signalSemaphoreValueCount = 1u,
+    //    .pSignalSemaphoreValues = &signal_value,
+    //};
+    const vk::BindSparseInfo sparse_info = {
+        //.pNext = &timeline_si,
+        .bufferBindCount = 1u,
+        .pBufferBinds = &buf_bind,
+        .signalSemaphoreCount = 0u,
+        .pSignalSemaphores = nullptr,
+    };
+    auto fence = Check(instance.GetDevice().createFence({}));
+    Check(instance.GetGraphicsQueue().bindSparse(sparse_info, fence));
+    Check(instance.GetDevice().waitForFences(fence, true, std::numeric_limits<u64>::max()));
+    instance.GetDevice().destroyFence(fence);
+
+    // Ensure the following commands wait for the sparse binds so no unmapped memory is accessed
+    //info.AddWait(signal_sema, signal_value);
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();
@@ -392,13 +507,8 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    if (fault_process_pending) {
-        fault_process_pending = false;
-        buffer_cache.ProcessFaultBuffer();
-    }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
-    buffer_cache.RunGarbageCollector();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -432,11 +542,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     if (uses_dma) {
         // We only use fault buffer for DMA right now.
-        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        for (auto& range : mapped_ranges) {
-            buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
-        }
-        fault_process_pending = true;
+        /*Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+        mapped_ranges.ForEach([this](VAddr start, VAddr end, bool device_mem) {
+            if (device_mem) {
+                buffer_cache.SynchronizeMemory(start, end - start, false, false);
+            }
+       });*/
     }
 
     return true;
@@ -605,29 +716,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     buffer_bindings.clear();
 
+    int idx{};
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
-            const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
-            buffer_bindings.emplace_back(buffer_id, vsharp, size);
+            const u64 size = /*memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize())*/vsharp.GetSize();
+            buffer_bindings.emplace_back(true, vsharp, size);
+            //ASSERT(IsMapped(vsharp.base_address, size));
+            //LOG_WARNING(Render, "Shader {:#x} binding {} addr={:#x} size={:#x}", stage.pgm_hash, idx++, vsharp.base_address, size);
         } else {
-            buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
+            buffer_bindings.emplace_back(false, vsharp, 0);
         }
     }
 
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
-        const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+        const auto& [is_bound, vsharp, size] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
         const bool is_storage = desc.IsStorage(vsharp);
-        const u32 alignment =
+        const u64 alignment =
             is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
         // Buffer is not from the cache, either a special buffer or unbound.
-        if (!buffer_id) {
+        if (!is_bound) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
-                const auto* gds_buf = buffer_cache.GetGdsBuffer();
-                buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
+                const auto& gds_buf = buffer_cache.GetGdsBuffer();
+                buffer_infos.emplace_back(gds_buf.Handle(), 0, gds_buf.SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
@@ -653,12 +766,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
                     buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
                 }
-            } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
-                const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
-                buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
-            } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
-                const auto* fault_buffer = buffer_cache.GetFaultBuffer();
-                buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const auto& cs_program = liverpool->GetCsRegs();
@@ -671,9 +778,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
-            const u32 offset_aligned = Common::AlignDown(offset, alignment);
-            const u32 adjust = offset - offset_aligned;
+                vsharp.base_address, size, desc.is_written, desc.is_formatted);
+            const u64 offset_aligned = Common::AlignDown(offset, alignment);
+            const u64 adjust = offset - offset_aligned;
             ASSERT(adjust % 4 == 0);
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
@@ -1061,9 +1168,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
-    auto* gds_buf = buffer_cache.GetGdsBuffer();
+    const auto& gds_buf = buffer_cache.GetGdsBuffer();
     u32 value;
-    std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
+    std::memcpy(&value, gds_buf.mapped_data.data() + gds_offset, sizeof(u32));
     return value;
 }
 
@@ -1099,18 +1206,20 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         // Memory range wrapped the address space, cannot be mapped.
         return false;
     }
-    const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
-
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-    return boost::icl::contains(mapped_ranges, range);
+    return boost::icl::contains(mapped_ranges, Interval{addr, addr+size});
 }
 
-void Rasterizer::MapMemory(VAddr addr, u64 size) {
+void Rasterizer::MapMemory(VAddr addr, u64 size, bool device_mem) {
+    if (addr == 0x242c00000ULL || addr == 0x313600000ULL || addr == 0x4000000000ULL) {
+        device_mem = false;
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        pending_mapped_ranges.insert({Interval{addr, addr+size}, device_mem});
+        mapped_ranges.insert({Interval{addr, addr+size}, device_mem});
     }
-    page_manager.OnGpuMap(addr, size);
+    page_manager.OnGpuMap(addr, size, device_mem);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
@@ -1119,8 +1228,69 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     page_manager.OnGpuUnmap(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
-        mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        pending_mapped_ranges -= Interval{addr, addr+size};
+        mapped_ranges -= Interval{addr, addr+size};
     }
+}
+
+uintptr_t Rasterizer::CreateGpuMem(PAddr phys, u64 size, bool device_mem) {
+    if (device_mem) {
+        const vk::MemoryAllocateInfo allocate_info = {
+            .allocationSize = size,
+            .memoryTypeIndex = buffer_cache.GetAddressSpace().mem_type,
+        };
+        const auto memory = Check(instance.GetDevice().allocateMemory(allocate_info));
+        return std::bit_cast<uintptr_t>(memory);
+    }
+
+    const vk::Device device = instance.GetDevice();
+    const auto memory_props = instance.GetPhysicalDevice().getMemoryProperties();
+    auto& impl = memory->GetAddressSpace();
+
+    void* host_pointer = impl.BackingBase() + phys;
+    const auto host_mem_props = Check(device.getMemoryHostPointerPropertiesEXT(
+        vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, host_pointer));
+    ASSERT(host_mem_props.memoryTypeBits != 0);
+
+    int mapped_memory_type = -1;
+    auto find_mem_type_with_flag = [&](const vk::MemoryPropertyFlags flags) {
+        u32 host_mem_types = host_mem_props.memoryTypeBits;
+        while (host_mem_types != 0) {
+            // Try to find a cached memory type
+            mapped_memory_type = std::countr_zero(host_mem_types);
+            host_mem_types -= (1 << mapped_memory_type);
+
+            if ((memory_props.memoryTypes[mapped_memory_type].propertyFlags & flags) == flags) {
+                return;
+            }
+        }
+
+        mapped_memory_type = -1;
+    };
+
+    // First try to find a memory that is both coherent and cached
+    find_mem_type_with_flag(vk::MemoryPropertyFlagBits::eHostCoherent |
+                            vk::MemoryPropertyFlagBits::eHostCached);
+    if (mapped_memory_type == -1)
+        // Then only coherent (lower performance)
+        find_mem_type_with_flag(vk::MemoryPropertyFlagBits::eHostCoherent);
+
+    if (mapped_memory_type == -1) {
+        LOG_CRITICAL(Render_Vulkan, "No coherent memory available for memory mapping");
+        mapped_memory_type = std::countr_zero(host_mem_props.memoryTypeBits);
+    }
+
+    const vk::ImportMemoryHostPointerInfoEXT host_pointer_info = {
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+            .pHostPointer = host_pointer,
+    };
+    const vk::MemoryAllocateInfo allocate_info = {
+        .pNext = &host_pointer_info,
+        .allocationSize = size,
+        .memoryTypeIndex = static_cast<u32>(mapped_memory_type),
+    };
+    const auto memory = Check(device.allocateMemory(allocate_info));
+    return std::bit_cast<uintptr_t>(memory);
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
