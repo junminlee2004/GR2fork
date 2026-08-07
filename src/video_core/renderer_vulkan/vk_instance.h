@@ -330,6 +330,11 @@ public:
         return properties.limits.nonCoherentAtomSize;
     }
 
+    /// Returns the maximum allowed sparse address space size
+    vk::DeviceSize SparseAddressSpaceSize() const {
+        return properties.limits.sparseAddressSpaceSize;
+    }
+
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
         return vk11_props.subgroupSize;

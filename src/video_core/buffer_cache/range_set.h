@@ -41,6 +41,10 @@ struct RangeSet {
         m_ranges_set.subtract(interval);
     }
 
+    bool IsEmpty() const {
+        return m_ranges_set.empty();
+    }
+
     void Clear() {
         m_ranges_set.clear();
     }
@@ -143,6 +147,18 @@ public:
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
         m_ranges_map -= interval;
+    }
+
+    auto Find(VAddr base_address) {
+        return m_ranges_map.find(base_address);
+    }
+
+    auto End() {
+        return m_ranges_map.end();
+    }
+
+    bool IsEmpty() const {
+        return m_ranges_map.empty();
     }
 
     void Clear() {

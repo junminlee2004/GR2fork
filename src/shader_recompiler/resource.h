@@ -20,8 +20,6 @@ static constexpr u32 NUM_FMASKS = 8;
 enum class BufferType : u32 {
     Guest,
     Flatbuf,
-    BdaPagetable,
-    FaultBuffer,
     GdsBuffer,
     SharedMemory,
 };
@@ -146,6 +144,7 @@ struct PushData {
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 UdRegsIndex = 4;
     static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
+    static constexpr u32 GuestSpaceIndex = BufOffsetIndex + 3;
 
     float xoffset;
     float yoffset;
@@ -153,6 +152,7 @@ struct PushData {
     float yscale;
     std::array<u32, NUM_USER_DATA_REGS> ud_regs;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    u64 guest_space_addr;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

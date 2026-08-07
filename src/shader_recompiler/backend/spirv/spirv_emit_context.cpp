@@ -739,6 +739,7 @@ void EmitContext::DefinePushDataBlock() {
     MemberName(struct_type, PushData::BufOffsetIndex + 0, "buf_offsets0");
     MemberName(struct_type, PushData::BufOffsetIndex + 1, "buf_offsets1");
     MemberName(struct_type, PushData::BufOffsetIndex + 2, "buf_offsets2");
+    //MemberName(struct_type, PushData::GuestSpaceIndex, "guest_space_addr");
     MemberDecorate(struct_type, PushData::XOffsetIndex, spv::Decoration::Offset, 0U);
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
     MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);
@@ -750,6 +751,7 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 80U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 96U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 112U);
+    //MemberDecorate(struct_type, PushData::GuestSpaceIndex, spv::Decoration::Offset, 120U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -789,12 +791,6 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_storage, bool is_writte
     case BufferType::Flatbuf:
         Name(id, "srt_flatbuf");
         break;
-    case BufferType::BdaPagetable:
-        Name(id, "bda_pagetable");
-        break;
-    case BufferType::FaultBuffer:
-        Name(id, "fault_buffer");
-        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
@@ -814,10 +810,6 @@ void EmitContext::DefineBuffers() {
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
             flatbuf_index = buffers.size();
-        } else if (desc.buffer_type == BufferType::BdaPagetable) {
-            bda_pagetable_index = buffers.size();
-        } else if (desc.buffer_type == BufferType::FaultBuffer) {
-            fault_buffer_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
@@ -1150,7 +1142,7 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
 }
 
 Id EmitContext::DefineGetBdaPointer() {
-    const auto caching_pagebits{
+    /*const auto caching_pagebits{
         Constant(U64, static_cast<u64>(VideoCore::BufferCache::CACHING_PAGEBITS))};
     const auto caching_pagemask{Constant(U64, VideoCore::BufferCache::CACHING_PAGESIZE - 1)};
 
@@ -1205,7 +1197,8 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto result{OpPhi(U64, addr, available_label, fallback_result, fault_label)};
     OpReturnValue(result);
     OpFunctionEnd();
-    return func;
+    return func;*/
+    UNREACHABLE();
 }
 
 Id EmitContext::DefineReadConst(bool dynamic) {

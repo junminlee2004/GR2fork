@@ -30,7 +30,7 @@ public:
     ~PageManager();
 
     /// Register a range of mapped gpu memory.
-    void OnGpuMap(VAddr address, size_t size);
+    void OnGpuMap(VAddr address, size_t size, bool device_mem);
 
     /// Unregister a range of gpu memory that was unmapped.
     void OnGpuUnmap(VAddr address, size_t size);

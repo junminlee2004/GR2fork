@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-
+//#pragma clang optimize off
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -16,7 +16,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace AmdGpu {
 
@@ -137,14 +139,16 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
+            rasterizer->GetScheduler().Flush();
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
-                rasterizer->Flush();
             }
             submit_done = false;
+            label_writes.clear();
         }
 
+        //rasterizer->GetScheduler().Finish();
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -694,11 +698,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                event_eos->SignalFence([this](void* address, u64 data, u32 num_bytes) {
+                    label_writes[VAddr(address)] = data;
+
                     auto* memory = Core::Memory::Instance();
-                    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        memcpy(address, &data, num_bytes);
-                    }
+                    LOG_WARNING(Render, "EventWriteEos is_host = {}, address = {:#x}",
+                                memory->EnsureBackingIsHost(address, num_bytes), VAddr(address));
+                    //memory->EnsureBackingIsHost(address, num_bytes);
+                    auto& scheduler = rasterizer->GetScheduler();
+                    auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
+                    //scheduler.EndRendering();
+                    //scheduler.CommandBuffer().updateBuffer(address_space.Handle(), VAddr(address), num_bytes, &data);
+                    ASSERT(num_bytes == 4);
+                    scheduler.CommandBuffer().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                                                    address_space.Handle(), VAddr(address), data);
+
+                    //if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                    //    memcpy(address, &data, num_bytes);
+                    //}
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
@@ -711,20 +728,35 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
+#pragma clang optimize off
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
                 event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
+                    [this](void* address, u64 data, u32 num_bytes) {
+                        label_writes[VAddr(address)] = data;
                         auto* memory = Core::Memory::Instance();
-                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            memcpy(address, &data, num_bytes);
+                        //memory->EnsureBackingIsHost(address, num_bytes);
+                        //LOG_WARNING(Render, "EventWriteEop is_host = {}, address = {:#x}",
+                        //            memory->EnsureBackingIsHost(address, num_bytes), VAddr(address));
+                        auto& scheduler = rasterizer->GetScheduler();
+                        auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
+                        if (num_bytes == 4) {
+                        scheduler.CommandBuffer().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                                                        address_space.Handle(), VAddr(address), data);
+                        } else {
+                            scheduler.EndRendering();
+                            scheduler.CommandBuffer().updateBuffer(address_space.Handle(), VAddr(address), num_bytes, &data);
                         }
+                        //if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                        //    memcpy(address, &data, num_bytes);
+                        //}
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
             }
+#pragma clang optimize on
             case PM4ItOpcode::DmaData: {
                 const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
                 if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
@@ -765,9 +797,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
-                u64* address = write_data->Address<u64*>();
+                VAddr address = write_data->Address<VAddr>();
                 if (!write_data->wr_one_addr.Value()) {
-                    std::memcpy(address, write_data->data, data_size);
+                    auto* memory = Core::Memory::Instance();
+                    if (memory->IsValidMapping(address)) {
+                        bool is_host = memory->EnsureBackingIsHost((void*)address, data_size);
+                    LOG_WARNING(Render, "WriteDataGfx is_host = {}, address = {:#x} data_size = {}, data = {}, host_data = {}", is_host,
+                                    address, data_size, write_data->data[0], is_host ? *(u32*)address : -1);
+                    //memory->EnsureBackingIsHost(address, data_size);
+                    auto& scheduler = rasterizer->GetScheduler();
+                    auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
+                    if (data_size == 4) {
+                    scheduler.CommandBuffer().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                                                    address_space.Handle(), address, write_data->data[0]);
+                    } else {
+                        scheduler.EndRendering();
+                        scheduler.CommandBuffer().updateBuffer(address_space.Handle(), address, data_size, write_data->data);
+                    }
+                    //std::memcpy((void*)address, write_data->data, data_size);
+                    } else {
+                        std::memcpy((void*)address, write_data->data, data_size);
+                    }
                 } else {
                     UNREACHABLE();
                 }
@@ -822,8 +872,50 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
+                const auto test = [&] {
+                    if (wait_reg_mem->function.Value() == PM4CmdWaitRegMem::Function::Always) {
+                        return true;
+                    }
+                    ASSERT(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory);
+                    auto it = label_writes.find(wait_reg_mem->Address<VAddr>());
+                    if (it == label_writes.end()) {
+                        return false;
+                    }
+                    u32 value = it->second;
+                    switch (wait_reg_mem->function.Value()) {
+                    case PM4CmdWaitRegMem::Function::LessThan: {
+                        return (value & wait_reg_mem->mask) < wait_reg_mem->ref;
+                    }
+                    case PM4CmdWaitRegMem::Function::LessThanEqual: {
+                        return (value & wait_reg_mem->mask) <= wait_reg_mem->ref;
+                    }
+                    case PM4CmdWaitRegMem::Function::Equal: {
+                        return (value & wait_reg_mem->mask) == wait_reg_mem->ref;
+                    }
+                    case PM4CmdWaitRegMem::Function::NotEqual: {
+                        return (value & wait_reg_mem->mask) != wait_reg_mem->ref;
+                    }
+                    case PM4CmdWaitRegMem::Function::GreaterThanEqual: {
+                        return (value & wait_reg_mem->mask) >= wait_reg_mem->ref;
+                    }
+                    case PM4CmdWaitRegMem::Function::GreaterThan: {
+                        return (value & wait_reg_mem->mask) > wait_reg_mem->ref;
+                    }
+                    case PM4CmdWaitRegMem::Function::Reserved:
+                        [[fallthrough]];
+                    default: {
+                        UNREACHABLE();
+                    }
+                    }
+                };
+                int counter = 0;
+                while (!test()) {
+                    counter++;
                     YIELD_GFX();
+                    if (counter == 5) {
+                        //rasterizer->GetScheduler().Flush();
+                        break;
+                    }
                 }
                 break;
             }
@@ -886,6 +978,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
+
+            /*vk::MemoryBarrier2 memory_barrier{};
+            memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+            memory_barrier.dstAccessMask =
+                vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+            memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+            memory_barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+            rasterizer->GetScheduler().CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &memory_barrier,
+            });*/
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
         }
@@ -897,6 +1001,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
         ce_task.handle.destroy();
     }
+
+    rasterizer->GetScheduler().Flush();
 
     FIBER_EXIT;
 }
@@ -925,6 +1031,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         if (queue.tmp_dwords > 0) [[unlikely]] {
             header = reinterpret_cast<const PM4Header*>(queue.tmp_packet.data());
             next_dw_off = header->type3.NumWords() + 1 - queue.tmp_dwords;
+            ASSERT(queue.tmp_dwords + next_dw_off < queue.tmp_packet.size());
             std::memcpy(queue.tmp_packet.data() + queue.tmp_dwords, acb.data(),
                         next_dw_off * sizeof(u32));
             queue.tmp_dwords = 0;
@@ -932,6 +1039,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         // If the packet is split across ring boundary, buffer until next submission
         if (next_dw_off > acb.size()) [[unlikely]] {
+            LOG_WARNING(Render, "is_indirect = {}", is_indirect);
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
@@ -1029,6 +1137,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer) {
                 break;
             }
+            rasterizer->Finish();
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
@@ -1114,8 +1223,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            u64* address = write_data->Address<u64*>();
             if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                auto* memory = Core::Memory::Instance();
+                LOG_WARNING(Render, "WriteDataAsc is_host = {}", memory->EnsureBackingIsHost(address, data_size));
+                auto& scheduler = rasterizer->GetScheduler();
+                auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
+                ASSERT(data_size == 4);
+                scheduler.CommandBuffer().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                                                address_space.Handle(), VAddr(address), write_data->data[0]);
+                //scheduler.EndRendering();
+                //scheduler.CommandBuffer().updateBuffer(address_space.Handle(), VAddr(address), data_size, &write_data->data);
+                //std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
             }
@@ -1136,8 +1255,50 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
+            const auto test = [&] {
+                if (wait_reg_mem->function.Value() == PM4CmdWaitRegMem::Function::Always) {
+                    return true;
+                }
+                ASSERT(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory);
+                auto it = label_writes.find(wait_reg_mem->Address<VAddr>());
+                if (it == label_writes.end()) {
+                    return false;
+                }
+                u32 value = it->second;
+                switch (wait_reg_mem->function.Value()) {
+                case PM4CmdWaitRegMem::Function::LessThan: {
+                    return (value & wait_reg_mem->mask) < wait_reg_mem->ref;
+                }
+                case PM4CmdWaitRegMem::Function::LessThanEqual: {
+                    return (value & wait_reg_mem->mask) <= wait_reg_mem->ref;
+                }
+                case PM4CmdWaitRegMem::Function::Equal: {
+                    return (value & wait_reg_mem->mask) == wait_reg_mem->ref;
+                }
+                case PM4CmdWaitRegMem::Function::NotEqual: {
+                    return (value & wait_reg_mem->mask) != wait_reg_mem->ref;
+                }
+                case PM4CmdWaitRegMem::Function::GreaterThanEqual: {
+                    return (value & wait_reg_mem->mask) >= wait_reg_mem->ref;
+                }
+                case PM4CmdWaitRegMem::Function::GreaterThan: {
+                    return (value & wait_reg_mem->mask) > wait_reg_mem->ref;
+                }
+                case PM4CmdWaitRegMem::Function::Reserved:
+                    [[fallthrough]];
+                default: {
+                    UNREACHABLE();
+                }
+                }
+            };
+            int counter = 0;
+            while (!test()) {
+                counter++;
                 YIELD_ASC(vqid);
+                if (counter == 5) {
+                    //rasterizer->GetScheduler().Flush();
+                    break;
+                }
             }
             break;
         }
@@ -1147,7 +1308,25 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->ProcessDownloadImages();
             }
             release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
+                [this](u32* address, u64 data, u32 size) {
+                    label_writes[VAddr(address)] = data;
+
+                    auto* memory = Core::Memory::Instance();
+                    LOG_WARNING(Render, "ReleaseMem is_host = {}, address={:#x}, data={}, host_data={}",
+                                memory->EnsureBackingIsHost(address, size), VAddr(address), data, *(u32*)address);
+                    auto& scheduler = rasterizer->GetScheduler();
+                    auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
+                    if (size == 4) {
+                    scheduler.CommandBuffer().writeBufferMarker2AMD(vk::PipelineStageFlagBits2::eBottomOfPipe,
+                                                                    address_space.Handle(), VAddr(address), data);
+                    } else {
+                    scheduler.EndRendering();
+                    scheduler.CommandBuffer().updateBuffer(address_space.Handle(), VAddr(address), size, &data);
+                    }
+                    //std::memcpy(address, &data, size);
+                    //rasterizer->Finish();
+                },
+                [pipe_id = queue.pipe_id, this] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
                 },
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
@@ -1164,12 +1343,27 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             static_cast<u32>(opcode), header->type3.NumWords());
         }
 
+        /*vk::MemoryBarrier2 memory_barrier{};
+        memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+        memory_barrier.dstAccessMask =
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+        memory_barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        rasterizer->GetScheduler().CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &memory_barrier,
+        });*/
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
             *queue.read_addr += next_dw_off;
             *queue.read_addr %= queue.ring_size_dw;
         }
+    }
+
+    if (!is_indirect) {
+        //rasterizer->GetScheduler().Flush();
     }
 
     FIBER_EXIT;
@@ -1241,6 +1435,10 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
     submit_cv.notify_one();
+}
+
+bool Liverpool::IsGpuIdle() const {
+    return num_submits == 0;
 }
 
 } // namespace AmdGpu

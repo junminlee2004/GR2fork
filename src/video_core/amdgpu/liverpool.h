@@ -70,21 +70,14 @@ public:
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
+    bool IsGpuIdle() const;
+
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
         mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
         mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;
         submit_cv.notify_one();
-    }
-
-    void WaitGpuIdle() noexcept {
-        std::unique_lock lk{submit_mutex};
-        submit_cv.wait(lk, [this] { return num_submits == 0; });
-    }
-
-    bool IsGpuIdle() const {
-        return num_submits == 0;
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -231,6 +224,7 @@ private:
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
     s32 curr_qid{-1};
+    std::unordered_map<VAddr, u64> label_writes;
 };
 
 } // namespace AmdGpu

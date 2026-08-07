@@ -60,6 +60,7 @@ struct SubmitInfo {
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
+    bool do_callback{true};
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
         wait_semas[num_wait_semas] = semaphore;
@@ -423,6 +424,10 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    void SetOnSubmitCallback(std::move_only_function<void(SubmitInfo&)>&& callback) {
+        on_submit_cb = std::move(callback);
+    }
+
     static std::mutex submit_mutex;
 
 private:
@@ -438,6 +443,7 @@ private:
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+    std::move_only_function<void(SubmitInfo&)> on_submit_cb;
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

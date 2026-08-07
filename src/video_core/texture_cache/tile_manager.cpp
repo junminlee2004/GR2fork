@@ -161,7 +161,7 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     return *tiling_pipelines[pl_id];
 }
 
-TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset,
+TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u64 in_offset,
                                              const ImageInfo& info) {
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
@@ -237,12 +237,15 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
+    if (dim_x == 87373) {
+        printf("bad\n");
+    }
     cmdbuf.dispatch(dim_x, 1, 1);
     return {out_buffer, 0};
 }
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                            vk::Buffer out_buffer, u32 out_offset, u32 copy_size) {
+                            vk::Buffer out_buffer, u64 out_offset, u32 copy_size) {
     const auto& info = in_image.info;
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {

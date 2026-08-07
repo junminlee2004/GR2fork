@@ -74,23 +74,16 @@ struct UniqueBuffer {
 
 class Buffer {
 public:
+    explicit Buffer(const Vulkan::Instance& instance, u64 size_bytes);
     explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                    MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
-                    u64 size_bytes_);
+                    MemoryUsage usage, VAddr cpu_addr, vk::BufferUsageFlags flags,
+                    u64 size_bytes);
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 
     Buffer& operator=(Buffer&&) = default;
     Buffer(Buffer&&) = default;
-
-    void IncreaseStreamScore(int score) noexcept {
-        stream_score += score;
-    }
-
-    [[nodiscard]] int StreamScore() const noexcept {
-        return stream_score;
-    }
 
     [[nodiscard]] bool IsInBounds(VAddr addr, u64 size) const noexcept {
         return addr >= cpu_addr && addr + size <= cpu_addr + SizeBytes();
@@ -106,14 +99,6 @@ public:
 
     size_t SizeBytes() const {
         return size_bytes;
-    }
-
-    void SetLRUId(u64 id) noexcept {
-        lru_id = id;
-    }
-
-    u64 LRUId() const noexcept {
-        return lru_id;
     }
 
     vk::Buffer Handle() const noexcept {
@@ -155,9 +140,7 @@ public:
     bool is_picked{};
     bool is_coherent{};
     bool is_deleted{};
-    int stream_score = 0;
     size_t size_bytes = 0;
-    u64 lru_id = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;
@@ -167,6 +150,18 @@ public:
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
     vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+};
+
+class AddressSpaceBuffer : public Buffer {
+public:
+    explicit AddressSpaceBuffer(const Vulkan::Instance& instance, u64 size_bytes_);
+
+    AddressSpaceBuffer& operator=(AddressSpaceBuffer&&) = delete;
+    AddressSpaceBuffer(AddressSpaceBuffer&&) = delete;
+
+public:
+    vk::DeviceSize sparse_alignment;
+    u32 mem_type;
 };
 
 class StreamBuffer : public Buffer {
