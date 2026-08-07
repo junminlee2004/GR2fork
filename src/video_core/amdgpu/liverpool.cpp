@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -96,34 +94,18 @@ void Liverpool::Process(std::stop_token stoken) {
     gpu_id = std::this_thread::get_id();
 
     while (!stoken.stop_requested()) {
-        bool woke = false;
         {
             std::unique_lock lk{submit_mutex};
-            woke = submit_cv.wait_for(lk, std::chrono::milliseconds(4), [this] {
-                return num_commands || submit_done || HasEligibleSubmit();
-            });
+            Common::CondvarWait(submit_cv, lk, stoken,
+                                [this] { return num_commands || num_submits || submit_done; });
         }
         if (stoken.stop_requested()) {
             break;
-        }
-        if (!woke) {
-            const u64 now_ns = static_cast<u64>(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            if (num_submits && !HasEligibleSubmit() &&
-                now_ns - last_submit_ns.load() > 50'000'000ULL) {
-                // The guest went quiet with packets still deferred; release them so
-                // polled labels and fences can make progress.
-                released_gen = static_cast<s64>(submit_gen.load());
-                LOG_DEBUG(Render, "Releasing deferred submissions on timeout");
-            } else if (!num_commands && !submit_done) {
-                continue;
-            }
         }
 
         VideoCore::StartCapture();
 
         curr_qid = -1;
-        u32 idle_scans = 0;
 
         while (num_submits || num_commands) {
             ProcessCommands();
@@ -135,16 +117,11 @@ void Liverpool::Process(std::stop_token stoken) {
             Task::Handle task{};
             {
                 std::scoped_lock lock{queue.m_access};
-                if (queue.submits.empty() ||
-                    static_cast<s64>(queue.submits.front().second) > released_gen.load()) {
-                    if (++idle_scans >= num_mapped_queues) {
-                        break;
-                    }
+                if (queue.submits.empty()) {
                     continue;
                 }
-                task = queue.submits.front().first;
+                task = queue.submits.front();
             }
-            idle_scans = 0;
             task.resume();
 
             if (task.done()) {
@@ -152,9 +129,6 @@ void Liverpool::Process(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
-                queue.front_gen = queue.submits.empty()
-                                      ? std::numeric_limits<s64>::max()
-                                      : static_cast<s64>(queue.submits.front().second);
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -1258,19 +1232,13 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     auto task = ProcessGraphics(dcb, ccb);
     {
-        const u64 gen = submit_gen.load();
         std::scoped_lock lock{queue.m_access};
-        if (queue.submits.empty()) {
-            queue.front_gen = static_cast<s64>(gen);
-        }
-        queue.submits.emplace(task.handle, gen);
+        queue.submits.emplace(task.handle);
     }
 
     std::scoped_lock lk{submit_mutex};
-    last_submit_ns = static_cast<u64>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
     ++num_submits;
-    submit_cv.notify_all();
+    submit_cv.notify_one();
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
@@ -1280,20 +1248,14 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);
     {
-        const u64 gen = submit_gen.load();
         std::scoped_lock lock{queue.m_access};
-        if (queue.submits.empty()) {
-            queue.front_gen = static_cast<s64>(gen);
-        }
-        queue.submits.emplace(task.handle, gen);
+        queue.submits.emplace(task.handle);
     }
 
     std::scoped_lock lk{submit_mutex};
-    last_submit_ns = static_cast<u64>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
-    submit_cv.notify_all();
+    submit_cv.notify_one();
 }
 
 } // namespace AmdGpu

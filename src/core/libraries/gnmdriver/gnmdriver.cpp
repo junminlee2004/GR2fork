@@ -83,6 +83,12 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
     cv_lock.notify_all();
 }
 
+static void WaitGpuIdle() {
+    HLE_TRACE;
+    std::unique_lock lock{m_submission};
+    cv_lock.wait(lock, [] { return submission_lock == 0; });
+}
+
 // Write a special ending NOP packet with N DWs data block
 static inline u32* WriteTrailingNop(u32* cmdbuf, u32 data_block_size) {
     auto* nop = reinterpret_cast<PM4CmdNop*>(cmdbuf);
@@ -290,6 +296,8 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     if (gnm_vqid == 0) {
         return;
     }
+
+    WaitGpuIdle();
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -2219,6 +2227,8 @@ int PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         }
     }
 
+    WaitGpuIdle();
+
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
     }
@@ -2303,6 +2313,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 int PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
+    WaitGpuIdle();
+    if (!liverpool->IsGpuIdle()) {
+        submission_lock = true;
+    }
     liverpool->SubmitDone();
     send_init_packet = true;
     ++frames_submitted;
