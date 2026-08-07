@@ -619,6 +619,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     } else {
                         rasterizer->DispatchDirect();
                     }
+                } else if (rasterizer) {
+                    LOG_WARNING(Render, "Gfx dispatch skipped: initiator {:#x}",
+                                cs_program.dispatch_initiator);
                 }
                 break;
             }
@@ -642,6 +645,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     } else {
                         rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
                     }
+                } else if (rasterizer) {
+                    LOG_WARNING(Render, "Gfx dispatch skipped: initiator {:#x}",
+                                cs_program.dispatch_initiator);
                 }
                 break;
             }
@@ -1084,6 +1090,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 } else {
                     rasterizer->DispatchDirect();
                 }
+            } else if (rasterizer) {
+                LOG_WARNING(Render, "Asc dispatch skipped: initiator {:#x}",
+                            cs_program.dispatch_initiator);
             }
             break;
         }
@@ -1107,6 +1116,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 } else {
                     rasterizer->DispatchIndirect(ib_address, 0, size);
                 }
+            } else if (rasterizer) {
+                LOG_WARNING(Render, "Asc dispatch skipped: initiator {:#x}",
+                            cs_program.dispatch_initiator);
             }
             break;
         }
@@ -1156,7 +1168,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            LOG_DEBUG(Render, "Encountered ACB EventWrite: event_type = {}, event_index = {}",
+                      magic_enum::enum_name(event->event_type.Value()),
+                      magic_enum::enum_name(event->event_index.Value()));
             break;
         }
         default:
