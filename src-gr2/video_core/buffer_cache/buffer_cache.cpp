@@ -1009,6 +1009,32 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return !(e && e[0] == '1');
         }();
 
+        // GR2FORK FIX: stream-eligibility hardening (the parasol-class stale-vertex bug,
+        // proven readback-fixable). With readbacks off, the CPU shadow of GPU-written
+        // memory is stale by design; streaming it over a range the GPU wrote is what
+        // exploded GPU-simulated meshes. Two leaks closed at the walk sites: (a) the
+        // tracker query now runs PAGE-ALIGNED (exact-range queries leak at boundaries);
+        // (b) the sticky gpu_modified_ranges interval set - populated by every GPU-write
+        // marking path but never consulted here before - vetoes ranges the GPU has EVER
+        // written, surviving any later tracker-state loss. Never runs on the epoch-hit
+        // fast path. GR2_NOSTREAMGUARD=1 restores the old exact-range gate.
+        static const bool kStreamGuardEnabled = []() noexcept {
+            const char* e = std::getenv("GR2_NOSTREAMGUARD");
+            return !(e && e[0] == '1');
+        }();
+        const auto stream_eligible = [&]() noexcept {
+            if (!kStreamGuardEnabled) {
+                return !IsRegionGpuModified(device_addr, size);
+            }
+            if (gpu_modified_ranges.Intersects(device_addr, size)) {
+                return false;
+            }
+            const VAddr page_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+            const u64 page_size =
+                Common::AlignUp(device_addr + size, CACHING_PAGESIZE) - page_addr;
+            return !IsRegionGpuModified(page_addr, page_size);
+        };
+
         const u64 tick = scheduler.CurrentTick();
         StreamCopyCacheSet& set = cache.sets[set_idx];
 
@@ -1047,7 +1073,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 return serve_hit(hit);
             }
             // Stamp stale (or epoch disabled): one walk to re-validate.
-            if (!IsRegionGpuModified(device_addr, size)) [[likely]] {
+            if (stream_eligible()) [[likely]] {
                 hit->gpu_gen = gpu_dirty_generation_;
                 return serve_hit(hit);
             }
@@ -1058,7 +1084,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             // Miss in both ways: eligibility gate first,
             // then Copy fresh and insert into the LRU way. cache.lru names
             // the next victim; after the insert it flips to the other way.
-            if (!IsRegionGpuModified(device_addr, size)) [[likely]] {
+            if (stream_eligible()) [[likely]] {
                 const u64 offset =
                     stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
                 const u8 victim_way = cache.lru[set_idx] & 1u;
