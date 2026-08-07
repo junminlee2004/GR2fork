@@ -607,6 +607,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
+        if (stage.pgm_hash == 0x896aa88eULL) {
+            static u32 shaft_bind_logs{0};
+            if (shaft_bind_logs++ < 240) {
+                LOG_WARNING(Render, "shaft vs buf[{}] va={:#x} size={}",
+                            &desc - stage.buffers.data(), vsharp.base_address,
+                            vsharp.GetSize());
+            }
+        }
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
