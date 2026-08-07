@@ -43,6 +43,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    scheduler.SetOnSubmit([this] { buffer_cache.LatchDeferredUploads(); });
 }
 
 Rasterizer::~Rasterizer() = default;

@@ -74,6 +74,22 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 
+void BufferCache::LatchDeferredUploads() {
+    std::scoped_lock lk{deferred_uploads_mutex};
+    u32 num_latched = 0;
+    for (const auto& upload : deferred_uploads) {
+        if (memory_tracker->IsRegionCpuModified(upload.device_addr, upload.size)) {
+            memory->CopySparseMemory(upload.device_addr, upload.staging, upload.size);
+            ++num_latched;
+        }
+    }
+    if (num_latched != 0) {
+        LOG_DEBUG(Render, "Latched {} of {} staged uploads", num_latched,
+                  deferred_uploads.size());
+    }
+    deferred_uploads.clear();
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
@@ -697,10 +713,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     }
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
     if (staging) {
+        std::scoped_lock lk{deferred_uploads_mutex};
         for (auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            deferred_uploads.push_back(
+                {device_addr, src_pointer, static_cast<u32>(copy.size)});
             // Apply the staging offset
             copy.srcOffset += offset;
         }
@@ -713,10 +732,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                                      vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
         const vk::Buffer src_buffer = temp_buffer->Handle();
         u8* const staging = temp_buffer->mapped_data.data();
+        std::scoped_lock lk{deferred_uploads_mutex};
         for (const auto& copy : copies) {
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            deferred_uploads.push_back(
+                {device_addr, src_pointer, static_cast<u32>(copy.size)});
         }
         scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
         return src_buffer;

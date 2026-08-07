@@ -423,6 +423,11 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// Registers a callback that runs right before every queue submission.
+    void SetOnSubmit(Common::UniqueFunction<void>&& callback) {
+        on_submit = std::move(callback);
+    }
+
     static std::mutex submit_mutex;
 
 private:
@@ -443,6 +448,7 @@ private:
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
     };
+    Common::UniqueFunction<void> on_submit;
     std::queue<PendingOp> pending_ops;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;

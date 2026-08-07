@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <vector>
+
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -105,6 +108,9 @@ public:
 
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size);
+
+    /// Recopies staged uploads whose guest ranges were rewritten after staging.
+    void LatchDeferredUploads();
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
@@ -221,6 +227,13 @@ private:
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+    struct DeferredUpload {
+        VAddr device_addr;
+        u8* staging;
+        u32 size;
+    };
+    std::vector<DeferredUpload> deferred_uploads;
+    std::mutex deferred_uploads_mutex;
 };
 
 } // namespace VideoCore

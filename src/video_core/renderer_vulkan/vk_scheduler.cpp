@@ -160,6 +160,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
+    if (on_submit) {
+        on_submit();
+    }
     EndRendering();
     Check(current_cmdbuf.end());
 
