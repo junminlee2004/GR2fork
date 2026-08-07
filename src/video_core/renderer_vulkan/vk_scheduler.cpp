@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
-#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -163,13 +162,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
-    static const int latch_delay_ms = [] {
-        const char* env = std::getenv("SHAD_LATCH_DELAY_MS");
-        return env ? std::atoi(env) : 0;
-    }();
-    if (latch_delay_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(latch_delay_ms));
-    }
+    // Timing probe: stall each submit so late guest patches land before the latch.
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
     if (on_submit) {
         on_submit();
     }
