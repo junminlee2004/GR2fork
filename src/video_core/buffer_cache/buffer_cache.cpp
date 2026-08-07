@@ -275,8 +275,8 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         // Without a readback there's nothing we can do with this
         // Fallback to creating dst buffer on GPU to at least have this data there
     }
-    LOG_WARNING(Render, "Copy src_gds={}, dst_gds={}, src={:#x}, dst={:#x}",
-                src_gds, dst_gds, src, dst);
+    LOG_DEBUG(Render, "Copy src_gds={}, dst_gds={}, src={:#x}, dst={:#x}",
+              src_gds, dst_gds, src, dst);
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto [src_buffer, src_offset] = [&] -> std::pair<Buffer*, u64> {
         if (src_gds) {
@@ -394,7 +394,7 @@ bool BufferCache::SynchronizeMemory(VAddr device_addr, u32 size, bool is_written
         [&] { src_buffer = UploadCopies(copies, total_size_bytes); });
 
         if (src_buffer) {
-            LOG_WARNING(Render, "Buffer sync");
+            LOG_DEBUG(Render, "Buffer sync");
             scheduler.EndRendering();
             const auto cmdbuf = scheduler.CommandBuffer();
             const vk::BufferMemoryBarrier2 pre_barrier = {

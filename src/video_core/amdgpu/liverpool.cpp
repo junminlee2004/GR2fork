@@ -702,8 +702,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     label_writes[VAddr(address)] = data;
 
                     auto* memory = Core::Memory::Instance();
-                    LOG_WARNING(Render, "EventWriteEos is_host = {}, address = {:#x}",
-                                memory->EnsureBackingIsHost(address, num_bytes), VAddr(address));
+                    const bool is_host = memory->EnsureBackingIsHost(address, num_bytes);
+                    LOG_DEBUG(Render, "EventWriteEos is_host = {}, address = {:#x}", is_host,
+                              VAddr(address));
                     //memory->EnsureBackingIsHost(address, num_bytes);
                     auto& scheduler = rasterizer->GetScheduler();
                     auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
@@ -805,7 +806,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     auto* memory = Core::Memory::Instance();
                     if (memory->IsValidMapping(address)) {
                         bool is_host = memory->EnsureBackingIsHost((void*)address, data_size);
-                    LOG_WARNING(Render, "WriteDataGfx is_host = {}, address = {:#x} data_size = {}, data = {}, host_data = {}", is_host,
+                    LOG_DEBUG(Render, "WriteDataGfx is_host = {}, address = {:#x} data_size = {}, data = {}, host_data = {}", is_host,
                                     address, data_size, write_data->data[0], is_host ? *(u32*)address : -1);
                     //memory->EnsureBackingIsHost(address, data_size);
                     auto& scheduler = rasterizer->GetScheduler();
@@ -1230,7 +1231,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             u64* address = write_data->Address<u64*>();
             if (!write_data->wr_one_addr.Value()) {
                 auto* memory = Core::Memory::Instance();
-                LOG_WARNING(Render, "WriteDataAsc is_host = {}", memory->EnsureBackingIsHost(address, data_size));
+                const bool is_host = memory->EnsureBackingIsHost(address, data_size);
+                LOG_DEBUG(Render, "WriteDataAsc is_host = {}", is_host);
                 auto& scheduler = rasterizer->GetScheduler();
                 auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
                 ASSERT(data_size == 4);
@@ -1318,8 +1320,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     label_writes[VAddr(address)] = data;
 
                     auto* memory = Core::Memory::Instance();
-                    LOG_WARNING(Render, "ReleaseMem is_host = {}, address={:#x}, data={}, host_data={}",
-                                memory->EnsureBackingIsHost(address, size), VAddr(address), data, *(u32*)address);
+                    const bool is_host = memory->EnsureBackingIsHost(address, size);
+                    LOG_DEBUG(Render, "ReleaseMem is_host = {}, address={:#x}, data={}, host_data={}",
+                              is_host, VAddr(address), data, *(u32*)address);
                     auto& scheduler = rasterizer->GetScheduler();
                     auto& address_space = rasterizer->GetBufferCache().GetAddressSpace();
                     scheduler.EndRendering();
