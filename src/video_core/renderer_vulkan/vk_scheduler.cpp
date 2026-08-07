@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -160,6 +163,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
+    static const int latch_delay_ms = [] {
+        const char* env = std::getenv("SHAD_LATCH_DELAY_MS");
+        return env ? std::atoi(env) : 0;
+    }();
+    if (latch_delay_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(latch_delay_ms));
+    }
     if (on_submit) {
         on_submit();
     }
