@@ -210,10 +210,6 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
-        auto it = rasterizer->mapped_ranges.find(address);
-        auto it2 = rasterizer->mapped_ranges.find(address + size - 1);
-        ASSERT(it != rasterizer->mapped_ranges.end() && it2 != rasterizer->mapped_ranges.end());
-        if (it->second && it2->second)
         impl.Protect(address, size, perms);
     }
 
