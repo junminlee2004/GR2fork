@@ -607,12 +607,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
-        if (stage.pgm_hash == 0x896aa88eULL) {
+        if (stage.pgm_hash == 0x896aa88eULL && vsharp.base_address != 0) {
             static u32 shaft_bind_logs{0};
+            static VAddr shaft_prev_va{0};
             if (shaft_bind_logs++ < 240) {
-                LOG_WARNING(Render, "shaft vs buf[{}] va={:#x} size={}",
-                            &desc - stage.buffers.data(), vsharp.base_address,
-                            vsharp.GetSize());
+                const auto* cur = reinterpret_cast<const u32*>(vsharp.base_address);
+                LOG_WARNING(Render, "shaft bind va={:#x} f17={} f25={}",
+                            vsharp.base_address, std::bit_cast<float>(cur[17]),
+                            std::bit_cast<float>(cur[25]));
+                if (shaft_prev_va) {
+                    const auto* prev = reinterpret_cast<const u32*>(shaft_prev_va);
+                    LOG_WARNING(Render, "shaft prev va={:#x} f17={} f25={} later",
+                                shaft_prev_va, std::bit_cast<float>(prev[17]),
+                                std::bit_cast<float>(prev[25]));
+                }
+                shaft_prev_va = vsharp.base_address;
             }
         }
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
