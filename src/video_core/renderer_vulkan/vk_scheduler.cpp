@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -162,8 +160,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
-    // Timing probe: stall each submit so late guest patches land before the latch.
-    std::this_thread::sleep_for(std::chrono::milliseconds(15));
     if (on_submit) {
         on_submit();
     }
