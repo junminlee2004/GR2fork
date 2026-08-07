@@ -7,9 +7,11 @@
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <limits>
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <queue>
 
@@ -72,10 +74,15 @@ public:
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
+        // Packets of the finished frame stay deferred until the next frame's
+        // SubmitDone, letting the guest CPU run a frame ahead of packet
+        // processing the way it runs ahead of the real GPU.
+        released_gen = static_cast<s64>(submit_gen.load()) - 1;
+        ++submit_gen;
         mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
         mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;
-        submit_cv.notify_one();
+        submit_cv.notify_all();
     }
 
     void WaitGpuIdle() noexcept {
@@ -85,6 +92,19 @@ public:
 
     bool IsGpuIdle() const {
         return num_submits == 0;
+    }
+
+    bool HasEligibleSubmit() const {
+        if (num_submits == 0) {
+            return false;
+        }
+        const s64 released = released_gen.load(std::memory_order_relaxed);
+        for (u32 i = 0; i < num_mapped_queues; ++i) {
+            if (mapped_queues[i].front_gen.load(std::memory_order_relaxed) <= released) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -192,7 +212,8 @@ private:
         std::atomic<u32> ccb_buffer_offset;
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
-        std::queue<Task::Handle> submits{};
+        std::queue<std::pair<Task::Handle, u64>> submits{};
+        std::atomic<s64> front_gen{std::numeric_limits<s64>::max()};
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
@@ -226,6 +247,9 @@ private:
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
+    std::atomic<u64> submit_gen{0};
+    std::atomic<s64> released_gen{-1};
+    std::atomic<u64> last_submit_ns{0};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
