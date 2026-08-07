@@ -618,9 +618,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             std::bit_cast<float>(cur[25]));
                 if (shaft_prev_va) {
                     const auto* prev = reinterpret_cast<const u32*>(shaft_prev_va);
-                    LOG_WARNING(Render, "shaft prev va={:#x} f17={} f25={} later",
-                                shaft_prev_va, std::bit_cast<float>(prev[17]),
-                                std::bit_cast<float>(prev[25]));
+                    if (shaft_bind_logs <= 11) {
+                        LOG_WARNING(Render, "shaft prev va={:#x} full:", shaft_prev_va);
+                        for (u32 r = 0; r < 13; ++r) {
+                            LOG_WARNING(Render,
+                                        "  row{:02} {:+14.4f} {:+14.4f} {:+14.4f} {:+14.4f}", r,
+                                        std::bit_cast<float>(prev[r * 4]),
+                                        std::bit_cast<float>(prev[r * 4 + 1]),
+                                        std::bit_cast<float>(prev[r * 4 + 2]),
+                                        std::bit_cast<float>(prev[r * 4 + 3]));
+                        }
+                    } else {
+                        LOG_WARNING(Render, "shaft prev va={:#x} f17={} f25={} later",
+                                    shaft_prev_va, std::bit_cast<float>(prev[17]),
+                                    std::bit_cast<float>(prev[25]));
+                    }
                 }
                 shaft_prev_va = vsharp.base_address;
             }
