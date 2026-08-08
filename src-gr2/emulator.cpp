@@ -355,9 +355,16 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // lands in shad_log.txt (an earlier install is dropped by the init logging suppression).
     // The missing-eboot quick_exit(0) below then logs as a stack-walked crash entry, as intended.
     Common::CrashHandler::Install();
-    if (!std::filesystem::exists(file)) {
+    // GR2FORK: for a ".zar" the executable lives INSIDE the archive and has no host path, so
+    // probe through the mount (/app0 was mounted above and its backend reads the archive)
+    // instead of the host filesystem, which would always report it missing.
+    const std::string guest_eboot_probe = "/app0/" + eboot_name.generic_string();
+    const bool eboot_missing = from_archive ? !mnt->Exists(guest_eboot_probe)
+                                            : !std::filesystem::exists(file);
+    if (eboot_missing) {
         LOG_CRITICAL(Loader, "eboot.bin does not exist: {}",
-                     std::filesystem::absolute(file).string());
+                     from_archive ? guest_eboot_probe
+                                  : std::filesystem::absolute(file).string());
         std::quick_exit(0);
     }
 
