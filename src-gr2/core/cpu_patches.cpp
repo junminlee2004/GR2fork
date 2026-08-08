@@ -502,6 +502,11 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
 
 static std::once_flag init_flag;
 
+// Windows static guest red-zone protection: size of a rel32 JMP, the smallest patch that can
+// reach a trampoline. (ShortJumpSize, the 2-byte rel8 form, is defined inside the red-zone
+// block.)
+constexpr size_t NearJumpSize = 5;
+
 struct PatchModule {
     /// Mutex controlling access to module code regions.
     std::mutex mutex{};
@@ -521,12 +526,31 @@ struct PatchModule {
     /// Code generator for writing trampoline patches.
     Xbyak::CodeGenerator trampoline_gen;
 
+    /// Prevents repeated generation attempts after the fixed trampoline area is exhausted.
+    bool trampoline_exhausted{};
+
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
           trampoline_gen(trampoline_size, trampoline_ptr) {}
 };
 static std::map<u64, PatchModule> modules;
+
+// Windows static guest red-zone protection: reports a one-shot warning when a module's fixed
+// trampoline area fills up, so the patcher can stop retrying. Marked maybe_unused because this
+// fork's TryPatch keeps its own error handling and only the red-zone patcher calls this.
+[[maybe_unused]] static bool HandleTrampolineError(PatchModule* module,
+                                                   const Xbyak::Error& error) {
+    if (static_cast<int>(error) != Xbyak::ERR_CODE_IS_TOO_BIG) {
+        return false;
+    }
+    if (!module->trampoline_exhausted) {
+        LOG_WARNING(Core, "Patch trampoline space exhausted for module at {}",
+                    fmt::ptr(module->start));
+        module->trampoline_exhausted = true;
+    }
+    return true;
+}
 
 static PatchModule* GetModule(const void* ptr) {
     auto upper_bound = modules.upper_bound(reinterpret_cast<u64>(ptr));
