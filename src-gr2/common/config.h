@@ -216,6 +216,10 @@ void setNeoMode(bool enable, bool is_game_specific = false);
 bool isDevKitConsole();
 void setDevKitConsole(bool enable, bool is_game_specific = false);
 
+// Windows static guest red-zone protection (upstream #4802). Runtime effect is Windows-only.
+bool getWindowsGuestRedZoneProtection();
+void setWindowsGuestRedZoneProtection(bool enable, bool is_game_specific = false);
+
 int getExtraDmemInMbytes();
 void setExtraDmemInMbytes(int value, bool is_game_specific = false);
 bool getIsMotionControlsEnabled();
