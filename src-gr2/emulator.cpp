@@ -714,11 +714,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     Libraries::InitHLELibs(&linker->GetHLESymbols());
 
     // Load the module with the linker
-    auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
-    const auto eboot_path = mnt->GetHostPath(guest_eboot_path);
-    if (linker->LoadModule(eboot_path) == -1) {
-        LOG_CRITICAL(Loader, "Failed to load game's eboot.bin: {}",
-                     Common::FS::PathToUTF8String(std::filesystem::absolute(eboot_path)));
+    // GR2FORK FIX: hand the linker the guest path so it reads through the mounted backend.
+    // Resolving to a host path first breaks archive-backed (.zar) games, whose eboot.bin
+    // exists only inside the archive.
+    const auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
+    if (linker->LoadModule(guest_eboot_path) == -1) {
+        LOG_CRITICAL(Loader, "Failed to load game's eboot.bin: {}", guest_eboot_path);
         std::quick_exit(0);
     }
 

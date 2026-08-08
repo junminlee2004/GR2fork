@@ -95,6 +95,17 @@ Module::Module(Core::MemoryManager* memory_, const std::filesystem::path& file_,
     }
 }
 
+Module::Module(Core::MemoryManager* memory_, const std::filesystem::path& file_,
+               std::unique_ptr<Core::FileSys::IFile> handle, u32& max_tls_index)
+    : memory{memory_}, file{file_}, name{file.filename().string()} {
+    elf.Open(std::move(handle));
+    if (elf.IsElfFile()) {
+        LoadModuleToMemory(max_tls_index);
+        LoadDynamicInfo();
+        LoadSymbols();
+    }
+}
+
 Module::~Module() = default;
 
 s32 Module::Start(u64 args, const void* argp, void* param) {

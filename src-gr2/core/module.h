@@ -142,6 +142,10 @@ class Module {
 public:
     explicit Module(Core::MemoryManager* memory, const std::filesystem::path& file,
                     u32& max_tls_index);
+    // GR2FORK FIX: load from an already-opened backend handle so archive-backed (.zar)
+    // modules work, since they have no host file to reopen by path.
+    explicit Module(Core::MemoryManager* memory, const std::filesystem::path& file,
+                    std::unique_ptr<Core::FileSys::IFile> handle, u32& max_tls_index);
     ~Module();
 
     VAddr GetBaseAddress() const noexcept {
