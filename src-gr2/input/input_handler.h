@@ -528,4 +528,9 @@ bool UpdatePressedKeys(InputEvent event);
 
 void ActivateOutputsFromInputs();
 
+// GR2FORK FIX: drops all cached per-device axis values for the multi-pad arbitration
+// (see input_handler.cpp) - called on gamepad add/remove so an unplugged pad's last
+// deflection cannot keep winning the merge (a stuck stick otherwise).
+void ClearGamepadAxisArbitration();
+
 } // namespace Input

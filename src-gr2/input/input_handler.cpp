@@ -672,6 +672,47 @@ u32 GetMouseWheelEvent(const SDL_Event& event) {
     return SDL_UNMAPPED;
 }
 
+// GR2FORK FIX: multi-pad axis arbitration. Axis events lose their SDL device id at the
+// conversion below, so with two pads connected the idle pad's center-noise events
+// interleaved last-writer-wins with the held pad's deflection - the emulated stick
+// flickered between deflection and center (jitter) and the game's smoothing read it as
+// lag. Mirror ReadState()'s polled merge semantics: cache the latest raw value per
+// (device, axis) and emit the largest deflection across devices (SDL raw rest is 0 for
+// sticks AND triggers, so |value| is the deflection). A pad that holds a steady
+// deflection stops sending events, but its cached value still wins every recompute
+// triggered by the other pad. SDL pumps all events on one thread - no locking needed.
+// GR2_NOPADARB=1 restores the raw pass-through.
+static std::unordered_map<SDL_JoystickID, std::array<s16, SDL_GAMEPAD_AXIS_COUNT>>
+    g_pad_axis_cache;
+
+void ClearGamepadAxisArbitration() {
+    g_pad_axis_cache.clear();
+}
+
+static s16 ArbitratedAxisValue(const SDL_GamepadAxisEvent& e) {
+    static const bool arb_enabled = []() noexcept {
+        const char* v = std::getenv("GR2_NOPADARB");
+        return !(v && v[0] == '1');
+    }();
+    if (!arb_enabled || e.axis >= SDL_GAMEPAD_AXIS_COUNT) {
+        return e.value;
+    }
+    auto& per_axis =
+        g_pad_axis_cache.try_emplace(e.which, std::array<s16, SDL_GAMEPAD_AXIS_COUNT>{})
+            .first->second;
+    per_axis[e.axis] = e.value;
+    int best = 0;
+    for (const auto& [id, axes] : g_pad_axis_cache) {
+        const int v = axes[e.axis];
+        const int mag = v < 0 ? -v : v;
+        const int best_mag = best < 0 ? -best : best;
+        if (mag > best_mag) {
+            best = v;
+        }
+    }
+    return static_cast<s16>(best);
+}
+
 InputEvent InputBinding::GetInputEventFromSDLEvent(const SDL_Event& e) {
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
@@ -691,7 +732,7 @@ InputEvent InputBinding::GetInputEventFromSDLEvent(const SDL_Event& e) {
                           0); // clang made me do it
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
         return InputEvent(InputType::Axis, static_cast<u32>(e.gaxis.axis), true,
-                          e.gaxis.value / 256); // this too
+                          ArbitratedAxisValue(e.gaxis) / 256); // this too
     default:
         return InputEvent();
     }

@@ -529,6 +529,10 @@ void WindowSDL::WaitEvent() {
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
     case SDL_EVENT_GAMEPAD_REMOVED:
+        // GR2FORK FIX: forget cached per-device axis values on hotplug so an unplugged
+        // pad's last deflection cannot keep winning the multi-pad merge (stuck stick).
+        // Values repopulate on the next motion events.
+        Input::ClearGamepadAxisArbitration();
         controller->SetEngine(std::make_unique<Input::SDLInputEngine>());
         break;
     case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
