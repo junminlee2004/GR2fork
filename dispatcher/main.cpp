@@ -144,10 +144,32 @@ std::filesystem::path FindParamSfo(int argc, char* argv[]) {
 // dispatcher has no access to the emulator's logging).
 std::string AutoSelectCore(int argc, char* argv[]) {
     std::string id;
-    // (a) a bare title id passed as an argument (game launched by id)
+    // (a) a title id carried by an argument: either passed bare (launched by id) or embedded
+    //     in the path. A ".zar" game is a single FILE, so there is no sce_sys/param.sfo on
+    //     disk for step (b) to read - the id has to come from the name. Every path component
+    //     is tested, with and without its extension, so all of these resolve:
+    //         CUSA04943            /games/CUSA04943            /games/CUSA04943.zar
+    //         /games/CUSA04943.zar/eboot.bin                   /games/CUSA04943/eboot.bin
     for (int i = 1; i < argc && id.empty(); ++i) {
-        if (IsGravityRushTitle(argv[i])) {
-            id = argv[i];
+        const char* a = argv[i];
+        if (a == nullptr || a[0] == '\0' || a[0] == '-') {
+            continue;
+        }
+        if (IsGravityRushTitle(a)) {
+            id = a;
+            break;
+        }
+        for (const auto& part : std::filesystem::path(a)) {
+            const std::string name = part.string();
+            if (IsGravityRushTitle(name)) {
+                id = name;
+                break;
+            }
+            const std::string stem = part.stem().string(); // CUSA04943.zar -> CUSA04943
+            if (!stem.empty() && stem != name && IsGravityRushTitle(stem)) {
+                id = stem;
+                break;
+            }
         }
     }
     // (b) otherwise read TITLE_ID from the game's param.sfo

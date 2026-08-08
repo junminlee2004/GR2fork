@@ -201,8 +201,46 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         file /= "eboot.bin";
     }
 
+    // GR2FORK: ".zar" support. A packed game is a single FILE, so split the launch path at its
+    // archive component: everything up to and including the ".zar" is the mount root (MntPoints
+    // ::Mount builds a ZArchive backend for it), the remainder is the executable inside. A bare
+    // archive path ("-g CUSA04943.zar") defaults to eboot.bin. Without this, `file.parent_path()`
+    // below would mount the archive's PARENT directory and the eboot would never be found.
+    std::filesystem::path archive_path;
+    std::filesystem::path archive_inner;
+    {
+        std::filesystem::path accum;
+        bool found = false;
+        for (const auto& comp : file) {
+            if (!found) {
+                accum /= comp;
+                if (comp.extension() == ".zar") {
+                    found = true;
+                    archive_path = accum;
+                }
+            } else {
+                archive_inner /= comp;
+            }
+        }
+        // Only treat it as an archive if the ".zar" element is a real file on disk.
+        if (found && !std::filesystem::is_regular_file(archive_path)) {
+            found = false;
+            archive_path.clear();
+            archive_inner.clear();
+        }
+        if (found && archive_inner.empty()) {
+            archive_inner = "eboot.bin";
+        }
+    }
+    const bool from_archive = !archive_path.empty();
+    if (from_archive) {
+        file = archive_path / archive_inner;
+    }
+
     std::filesystem::path game_folder;
-    if (p_game_folder.has_value()) {
+    if (from_archive) {
+        game_folder = archive_path;
+    } else if (p_game_folder.has_value()) {
         game_folder = p_game_folder.value();
     } else {
         game_folder = file.parent_path();
@@ -218,7 +256,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         }
     }
 
-    std::filesystem::path eboot_name = std::filesystem::relative(file, game_folder);
+    std::filesystem::path eboot_name =
+        from_archive ? archive_inner : std::filesystem::relative(file, game_folder);
 
     // Applications expect to be run from /app0 so mount the file's parent path as app0.
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
