@@ -1228,6 +1228,84 @@ def absorbed_by_rename(body, conflicted, target_text):
     return resolve_conflicts_ours(conflicted) == target_text.splitlines()
 
 
+def _ws_norm(line):
+    """Whitespace-collapsed form of a line (also used to join re-wrapped lines)."""
+    return " ".join(line.split())
+
+
+def _absorb_ctx(target_text):
+    """Precomputed matching context for _line_absorbed over one target file."""
+    lines = target_text.splitlines()
+    collapsed = " ".join(_ws_norm(l) for l in lines)
+    nospace = "".join("".join(l.split()) for l in lines)
+    return collapsed, nospace, Counter(_TOKEN_RE.findall(target_text))
+
+
+def _line_absorbed(line, ctx):
+    """True when an added line survives in the target under reformatting.
+
+    Tier 1 matches the whitespace-collapsed line inside the collapsed target.
+    Tier 2 handles intra-statement re-wraps (the collapsed join leaves a space
+    at the wrap point that the unwrapped original lacks - 'Relaunch( {' vs
+    'Relaunch({'): match with ALL whitespace removed, guarded by every token of
+    the line existing in the target so 'x = 1' cannot bleed into 'xx = 1'.
+    """
+    collapsed_blob, nospace_blob, tokens = ctx
+    c = _ws_norm(line)
+    if not c:
+        return True
+    if c in collapsed_blob:
+        return True
+    ns = "".join(line.split())
+    return ns in nospace_blob and all(tokens[t] for t in _TOKEN_RE.findall(line))
+
+
+def absorbed_reformatted(body, conflicted, target_text):
+    """Judges whether a conflicted patch survives in the new base under reformatting.
+
+    Covers what the two detectors above cannot, and what blocked the 2026-08 sync:
+    upstream adopted the deviation but re-wrapped a long statement across lines
+    (defeating absorbed_upstream's verbatim-line match) and kept a retired call
+    alive behind a new conditional (defeating absorbed_by_rename's vanished-token
+    demand - big_picture's unconditional Relaunch became the sameProcess=false
+    default with the old Run call preserved in the true branch). The patch counts
+    as absorbed when every added line, whitespace-collapsed, appears inside the
+    whitespace-collapsed base (line joins included), and resolving every conflict
+    toward upstream reproduces the base exactly (so each cleanly merged hunk was
+    a textual no-op). Removals are deliberately not required to be gone - upstream
+    generalizing a deviation behind a flag legitimately keeps them - so the caller
+    must put the retired-token audit trail in the report line.
+    """
+    added = [l for l in patch_hunk_lines(body, "+") if _ws_norm(l)]
+    if not added:
+        return False
+    ctx = _absorb_ctx(target_text)
+    if any(not _line_absorbed(l, ctx) for l in added):
+        return False
+    return resolve_conflicts_ours(conflicted) == target_text.splitlines()
+
+
+def split_patch_hunks(body):
+    """Splits a single-file patch into (preamble, [hunk_text, ...]).
+
+    The preamble is everything up to the first @@ (carried-patch comment header
+    plus the diff/index/---/+++ lines); each hunk starts at its @@ line.
+    """
+    lines = body.splitlines(keepends=True)
+    first = next((i for i, l in enumerate(lines) if l.startswith("@@")), None)
+    if first is None:
+        return body, []
+    pre = "".join(lines[:first])
+    hunks, cur = [], []
+    for l in lines[first:]:
+        if l.startswith("@@") and cur:
+            hunks.append("".join(cur))
+            cur = []
+        cur.append(l)
+    hunks.append("".join(cur))
+    return pre, hunks
+
+
 # ======================================================================== sync logic
 
 
@@ -1519,6 +1597,57 @@ class Sync:
                          "none it retires; conflicted merge kept at "
                          f"{dump}"))
                     continue
+                if target_text and absorbed_reformatted(body, conflicted, target_text):
+                    tgt_toks = Counter(_TOKEN_RE.findall(target_text))
+                    plus = patch_hunk_tokens(body, "+")
+                    minus = patch_hunk_tokens(body, "-")
+                    kept = sorted(t for t in (minus - plus) if tgt_toks[t])
+                    note = ("every added line survives whitespace-collapsed in the new "
+                            f"base; conflicted merge kept at {dump}")
+                    if kept:
+                        note += ("; AUDIT - base still uses retired token(s) "
+                                 f"{', '.join(kept[:5])} (upstream likely generalized "
+                                 "the deviation behind a conditional; review the dump)")
+                    os.remove(ppath)
+                    self.patch_results.append(
+                        (patch, "absorbed upstream (reformatted/generalized) - dropped",
+                         note))
+                    continue
+                # Hunk-level salvage: a genuinely partial absorption - drop only the
+                # hunks whose additions survive (whitespace-collapsed) in the new base
+                # and 3-way the residual. The refresh phase below regenerates the stored
+                # patch from the worktree diff, so absorbed hunks fall out of it.
+                if target_text:
+                    pre, hunks = split_patch_hunks(body)
+                    actx = _absorb_ctx(target_text)
+                    residual, absorbed_n = [], 0
+                    for h in hunks:
+                        h_added = [l for l in patch_hunk_lines(h, "+") if _ws_norm(l)]
+                        if h_added and all(_line_absorbed(l, actx) for l in h_added):
+                            absorbed_n += 1
+                        else:
+                            residual.append(h)
+                    if absorbed_n and residual:
+                        tmp = ppath + ".residual"
+                        with open(tmp, "w") as f:
+                            f.write(pre + "".join(residual))
+                        r2 = git("apply", "--3way", "--whitespace=nowarn", tmp,
+                                 check=False)
+                        os.remove(tmp)
+                        if r2.returncode == 0:
+                            if fpath:
+                                git("add", "--", fpath)
+                            self.patch_results.append(
+                                (patch,
+                                 f"applied (residual {len(residual)}/{len(hunks)} hunks)",
+                                 f"{absorbed_n} hunk(s) already absorbed by the new base; "
+                                 "stored patch regenerated from the residual"))
+                            continue
+                        # residual still conflicts - reset to the pure upstream side and
+                        # fall through to the normal failure diagnostics.
+                        if fpath:
+                            git("checkout", self.target, "--", fpath, check=False)
+                            git("add", "--", fpath, check=False)
                 if target_text:
                     added = patch_hunk_lines(body, "+")
                     have = Counter(target_text.splitlines())
