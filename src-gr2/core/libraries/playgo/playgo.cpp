@@ -253,8 +253,13 @@ s32 PS4_SYSV_ABI scePlayGoInitialize(OrbisPlayGoInitParams* param) {
     playgo = std::make_unique<PlaygoFile>();
 
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
-    const auto file_path = mnt->GetHostPath("/app0/sce_sys/playgo-chunk.dat");
-    if (!playgo->Open(file_path)) {
+    // GR2FORK FIX: read playgo-chunk.dat through the mount so archive-backed (.zar) games
+    // parse it; a host path does not exist inside an archive.
+    if (auto bytes = mnt->ReadFile("/app0/sce_sys/playgo-chunk.dat")) {
+        if (!playgo->Open(std::span<const u8>{*bytes})) {
+            LOG_WARNING(Lib_PlayGo, "Could not parse PlayGo file");
+        }
+    } else {
         LOG_WARNING(Lib_PlayGo, "Could not open PlayGo file");
     }
 

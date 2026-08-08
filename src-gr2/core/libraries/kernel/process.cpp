@@ -75,33 +75,30 @@ s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, 
     LOG_INFO(Lib_Kernel, "called filename = {}, args = {}", moduleFileName, args);
     ASSERT(flags == 0);
 
-    auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     auto* linker = Common::Singleton<Core::Linker>::Instance();
 
-    std::filesystem::path path;
     std::string guest_path(moduleFileName);
 
     s32 handle = -1;
 
+    // GR2FORK FIX: hand the linker guest paths; it opens through the mount, so modules inside
+    // an archive-backed (.zar) game load. Resolving to a host path first found nothing there.
     if (guest_path[0] == '/') {
         // try load /system/common/lib/ +path
         // try load /system/priv/lib/   +path
-        path = mnt->GetHostPath(guest_path);
-        handle = linker->LoadAndStartModule(path, args, argp, pRes);
+        handle = linker->LoadAndStartModule(guest_path, args, argp, pRes);
         if (handle != -1)
             return handle;
     } else {
         if (!guest_path.contains('/')) {
-            path = mnt->GetHostPath("/app0/" + guest_path);
-            handle = linker->LoadAndStartModule(path, args, argp, pRes);
+            handle = linker->LoadAndStartModule("/app0/" + guest_path, args, argp, pRes);
             if (handle != -1)
                 return handle;
             // if ((flags & 0x10000) != 0)
             //  try load /system/priv/lib/   +basename
             //  try load /system/common/lib/ +basename
         } else {
-            path = mnt->GetHostPath(guest_path);
-            handle = linker->LoadAndStartModule(path, args, argp, pRes);
+            handle = linker->LoadAndStartModule(guest_path, args, argp, pRes);
             if (handle != -1)
                 return handle;
         }

@@ -7,6 +7,7 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_file_streamer.h"
+#include "core/libraries/avplayer/avplayer_handle_streamer.h"
 #include "core/libraries/avplayer/avplayer_source.h"
 // GR2FORK FIX: needed for Stop() to drain the GPU before freeing video buffers.
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -56,10 +57,32 @@ bool AvPlayerSource::Init(const AvPlayerInitData& init_data, std::string_view pa
         }
     } else {
         const auto mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
-        const auto filepath = mnt->GetHostPath(path);
-        if (AVPLAYER_IS_ERROR(
-                avformat_open_input(&context, filepath.string().c_str(), nullptr, nullptr))) {
-            return false;
+        // GR2FORK FIX: prefer a backend handle so archive-backed (.zar) media plays. Only a
+        // host-backed file can be handed to ffmpeg by path; anything else streams through the
+        // handle. Falls back to the old host path when the guest path is not mounted.
+        auto handle = mnt->Open(path, /*writable=*/false);
+        if (handle) {
+            if (auto host = handle->GetHostPath(); host.has_value()) {
+                if (AVPLAYER_IS_ERROR(
+                        avformat_open_input(&context, host->string().c_str(), nullptr, nullptr))) {
+                    return false;
+                }
+            } else {
+                m_up_data_streamer = std::make_unique<AvPlayerHandleStreamer>(std::move(handle));
+                if (!m_up_data_streamer->Init(path)) {
+                    return false;
+                }
+                context->pb = m_up_data_streamer->GetContext();
+                if (AVPLAYER_IS_ERROR(avformat_open_input(&context, nullptr, nullptr, nullptr))) {
+                    return false;
+                }
+            }
+        } else {
+            const auto filepath = mnt->GetHostPath(path);
+            if (AVPLAYER_IS_ERROR(
+                    avformat_open_input(&context, filepath.string().c_str(), nullptr, nullptr))) {
+                return false;
+            }
         }
     }
     m_avformat_context = AVFormatContextPtr(context, &ReleaseAVFormatContext);

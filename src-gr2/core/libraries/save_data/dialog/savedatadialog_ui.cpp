@@ -138,9 +138,9 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
             auto buf = (u8*)new_item->iconBuf;
             icon = RefCountedTexture::DecodePngTexture({buf, buf + new_item->iconSize});
         } else {
-            const auto& src_icon = g_mnt->GetHostPath("/app0/sce_sys/save_data.png");
-            if (std::filesystem::exists(src_icon)) {
-                icon = RefCountedTexture::DecodePngFile(src_icon);
+            // GR2FORK FIX: read through the mount so archive-backed (.zar) games show the icon.
+            if (auto bytes = g_mnt->ReadFile("/app0/sce_sys/save_data.png")) {
+                icon = RefCountedTexture::DecodePngTexture(std::move(*bytes));
             }
         }
         if (new_item->title != nullptr) {

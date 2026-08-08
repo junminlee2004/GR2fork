@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <span>
 #include <sstream>
 #include <fmt/core.h>
 #include <fmt/xchar.h>
@@ -26,6 +27,8 @@
 #include "common/discord_rpc_handler.h"
 #endif
 #include "common/elf_info.h"
+#include "common/io_file.h"
+#include "common/string_util.h"
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
 #include "common/path_util.h"
@@ -120,12 +123,17 @@ Emulator::~Emulator() {}
 // GR2FORK: extract a game's trophies into the shared user/trophy/<npcommid> tree and seed each
 // user's home/<uid>/trophy/<npcommid>.xml from TROPCONF.XML. Returns a trophy-index -> npcommid
 // map (stored on the ElfInfo) so np_trophy can resolve the npcommid at sceNpTrophyCreateContext.
-static std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& npbind_path,
-                                                  const std::filesystem::path& trophy_dir) {
+// GR2FORK FIX: takes GUEST paths and reads through the mount so archive-backed (.zar) games
+// still extract their trophies; an archive has no host file behind sce_sys/trophy.
+static std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
+                                                  std::string_view trophy_dir_guest) {
     std::map<s32, std::string> trophy_index_map{};
 
+    auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+
     NPBindFile npbind;
-    if (!npbind.Load(npbind_path.string())) {
+    const auto npbind_bytes = mnt->ReadFile(npbind_guest);
+    if (!npbind_bytes || !npbind.Load(std::span<const u8>{*npbind_bytes})) {
         LOG_WARNING(Common_Filesystem, "Failed to load npbind.dat file");
         return trophy_index_map;
     }
@@ -136,23 +144,39 @@ static std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& n
         return trophy_index_map;
     }
 
-    if (!std::filesystem::exists(trophy_dir)) {
+    if (!mnt->IsDirectory(trophy_dir_guest)) {
         LOG_WARNING(Common_Filesystem, "Game does not contain a trophy directory");
         return trophy_index_map;
     }
 
+    auto dir = mnt->OpenDir(trophy_dir_guest);
+    if (!dir) {
+        return trophy_index_map;
+    }
+
     const std::string pattern = "trophy";
-    for (const auto& entry : std::filesystem::directory_iterator(trophy_dir)) {
-        if (!entry.is_regular_file() || entry.path().extension() != ".trp") {
+    Core::FileSys::DirEntry entry;
+    while (dir->Next(entry)) {
+        if (entry.is_directory) {
             continue;
         }
-        std::string filename = entry.path().stem().string(); // "trophy00", "trophy01", etc.
-        if (filename.find(pattern) != 0) {
+        // Extension check: match TROPHY00.TRP as well as trophy00.trp.
+        const std::string name_lower = Common::ToLower(entry.name);
+        if (!name_lower.ends_with(".trp")) {
+            continue;
+        }
+        const std::string filename = name_lower.substr(0, name_lower.size() - 4);
+        if (!filename.starts_with(pattern)) {
             continue;
         }
 
         const std::string num_str = filename.substr(pattern.length());
-        s32 trophy_index = std::stoi(num_str);
+        s32 trophy_index;
+        try {
+            trophy_index = std::stoi(num_str);
+        } catch (...) {
+            continue;
+        }
 
         // This currently assumes the order of NPCommIDs matches the order of trophies.
         if (np_comm_ids.size() <= static_cast<size_t>(trophy_index)) {
@@ -169,9 +193,35 @@ static std::map<s32, std::string> ExtractTrophies(const std::filesystem::path& n
         const auto trophy_output_dir =
             Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "trophy" / np_comm_id;
         if (!std::filesystem::exists(trophy_output_dir)) {
+            // GR2FORK FIX: TRP::Extract needs a host file. An archive-backed .trp has none, so
+            // dump its bytes to a temp file and clean up after extraction.
+            const std::string entry_guest = std::string(trophy_dir_guest) + "/" + entry.name;
+            std::filesystem::path trp_source;
+            std::filesystem::path temp_extract;
+            if (auto handle = mnt->Open(entry_guest, /*writable=*/false)) {
+                if (auto host = handle->GetHostPath(); host.has_value()) {
+                    trp_source = *host;
+                } else if (auto bytes = mnt->ReadFile(entry_guest)) {
+                    temp_extract =
+                        std::filesystem::temp_directory_path() / (np_comm_id + "_" + entry.name);
+                    Common::FS::IOFile out(temp_extract, Common::FS::FileAccessMode::Create);
+                    out.WriteRaw<u8>(bytes->data(), bytes->size());
+                    out.Close();
+                    trp_source = temp_extract;
+                }
+            }
+            if (trp_source.empty()) {
+                LOG_ERROR(Loader, "Couldn't read trophy file {}", entry.name);
+                continue;
+            }
             TRP trp;
-            if (!trp.Extract(entry.path(), np_comm_id, trophy_output_dir)) {
-                LOG_ERROR(Loader, "Couldn't extract trophy file {}", filename);
+            const bool extracted = trp.Extract(trp_source, np_comm_id, trophy_output_dir);
+            if (!temp_extract.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(temp_extract, ec);
+            }
+            if (!extracted) {
+                LOG_ERROR(Loader, "Couldn't extract trophy file {}", entry.name);
                 continue;
             }
         }
@@ -265,19 +315,21 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Certain games may use /hostapp as well such as CUSA001100
     mnt->Mount(game_folder, "/hostapp", true);
 
-    const auto param_sfo_path = mnt->GetHostPath("/app0/sce_sys/param.sfo");
-    const auto param_sfo_exists = std::filesystem::exists(param_sfo_path);
-
     // Load param.sfo details if it exists
     std::string id;
     std::string title;
     std::string app_version;
     u32 sdk_version;
     u32 fw_version;
+    bool param_sfo_exists = false;
     Common::PSFAttributes psf_attributes{};
-    if (param_sfo_exists) {
+    // GR2FORK FIX: read param.sfo through the mount instead of a host path, so archive-backed
+    // (.zar) games find it. A host path resolves to a file that does not exist in an archive,
+    // which left TITLE_ID empty and tripped the UNREACHABLE in sceAppContentInitialize.
+    if (auto psf_buf = mnt->ReadFile("/app0/sce_sys/param.sfo")) {
         auto* param_sfo = Common::Singleton<PSF>::Instance();
-        ASSERT_MSG(param_sfo->Open(param_sfo_path), "Failed to open param.sfo");
+        ASSERT_MSG(param_sfo->Open(*psf_buf), "Failed to open param.sfo");
+        param_sfo_exists = true;
 
         const auto content_id = param_sfo->GetString("CONTENT_ID");
         const auto title_id = param_sfo->GetString("TITLE_ID");
@@ -327,9 +379,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     game_info.sdk_ver = sdk_version;
     game_info.psf_attributes = psf_attributes;
 
-    const auto pic1_path = mnt->GetHostPath("/app0/sce_sys/pic1.png");
-    if (std::filesystem::exists(pic1_path)) {
-        game_info.splash_path = pic1_path;
+    // GR2FORK FIX: read the splash through the mount so archive-backed (.zar) games show it.
+    if (auto splash = mnt->ReadFile("/app0/sce_sys/pic1.png")) {
+        game_info.splash_data = std::move(*splash);
     }
 
     game_info.game_folder = game_folder;
@@ -613,9 +665,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         // GR2FORK: extract trophies into the shared user/trophy tree + each user's
         // home/<uid>/trophy, and record the trophy-index -> npcommid map on the
         // ElfInfo so np_trophy can resolve the npcommid at context creation.
-        const auto npbind_path = mnt->GetHostPath("/app0/sce_sys/npbind.dat");
-        const auto trophy_dir = mnt->GetHostPath("/app0/sce_sys/trophy");
-        game_info.trophy_index_map = ExtractTrophies(npbind_path, trophy_dir);
+        game_info.trophy_index_map =
+            ExtractTrophies("/app0/sce_sys/npbind.dat", "/app0/sce_sys/trophy");
     }
 
     std::string game_title = fmt::format("{} - {} <{}>", id, title, app_version);
@@ -675,10 +726,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     g_window = window.get();
 
     // GR2FORK: point the window/taskbar icon at the game's own icon0.png (ported from upstream
-    // PR #4586). /app0 is mounted above; skipped when no icon0.png ships, best-effort past that.
-    const auto icon_path = mnt->GetHostPath("/app0/sce_sys/icon0.png");
-    if (std::filesystem::exists(icon_path)) {
-        window->SetIcon(icon_path);
+    // PR #4586). Read through the mount so archive-backed (.zar) games get their icon too;
+    // skipped when no icon0.png ships, best-effort past that.
+    if (auto icon = mnt->ReadFile("/app0/sce_sys/icon0.png")) {
+        window->SetIcon(*icon);
     }
 
     const auto& mount_data_dir = Common::FS::GetUserPath(Common::FS::PathType::GameDataDir) / id;

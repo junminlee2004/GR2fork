@@ -455,24 +455,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
 
 WindowSDL::~WindowSDL() = default;
 
-// GR2FORK: apply an RGBA image off disk as the window icon (the game's own sce_sys/icon0.png).
-// Ported from upstream PR #4586, adapted to the fork's IOFile/stb wrappers. Best-effort: every
-// failure path logs and bails without disturbing window creation.
-void WindowSDL::SetIcon(const std::filesystem::path& path) {
-    Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read,
-                            Common::FS::FileType::BinaryFile,
-                            Common::FS::FileShareFlag::ShareReadWrite};
-    if (!file.IsOpen()) {
-        LOG_ERROR(Frontend, "Failed to open window icon file '{}'.", fmt::UTF(path.u8string()));
-        return;
-    }
-
-    const u64 file_size = file.GetSize();
-    std::vector<u8> buf(file_size);
-    const size_t bytes_read = file.ReadRaw<u8>(buf.data(), file_size);
-    file.Close();
-    if (bytes_read < file_size) {
-        LOG_ERROR(Frontend, "Failed to read window icon file '{}'.", fmt::UTF(path.u8string()));
+// GR2FORK: apply the game's own sce_sys/icon0.png as the window icon. Ported from upstream
+// PR #4586. Takes already-read bytes rather than a path so archive-backed (.zar) games work,
+// since their icon has no host file. Best-effort: failures log and leave the window untouched.
+void WindowSDL::SetIcon(std::span<const u8> png_data) {
+    if (png_data.empty()) {
+        LOG_WARNING(Frontend, "No window icon data available, using default icon.");
         return;
     }
 
@@ -480,11 +468,10 @@ void WindowSDL::SetIcon(const std::filesystem::path& path) {
     s32 image_height = 0;
     constexpr s32 num_channels = 4;
     unsigned char* image_data =
-        stbi_load_from_memory(buf.data(), static_cast<s32>(buf.size()), &image_width, &image_height,
-                              nullptr, num_channels);
+        stbi_load_from_memory(png_data.data(), static_cast<s32>(png_data.size()), &image_width,
+                              &image_height, nullptr, num_channels);
     if (image_data == nullptr) {
-        LOG_ERROR(Frontend, "Failed to load window icon image '{}': {}", fmt::UTF(path.u8string()),
-                  stbi_failure_reason());
+        LOG_ERROR(Frontend, "Failed to load window icon image: {}", stbi_failure_reason());
         return;
     }
     SCOPE_EXIT {

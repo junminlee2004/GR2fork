@@ -1874,10 +1874,21 @@ int PS4_SYSV_ABI sceSystemServiceLoadExec(const char* path, const char* argv[]) 
     LOG_DEBUG(Lib_SystemService, "called");
     auto emu = Common::Singleton<Core::Emulator>::Instance();
     auto mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
-    auto hostPath = mnt->GetHostPath(std::string_view(path));
-    if (hostPath.empty()) {
+    // GR2FORK FIX: validate and resolve through the mount stack so archive-backed (.zar)
+    // targets are found; only a host-backed file yields a real host path to re-exec.
+    if (!mnt->Exists(std::string_view(path))) {
         LOG_INFO(Lib_SystemService, "Restart called with invalid file '{}', exiting.", path);
         std::quick_exit(0);
+    }
+    std::filesystem::path hostPath;
+    if (auto handle = mnt->Open(std::string_view(path), /*writable=*/false)) {
+        if (auto host = handle->GetHostPath(); host.has_value()) {
+            hostPath = *host;
+        } else {
+            hostPath = std::filesystem::path(std::string_view(path));
+        }
+    } else {
+        hostPath = mnt->GetHostPath(std::string_view(path));
     }
     std::vector<std::string> args;
     if (argv != nullptr) {
