@@ -239,9 +239,11 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             // before any game code executes. Title-gated (GR2 45 sites vs GRR) inside
             // ApplyAspectPatches. Driven by [GPU] aspectRatioOverride = "16:9" | "16:10" | "21:9"
             // | "21:10" | "32:9" | "32:10" | "4:3" (default "16:9" = no patching).
-            const auto _gr2_aspect_target =
+            // "21:9" resolves against the reconciled SDL window: a scope-class window
+            // (2.37-2.39) patches 2.39:1 instead - see ResolveTargetAspect.
+            const auto _gr2_aspect_target = Libraries::AspectPatches::ResolveTargetAspect(
                 Libraries::AspectPatches::ParseAspectFromConfig(
-                    Config::getAspectRatioOverride());
+                    Config::getAspectRatioOverride()));
             Libraries::AspectPatches::ApplyAspectPatches(
                 base_virtual_addr, _gr2_aspect_target);
 

@@ -135,9 +135,11 @@ public:
             out_ptr = zero_buf.data();
         }
 
-        // Per-buffer safety guard (every port) plus a one-time Audio3D warmup mute. Glitched float
-        // buffers (NaN/Inf, peak > 1.0) fold into [-1, 1], an identity on clean audio; the int16
-        // Audio3D bus arrives already wrapped, so it gets a short wrap/square-signature-keyed mute.
+        // Per-buffer safety guard (every port) plus a one-time Audio3D warmup mute. Float
+        // buffers get NaN/Inf samples zeroed only - the old peak>1.0 clamp into [-1, 1] was
+        // reverted: GR2's mix runs hot during gravity kicks, so the clamp flattened valid
+        // peaks constantly and read as a global volume drop. The int16 Audio3D bus arrives
+        // already wrapped, so it gets a short wrap/square-signature-keyed mute.
         if (ptr != nullptr) {
             if (is_float) {
                 const float* in = static_cast<const float*>(ptr);
@@ -161,21 +163,22 @@ public:
                     ArmWarmupMute();
                 }
 
-                // Sanitize in place when the buffer is hot (any sample past 0 dBFS) or carries a
-                // non-finite sample: NaN/Inf -> 0, finite values clamped to [-1, 1]. Clamping does
-                // nothing to in-range samples, so the rest of the mix is untouched.
-                if (non_finite > 0 || peak > 1.0f) {
+                // Sanitize only when the buffer carries non-finite samples: NaN/Inf -> 0,
+                // every finite value passes through UNMODIFIED. Finite values are never
+                // clamped - the former [-1, 1] fold on peak > 1.0 flattened GR2's valid
+                // hot mix and was reverted as a de facto volume reduction.
+                if (non_finite > 0) {
                     if (f32_buf.size() != n) {
                         f32_buf.resize(n);
                     }
                     for (size_t i = 0; i < n; ++i) {
                         const float v = in[i];
-                        f32_buf[i] = std::isfinite(v) ? std::clamp(v, -1.0f, 1.0f) : 0.0f;
+                        f32_buf[i] = std::isfinite(v) ? v : 0.0f;
                     }
                     out_ptr = f32_buf.data();
-                    LogLimiterEdge(peak, non_finite);
+                    LogSanitizeEdge(peak, non_finite);
                 } else {
-                    limiter_engaged = false; // clean buffer: re-arm the edge-triggered log
+                    sanitize_engaged = false; // clean buffer: re-arm the edge-triggered log
                 }
 
                 // A mostly-non-finite buffer is too broken to repair cleanly (scattered NaN -> 0
@@ -292,14 +295,14 @@ private:
         mute_buffers = std::max(mute_buffers, GLITCH_MUTE_BUFFERS);
     }
 
-    // Edge-triggered log for the float limiter so the hot path never logs per-buffer: it fires once
-    // on a clean->limiting transition and stays quiet until a clean buffer re-arms it (see the
-    // `limiter_engaged = false` reset in Output()).
-    void LogLimiterEdge(float peak, size_t non_finite) {
-        if (!limiter_engaged) {
-            limiter_engaged = true;
+    // Edge-triggered log for the float NaN/Inf repair so the hot path never logs per-buffer: it
+    // fires once on a clean->sanitizing transition and stays quiet until a clean buffer re-arms
+    // it (see the `sanitize_engaged = false` reset in Output()).
+    void LogSanitizeEdge(float peak, size_t non_finite) {
+        if (!sanitize_engaged) {
+            sanitize_engaged = true;
             LOG_WARNING(Lib_AudioOut,
-                        "Audio limiter engaged (is_float={}, audio3d={}, non_finite={}, peak={:.3f}); "
+                        "Audio NaN/Inf repair engaged (is_float={}, audio3d={}, non_finite={}, peak={:.3f}); "
                         "folding buffer to <= 0 dBFS",
                         is_float, is_audio3d, non_finite, peak);
         }
@@ -320,7 +323,7 @@ private:
     bool is_audio3d;
     bool is_float;
     bool audio3d_seen_non_silent{false};
-    bool limiter_engaged{false};
+    bool sanitize_engaged{false};
     u32 mute_buffers{0};
     std::vector<std::uint8_t> zero_buf{};
     std::vector<float> f32_buf{};

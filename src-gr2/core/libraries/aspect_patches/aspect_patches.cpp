@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
+#include <cmath>
 #include <cstring>
 #include <span>
 
@@ -85,6 +87,7 @@ constexpr std::array<std::uint8_t, 4> EncodeReplacement(TargetAspect t) {
     case TargetAspect::R21_10: return {0x66, 0x66, 0x06, 0x40}; // 2.1f
     case TargetAspect::R32_10: return {0xCD, 0xCC, 0x4C, 0x40}; // 3.2f
     case TargetAspect::R4_3:   return {0xAB, 0xAA, 0xAA, 0x3F}; // 1.3333334f
+    case TargetAspect::R2_39:  return {0xC3, 0xF5, 0x18, 0x40}; // 2.39f
     default:                   return {0x39, 0x8E, 0xE3, 0x3F}; // 16:9 (no-op)
     }
 }
@@ -97,6 +100,7 @@ const char* TargetName(TargetAspect t) {
     case TargetAspect::R21_10: return "21:10 (2.1)";
     case TargetAspect::R32_10: return "32:10 (3.2)";
     case TargetAspect::R4_3:   return "4:3 (1.333)";
+    case TargetAspect::R2_39:  return "2.39:1 (2.39, via 21:9 window match)";
     default:                   return "Off";
     }
 }
@@ -213,6 +217,49 @@ int ApplyAspectPatches(uintptr_t eboot_base, TargetAspect target) {
     return 0;
 }
 
+namespace {
+// Reconciled window pixel size + the latched 21:9 resolution (doc in the header).
+// Written on the main thread before module load; read from loader and presenter threads.
+std::atomic<int> g_reconciled_w{0};
+std::atomic<int> g_reconciled_h{0};
+std::atomic<int> g_r21_9_resolved{-1}; // -1 = unresolved, else int(TargetAspect)
+} // namespace
+
+void NoteReconciledWindowSize(int width, int height) {
+    if (width > 0 && height > 0) {
+        g_reconciled_w.store(width, std::memory_order_relaxed);
+        g_reconciled_h.store(height, std::memory_order_release);
+    }
+}
+
+TargetAspect ResolveTargetAspect(TargetAspect parsed) {
+    if (parsed != TargetAspect::R21_9) {
+        return parsed;
+    }
+    int resolved = g_r21_9_resolved.load(std::memory_order_acquire);
+    if (resolved < 0) {
+        const int h = g_reconciled_h.load(std::memory_order_acquire);
+        const int w = g_reconciled_w.load(std::memory_order_relaxed);
+        if (w <= 0 || h <= 0) {
+            return parsed; // window not up yet (pre-window sizing pass) - no latch
+        }
+        const float ratio = static_cast<float>(w) / static_cast<float>(h);
+        const TargetAspect choice = (std::fabs(ratio - 2.39f) < std::fabs(ratio - 21.0f / 9.0f))
+                                        ? TargetAspect::R2_39
+                                        : TargetAspect::R21_9;
+        int expected = -1;
+        if (g_r21_9_resolved.compare_exchange_strong(expected, static_cast<int>(choice),
+                                                     std::memory_order_acq_rel)) {
+            LOG_INFO(Core,
+                     "[Aspect 2.39-compat] 21:9 resolved against reconciled window {}x{} "
+                     "(ratio {:.4f}) -> {}",
+                     w, h, ratio, TargetName(choice));
+        }
+        resolved = g_r21_9_resolved.load(std::memory_order_acquire);
+    }
+    return static_cast<TargetAspect>(resolved);
+}
+
 TargetAspect ParseAspectFromConfig(std::string_view s) {
     if (s == "16:10") return TargetAspect::R16_10;
     if (s == "21:9")  return TargetAspect::R21_9;
@@ -232,6 +279,7 @@ float TargetAspectToRatio(TargetAspect t) {
     case TargetAspect::R21_10: return 21.0f / 10.0f;      // 2.1f
     case TargetAspect::R32_10: return 32.0f / 10.0f;      // 3.2f
     case TargetAspect::R4_3:   return 4.0f / 3.0f;        // 1.3333334f
+    case TargetAspect::R2_39:  return 2.39f;
     default:                   return 16.0f / 9.0f;       // 1.7777778f (Off)
     }
 }

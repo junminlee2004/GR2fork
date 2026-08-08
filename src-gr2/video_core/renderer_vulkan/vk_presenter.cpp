@@ -481,8 +481,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // presenter stops letterboxing the game's native 16:9 render; 16:9/Off falls through to the
     // original computation.
     {
-        const auto _aspect_target = Libraries::AspectPatches::ParseAspectFromConfig(
-            Config::getAspectRatioOverride());
+        // Resolved (not just parsed): 21:9 may have latched to 2.39:1 at patch time
+        // against the reconciled window - the presenter must agree with the eboot patch.
+        const auto _aspect_target = Libraries::AspectPatches::ResolveTargetAspect(
+            Libraries::AspectPatches::ParseAspectFromConfig(Config::getAspectRatioOverride()));
         if (_aspect_target == Libraries::AspectPatches::TargetAspect::Off) {
             expected_ratio =
                 static_cast<float>(image_size.width) / static_cast<float>(image_size.height);

@@ -18,6 +18,7 @@
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/libraries/kernel/time.h"
+#include "core/libraries/aspect_patches/aspect_patches.h"
 #include "core/libraries/pad/pad.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
@@ -384,6 +385,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
         int actual_w = width;
         int actual_h = height;
         SDL_GetWindowSizeInPixels(window, &actual_w, &actual_h);
+        // GR2FORK: publish the reconciled pixel size for the 2.39:1-vs-21:9 aspect-patch
+        // resolution (AspectPatches::ResolveTargetAspect). The eboot maps - and patches
+        // apply - after this point, so the resolver sees the real window.
+        Libraries::AspectPatches::NoteReconciledWindowSize(actual_w, actual_h);
         if (actual_w != width || actual_h != height) {
             LOG_INFO(Frontend,
                      "[GR2FORK] window size reconciled after SDL setup: "
