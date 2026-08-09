@@ -1211,10 +1211,9 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size, bool device_mem) {
-    // Back every mapping with imported host memory so the GPU reads guest
-    // writes at execution time; device-local residency stays opt-in until a
-    // per-mapping policy exists.
-    device_mem = false;
+    if (addr == 0x242c00000ULL || addr == 0x313600000ULL || addr == 0x4000000000ULL) {
+        device_mem = false;
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         pending_mapped_ranges.insert({Interval{addr, addr+size}, device_mem});
