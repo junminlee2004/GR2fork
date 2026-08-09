@@ -214,9 +214,11 @@ private:
         bool permafailed{false};
     };
 
-    // GR2FORK: the inline wait budget is the [GR2Fork] gameplaySyncBudgetMs config key (default 100,
+    // GR2FORK: the inline wait budget is the [GR2Fork] gameplaySyncBudgetMs config key (default 0,
     // launcher slider 0..50000 ms), read fresh at the cold-compile wait site. A low budget is safe
     // (a skip costs 1-3 frames of pop-in) and keeps the assembler draining draws during loads.
+    // Photo captures are the exception: a skipped draw there saves a black photo, so the wait is
+    // raised for the capture window only. See common/gr2_photo_capture.h.
     static constexpr std::chrono::seconds      kHangLogThreshold{5};
     static constexpr std::chrono::seconds      kPermaFailThreshold{30};
 

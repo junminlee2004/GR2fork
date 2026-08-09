@@ -262,9 +262,10 @@ static ConfigEntry<bool> isHDRAllowed(false);
 static ConfigEntry<bool> fsrEnabled(false);
 static ConfigEntry<bool> rcasEnabled(true);
 static ConfigEntry<int> rcasAttenuation(250);
-// GR2FORK: pipeline-compile sync-wait budget in ms (see config.h). Default
-// 100; user-tunable from the Qt launcher.
-static ConfigEntry<int> gameplaySyncBudgetMs(100);
+// GR2FORK: pipeline-compile sync-wait budget in ms (see config.h). Default 0 - the shorter the
+// wait, the less time the device spends blocked on a frame, which lowers the chance of a device
+// loss; user-tunable from the Qt launcher. Photo captures override this, see gr2_photo_capture.h.
+static ConfigEntry<int> gameplaySyncBudgetMs(0);
 static ConfigEntry<string> aspectRatioOverride("16:9");
 static ConfigEntry<string> resolutionOverride("Off");
 static ConfigEntry<string> resolutionPatchGroups("recommended");
@@ -2168,7 +2169,7 @@ void setDefaultValues(bool is_game_specific) {
     fsrEnabled.set(true, is_game_specific);
     rcasEnabled.set(true, is_game_specific);
     rcasAttenuation.set(250, is_game_specific);
-    gameplaySyncBudgetMs.set(100, is_game_specific);
+    gameplaySyncBudgetMs.set(0, is_game_specific);
     aspectRatioOverride.set("16:9", is_game_specific);
     resolutionOverride.set("Off", is_game_specific);
     resolutionPatchGroups.set("recommended", is_game_specific);

@@ -18,7 +18,9 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/gr2_photo_capture.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -352,6 +354,11 @@ s32 PS4_SYSV_ABI sceJpegEncCreate(const OrbisJpegEncCreateParam* param, void* me
     handle_internal->handle_size = sizeof(OrbisJpegEncHandleInternal*);
     *handle = handle_internal;
 
+    // GR2FORK FIX: open the photo-capture scope. The scene is rendered between here and the
+    // encode below, and a draw skipped for a still-compiling pipeline saves a black photo, so
+    // the pipeline-compile wait is held high until that encode returns.
+    Common::BeginPhotoCapture();
+
     // GR2: Record handle location so the context finder can scan nearby memory
     // for the game's photo context object after encode completes.
     GR2PhotoContextFinder::Instance().OnCreate(
@@ -363,6 +370,10 @@ s32 PS4_SYSV_ABI sceJpegEncCreate(const OrbisJpegEncCreateParam* param, void* me
 }
 
 s32 PS4_SYSV_ABI sceJpegEncDelete(OrbisJpegEncHandle handle) {
+    // GR2FORK FIX: backstop close. A create that never reaches a photo encode must not leave
+    // the pipeline-compile wait pinned high for the rest of the session.
+    Common::EndPhotoCapture();
+
     if (auto handle_ret = ValidateJpecEngHandle(handle); handle_ret != ORBIS_OK) {
         LOG_ERROR(Lib_Jpeg, "Invalid handle");
         return handle_ret;
@@ -390,6 +401,14 @@ s32 PS4_SYSV_ABI sceJpegEncEncode(OrbisJpegEncHandle handle, const OrbisJpegEncE
 
     // For photo-sized encodes: ensure GPU data is flushed to CPU memory.
     const bool is_photo_encode = (width == 1024 && height == 1024);
+
+    // GR2FORK FIX: the capture is done once this encode returns, so drop the pipeline-compile
+    // wait back to the configured value on every exit path.
+    SCOPE_EXIT {
+        if (is_photo_encode) {
+            Common::EndPhotoCapture();
+        }
+    };
     bool readback_ok = false;
     if (is_photo_encode) {
         readback_ok = GR2PhotoForceReadbackIfPossible(param);

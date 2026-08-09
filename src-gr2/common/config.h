@@ -256,8 +256,9 @@ int getRcasAttenuation();
 void setRcasAttenuation(int value, bool is_game_specific = false);
 // GR2FORK: pipeline-compile synchronous-wait budget in milliseconds - on a new graphics
 // pipeline the GpuComm thread blocks up to this long for the async compile before skipping the
-// draw. Default 50, [GPU] section, Qt slider 0..50000 ms; see vk_pipeline_cache for the wait
-// site and why it must not be set near zero.
+// draw. Default 0 (shorter waits mean less time blocked on a frame, so fewer device losses),
+// [GPU] section, Qt slider 0..50000 ms. Photo captures raise it for the capture only; see
+// gr2_photo_capture.h and the wait site in vk_pipeline_cache.
 int getGameplaySyncBudgetMs();
 void setGameplaySyncBudgetMs(int value, bool is_game_specific = false);
 std::string getAspectRatioOverride();

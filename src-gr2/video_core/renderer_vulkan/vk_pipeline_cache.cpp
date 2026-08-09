@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ranges>
 #include <limits>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <xxhash.h>
 
 #include "common/config.h"
+#include "common/gr2_photo_capture.h"
 #include "core/libraries/resolution_patches/resolution_patches.h"
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -741,7 +743,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
         // Most compiles finish in <50ms, so waiting the configured gameplaySyncBudgetMs catches
         // them without frame-skip; on timeout the future is stashed in pending_graphics_pipelines
         // and the draw is skipped. Config is read fresh on this cold path (launcher slider).
-        const std::chrono::milliseconds sync_budget{Config::getGameplaySyncBudgetMs()};
+        // GR2FORK FIX: a skipped draw during a photo capture leaves the photo target empty and
+        // saves a black square, so hold the wait at PhotoCaptureSyncBudgetMs for the capture.
+        // Takes the larger value: a user who configured a longer wait keeps it.
+        int budget_ms = Config::getGameplaySyncBudgetMs();
+        if (Common::IsPhotoCaptureActive()) {
+            budget_ms = std::max(budget_ms, Common::PhotoCaptureSyncBudgetMs);
+        }
+        const std::chrono::milliseconds sync_budget{budget_ms};
         if (pending->future.wait_for(sync_budget) == std::future_status::ready) {
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {
