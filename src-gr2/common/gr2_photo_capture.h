@@ -17,8 +17,13 @@ namespace Common {
 // value.
 //
 // Opened at sceJpegEncCreate, closed when the photo encode returns (also on sceJpegEncDelete,
-// so a create that never encodes cannot pin the budget high). See vk_pipeline_cache for the
-// wait site.
+// so a create that never encodes cannot pin the budget high).
+//
+// This scope alone is NOT enough: the game renders the photo before it creates the encoder, so
+// on the first capture of a session the photo draw hits a cold pipeline outside this window and
+// the photo saves black (later captures survive only because the pipeline is cached by then).
+// The primary trigger is therefore IsPhotoRenderTarget() at the pipeline lookup in
+// vk_pipeline_cache; this scope just covers whatever still compiles during the encode itself.
 inline constexpr int PhotoCaptureSyncBudgetMs = 700;
 
 inline std::atomic<bool>& PhotoCaptureActiveFlag() {

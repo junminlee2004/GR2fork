@@ -658,6 +658,30 @@ PipelineCache::~PipelineCache() {
 }
 
 
+// GR2FORK FIX: does this draw write the GR2 photo target? Same shape the texture cache tracks
+// as the photo RT (1024x1024, untiled). Checked at the pipeline lookup rather than at bind time
+// because a cold pipeline skips the draw before any render target is bound, which is exactly how
+// the first photo of a session came out black. GR2_NOPHOTOSYNC restores the plain budget.
+static bool IsPhotoRenderTarget(const AmdGpu::LiverpoolRegsSnapshot& regs) {
+    static const bool disabled = std::getenv("GR2_NOPHOTOSYNC") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
+        return false;
+    }
+    for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (!col_buf || !regs.color_target_mask.GetMask(cb)) {
+            continue;
+        }
+        if (col_buf.Pitch() == 1024 && col_buf.Height() == 1024 && !col_buf.IsTiled()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
     const AmdGpu::LiverpoolRegsSnapshot& regs) {
     // GR2FORK: read the stamp + dirty bit from the captured snapshot, not the live Liverpool;
@@ -743,11 +767,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(
         // Most compiles finish in <50ms, so waiting the configured gameplaySyncBudgetMs catches
         // them without frame-skip; on timeout the future is stashed in pending_graphics_pipelines
         // and the draw is skipped. Config is read fresh on this cold path (launcher slider).
-        // GR2FORK FIX: a skipped draw during a photo capture leaves the photo target empty and
-        // saves a black square, so hold the wait at PhotoCaptureSyncBudgetMs for the capture.
-        // Takes the larger value: a user who configured a longer wait keeps it.
+        // GR2FORK FIX: a skipped draw leaves the photo target empty and saves a black square, so
+        // hold the wait at PhotoCaptureSyncBudgetMs for draws that write the photo target, and
+        // for the encode window that follows. Takes the larger value: a user who configured a
+        // longer wait keeps it.
         int budget_ms = Config::getGameplaySyncBudgetMs();
-        if (Common::IsPhotoCaptureActive()) {
+        if (IsPhotoRenderTarget(regs) || Common::IsPhotoCaptureActive()) {
             budget_ms = std::max(budget_ms, Common::PhotoCaptureSyncBudgetMs);
         }
         const std::chrono::milliseconds sync_budget{budget_ms};
