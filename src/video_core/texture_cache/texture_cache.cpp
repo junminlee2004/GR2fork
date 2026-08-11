@@ -123,6 +123,15 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     UntrackImage(image_id);
 }
 
+bool TextureCache::IsRegionGpuModified(VAddr addr, size_t size) {
+    std::scoped_lock lock{mutex};
+    bool gpu_modified = false;
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        return gpu_modified |= True(image.flags & ImageFlagBits::GpuModified);
+    });
+    return gpu_modified;
+}
+
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);

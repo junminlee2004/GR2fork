@@ -84,6 +84,9 @@ public:
         return tile_manager;
     }
 
+    /// Returns true when any image overlapping the region was modified by the GPU.
+    bool IsRegionGpuModified(VAddr addr, size_t size);
+
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 

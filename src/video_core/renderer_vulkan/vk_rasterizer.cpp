@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/alignment.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -1075,6 +1076,21 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
     return true;
+}
+
+bool Rasterizer::InvalidateMemoryFromFault(VAddr addr) {
+    // Invalidating a whole window per write fault is safe only where nothing is
+    // gpu-modified: widened cpu-dirty tracking over live gpu data would schedule
+    // stale uploads on top of it.
+    constexpr u64 WindowSize = 256_KB;
+    const VAddr window = Common::AlignDown(addr, WindowSize);
+    if (IsMapped(window, WindowSize) && !buffer_cache.IsRegionGpuModified(window, WindowSize) &&
+        !texture_cache.IsRegionGpuModified(window, WindowSize)) {
+        buffer_cache.InvalidateMemory(window, WindowSize);
+        texture_cache.InvalidateMemory(window, WindowSize);
+        return true;
+    }
+    return InvalidateMemory(addr, 8);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size) {

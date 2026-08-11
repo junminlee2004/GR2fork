@@ -57,7 +57,11 @@ struct PageManager::Impl {
         }
 
         Core::MemoryPermission Perms() const noexcept {
-            return ReadPerm() | WritePerm();
+            // Write-only protection is not expressible, so a page that is both
+            // CPU-dirty and GPU-modified is protected as no-access and faults on
+            // any access.
+            const auto perms = ReadPerm() | WritePerm();
+            return perms == Core::MemoryPermission::Write ? Core::MemoryPermission::None : perms;
         }
 
         template <s32 delta, bool is_read>
@@ -210,7 +214,7 @@ struct PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
+            return rasterizer->InvalidateMemoryFromFault(addr);
         } else {
             return rasterizer->ReadMemory(addr, 8);
         }
