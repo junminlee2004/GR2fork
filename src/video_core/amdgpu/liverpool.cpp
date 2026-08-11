@@ -881,6 +881,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         return true;
                     }
                     ASSERT(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory);
+                    // Guest memory holds the truth for CPU-written labels and
+                    // executed GPU label writes.
+                    if (wait_reg_mem->Test(regs.reg_array)) {
+                        return true;
+                    }
+                    // A label write recorded but not yet executed satisfies the
+                    // wait too: recording order is execution order on the queue.
                     auto it = label_writes.find(wait_reg_mem->Address<VAddr>());
                     if (it == label_writes.end()) {
                         return false;
@@ -914,11 +921,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 };
                 int counter = 0;
                 while (!test()) {
-                    counter++;
+                    if (++counter == 1) {
+                        rasterizer->GetScheduler().Flush();
+                    }
                     YIELD_GFX();
-                    if (counter == 5) {
-                        //rasterizer->GetScheduler().Flush();
-                        break;
+                    if (counter % 100000 == 0) {
+                        LOG_WARNING(Render, "WaitRegMem gfx stalled: address={:#x} ref={:#x}",
+                                    wait_reg_mem->Address<VAddr>(), wait_reg_mem->ref);
                     }
                 }
                 break;
@@ -1266,6 +1275,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     return true;
                 }
                 ASSERT(wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory);
+                // Guest memory holds the truth for CPU-written labels and
+                // executed GPU label writes.
+                if (wait_reg_mem->Test(regs.reg_array)) {
+                    return true;
+                }
+                // A label write recorded but not yet executed satisfies the
+                // wait too: recording order is execution order on the queue.
                 auto it = label_writes.find(wait_reg_mem->Address<VAddr>());
                 if (it == label_writes.end()) {
                     return false;
@@ -1299,11 +1315,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             };
             int counter = 0;
             while (!test()) {
-                counter++;
+                if (++counter == 1) {
+                    rasterizer->GetScheduler().Flush();
+                }
                 YIELD_ASC(vqid);
-                if (counter == 5) {
-                    //rasterizer->GetScheduler().Flush();
-                    break;
+                if (counter % 100000 == 0) {
+                    LOG_WARNING(Render, "WaitRegMem asc stalled: address={:#x} ref={:#x}",
+                                wait_reg_mem->Address<VAddr>(), wait_reg_mem->ref);
                 }
             }
             break;
