@@ -46,6 +46,15 @@ public:
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address);
 
+    /// Begins an occlusion query bracket; draws until the end dump are counted.
+    void OcclusionQueryBegin(VAddr results_addr, u32 num_pairs);
+    /// Ends the bracket and schedules the zpass count write to guest memory.
+    void OcclusionQueryEnd(VAddr results_addr, u32 num_pairs);
+
+    [[nodiscard]] bool SupportsOcclusionQueries() const noexcept {
+        return static_cast<bool>(occlusion_pool);
+    }
+
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
@@ -99,6 +108,9 @@ private:
 
     bool FilterDraw();
 
+    void BeginDrawOcclusion(vk::CommandBuffer cmdbuf);
+    void EndDrawOcclusion(vk::CommandBuffer cmdbuf);
+
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
@@ -140,6 +152,12 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
+
+    static constexpr u32 NumOcclusionQueries = 1024;
+    vk::UniqueQueryPool occlusion_pool;
+    std::vector<u32> occlusion_queries;
+    u32 occlusion_cursor{};
+    bool occlusion_active{};
 
     using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64>;
     boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;

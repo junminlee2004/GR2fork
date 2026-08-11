@@ -43,6 +43,20 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+
+    if (instance.IsHostQueryResetSupported()) {
+        auto [result, pool] = instance.GetDevice().createQueryPoolUnique({
+            .queryType = vk::QueryType::eOcclusion,
+            .queryCount = NumOcclusionQueries,
+        });
+        if (result == vk::Result::eSuccess) {
+            occlusion_pool = std::move(pool);
+            instance.GetDevice().resetQueryPool(occlusion_pool.get(), 0, NumOcclusionQueries);
+        }
+    }
+    if (!occlusion_pool) {
+        LOG_WARNING(Render_Vulkan, "Occlusion queries unavailable, zpass counts will be faked");
+    }
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -223,6 +237,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    BeginDrawOcclusion(cmdbuf);
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -230,6 +245,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    EndDrawOcclusion(cmdbuf);
     DebugState.IncDrawCall();
 
     ResetBindings();
@@ -291,6 +307,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    BeginDrawOcclusion(cmdbuf);
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
@@ -312,8 +329,70 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         DebugState.IncDrawCall();
     }
+    EndDrawOcclusion(cmdbuf);
 
     ResetBindings();
+}
+
+// Occlusion results are u64 [begin, end] snapshot pairs at 16-byte stride; the dump address
+// selects which half is written. The guest sums end - begin over all pairs, so the count
+// goes into pair 0 and the remaining pairs contribute zero.
+static void WriteZpassPairs(VAddr results_addr, u32 num_pairs, u64 total) {
+    u64* const results = reinterpret_cast<u64*>(results_addr);
+    for (u32 i = 0; i < num_pairs; ++i) {
+        results[i * 2] = (i == 0 ? total : 0) | AmdGpu::OcclusionCounterValidMask;
+    }
+}
+
+void Rasterizer::BeginDrawOcclusion(vk::CommandBuffer cmdbuf) {
+    if (!occlusion_active) {
+        return;
+    }
+    const u32 query = occlusion_cursor;
+    occlusion_cursor = (occlusion_cursor + 1) % NumOcclusionQueries;
+    occlusion_queries.push_back(query);
+    cmdbuf.beginQuery(occlusion_pool.get(), query,
+                      instance.IsOcclusionQueryPreciseSupported()
+                          ? vk::QueryControlFlagBits::ePrecise
+                          : vk::QueryControlFlags{});
+}
+
+void Rasterizer::EndDrawOcclusion(vk::CommandBuffer cmdbuf) {
+    if (!occlusion_active) {
+        return;
+    }
+    cmdbuf.endQuery(occlusion_pool.get(), occlusion_queries.back());
+}
+
+void Rasterizer::OcclusionQueryBegin(VAddr results_addr, u32 num_pairs) {
+    WriteZpassPairs(results_addr, num_pairs, 0);
+    occlusion_active = true;
+    occlusion_queries.clear();
+}
+
+void Rasterizer::OcclusionQueryEnd(VAddr results_addr, u32 num_pairs) {
+    occlusion_active = false;
+    if (occlusion_queries.empty()) {
+        WriteZpassPairs(results_addr, num_pairs, 0);
+        return;
+    }
+    scheduler.DeferOperation(
+        [this, queries = std::move(occlusion_queries), results_addr, num_pairs] {
+            const auto device = instance.GetDevice();
+            u64 total = 0;
+            for (const u32 query : queries) {
+                u64 count = 0;
+                const auto result = device.getQueryPoolResults(
+                    occlusion_pool.get(), query, 1, sizeof(count), &count, sizeof(count),
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+                if (result == vk::Result::eSuccess) {
+                    total += count;
+                }
+                device.resetQueryPool(occlusion_pool.get(), query, 1);
+            }
+            WriteZpassPairs(results_addr, num_pairs, total);
+        });
+    occlusion_queries.clear();
 }
 
 void Rasterizer::DispatchDirect() {

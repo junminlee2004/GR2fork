@@ -89,6 +89,16 @@ public:
         return features.depthBounds;
     }
 
+    /// Returns true if precise occlusion queries are supported
+    bool IsOcclusionQueryPreciseSupported() const {
+        return features.occlusionQueryPrecise;
+    }
+
+    /// Returns true if host query reset is supported
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
     /// Returns true if 16-bit floats are supported in shaders
     bool IsShaderFloat16Supported() const {
         return vk12_features.shaderFloat16;

@@ -678,13 +678,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     regs.cp_strmout_cntl.offset_update_done = 1;
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                        const VAddr addr = event->Address<VAddr>();
+                        if (rasterizer && rasterizer->SupportsOcclusionQueries()) {
+                            // Occlusion results are [begin, end] u64 snapshot pairs per render
+                            // backend; the begin dump targets base + 0 and the end dump base + 8,
+                            // with the queried draws submitted between the two dumps.
+                            if ((addr & 0xf) == 8) {
+                                rasterizer->OcclusionQueryEnd(addr, num_counter_pairs);
+                            } else {
+                                rasterizer->OcclusionQueryBegin(addr, num_counter_pairs);
+                            }
+                        } else {
+                            static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+                            u64* results = reinterpret_cast<u64*>(addr);
+                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                                *results = pixel_counter | OcclusionCounterValidMask;
+                            }
+                            pixel_counter += OcclusionCounterStep;
                         }
-                        pixel_counter += OcclusionCounterStep;
                     }
                 }
                 break;

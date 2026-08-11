@@ -30,6 +30,9 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+/// Bit 63 of each zpass counter snapshot signals validity to the guest.
+constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
