@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 //#pragma clang optimize off
+#include <algorithm>
+#include <cstdlib>
+#include <string_view>
+#include <vector>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -1210,10 +1214,51 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     return boost::icl::contains(mapped_ranges, Interval{addr, addr+size});
 }
 
+// Every mapping is backed by imported host memory by default: GPU writes land
+// in guest RAM directly, which is what keeps CPU-consumed GPU output (particle
+// and lighting readbacks) alive. SHAD_HOST_RANGES overrides the policy for
+// experiments: "none" restores the device-local default, a comma-separated
+// list of hex addresses host-backs only the mappings containing them, and
+// "all" (or unset) is the default all-host behavior.
+static bool ForceHostBacking(VAddr addr, u64 size) {
+    struct Policy {
+        bool all{};
+        std::vector<VAddr> addrs;
+    };
+    static const Policy policy = [] {
+        Policy p{};
+        const char* env = std::getenv("SHAD_HOST_RANGES");
+        if (!env || std::string_view{env} == "all") {
+            p.all = true;
+            return p;
+        }
+        if (std::string_view{env} == "none") {
+            return p;
+        }
+        for (const char* s = env; *s != '\0';) {
+            char* end{};
+            const u64 parsed = std::strtoull(s, &end, 16);
+            if (end == s) {
+                break;
+            }
+            p.addrs.push_back(parsed);
+            s = *end != '\0' ? end + 1 : end;
+        }
+        return p;
+    }();
+    if (policy.all) {
+        return true;
+    }
+    return std::ranges::any_of(policy.addrs,
+                               [&](VAddr a) { return a >= addr && a - addr < size; });
+}
+
 void Rasterizer::MapMemory(VAddr addr, u64 size, bool device_mem) {
-    if (addr == 0x242c00000ULL || addr == 0x313600000ULL || addr == 0x4000000000ULL) {
+    if (ForceHostBacking(addr, size)) {
         device_mem = false;
     }
+    LOG_INFO(Render_Vulkan, "MapMemory {:#x}..{:#x} backing={}", addr, addr + size,
+             device_mem ? "device" : "host");
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         pending_mapped_ranges.insert({Interval{addr, addr+size}, device_mem});
