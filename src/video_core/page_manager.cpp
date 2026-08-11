@@ -60,7 +60,11 @@ struct PageManager::Impl {
         }
 
         Core::MemoryPermission Perms() const noexcept {
-            return ReadPerm() | WritePerm();
+            // Write-only protection is not expressible, so a page that is both
+            // CPU-dirty and GPU-modified is protected as no-access and faults on
+            // any access.
+            const auto perms = ReadPerm() | WritePerm();
+            return perms == Core::MemoryPermission::Write ? Core::MemoryPermission::None : perms;
         }
 
         template <s32 delta, bool is_read>

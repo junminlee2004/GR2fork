@@ -54,6 +54,16 @@ public:
                             });
     }
 
+    /// Mark region as modified from the host GPU, engaging read protection
+    void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::GPU, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,
@@ -74,8 +84,10 @@ public:
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
-                        manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                    // A guest write over gpu-pending bytes must wait for execution
+                    // regardless of the readbacks setting, or the GPU's late write
+                    // lands on top of the newer guest data.
+                    if (manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
                     }
                     manager->template ChangeRegionState<Type::CPU, true>(

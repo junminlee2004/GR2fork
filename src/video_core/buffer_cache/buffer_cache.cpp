@@ -42,19 +42,26 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 BufferCache::~BufferCache() = default;
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
-    auto it = mapped_ranges.find(device_addr);
-    auto range = it->first;
-    auto device_mem = it->second;
-    if (it == mapped_ranges.end() || !it->second) {
-        return;
-    }
+    // Host-backed ranges need no upload bookkeeping but their pages can still be
+    // read-protected as gpu-pending, so the tracker must always be consulted or a
+    // guest write to such a page faults forever.
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
-        DownloadBufferMemory<false>(device_addr, size, is_write);
+        // GPU-pending ranges come as many small scattered islands, so the fault
+        // is serviced per window: one blocking drain settles every pending range
+        // inside it and releases all of its pages at once.
+        constexpr u64 WindowSize = 256_KB;
+        const VAddr window_start = Common::AlignDown(device_addr, WindowSize);
+        const VAddr window_end =
+            std::max<VAddr>(window_start + WindowSize, device_addr + size);
+        DownloadBufferMemory<false>(window_start, window_end - window_start, false);
+        if (is_write) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
     });
 }
 
@@ -66,7 +73,7 @@ void BufferCache::DownloadBufferMemory(VAddr device_addr, u64 size, bool is_writ
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
             const auto add_download = [&](VAddr start, VAddr end) {
                 const u64 new_size = end - start;
-                LOG_WARNING(Render, "Flushing device_addr={:#x} start={:#x}, size={:#x}", device_addr, start, new_size);
+
                 copies.push_back(vk::BufferCopy{
                     .srcOffset = address_space.Offset(start),
                     .dstOffset = total_size_bytes,
@@ -81,6 +88,10 @@ void BufferCache::DownloadBufferMemory(VAddr device_addr, u64 size, bool is_writ
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
+        // The pages may still be tracked as gpu-pending (the byte-exact ranges
+        // were already consumed); unprotect them or the fault repeats forever.
+        scheduler.Finish();
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         return;
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
@@ -96,7 +107,11 @@ void BufferCache::DownloadBufferMemory(VAddr device_addr, u64 size, bool is_writ
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
             const u64 dst_offset = copy.dstOffset - offset;
-            LOG_WARNING(Render, "Writing backing addr={:#x} size={:#x}", copy.srcOffset, copy.size);
+            // Bytes the guest wrote and never uploaded are newer than the device
+            // copy and are kept.
+            if (memory_tracker->IsRegionCpuModified(copy.srcOffset, copy.size)) {
+                continue;
+            }
             memory->TryWriteBacking(std::bit_cast<u8*>(copy.srcOffset), download + dst_offset,
                                     copy.size);
         }
@@ -355,6 +370,10 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     SynchronizeMemory(device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        // Host-backed ranges skip SynchronizeMemory entirely, so the tracker
+        // never learns about pending GPU writes there; mark them here so the
+        // pages are read-protected and a guest read blocks until execution.
+        memory_tracker->MarkRegionAsGpuModified(device_addr, size);
     }
     return {&address_space, address_space.Offset(device_addr)};
 }

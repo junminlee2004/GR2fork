@@ -95,7 +95,11 @@ public:
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
-        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        } else {
+            // Guest reads of gpu-pending memory must fault and wait for
+            // execution regardless of the readbacks setting: with live
+            // host-backed mappings the fault is the only synchronization
+            // point between the guest and the GPU.
             UpdateProtection<enable, true>();
         }
     }
