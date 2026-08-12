@@ -665,11 +665,15 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     UpdateImage(image_id);
 
     // Register meta data for this depth buffer
-    if (desc.info.meta_info.htile_addr) {
-        surface_metas.emplace(desc.info.meta_info.htile_addr,
-                              MetaDataInfo{.type = MetaDataInfo::Type::HTile,
-                                           .clear_mask = image.info.meta_info.htile_clear_mask});
-        image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
+    if (!(image.flags & ImageFlagBits::MetaRegistered)) {
+        if (desc.info.meta_info.htile_addr) {
+            surface_metas.emplace(
+                desc.info.meta_info.htile_addr,
+                MetaDataInfo{.type = MetaDataInfo::Type::HTile,
+                             .clear_mask = image.info.meta_info.htile_clear_mask});
+            image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
+            image.flags |= ImageFlagBits::MetaRegistered;
+        }
     }
 
     // If there is a stencil attachment, link depth and stencil.
