@@ -679,7 +679,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         const VAddr addr = event->Address<VAddr>();
-                        if (rasterizer && rasterizer->SupportsOcclusionQueries()) {
+                        static constexpr bool RealOcclusionQueries = true;
+                        if (RealOcclusionQueries && rasterizer &&
+                            rasterizer->SupportsOcclusionQueries()) {
                             // Occlusion results are [begin, end] u64 snapshot pairs per render
                             // backend; the begin dump targets base + 0 and the end dump base + 8,
                             // with the queried draws submitted between the two dumps.

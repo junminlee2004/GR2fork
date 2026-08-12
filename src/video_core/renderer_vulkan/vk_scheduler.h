@@ -373,6 +373,22 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// Starts a query scope outside of rendering; only one can be active at a time.
+    void BeginQuery(vk::QueryPool pool, u32 slot, vk::QueryControlFlags flags);
+
+    /// Ends the active query scope, if any.
+    void EndQuery();
+
+    /// Returns true if a query scope is active.
+    bool IsQueryActive() const {
+        return active_query_pool != vk::QueryPool{};
+    }
+
+    /// Returns the number of query scopes ended so far.
+    u64 QueryCuts() const {
+        return query_cuts;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -452,6 +468,9 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    vk::QueryPool active_query_pool{};
+    u32 active_query_slot{};
+    u64 query_cuts{};
     tracy::VkCtxScope* profiler_scope{};
 };
 

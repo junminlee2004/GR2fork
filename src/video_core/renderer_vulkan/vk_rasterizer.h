@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -108,8 +111,9 @@ private:
 
     bool FilterDraw();
 
-    void BeginDrawOcclusion(vk::CommandBuffer cmdbuf);
-    void EndDrawOcclusion(vk::CommandBuffer cmdbuf);
+    void OpenOcclusionQuery();
+    void HarvestOcclusion(u32 first, u32 count, VAddr results_addr, u32 num_pairs);
+    void ResetOcclusionRange(u32 first, u32 count);
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -155,9 +159,22 @@ private:
 
     static constexpr u32 NumOcclusionQueries = 1024;
     vk::UniqueQueryPool occlusion_pool;
-    std::vector<u32> occlusion_queries;
     u32 occlusion_cursor{};
+    u32 occlusion_first{};
+    u32 occlusion_count{};
     bool occlusion_active{};
+    std::atomic<u32> occlusion_in_flight{};
+    u64 occ_brackets{};
+    u64 occ_empty{};
+    u64 occ_draws{};
+    u64 occ_segments{};
+    u64 occ_overflows{};
+    u64 occ_unpaired{};
+    u64 occ_not_ready{};
+    u64 occ_latency_us{};
+    u64 occ_harvests{};
+    u32 occ_inflight_peak{};
+    std::chrono::steady_clock::time_point occ_last_log{};
 
     using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64>;
     boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;

@@ -91,6 +91,25 @@ void Scheduler::EndRendering() {
     current_cmdbuf.endRendering();
 }
 
+void Scheduler::BeginQuery(vk::QueryPool pool, u32 slot, vk::QueryControlFlags flags) {
+    // The query is begun outside of a rendering scope so it may contain entire render
+    // pass instances.
+    EndRendering();
+    current_cmdbuf.beginQuery(pool, slot, flags);
+    active_query_pool = pool;
+    active_query_slot = slot;
+}
+
+void Scheduler::EndQuery() {
+    if (!IsQueryActive()) {
+        return;
+    }
+    EndRendering();
+    current_cmdbuf.endQuery(active_query_pool, active_query_slot);
+    active_query_pool = vk::QueryPool{};
+    ++query_cuts;
+}
+
 void Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
@@ -160,6 +179,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
+    // Queries cannot span command buffers; the next queried draw lazily reopens a new
+    // segment. The present thread submits here only while the video out port is closed,
+    // when no query scope can be active.
+    EndQuery();
     EndRendering();
     Check(current_cmdbuf.end());
 
