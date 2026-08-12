@@ -63,7 +63,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.base.layer = image.base_array;
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array);
+    type = image.GetCoercedViewType(desc.is_array);
     min_lod = static_cast<u32>(image.min_lod);
 
     if (!is_storage) {

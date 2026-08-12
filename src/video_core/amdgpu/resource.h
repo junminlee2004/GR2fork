@@ -307,6 +307,16 @@ struct Image {
         return base_type;
     }
 
+    /// Block-compressed 1D images are not universally supported; they are
+    /// emitted, viewed and backed as height-1 2D images instead.
+    bool IsBlockCoded1D(const bool is_array) const noexcept {
+        return GetViewType(is_array) == ImageType::Color1D && IsBlockCoded(GetDataFmt());
+    }
+
+    ImageType GetCoercedViewType(const bool is_array) const noexcept {
+        return IsBlockCoded1D(is_array) ? ImageType::Color2D : GetViewType(is_array);
+    }
+
     ImageType GetViewType(const bool is_array) const noexcept {
         const auto base_type = GetType();
         if (IsCube()) {

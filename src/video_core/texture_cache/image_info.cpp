@@ -132,6 +132,12 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     props.is_block = AmdGpu::IsBlockCoded(image.GetDataFmt());
     size.width = image.width + 1;
     size.height = image.height + 1;
+    if (type == AmdGpu::ImageType::Color1D && props.is_block) {
+        // Backed as a one-block-row 2D image so block math never sees a
+        // zero-height row count; see Image::GetCoercedViewType.
+        type = AmdGpu::ImageType::Color2D;
+        size.height = 4;
+    }
     size.depth = props.is_volume ? image.depth + 1 : 1;
     pitch = image.Pitch();
     resources.levels = image.NumLevels();

@@ -955,6 +955,10 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
 
         switch (view_type) {
         case AmdGpu::ImageType::Color1D:
+            if (image.IsBlockCoded1D(false)) {
+                return ir.CompositeConstruct(read(0), ir.Imm32(0));
+            }
+            return read(0);
         case AmdGpu::ImageType::Color1DArray:
             return read(0);
         case AmdGpu::ImageType::Color2D:
@@ -1031,6 +1035,9 @@ void PatchImageSampleArgs(IR::Block& block, IR::Inst& inst, Info& info,
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x
             addr_reg = addr_reg + 1;
+            if (image.IsBlockCoded1D(false)) {
+                return ir.CompositeConstruct(get_coord(addr_reg - 1, 0), ir.Imm32(0.f));
+            }
             return get_coord(addr_reg - 1, 0);
         case AmdGpu::ImageType::Color1DArray: // x, slice
         case AmdGpu::ImageType::Color2D:      // x, y
