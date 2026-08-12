@@ -384,11 +384,6 @@ public:
         return active_query_pool != vk::QueryPool{};
     }
 
-    /// Returns the number of query scopes ended so far.
-    u64 QueryCuts() const {
-        return query_cuts;
-    }
-
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -470,7 +465,6 @@ private:
     bool is_rendering = false;
     vk::QueryPool active_query_pool{};
     u32 active_query_slot{};
-    u64 query_cuts{};
     tracy::VkCtxScope* profiler_scope{};
 };
 

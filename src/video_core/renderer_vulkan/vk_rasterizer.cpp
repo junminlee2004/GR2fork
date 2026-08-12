@@ -49,12 +49,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
             .queryType = vk::QueryType::eOcclusion,
             .queryCount = NumOcclusionQueries,
         });
-        if (result == vk::Result::eSuccess) {
-            occlusion_pool = std::move(pool);
-            instance.GetDevice().resetQueryPool(occlusion_pool.get(), 0, NumOcclusionQueries);
-        }
-    }
-    if (!occlusion_pool) {
+        ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create occlusion query pool: {}",
+                   vk::to_string(result));
+        occlusion_pool = std::move(pool);
+        instance.GetDevice().resetQueryPool(occlusion_pool.get(), 0, NumOcclusionQueries);
+    } else {
         LOG_WARNING(Render_Vulkan, "Occlusion queries unavailable, zpass counts will be faked");
     }
 }
@@ -366,8 +365,7 @@ void Rasterizer::OpenOcclusionQuery() {
     const u32 in_flight = occlusion_in_flight.fetch_add(1) + 1;
     occ_inflight_peak = std::max(occ_inflight_peak, in_flight);
     ++occ_segments;
-    // Opening the query splits the rendering scope like a dispatch does; color clears are
-    // one-shot metas and cannot replay, register-derived depth clears behave as at any split.
+    // Opening the query splits the rendering scope like a dispatch does.
     scheduler.BeginQuery(occlusion_pool.get(), slot,
                          instance.IsOcclusionQueryPreciseSupported()
                              ? vk::QueryControlFlagBits::ePrecise
@@ -386,28 +384,27 @@ void Rasterizer::ResetOcclusionRange(u32 first, u32 count) {
 
 void Rasterizer::HarvestOcclusion(u32 first, u32 count, VAddr results_addr, u32 num_pairs) {
     const auto device = instance.GetDevice();
+    std::array<u64, NumOcclusionQueries> counts;
     u64 total = 0;
-    u32 slot = first;
-    u32 remaining = count;
-    while (remaining > 0) {
-        std::array<u64, 64> counts;
-        const u32 run = std::min({remaining, NumOcclusionQueries - slot,
-                                  static_cast<u32>(counts.size())});
+    const auto gather = [&](u32 slot, u32 run) {
         const auto result =
             device.getQueryPoolResults(occlusion_pool.get(), slot, run, run * sizeof(u64),
                                        counts.data(), sizeof(u64), vk::QueryResultFlagBits::e64);
-        if (result == vk::Result::eSuccess) {
-            for (u32 i = 0; i < run; ++i) {
-                total += counts[i];
-            }
-        } else {
+        if (result != vk::Result::eSuccess) {
             // Deferred operations only run once the submission's tick has signaled, so results
             // are available on a conforming driver. Count zero rather than requeue, which would
             // break the ring's FIFO release order.
             ++occ_not_ready;
+            return;
         }
-        slot = (slot + run) % NumOcclusionQueries;
-        remaining -= run;
+        for (u32 i = 0; i < run; ++i) {
+            total += counts[i];
+        }
+    };
+    const u32 first_run = std::min(count, NumOcclusionQueries - first);
+    gather(first, first_run);
+    if (count > first_run) {
+        gather(0, count - first_run);
     }
     ResetOcclusionRange(first, count);
     WriteZpassPairs(results_addr, num_pairs, total);
@@ -442,9 +439,9 @@ void Rasterizer::OcclusionQueryEnd(VAddr results_addr, u32 num_pairs) {
         scheduler.DeferOperation([this, first = occlusion_first, count = occlusion_count,
                                   results_addr, num_pairs,
                                   start = std::chrono::steady_clock::now()] {
-            occ_latency_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                   std::chrono::steady_clock::now() - start)
-                                                   .count());
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            occ_latency_us += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
             ++occ_harvests;
             HarvestOcclusion(first, count, results_addr, num_pairs);
         });
@@ -454,11 +451,10 @@ void Rasterizer::OcclusionQueryEnd(VAddr results_addr, u32 num_pairs) {
     const auto now = std::chrono::steady_clock::now();
     if (now - occ_last_log >= std::chrono::seconds(1)) {
         LOG_INFO(Render_Vulkan,
-                 "occlusion: {} brackets ({} empty), {} draws, {} segments, {} cuts, peak {} "
-                 "in-flight, ovf {} unpaired {} nrdy {}, avg latency {} us",
-                 occ_brackets, occ_empty, occ_draws, occ_segments, scheduler.QueryCuts(),
-                 occ_inflight_peak, occ_overflows, occ_unpaired, occ_not_ready,
-                 occ_latency_us / std::max<u64>(occ_harvests, 1));
+                 "occlusion: {} brackets ({} empty), {} draws, {} segments, peak {} in-flight, "
+                 "ovf {} unpaired {} nrdy {}, avg latency {} us",
+                 occ_brackets, occ_empty, occ_draws, occ_segments, occ_inflight_peak, occ_overflows,
+                 occ_unpaired, occ_not_ready, occ_latency_us / std::max<u64>(occ_harvests, 1));
         occ_brackets = occ_empty = occ_draws = occ_segments = occ_overflows = occ_unpaired =
             occ_not_ready = occ_latency_us = occ_harvests = 0;
         occ_inflight_peak = 0;

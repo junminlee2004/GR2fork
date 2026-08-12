@@ -107,7 +107,6 @@ void Scheduler::EndQuery() {
     EndRendering();
     current_cmdbuf.endQuery(active_query_pool, active_query_slot);
     active_query_pool = vk::QueryPool{};
-    ++query_cuts;
 }
 
 void Scheduler::Flush(SubmitInfo& info) {

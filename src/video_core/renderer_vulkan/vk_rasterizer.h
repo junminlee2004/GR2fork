@@ -49,6 +49,9 @@ public:
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address);
 
+    void DispatchDirect();
+    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+
     /// Begins an occlusion query bracket; draws until the end dump are counted.
     void OcclusionQueryBegin(VAddr results_addr, u32 num_pairs);
     /// Ends the bracket and schedules the zpass count write to guest memory.
@@ -57,9 +60,6 @@ public:
     [[nodiscard]] bool SupportsOcclusionQueries() const noexcept {
         return static_cast<bool>(occlusion_pool);
     }
-
-    void DispatchDirect();
-    void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
     void ScopeMarkerEnd(bool from_guest = false);
