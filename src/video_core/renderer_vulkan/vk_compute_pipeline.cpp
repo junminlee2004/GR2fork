@@ -21,11 +21,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     info = &info_;
     const auto debug_str = GetDebugString();
 
+    // Force the 32-wide shape NVIDIA runs, to reproduce its wave-op semantics
+    // on hardware that is otherwise flicker-free. [DIAG]
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
+        .requiredSubgroupSize = 32,
     };
     const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+        .pNext = &subgroup_size_ci,
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
         .pName = "main",

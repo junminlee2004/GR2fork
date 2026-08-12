@@ -332,7 +332,9 @@ public:
 
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
-        return vk11_props.subgroupSize;
+        // Forced to the 32-wide shape NVIDIA runs, so recompiled shaders take
+        // the same paths on hardware that is otherwise flicker-free. [DIAG]
+        return 32;
     }
 
     /// Returns the maximum size of compute shared memory.
