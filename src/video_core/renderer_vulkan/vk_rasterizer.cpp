@@ -767,10 +767,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             if (!cur.is_ud) {
                                 LOG_WARNING(Render, "SRTMAP hash={:#x} flat[{}] <- {:#x}",
                                             stage.pgm_hash, op.b, src);
+                                // Prefer the dwords the stale-AO initializer reads.
+                                const bool hot = op.b >= 32 && op.b < 40;
                                 if (watch.count < watch.dst.size()) {
                                     watch.dst[watch.count] = op.b;
                                     watch.src[watch.count] = src;
                                     watch.count++;
+                                } else if (hot) {
+                                    for (u32 wi = 0; wi < watch.count; ++wi) {
+                                        if (watch.dst[wi] < 32 || watch.dst[wi] >= 40) {
+                                            watch.dst[wi] = op.b;
+                                            watch.src[wi] = src;
+                                            break;
+                                        }
+                                    }
                                 }
                             } else {
                                 LOG_WARNING(Render, "SRTMAP hash={:#x} flat[{}] <- ud[{}]",
