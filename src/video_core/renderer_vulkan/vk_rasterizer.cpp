@@ -468,6 +468,28 @@ void Rasterizer::OnSubmit() {
     }
     flatbuf_prev_latch = std::move(flatbuf_latch);
     flatbuf_latch.clear();
+
+    // Source watch: sample the guest addresses feeding watched flatbuf dwords
+    // and log value changes with their gpu-modified state. [DIAG]
+    {
+        auto* memory = Core::Memory::Instance();
+        for (auto& w : srt_watches) {
+            for (u32 i = 0; i < w.count; ++i) {
+                u32 val = 0xDEADDEAD;
+                if (memory->IsValidMapping(w.src[i], 4)) {
+                    std::memcpy(&val, reinterpret_cast<const void*>(w.src[i]), 4);
+                }
+                if (!w.logged || val != w.last[i]) {
+                    LOG_WARNING(Render,
+                                "SRTWATCH hash={:#x} flat[{}] src={:#x} val={:#010x} gpu_mod={}",
+                                w.hash, w.dst[i], w.src[i], val,
+                                buffer_cache.IsRegionGpuModified(w.src[i], 4));
+                    w.last[i] = val;
+                }
+            }
+            w.logged = true;
+        }
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -703,6 +725,58 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                // Source map: for flatbuf-only shaders (the stale-AO initializer
+                // shape), interpret the recorded walker ops once per shader to
+                // learn which guest addresses feed which flatbuf dwords, and put
+                // the first few guest-memory sources under a per-submit watch.
+                // [DIAG]
+                if (stage.images.empty() && stage.buffers.size() == 1 &&
+                    !stage.srt_info.ops.empty() && srt_seen.insert(stage.pgm_hash).second) {
+                    using SrtOp = Shader::PersistentSrtInfo::SrtOp;
+                    struct Lvl {
+                        u64 base;
+                        bool is_ud;
+                    };
+                    std::vector<Lvl> lvls;
+                    Lvl cur{reinterpret_cast<u64>(stage.user_data.data()), true};
+                    SrtWatch watch{};
+                    watch.hash = stage.pgm_hash;
+                    auto* memory = Core::Memory::Instance();
+                    for (const auto& op : stage.srt_info.ops) {
+                        if (op.kind == SrtOp::Kind::Push) {
+                            u64 ptr_val = 0;
+                            const u64 src = cur.base + op.a * 4;
+                            const bool ud_ok =
+                                cur.is_ud && op.a + 2 <= stage.user_data.size();
+                            if (ud_ok || (!cur.is_ud && memory->IsValidMapping(src, 8))) {
+                                std::memcpy(&ptr_val, reinterpret_cast<const void*>(src), 8);
+                                ptr_val &= 0xFFFFFFFFFFFFULL;
+                            }
+                            lvls.push_back(cur);
+                            cur = {ptr_val, false};
+                        } else if (op.kind == SrtOp::Kind::Pop) {
+                            cur = lvls.back();
+                            lvls.pop_back();
+                        } else {
+                            const u64 src = cur.base + op.a * 4;
+                            if (!cur.is_ud) {
+                                LOG_WARNING(Render, "SRTMAP hash={:#x} flat[{}] <- {:#x}",
+                                            stage.pgm_hash, op.b, src);
+                                if (watch.count < watch.dst.size()) {
+                                    watch.dst[watch.count] = op.b;
+                                    watch.src[watch.count] = src;
+                                    watch.count++;
+                                }
+                            } else {
+                                LOG_WARNING(Render, "SRTMAP hash={:#x} flat[{}] <- ud[{}]",
+                                            stage.pgm_hash, op.b, op.a);
+                            }
+                        }
+                    }
+                    if (watch.count && srt_watches.size() < 16) {
+                        srt_watches.push_back(watch);
+                    }
+                }
                 // Re-walked and compared at submit to time guest SRT writes that
                 // land after the bind-time flatten. [DIAG]
                 if (stage.srt_info.walker_func) {

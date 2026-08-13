@@ -171,8 +171,10 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
 };
 
 static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
-                         Xbyak::CodeGenerator& c) {
+                         Xbyak::CodeGenerator& c, Shader::PersistentSrtInfo& srt) {
+    using SrtOp = Shader::PersistentSrtInfo::SrtOp;
     PushPtr(c, off_dw);
+    srt.ops.push_back({SrtOp::Kind::Push, off_dw, 0});
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
     ASSERT(use_list);
 
@@ -185,6 +187,7 @@ static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
         c.mov(r10d, ptr[rdi + (src_off_dw << 2)]);
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
 
+        srt.ops.push_back({SrtOp::Kind::Copy, src_off_dw, pass_info.dst_off_dw});
         use->SetFlags<u32>(pass_info.dst_off_dw);
         pass_info.dst_off_dw++;
     }
@@ -192,11 +195,12 @@ static void VisitPointer(u32 off_dw, IR::Inst* subtree, PassInfo& pass_info,
     // Then visit any children used as pointers
     for (const auto [src_off_dw, use] : *use_list) {
         if (pass_info.GetUsesAsPointer(use)) {
-            VisitPointer(src_off_dw, use, pass_info, c);
+            VisitPointer(src_off_dw, use, pass_info, c, srt);
         }
     }
 
     PopPtr(c);
+    srt.ops.push_back({SrtOp::Kind::Pop, 0, 0});
 }
 
 static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
@@ -219,8 +223,9 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
+    info.srt_info.ops.clear();
     for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
-        VisitPointer(static_cast<u32>(sgpr_base), root, pass_info, c);
+        VisitPointer(static_cast<u32>(sgpr_base), root, pass_info, c, info.srt_info);
     }
 
     c.ret();

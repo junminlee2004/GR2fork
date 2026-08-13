@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <unordered_set>
 #include <vector>
 
 #include "common/recursive_lock.h"
@@ -99,6 +100,19 @@ private:
     };
     std::vector<LatchEntry> flatbuf_latch;
     std::vector<LatchEntry> flatbuf_prev_latch;
+
+    // Guest source addresses feeding watched flatbuf dwords of flatbuf-only
+    // shaders, sampled every submit. [DIAG]
+    struct SrtWatch {
+        u64 hash;
+        std::array<u32, 8> dst;
+        std::array<u64, 8> src;
+        std::array<u32, 8> last;
+        u32 count;
+        bool logged;
+    };
+    std::vector<SrtWatch> srt_watches;
+    std::unordered_set<u64> srt_seen;
 
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
