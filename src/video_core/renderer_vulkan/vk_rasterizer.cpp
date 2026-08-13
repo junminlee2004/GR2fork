@@ -730,8 +730,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // learn which guest addresses feed which flatbuf dwords, and put
                 // the first few guest-memory sources under a per-submit watch.
                 // [DIAG]
+                if (srt_seen.insert(stage.pgm_hash).second) {
+                    LOG_WARNING(Render, "SRTCENSUS hash={:#x} buffers={} images={} ops={}",
+                                stage.pgm_hash, stage.buffers.size(), stage.images.size(),
+                                stage.srt_info.ops.size());
+                }
                 if (stage.images.empty() && stage.buffers.size() == 1 &&
-                    !stage.srt_info.ops.empty() && srt_seen.insert(stage.pgm_hash).second) {
+                    !stage.srt_info.ops.empty() && srt_mapped.insert(stage.pgm_hash).second) {
                     using SrtOp = Shader::PersistentSrtInfo::SrtOp;
                     struct Lvl {
                         u64 base;
