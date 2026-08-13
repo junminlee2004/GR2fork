@@ -399,6 +399,75 @@ void Rasterizer::OnSubmit() {
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
+
+    // Flatbuf latch: re-run the SRT walker for every flatbuf slice bound since
+    // the last submit and patch slices whose guest source changed after the
+    // bind-time flatten; counts time the guest's late SRT writes. [DIAG]
+    if (!flatbuf_latch.empty()) {
+        auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+        u32 total = 0, changed_slices = 0;
+        for (auto& entry : flatbuf_latch) {
+            total++;
+            std::vector<u32> fresh(entry.size_dw);
+            std::memcpy(fresh.data(), entry.ud.data(), entry.ud_dw * sizeof(u32));
+            entry.info->srt_info.walker_func(entry.ud.data(), fresh.data());
+            u32* slice = reinterpret_cast<u32*>(vk_buffer.mapped_data.data() + entry.offset);
+            u32 changed = 0, first = 0;
+            for (u32 i = 0; i < entry.size_dw; ++i) {
+                if (slice[i] != fresh[i]) {
+                    if (changed == 0) {
+                        first = i;
+                    }
+                    changed++;
+                }
+            }
+            if (changed) {
+                changed_slices++;
+                LOG_WARNING(Render,
+                            "FLATLATCH hash={:#x} offset={} changed={}/{} first=[{}] "
+                            "{:#010x}->{:#010x}",
+                            entry.info->pgm_hash, entry.offset, changed, entry.size_dw,
+                            first, slice[first], fresh[first]);
+                std::memcpy(slice, fresh.data(), entry.size_dw * sizeof(u32));
+            }
+            u64 whash = 14695981039346656037ULL;
+            for (const u32 dw : fresh) {
+                whash = (whash ^ dw) * 1099511628211ULL;
+            }
+            entry.walk_hash = whash;
+        }
+        if (changed_slices) {
+            LOG_WARNING(Render, "FLATLATCH submit: {}/{} slices changed since bind",
+                        changed_slices, total);
+        }
+    }
+
+    // Second wave: re-walk the previous submit's slices once more and compare
+    // against the walk taken at its patch time (the ring may have been reused,
+    // so mapped content cannot be compared). A change here landed after that
+    // submit - too late for any CPU-side latch, provable only by a GPU-time
+    // read. [DIAG]
+    u32 post_changed = 0;
+    for (const auto& entry : flatbuf_prev_latch) {
+        std::vector<u32> fresh(entry.size_dw);
+        std::memcpy(fresh.data(), entry.ud.data(), entry.ud_dw * sizeof(u32));
+        entry.info->srt_info.walker_func(entry.ud.data(), fresh.data());
+        u64 hash = 14695981039346656037ULL;
+        for (const u32 dw : fresh) {
+            hash = (hash ^ dw) * 1099511628211ULL;
+        }
+        if (hash != entry.walk_hash) {
+            post_changed++;
+            LOG_WARNING(Render, "POSTLATCH hash={:#x} walk changed after its submit",
+                        entry.info->pgm_hash);
+        }
+    }
+    if (post_changed) {
+        LOG_WARNING(Render, "POSTLATCH: {} of previous submit's slices changed after its patch",
+                    post_changed);
+    }
+    flatbuf_prev_latch = std::move(flatbuf_latch);
+    flatbuf_latch.clear();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -634,6 +703,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                // Re-walked and compared at submit to time guest SRT writes that
+                // land after the bind-time flatten. [DIAG]
+                if (stage.srt_info.walker_func) {
+                    LatchEntry entry{};
+                    entry.info = &stage;
+                    entry.offset = offset;
+                    entry.size_dw = static_cast<u32>(stage.flattened_ud_buf.size());
+                    const size_t ud_dw =
+                        std::min<size_t>(stage.user_data.size(), entry.ud.size());
+                    std::memcpy(entry.ud.data(), stage.user_data.data(), ud_dw * sizeof(u32));
+                    entry.ud_dw = static_cast<u32>(ud_dw);
+                    flatbuf_latch.push_back(entry);
+                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.

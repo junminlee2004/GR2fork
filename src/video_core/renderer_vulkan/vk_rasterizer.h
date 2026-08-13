@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <vector>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -84,6 +87,19 @@ public:
     }
 
 private:
+    // Flatbuf slices bound since the last submit, re-walked there to time
+    // guest SRT writes landing after the bind-time flatten. [DIAG]
+    struct LatchEntry {
+        const Shader::Info* info;
+        std::array<u32, 16> ud;
+        u32 ud_dw;
+        u64 offset;
+        u32 size_dw;
+        u64 walk_hash;
+    };
+    std::vector<LatchEntry> flatbuf_latch;
+    std::vector<LatchEntry> flatbuf_prev_latch;
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
