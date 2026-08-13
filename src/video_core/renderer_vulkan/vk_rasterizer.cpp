@@ -735,8 +735,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 stage.pgm_hash, stage.buffers.size(), stage.images.size(),
                                 stage.srt_info.ops.size());
                 }
-                if (stage.images.empty() && stage.buffers.size() == 1 &&
-                    !stage.srt_info.ops.empty() && srt_mapped.insert(stage.pgm_hash).second) {
+                if (stage.images.empty() && !stage.srt_info.ops.empty() &&
+                    srt_mapped.insert(stage.pgm_hash).second) {
                     using SrtOp = Shader::PersistentSrtInfo::SrtOp;
                     struct Lvl {
                         u64 base;
