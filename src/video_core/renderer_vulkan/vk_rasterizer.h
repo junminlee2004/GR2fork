@@ -114,6 +114,7 @@ private:
     std::vector<SrtWatch> srt_watches;
     std::unordered_set<u64> srt_seen;
     std::unordered_set<u64> srt_mapped;
+    std::unordered_set<u64> ps_seen;
 
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);

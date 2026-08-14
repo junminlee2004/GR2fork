@@ -524,6 +524,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         uses_dma |= stage->uses_dma;
     }
 
+    for (const auto* st : pipeline->GetStages()) {
+        if (st && st->stage == Shader::Stage::Fragment &&
+            ps_seen.insert(st->pgm_hash).second) {
+            LOG_WARNING(Render, "PSBIND hash={:#x} buffers={} images={}", st->pgm_hash,
+                        st->buffers.size(), st->images.size());
+        }
+    }
+
     if (uses_dma) {
         // We only use fault buffer for DMA right now.
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
