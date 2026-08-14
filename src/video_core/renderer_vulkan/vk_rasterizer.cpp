@@ -472,6 +472,20 @@ void Rasterizer::OnSubmit() {
     flatbuf_prev_latch = std::move(flatbuf_latch);
     flatbuf_latch.clear();
 
+    // Submit-time resample of the stale-AO initializer's guest buffer: same
+    // frame as the AOBUF bind log above. [DIAG]
+    if (ao_buf_base != 0) {
+        auto* mem = Core::Memory::Instance();
+        u32 dw[4]{};
+        if (mem->IsValidMapping(ao_buf_base + 128, 16)) {
+            std::memcpy(dw, reinterpret_cast<const void*>(ao_buf_base + 128), 16);
+        }
+        LOG_WARNING(Render,
+                    "AOBUF submit base={:#x} dw[32..35]={:#010x} {:#010x} {:#010x} {:#010x}",
+                    ao_buf_base, dw[0], dw[1], dw[2], dw[3]);
+        ao_buf_base = 0;
+    }
+
     // Source watch: sample the guest addresses feeding watched flatbuf dwords
     // and log value changes with their gpu-modified state. [DIAG]
     {
@@ -710,6 +724,22 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
+            // The stale-AO initializer's constants live in this plain guest
+            // buffer, not the flatbuf: log the bytes the bind-time copy will
+            // snapshot and remember the address for a submit-time resample.
+            // [DIAG]
+            if (stage.pgm_hash == 0xfa2ea78eULL) {
+                u32 dw[4]{};
+                if (memory->IsValidMapping(vsharp.base_address + 128, 16)) {
+                    std::memcpy(dw, reinterpret_cast<const void*>(vsharp.base_address + 128),
+                                16);
+                }
+                LOG_WARNING(Render,
+                            "AOBUF bind base={:#x} size={} dw[32..35]={:#010x} {:#010x} "
+                            "{:#010x} {:#010x}",
+                            vsharp.base_address, vsharp.GetSize(), dw[0], dw[1], dw[2], dw[3]);
+                ao_buf_base = vsharp.base_address;
+            }
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);

@@ -115,6 +115,7 @@ private:
     std::unordered_set<u64> srt_seen;
     std::unordered_set<u64> srt_mapped;
     std::unordered_set<u64> ps_seen;
+    VAddr ao_buf_base{};
 
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
