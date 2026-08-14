@@ -428,7 +428,10 @@ void Rasterizer::OnSubmit() {
                             "{:#010x}->{:#010x}",
                             entry.info->pgm_hash, entry.offset, changed, entry.size_dw,
                             first, slice[first], fresh[first]);
-                std::memcpy(slice, fresh.data(), entry.size_dw * sizeof(u32));
+                // Patching disabled: re-walking with bind-time user data against
+                // current guest memory writes wrong-generation data over slices
+                // whose source was already rebuilt - an active confounder. The
+                // latch is observe-only now. [DIAG]
             }
             u64 whash = 14695981039346656037ULL;
             for (const u32 dw : fresh) {
