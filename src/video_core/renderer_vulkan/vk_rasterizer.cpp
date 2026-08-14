@@ -730,6 +730,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // learn which guest addresses feed which flatbuf dwords, and put
                 // the first few guest-memory sources under a per-submit watch.
                 // [DIAG]
+                // Targeted: the stale-AO initializer, identified from capture as
+                // fs_0xfa2ea78e. Log its painted dwords and their walker sources
+                // at every bind, same-frame with the submit-side watch. [DIAG]
+                if (stage.pgm_hash == 0xfa2ea78eULL) {
+                    const auto& fb = stage.flattened_ud_buf;
+                    if (fb.size() >= 36) {
+                        LOG_WARNING(Render,
+                                    "AOBIND flat[32..35]={:#010x} {:#010x} {:#010x} {:#010x}",
+                                    fb[32], fb[33], fb[34], fb[35]);
+                    }
+                }
                 if (srt_seen.insert(stage.pgm_hash).second) {
                     LOG_WARNING(Render, "SRTCENSUS hash={:#x} buffers={} images={} ops={}",
                                 stage.pgm_hash, stage.buffers.size(), stage.images.size(),
@@ -788,7 +799,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             }
                         }
                     }
-                    if (watch.count && srt_watches.size() < 16) {
+                    if (watch.count &&
+                        (srt_watches.size() < 16 || stage.pgm_hash == 0xfa2ea78eULL)) {
                         srt_watches.push_back(watch);
                     }
                 }
