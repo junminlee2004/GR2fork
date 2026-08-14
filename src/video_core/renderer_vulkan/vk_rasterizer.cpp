@@ -730,14 +730,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // [DIAG]
             if (stage.pgm_hash == 0xfa2ea78eULL) {
                 u32 dw[4]{};
-                if (memory->IsValidMapping(vsharp.base_address + 128, 16)) {
+                u32 head[4]{};
+                if (memory->IsValidMapping(vsharp.base_address, 144)) {
                     std::memcpy(dw, reinterpret_cast<const void*>(vsharp.base_address + 128),
                                 16);
+                    std::memcpy(head, reinterpret_cast<const void*>(vsharp.base_address), 16);
                 }
                 LOG_WARNING(Render,
-                            "AOBUF bind base={:#x} size={} dw[32..35]={:#010x} {:#010x} "
-                            "{:#010x} {:#010x}",
-                            vsharp.base_address, vsharp.GetSize(), dw[0], dw[1], dw[2], dw[3]);
+                            "AOBUF bind base={:#x} head={:#010x} {:#010x} {:#010x} {:#010x} "
+                            "tail={:#010x} {:#010x} {:#010x} {:#010x} gpu_mod={} cpu_mod={}",
+                            vsharp.base_address, head[0], head[1], head[2], head[3], dw[0],
+                            dw[1], dw[2], dw[3],
+                            buffer_cache.IsRegionGpuModified(vsharp.base_address + 128, 16),
+                            buffer_cache.IsRegionCpuModified(vsharp.base_address + 128, 16));
                 ao_buf_base = vsharp.base_address;
             }
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
