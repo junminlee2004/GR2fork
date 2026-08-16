@@ -158,7 +158,17 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     if constexpr (async) {
         scheduler.DeferOperation(write_data);
     } else {
+        const auto t0 = std::chrono::steady_clock::now();
         scheduler.Finish();
+        const auto finish_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count();
+        constexpr VAddr hair_start = 0x1001900000ULL;
+        constexpr VAddr hair_end = hair_start + 0xfc000ULL;
+        if (device_addr < hair_end && device_addr + size > hair_start) {
+            LOG_INFO(Render_Vulkan, "HAIRDIAG finish_us={} total_bytes={:#x}", finish_us,
+                     total_size_bytes);
+        }
         write_data();
     }
 }
