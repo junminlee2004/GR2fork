@@ -20,6 +20,12 @@
 
 namespace AmdGpu {
 
+void Liverpool::WakeVoSleep() {
+    if (vo_port) {
+        vo_port->SignalVoLabel();
+    }
+}
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -819,7 +825,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        vo_port->WaitVoLabel([&] {
+                            return wait_reg_mem->Test(regs.reg_array) || num_commands != 0;
+                        });
+                        ProcessCommands();
+                    }
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {

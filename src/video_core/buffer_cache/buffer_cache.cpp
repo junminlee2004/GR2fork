@@ -134,6 +134,9 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
+        // No GPU-modified islands to download; drop the GPU-dirty tracking so
+        // the pages are unprotected and do not re-fault for nothing.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         return;
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);

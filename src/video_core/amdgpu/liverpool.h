@@ -111,14 +111,22 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
+            // The GPU thread may be sleeping on a VO label; wake it so queued
+            // commands are serviced with bounded latency.
+            WakeVoSleep();
             sem.acquire();
         } else {
-            std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
-            ++num_commands;
-            submit_cv.notify_one();
+            {
+                std::scoped_lock lk{submit_mutex};
+                command_queue.emplace(std::move(func));
+                ++num_commands;
+                submit_cv.notify_one();
+            }
+            WakeVoSleep();
         }
     }
+
+    void WakeVoSleep();
 
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
