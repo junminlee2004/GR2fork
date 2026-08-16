@@ -75,6 +75,12 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    constexpr VAddr hair_start = 0x1001900000ULL;
+    constexpr VAddr hair_end = hair_start + 0xfc000ULL;
+    if (device_addr < hair_end && device_addr + size > hair_start) {
+        LOG_INFO(Render_Vulkan, "HAIRDIAG {}-fault addr={:#x} size={:#x}",
+                 is_write ? "write" : "read", device_addr, size);
+    }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
