@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -77,10 +78,20 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     constexpr VAddr hair_start = 0x1001900000ULL;
     constexpr VAddr hair_end = hair_start + 0xfc000ULL;
-    if (device_addr < hair_end && device_addr + size > hair_start) {
-        LOG_INFO(Render_Vulkan, "HAIRDIAG {}-fault addr={:#x} size={:#x}",
-                 is_write ? "write" : "read", device_addr, size);
-    }
+    const bool hair_diag = device_addr < hair_end && device_addr + size > hair_start;
+    const auto diag_begin = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        if (hair_diag) {
+            const auto settle = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - diag_begin)
+                                    .count();
+            const auto t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  diag_begin.time_since_epoch())
+                                  .count();
+            LOG_INFO(Render_Vulkan, "HAIRDIAG {}-fault addr={:#x} size={:#x} settle_us={} t={}",
+                     is_write ? "write" : "read", device_addr, size, settle, t_ms);
+        }
+    };
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
