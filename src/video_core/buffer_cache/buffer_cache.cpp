@@ -432,6 +432,18 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        constexpr VAddr hair_start = 0x1001900000ULL;
+        constexpr VAddr hair_end = hair_start + 0xfc000ULL;
+        if (device_addr < hair_end && device_addr + size > hair_start) {
+            static std::atomic<u64> bind_count{0};
+            const u64 n = ++bind_count;
+            if ((n & 255) == 1) {
+                const auto t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
+                LOG_INFO(Render_Vulkan, "HAIRDIAG gpu-bind n={} t={}", n, t_ms);
+            }
+        }
     }
     return {&buffer, buffer.Offset(device_addr)};
 }
@@ -909,6 +921,15 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
+    constexpr VAddr hair_start = 0x1001900000ULL;
+    constexpr VAddr hair_end = hair_start + 0xfc000ULL;
+    if (buffer.CpuAddr() < hair_end && buffer.CpuAddr() + buffer.SizeBytes() > hair_start) {
+        const auto t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+        LOG_INFO(Render_Vulkan, "HAIRDIAG evict buffer addr={:#x} size={:#x} t={}",
+                 buffer.CpuAddr(), buffer.SizeBytes(), t_ms);
+    }
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
     buffer.is_deleted = true;
