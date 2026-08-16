@@ -204,6 +204,12 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        constexpr VAddr hair_start = 0x1001900000ULL;
+        constexpr VAddr hair_end = hair_start + 0xfc000ULL;
+        if (address < hair_end && address + size > hair_start) {
+            LOG_INFO(Render_Vulkan, "HAIRDIAG protect addr={:#x} size={:#x} perms={}", address,
+                     size, static_cast<u32>(perms));
+        }
         impl.Protect(address, size, perms);
     }
 
