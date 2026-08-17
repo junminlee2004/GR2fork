@@ -6,6 +6,8 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <tuple>
+#include <vector>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -294,6 +296,10 @@ public:
     /// Returns the guest physical address backing [va, va+size) when that
     /// range is physically contiguous, otherwise nullopt (native UMA).
     std::optional<PAddr> GetContiguousPhys(VAddr va, u64 size);
+
+    /// Enumerates the physically contiguous runs backing [va, va+size) as
+    /// (va, phys, size) tuples (native UMA map notifications).
+    std::vector<std::tuple<VAddr, PAddr, u64>> GetPhysRuns(VAddr va, u64 size);
 
 private:
     VMAHandle FindVMA(VAddr target) {

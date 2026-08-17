@@ -4,6 +4,8 @@
 #pragma once
 
 #include <atomic>
+#include <map>
+#include <mutex>
 #include <optional>
 
 #include <boost/container/small_vector.hpp>
@@ -109,6 +111,10 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size);
 
+    /// Native UMA map notifications (called outside the memory lock).
+    void NotifyMapped(VAddr addr, u64 size);
+    void NotifyUnmapped(VAddr addr, u64 size);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
@@ -209,6 +215,8 @@ private:
     std::optional<Buffer> unified_wrapper;
     std::atomic<u64> uma_hits{};
     std::atomic<u64> uma_fallbacks{};
+    std::mutex uma_phys_mutex;
+    std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
     TextureCache& texture_cache;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;

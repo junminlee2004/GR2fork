@@ -72,6 +72,34 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() = default;
 
+void BufferCache::NotifyMapped(VAddr addr, u64 size) {
+    if (!unified_wrapper) {
+        return;
+    }
+    const auto runs = memory->GetPhysRuns(addr, size);
+    std::scoped_lock lk{uma_phys_mutex};
+    for (const auto& [va, phys, run] : runs) {
+        uma_phys_map[va] = {phys, run};
+    }
+}
+
+void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
+    if (!unified_wrapper) {
+        return;
+    }
+    std::scoped_lock lk{uma_phys_mutex};
+    auto it = uma_phys_map.lower_bound(addr);
+    if (it != uma_phys_map.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second.second > addr) {
+            it = prev;
+        }
+    }
+    while (it != uma_phys_map.end() && it->first < addr + size) {
+        it = uma_phys_map.erase(it);
+    }
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
@@ -401,7 +429,20 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // Bypasses the stream fast path deliberately: bind-time copies are the
     // snapshot-staleness class this path exists to eliminate.
     if (unified_wrapper && !is_texel_buffer) {
-        if (const auto phys = memory->GetContiguousPhys(device_addr, size);
+        const auto lookup = [&]() -> std::optional<PAddr> {
+            std::scoped_lock lk{uma_phys_mutex};
+            auto it = uma_phys_map.upper_bound(device_addr);
+            if (it == uma_phys_map.begin()) {
+                return std::nullopt;
+            }
+            --it;
+            const u64 delta = device_addr - it->first;
+            if (delta >= it->second.second || it->second.second - delta < size) {
+                return std::nullopt;
+            }
+            return it->second.first + delta;
+        };
+        if (const auto phys = lookup();
             phys && *phys + size <= unified_wrapper->SizeBytes()) {
             uma_hits.fetch_add(1, std::memory_order_relaxed);
             return {&*unified_wrapper, *phys};

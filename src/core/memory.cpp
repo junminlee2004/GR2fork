@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -1420,6 +1422,44 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
     stats->available_cached_blocks = 0;
 
     return ORBIS_OK;
+}
+
+std::vector<std::tuple<VAddr, PAddr, u64>> MemoryManager::GetPhysRuns(VAddr va, u64 size) {
+    std::vector<std::tuple<VAddr, PAddr, u64>> runs;
+    std::scoped_lock lk{mutex};
+    VAddr cursor = va;
+    const VAddr end = va + size;
+    while (cursor < end) {
+        const auto it = FindVMA(cursor);
+        if (it == vma_map.end() || !it->second.Contains(cursor, 1)) {
+            break;
+        }
+        const auto& vma = it->second;
+        const VAddr vma_end = vma.base + vma.size;
+        if (vma.phys_areas.empty()) {
+            cursor = vma_end;
+            continue;
+        }
+        const u64 offset_in_vma = cursor - vma.base;
+        auto phys = vma.phys_areas.upper_bound(offset_in_vma);
+        if (phys != vma.phys_areas.begin()) {
+            auto prev = std::prev(phys);
+            const u64 delta = offset_in_vma - prev->first;
+            if (delta < prev->second.size) {
+                const u64 run = std::min<u64>({prev->second.size - delta, vma_end - cursor,
+                                               end - cursor});
+                runs.emplace_back(cursor, prev->second.base + delta, run);
+                cursor += run;
+                continue;
+            }
+        }
+        if (phys == vma.phys_areas.end()) {
+            cursor = vma_end;
+            continue;
+        }
+        cursor = vma.base + phys->first;
+    }
+    return runs;
 }
 
 std::optional<PAddr> MemoryManager::GetContiguousPhys(VAddr va, u64 size) {

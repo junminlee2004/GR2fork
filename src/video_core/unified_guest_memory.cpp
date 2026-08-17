@@ -144,6 +144,8 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     LOG_INFO(Render_Vulkan,
              "Native UMA active: type {} covers {:#x} of {:#x} guest physical bytes", chosen_type,
              covered_size, backing_size);
+#else
+    (void)instance;
 #endif
 }
 
