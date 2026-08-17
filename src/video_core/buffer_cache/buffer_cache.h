@@ -215,6 +215,7 @@ private:
     std::optional<Buffer> unified_wrapper;
     std::atomic<u64> uma_hits{};
     std::atomic<u64> uma_fallbacks{};
+    std::atomic<u64> uma_guard_rejects{};
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
     TextureCache& texture_cache;

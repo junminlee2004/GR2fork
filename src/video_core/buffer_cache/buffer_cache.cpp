@@ -429,7 +429,8 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // Bypasses the stream fast path deliberately: bind-time copies are the
     // snapshot-staleness class this path exists to eliminate.
     if (unified_wrapper && !is_texel_buffer &&
-        (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2))) {
+        (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2)) &&
+        !IsRegionGpuModified(device_addr, size)) {
         const auto lookup = [&]() -> std::optional<PAddr> {
             std::scoped_lock lk{uma_phys_mutex};
             auto it = uma_phys_map.upper_bound(device_addr);
@@ -464,6 +465,13 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if ((n & (n - 1)) == 0) {
             LOG_INFO(Render_Vulkan, "Native UMA fallback #{}: addr={:#x} size={:#x} (hits={})", n,
                      device_addr, size, uma_hits.load(std::memory_order_relaxed));
+        }
+    } else if (unified_wrapper && !is_texel_buffer &&
+               (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2))) {
+        const u64 n = uma_guard_rejects.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA ownership reject #{}: addr={:#x} size={:#x}", n,
+                     device_addr, size);
         }
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
