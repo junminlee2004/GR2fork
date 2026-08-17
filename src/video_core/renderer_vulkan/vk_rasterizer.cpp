@@ -1683,7 +1683,9 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& fn) {
-    scheduler.DeferOperation(std::move(fn));
+    // Priority queue: popped by its own thread on fence completion, so label
+    // waits on guest threads cannot starve when the CP goes idle.
+    scheduler.DeferPriorityOperation(std::move(fn));
     scheduler.Flush();
 }
 
