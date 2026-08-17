@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/unified_guest_memory.h"
 
 namespace VideoCore {
 
@@ -40,6 +41,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+
+    if (auto* unified = instance.GetUnifiedGuestMemory(); unified && unified->IsActive()) {
+        unified_wrapper.emplace(instance, scheduler, unified->Handle(), unified->CoveredSize());
+        Vulkan::SetObjectName(instance.GetDevice(), unified->Handle(), "Unified Guest Memory");
+    }
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -390,6 +396,22 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 
 std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
+    // Native UMA: serve guest-backed ranges directly from unified device
+    // memory - the GPU reads and writes the guest's own bytes, coherently.
+    // Bypasses the stream fast path deliberately: bind-time copies are the
+    // snapshot-staleness class this path exists to eliminate.
+    if (unified_wrapper && !is_texel_buffer) {
+        if (const auto phys = memory->GetContiguousPhys(device_addr, size);
+            phys && *phys + size <= unified_wrapper->SizeBytes()) {
+            uma_hits.fetch_add(1, std::memory_order_relaxed);
+            return {&*unified_wrapper, *phys};
+        }
+        const u64 n = uma_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA fallback #{}: addr={:#x} size={:#x} (hits={})", n,
+                     device_addr, size, uma_hits.load(std::memory_order_relaxed));
+        }
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());

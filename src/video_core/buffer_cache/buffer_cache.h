@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <optional>
+
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -203,6 +206,9 @@ private:
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
+    std::optional<Buffer> unified_wrapper;
+    std::atomic<u64> uma_hits{};
+    std::atomic<u64> uma_fallbacks{};
     TextureCache& texture_cache;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
