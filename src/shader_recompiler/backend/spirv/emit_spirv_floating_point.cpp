@@ -40,7 +40,9 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 }
 
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F32[1], a, b);
+    // GCN v_max_f32 returns the non-NaN operand; SPIR-V FMax leaves NaN
+    // behavior undefined and vendors diverge. NMax matches GCN.
+    return ctx.OpNMax(ctx.F32[1], a, b);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
@@ -48,7 +50,7 @@ Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F32[1], a, b);
+    return ctx.OpNMin(ctx.F32[1], a, b);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
@@ -134,7 +136,9 @@ Id EmitFPRecip64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecipSqrt32(EmitContext& ctx, Id value) {
-    return ctx.OpInverseSqrt(ctx.F32[1], value);
+    // InverseSqrt is the loosest-specified SPIR-V op and diverges across
+    // vendors; 1/sqrt uses two tightly-specified ops and converges.
+    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), ctx.OpSqrt(ctx.F32[1], value));
 }
 
 Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {
