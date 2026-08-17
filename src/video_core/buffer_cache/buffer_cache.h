@@ -216,6 +216,7 @@ private:
     std::atomic<u64> uma_hits{};
     std::atomic<u64> uma_fallbacks{};
     std::atomic<u64> uma_guard_rejects{};
+    RangeSet unified_gpu_ranges;
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
     TextureCache& texture_cache;

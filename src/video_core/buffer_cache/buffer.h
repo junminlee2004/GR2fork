@@ -133,7 +133,16 @@ public:
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
         if (dst_acess_mask == access_mask && stage == dst_stage) {
-            return {};
+            // The unified wrapper aliases every guest range under one state;
+            // equal-state deduplication would suppress the barrier between a
+            // producing and a consuming pass whenever writes are involved, so
+            // only pure read-after-read repeats may be elided for it.
+            constexpr vk::AccessFlags2 write_access = vk::AccessFlagBits2::eShaderWrite |
+                                                      vk::AccessFlagBits2::eTransferWrite |
+                                                      vk::AccessFlagBits2::eMemoryWrite;
+            if (!is_unified || !((access_mask | dst_acess_mask) & write_access)) {
+                return {};
+            }
         }
 
         DEBUG_ASSERT(offset < size_bytes);
@@ -157,6 +166,7 @@ public:
 public:
     VAddr cpu_addr = 0;
     bool is_picked{};
+    bool is_unified{};
     bool is_coherent{};
     bool is_deleted{};
     int stream_score = 0;

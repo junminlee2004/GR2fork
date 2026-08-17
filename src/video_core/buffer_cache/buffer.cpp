@@ -105,6 +105,7 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     : size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{MemoryUsage::DeviceLocal}, buffer{instance->GetDevice(), instance->GetAllocator()} {
     buffer.buffer = external_buffer;
+    is_unified = true;
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,

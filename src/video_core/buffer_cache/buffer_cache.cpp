@@ -459,6 +459,9 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                               device_addr, *phys, size, n);
                 }
             }
+            if (is_written) {
+                unified_gpu_ranges.Add(device_addr, size);
+            }
             return {&*unified_wrapper, *phys};
         }
         const u64 n = uma_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
