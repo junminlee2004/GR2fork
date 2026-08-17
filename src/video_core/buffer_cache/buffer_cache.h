@@ -115,6 +115,11 @@ public:
     void NotifyMapped(VAddr addr, u64 size);
     void NotifyUnmapped(VAddr addr, u64 size);
 
+private:
+    void RemovePhysRange(VAddr addr, u64 size);
+
+public:
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 

@@ -73,12 +73,38 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() = default;
 
+void BufferCache::RemovePhysRange(VAddr addr, u64 size) {
+    // Erase [addr, addr+size) from the table, preserving trimmed head/tail
+    // survivors of partially covered runs.
+    const VAddr end = addr + size;
+    auto it = uma_phys_map.lower_bound(addr);
+    if (it != uma_phys_map.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second.second > addr) {
+            it = prev;
+        }
+    }
+    while (it != uma_phys_map.end() && it->first < end) {
+        const VAddr run_va = it->first;
+        const auto [run_phys, run_size] = it->second;
+        const VAddr run_end = run_va + run_size;
+        it = uma_phys_map.erase(it);
+        if (run_va < addr) {
+            uma_phys_map[run_va] = {run_phys, addr - run_va};
+        }
+        if (run_end > end) {
+            uma_phys_map[end] = {run_phys + (end - run_va), run_end - end};
+        }
+    }
+}
+
 void BufferCache::NotifyMapped(VAddr addr, u64 size) {
     if (!unified_wrapper) {
         return;
     }
     const auto runs = memory->GetPhysRuns(addr, size);
     std::scoped_lock lk{uma_phys_mutex};
+    RemovePhysRange(addr, size);
     for (const auto& [va, phys, run] : runs) {
         uma_phys_map[va] = {phys, run};
     }
@@ -89,16 +115,7 @@ void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
         return;
     }
     std::scoped_lock lk{uma_phys_mutex};
-    auto it = uma_phys_map.lower_bound(addr);
-    if (it != uma_phys_map.begin()) {
-        auto prev = std::prev(it);
-        if (prev->first + prev->second.second > addr) {
-            it = prev;
-        }
-    }
-    while (it != uma_phys_map.end() && it->first < addr + size) {
-        it = uma_phys_map.erase(it);
-    }
+    RemovePhysRange(addr, size);
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
