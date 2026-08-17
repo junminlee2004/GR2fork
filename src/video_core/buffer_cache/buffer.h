@@ -78,6 +78,10 @@ public:
                     MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
                     u64 size_bytes_);
 
+    /// Wraps an externally owned buffer (native UMA unified memory).
+    explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+                    vk::Buffer external_buffer, u64 size_bytes_);
+
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 

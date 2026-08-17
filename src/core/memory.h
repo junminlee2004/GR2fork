@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -289,6 +290,10 @@ public:
     s32 GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPoolBlockStats* stats);
 
     void InvalidateMemory(VAddr addr, u64 size) const;
+
+    /// Returns the guest physical address backing [va, va+size) when that
+    /// range is physically contiguous, otherwise nullopt (native UMA).
+    std::optional<PAddr> GetContiguousPhys(VAddr va, u64 size);
 
 private:
     VMAHandle FindVMA(VAddr target) {

@@ -1422,6 +1422,29 @@ s32 MemoryManager::GetMemoryPoolStats(::Libraries::Kernel::OrbisKernelMemoryPool
     return ORBIS_OK;
 }
 
+std::optional<PAddr> MemoryManager::GetContiguousPhys(VAddr va, u64 size) {
+    std::scoped_lock lk{mutex};
+    const auto it = FindVMA(va);
+    if (it == vma_map.end()) {
+        return std::nullopt;
+    }
+    const auto& vma = it->second;
+    if (!vma.Contains(va, size) || vma.phys_areas.empty()) {
+        return std::nullopt;
+    }
+    const u64 offset_in_vma = va - vma.base;
+    auto phys = vma.phys_areas.upper_bound(offset_in_vma);
+    if (phys == vma.phys_areas.begin()) {
+        return std::nullopt;
+    }
+    --phys;
+    const u64 delta = offset_in_vma - phys->first;
+    if (delta >= phys->second.size || phys->second.size - delta < size) {
+        return std::nullopt;
+    }
+    return phys->second.base + delta;
+}
+
 void MemoryManager::InvalidateMemory(const VAddr addr, const u64 size) const {
     if (rasterizer) {
         rasterizer->InvalidateMemory(addr, size);
