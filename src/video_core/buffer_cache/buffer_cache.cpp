@@ -446,7 +446,19 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         };
         if (const auto phys = lookup();
             phys && *phys + size <= unified_wrapper->SizeBytes()) {
-            uma_hits.fetch_add(1, std::memory_order_relaxed);
+            const u64 n = uma_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+            // Self-check: a correct resolution refers to the same physical
+            // pages, so guest VA and mirror+phys can never differ.
+            if (n <= 4096 || (n & 0xFFF) == 0) {
+                static u8* const mirror = Core::Memory::Instance()->GetAddressSpace().BackingBase();
+                const u64 check = std::min<u64>(size, 64);
+                if (std::memcmp(reinterpret_cast<const void*>(device_addr), mirror + *phys,
+                                check) != 0) {
+                    LOG_ERROR(Render_Vulkan,
+                              "UMA MISRESOLVE addr={:#x} phys={:#x} size={:#x} hit#{}",
+                              device_addr, *phys, size, n);
+                }
+            }
             return {&*unified_wrapper, *phys};
         }
         const u64 n = uma_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
