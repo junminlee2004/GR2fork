@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -64,9 +66,20 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
 
     // Cover as much of the backing as the heap allows, leaving headroom for
     // the driver's other GTT users. The tail stays memfd-backed (legacy path).
+    // A single VkBuffer also cannot exceed maxBufferSize/maxMemoryAllocationSize
+    // (RADV reports ~4GB for both).
+    const auto limit_props =
+        physical.getProperties2<vk::PhysicalDeviceProperties2,
+                                vk::PhysicalDeviceMaintenance4Properties,
+                                vk::PhysicalDeviceMaintenance3Properties>();
+    const u64 max_buffer =
+        std::min<u64>(limit_props.get<vk::PhysicalDeviceMaintenance4Properties>().maxBufferSize,
+                      limit_props.get<vk::PhysicalDeviceMaintenance3Properties>()
+                          .maxMemoryAllocationSize);
     constexpr u64 heap_headroom = 1_GB;
     const u64 heap_budget = chosen_heap > heap_headroom ? chosen_heap - heap_headroom : 0;
-    covered_size = Common::AlignDown(std::min(backing_size, heap_budget), 64_KB);
+    covered_size =
+        Common::AlignDown(std::min({backing_size, heap_budget, max_buffer}), 64_KB);
     if (covered_size < 1_GB) {
         LOG_WARNING(Render_Vulkan, "Native UMA: heap too small ({:#x})", chosen_heap);
         covered_size = 0;
