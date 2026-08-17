@@ -33,7 +33,7 @@ public:
         return backing_base;
     }
 
-    [[nodiscard]] u64 BackingSize() const noexcept {
+    [[nodiscard]] u64 GetBackingSize() const noexcept {
         return backing_size;
     }
 

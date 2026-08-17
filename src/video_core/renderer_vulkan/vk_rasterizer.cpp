@@ -59,7 +59,7 @@ void RunNativeUmaProbe(const Vulkan::Instance& instance) {
     auto* mem = Core::Memory::Instance();
     auto& aspace = mem->GetAddressSpace();
     u8* const backing = aspace.BackingBase();
-    const u64 backing_size = aspace.BackingSize();
+    const u64 backing_size = aspace.GetBackingSize();
     LOG_INFO(Render_Vulkan, "UMAPROBE backing={} size={:#x}", fmt::ptr(backing), backing_size);
 
     const auto host_props_ret = device.getMemoryHostPointerPropertiesEXT(
