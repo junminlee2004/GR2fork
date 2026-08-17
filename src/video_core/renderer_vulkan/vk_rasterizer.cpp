@@ -362,6 +362,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    {
+        const u32* guest_args = reinterpret_cast<const u32*>(address + offset);
+        const bool gpu_mod = buffer_cache.IsRegionGpuModified(address + offset, size);
+        LOG_INFO(Render_Vulkan, "HAIRDIAG indirect addr={:#x} guest_args=({},{},{}) gpu_mod={}",
+                 address + offset, guest_args[0], guest_args[1], guest_args[2], gpu_mod);
+    }
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
 
     if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
