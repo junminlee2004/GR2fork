@@ -1682,6 +1682,15 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     return boost::icl::contains(mapped_ranges, range);
 }
 
+void Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& fn) {
+    scheduler.DeferOperation(std::move(fn));
+    scheduler.Flush();
+}
+
+void Rasterizer::ProcessDeferredFences() {
+    scheduler.PopPendingOperations();
+}
+
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};

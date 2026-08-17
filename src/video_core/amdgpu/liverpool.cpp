@@ -694,12 +694,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        memcpy(address, &data, num_bytes);
-                    }
-                });
+                const auto signal_eos = [](const PM4CmdEventWriteEos& cmd) {
+                    cmd.SignalFence([](void* address, u64 data, u32 num_bytes) {
+                        auto* memory = Core::Memory::Instance();
+                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                            memcpy(address, &data, num_bytes);
+                        }
+                    });
+                };
+                if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0 &&
+                    event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+                    rasterizer->DeferUnifiedFence(
+                        [signal_eos, cmd = *event_eos] { signal_eos(cmd); });
+                    break;
+                }
+                signal_eos(*event_eos);
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
@@ -715,14 +724,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            memcpy(address, &data, num_bytes);
-                        }
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                const auto signal_eop = [](const PM4CmdEventWriteEop& cmd) {
+                    cmd.SignalFence(
+                        [](void* address, u64 data, u32 num_bytes) {
+                            auto* memory = Core::Memory::Instance();
+                            if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                                memcpy(address, &data, num_bytes);
+                            }
+                        },
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                };
+                if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0) {
+                    // Under native UMA the GPU reads guest memory at execution
+                    // time; a parse-time label write time-travels ahead of the
+                    // work it fences. Land it at fence completion instead.
+                    rasterizer->DeferUnifiedFence(
+                        [signal_eop, cmd = *event_eop] { signal_eop(cmd); });
+                    break;
+                }
+                signal_eop(*event_eop);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -822,7 +842,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
+                u32 wait_spins = 0;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0 &&
+                        (++wait_spins & 63) == 0) {
+                        rasterizer->ProcessDeferredFences();
+                    }
                     YIELD_GFX();
                 }
                 break;
@@ -1136,7 +1161,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            u32 wait_spins = 0;
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0 &&
+                    (++wait_spins & 63) == 0) {
+                    rasterizer->ProcessDeferredFences();
+                }
                 YIELD_ASC(vqid);
             }
             break;
