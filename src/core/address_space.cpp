@@ -808,6 +808,7 @@ struct AddressSpace::Impl {
 
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
     backing_base = impl->backing_base;
+    backing_size = BackingSize;
     system_managed_base = impl->system_managed_base;
     system_managed_size = impl->system_managed_size;
     system_reserved_base = impl->system_reserved_base;

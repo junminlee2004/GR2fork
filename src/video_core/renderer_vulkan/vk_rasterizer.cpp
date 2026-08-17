@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+
+#include "common/alignment.h"
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -32,6 +35,174 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+
+namespace {
+
+// P0 feasibility probe for native UMA: attempts to import the guest memory
+// backing as Vulkan device memory and round-trip data through it on the GPU.
+// Log-only; leaves no residue. See NATIVE_UMA_DESIGN.md.
+void RunNativeUmaProbe(const Vulkan::Instance& instance) {
+    LOG_INFO(Render_Vulkan, "UMAPROBE integrated={} ext_memory_host={}", instance.IsIntegrated(),
+             instance.IsExternalMemoryHostSupported());
+    if (!instance.IsExternalMemoryHostSupported()) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    const auto physical = instance.GetPhysicalDevice();
+
+    const auto props = physical.getProperties2<vk::PhysicalDeviceProperties2,
+                                               vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+    const u64 min_align =
+        props.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment;
+    LOG_INFO(Render_Vulkan, "UMAPROBE minImportedHostPointerAlignment={:#x}", min_align);
+
+    auto* mem = Core::Memory::Instance();
+    auto& aspace = mem->GetAddressSpace();
+    u8* const backing = aspace.BackingBase();
+    const u64 backing_size = aspace.BackingSize();
+    LOG_INFO(Render_Vulkan, "UMAPROBE backing={} size={:#x}", fmt::ptr(backing), backing_size);
+
+    const auto host_props_ret = device.getMemoryHostPointerPropertiesEXT(
+        vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, backing);
+    if (host_props_ret.result != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE getMemoryHostPointerProperties failed: {}",
+                 vk::to_string(host_props_ret.result));
+        return;
+    }
+    const u32 type_bits = host_props_ret.value.memoryTypeBits;
+    const auto mem_props = physical.getMemoryProperties();
+    s32 chosen_type = -1;
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if (!(type_bits & (1u << i))) {
+            continue;
+        }
+        const auto flags = mem_props.memoryTypes[i].propertyFlags;
+        LOG_INFO(Render_Vulkan, "UMAPROBE candidate type {} flags={} heap_size={:#x}", i,
+                 vk::to_string(flags), mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size);
+        const bool coherent = bool(flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        const bool device_local = bool(flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+        if (coherent && (chosen_type < 0 || device_local)) {
+            chosen_type = static_cast<s32>(i);
+        }
+    }
+    if (chosen_type < 0) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE no coherent import type; aborting");
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "UMAPROBE chosen type {}", chosen_type);
+
+    // Find the largest importable prefix of the backing.
+    u64 import_size = Common::AlignDown(backing_size, min_align);
+    vk::UniqueDeviceMemory memory{};
+    while (import_size >= 64_MB) {
+        const vk::ImportMemoryHostPointerInfoEXT import_info{
+            .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+            .pHostPointer = backing,
+        };
+        const vk::MemoryAllocateInfo alloc_info{
+            .pNext = &import_info,
+            .allocationSize = import_size,
+            .memoryTypeIndex = static_cast<u32>(chosen_type),
+        };
+        auto [alloc_result, mem_handle] = device.allocateMemoryUnique(alloc_info);
+        if (alloc_result == vk::Result::eSuccess) {
+            memory = std::move(mem_handle);
+            break;
+        }
+        LOG_INFO(Render_Vulkan, "UMAPROBE import of {:#x} failed ({}), halving", import_size,
+                 vk::to_string(alloc_result));
+        import_size = Common::AlignDown(import_size / 2, min_align);
+    }
+    if (!memory) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE import failed at all sizes");
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "UMAPROBE imported {:#x} of {:#x} ({}%)", import_size, backing_size,
+             import_size * 100 / backing_size);
+
+    // Bind a buffer over the imported memory.
+    const vk::ExternalMemoryBufferCreateInfo ext_buf{
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+    };
+    const vk::BufferCreateInfo buf_info{
+        .pNext = &ext_buf,
+        .size = import_size,
+        .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+                 vk::BufferUsageFlagBits::eTransferDst,
+    };
+    auto [buf_result, buffer] = device.createBufferUnique(buf_info);
+    if (buf_result != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE buffer creation failed: {}", vk::to_string(buf_result));
+        return;
+    }
+    if (const auto res = device.bindBufferMemory(*buffer, *memory, 0);
+        res != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE bind failed: {}", vk::to_string(res));
+        return;
+    }
+
+    // Round trip: CPU writes at src, GPU copies src->dst, CPU reads dst.
+    constexpr u64 src_off = 0x10000;
+    constexpr u64 dst_off = 0x20000;
+    constexpr u64 test_size = 64;
+    u64 pattern[test_size / 8];
+    for (u32 i = 0; i < test_size / 8; ++i) {
+        pattern[i] = 0xC0FFEE00DEADBEEFULL + i;
+    }
+    u8 saved_src[test_size];
+    u8 saved_dst[test_size];
+    std::memcpy(saved_src, backing + src_off, test_size);
+    std::memcpy(saved_dst, backing + dst_off, test_size);
+    std::memcpy(backing + src_off, pattern, test_size);
+    std::memset(backing + dst_off, 0, test_size);
+
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const vk::CommandPoolCreateInfo pool_info{.queueFamilyIndex = family};
+    auto [pool_res, pool] = device.createCommandPoolUnique(pool_info);
+    if (pool_res != vk::Result::eSuccess) {
+        return;
+    }
+    const vk::CommandBufferAllocateInfo cmd_info{
+        .commandPool = *pool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = 1,
+    };
+    auto [cmd_res, cmds] = device.allocateCommandBuffers(cmd_info);
+    if (cmd_res != vk::Result::eSuccess) {
+        return;
+    }
+    const auto cmdbuf = cmds[0];
+    void(cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+    const vk::BufferCopy copy{.srcOffset = src_off, .dstOffset = dst_off, .size = test_size};
+    cmdbuf.copyBuffer(*buffer, *buffer, copy);
+    const vk::MemoryBarrier host_read_barrier{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eHostRead,
+    };
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                           vk::DependencyFlags{}, host_read_barrier, {}, {});
+    void(cmdbuf.end());
+    auto [fence_res, fence] = device.createFenceUnique({});
+    if (fence_res != vk::Result::eSuccess) {
+        return;
+    }
+    const vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmdbuf};
+    const auto queue = instance.GetGraphicsQueue();
+    if (queue.submit(submit, *fence) != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE submit failed");
+        return;
+    }
+    void(device.waitForFences(*fence, true, UINT64_MAX));
+    const bool roundtrip_ok = std::memcmp(backing + dst_off, pattern, test_size) == 0;
+    LOG_INFO(Render_Vulkan, "UMAPROBE roundtrip {}", roundtrip_ok ? "OK" : "MISMATCH");
+    std::memcpy(backing + src_off, saved_src, test_size);
+    std::memcpy(backing + dst_off, saved_dst, test_size);
+    device.freeCommandBuffers(*pool, cmdbuf);
+}
+
+} // namespace
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -43,6 +214,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    RunNativeUmaProbe(instance);
 }
 
 Rasterizer::~Rasterizer() = default;
