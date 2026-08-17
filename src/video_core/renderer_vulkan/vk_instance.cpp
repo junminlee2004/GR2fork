@@ -12,6 +12,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/unified_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -167,9 +168,11 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
+    unified_guest_memory = std::make_unique<VideoCore::UnifiedGuestMemory>(*this);
 }
 
 Instance::~Instance() {
+    unified_guest_memory.reset();
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }

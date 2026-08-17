@@ -37,6 +37,11 @@ public:
         return backing_size;
     }
 
+    /// Rebacks the first `size` bytes of guest physical memory with the given
+    /// file descriptor (native UMA). Must be called before guest mappings
+    /// exist. Returns false when unsupported.
+    bool AdoptUnifiedBackingPrefix(int fd, u64 size);
+
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);
     }
