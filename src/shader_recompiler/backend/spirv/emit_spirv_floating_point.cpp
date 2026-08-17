@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -9,6 +11,25 @@ namespace Shader::Backend::SPIRV {
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
+}
+
+// The guest requested f32 denormal flushing but the device cannot provide it
+// (NVIDIA exposes no fp32 DenormFlushToZero); emulate by canonicalizing
+// arithmetic results so iterated math cannot diverge from GCN behavior.
+static bool NeedsManualFtz32(EmitContext& ctx) {
+    return !ctx.profile.support_fp32_denorm_flush &&
+           ctx.runtime_info.fp_denorm_mode32 == AmdGpu::FpDenormMode::InOutFlush;
+}
+
+static Id FlushDenorm32(EmitContext& ctx, Id value) {
+    if (!NeedsManualFtz32(ctx)) {
+        return value;
+    }
+    const Id tiny = ctx.ConstF32(std::numeric_limits<float>::min());
+    const Id is_denorm =
+        ctx.OpFOrdLessThan(ctx.U1[1], ctx.OpFAbs(ctx.F32[1], value), tiny);
+    const Id zeroed = ctx.OpFMul(ctx.F32[1], value, ctx.ConstF32(0.f));
+    return ctx.OpSelect(ctx.F32[1], is_denorm, zeroed, value);
 }
 
 Id EmitFPAbs32(EmitContext& ctx, Id value) {
@@ -20,7 +41,7 @@ Id EmitFPAbs64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
+    return Decorate(ctx, inst, FlushDenorm32(ctx, ctx.OpFAdd(ctx.F32[1], a, b)));
 }
 
 Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -28,11 +49,11 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
+    return Decorate(ctx, inst, FlushDenorm32(ctx, ctx.OpFSub(ctx.F32[1], a, b)));
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
+    return Decorate(ctx, inst, FlushDenorm32(ctx, ctx.OpFma(ctx.F32[1], a, b, c)));
 }
 
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
@@ -78,7 +99,7 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
+    return Decorate(ctx, inst, FlushDenorm32(ctx, ctx.OpFMul(ctx.F32[1], a, b)));
 }
 
 Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
