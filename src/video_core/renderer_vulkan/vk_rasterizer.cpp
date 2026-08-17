@@ -265,8 +265,16 @@ void RunNativeUmaProbe(const Vulkan::Instance& instance) {
     }
     LOG_INFO(Render_Vulkan, "UMAPROBE chosen type {}", chosen_type);
 
-    // Find the largest importable prefix of the backing.
-    u64 import_size = Common::AlignDown(backing_size, min_align);
+    // Find the largest importable prefix of the backing. Some drivers accept
+    // imports beyond the heap budget and fail catastrophically later, so cap
+    // the attempt at half the target heap up front.
+    const u64 heap_cap =
+        mem_props.memoryHeaps[mem_props.memoryTypes[chosen_type].heapIndex].size / 2;
+    u64 import_size = Common::AlignDown(std::min<u64>(backing_size, heap_cap), min_align);
+    if (import_size < backing_size) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE capping first attempt to {:#x} (heap budget)",
+                 import_size);
+    }
     vk::UniqueDeviceMemory memory{};
     while (import_size >= 64_MB) {
         const vk::ImportMemoryHostPointerInfoEXT import_info{
