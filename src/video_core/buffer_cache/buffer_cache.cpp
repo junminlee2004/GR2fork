@@ -5,6 +5,7 @@
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -428,7 +429,8 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // memory - the GPU reads and writes the guest's own bytes, coherently.
     // Bypasses the stream fast path deliberately: bind-time copies are the
     // snapshot-staleness class this path exists to eliminate.
-    if (unified_wrapper && !is_texel_buffer) {
+    if (unified_wrapper && !is_texel_buffer &&
+        (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2))) {
         const auto lookup = [&]() -> std::optional<PAddr> {
             std::scoped_lock lk{uma_phys_mutex};
             auto it = uma_phys_map.upper_bound(device_addr);

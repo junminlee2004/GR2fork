@@ -12,7 +12,7 @@ namespace VideoCore {
 
 UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
 #ifndef _WIN32
-    if (!EmulatorSettings.IsNativeUmaEnabled()) {
+    if (EmulatorSettings.GetNativeUmaMode() == 0) {
         return;
     }
     if (!instance.IsExternalMemoryDmaBufSupported()) {

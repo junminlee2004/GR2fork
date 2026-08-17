@@ -423,7 +423,7 @@ struct GPUSettings {
     Setting<bool> copy_gpu_buffers{false};
     Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
-    Setting<bool> native_uma{false};
+    Setting<u32> native_uma{0};
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
@@ -742,7 +742,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
-    SETTING_FORWARD_BOOL(m_gpu, NativeUmaEnabled, native_uma)
+    SETTING_FORWARD(m_gpu, NativeUmaMode, native_uma)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
