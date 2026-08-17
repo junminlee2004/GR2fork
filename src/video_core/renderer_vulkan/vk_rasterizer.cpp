@@ -44,6 +44,138 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 namespace {
 
 #ifndef _WIN32
+// P0c: per-type CPU cacheability of dma-buf mappings (the GO/NO-GO for the
+// native UMA memory-type policy), plus offset-mmap and exec-mmap support.
+void RunNativeUmaProbeCacheability(const Vulkan::Instance& instance) {
+    if (!instance.IsExternalMemoryDmaBufSupported()) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    const auto physical = instance.GetPhysicalDevice();
+    const auto mem_props = physical.getMemoryProperties();
+    constexpr u64 bench_size = 64_MB;
+
+    const auto bench_type = [&](u32 type_index) {
+        const vk::ExternalMemoryBufferCreateInfo ext_buf{
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+        };
+        const vk::BufferCreateInfo buf_info{
+            .pNext = &ext_buf,
+            .size = bench_size,
+            .usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                     vk::BufferUsageFlagBits::eTransferSrc |
+                     vk::BufferUsageFlagBits::eTransferDst,
+        };
+        auto [buf_result, buffer] = device.createBufferUnique(buf_info);
+        if (buf_result != vk::Result::eSuccess) {
+            return;
+        }
+        const auto reqs = device.getBufferMemoryRequirements(*buffer);
+        if (!(reqs.memoryTypeBits & (1u << type_index))) {
+            return;
+        }
+        const vk::MemoryDedicatedAllocateInfo dedicated{
+            .buffer = *buffer,
+        };
+        const vk::ExportMemoryAllocateInfo export_info{
+            .pNext = &dedicated,
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+        };
+        const vk::MemoryAllocateInfo alloc_info{
+            .pNext = &export_info,
+            .allocationSize = reqs.size,
+            .memoryTypeIndex = type_index,
+        };
+        auto [alloc_result, memory] = device.allocateMemoryUnique(alloc_info);
+        if (alloc_result != vk::Result::eSuccess) {
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} allocation failed: {}", type_index,
+                     vk::to_string(alloc_result));
+            return;
+        }
+        if (device.bindBufferMemory(*buffer, *memory, 0) != vk::Result::eSuccess) {
+            return;
+        }
+        const vk::MemoryGetFdInfoKHR fd_info{
+            .memory = *memory,
+            .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+        };
+        auto [fd_result, fd] = device.getMemoryFdKHR(fd_info);
+        if (fd_result != vk::Result::eSuccess) {
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} export failed: {}", type_index,
+                     vk::to_string(fd_result));
+            return;
+        }
+        u8* map = static_cast<u8*>(
+            mmap(nullptr, bench_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+        if (map == MAP_FAILED) {
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} mmap failed: {}", type_index,
+                     strerror(errno));
+            close(fd);
+            return;
+        }
+
+        using Clock = std::chrono::steady_clock;
+        const auto w0 = Clock::now();
+        std::memset(map, 0x5a, bench_size);
+        const auto w1 = Clock::now();
+        u64 sum = 0;
+        const u64* words = reinterpret_cast<const u64*>(map);
+        const auto r0 = Clock::now();
+        for (u64 i = 0; i < bench_size / 8; ++i) {
+            sum += words[i];
+        }
+        const auto r1 = Clock::now();
+        const auto us = [](auto a, auto b) {
+            return std::max<s64>(
+                1, std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+        };
+        const u64 write_mbs = bench_size / us(w0, w1);
+        const u64 read_mbs = bench_size / us(r0, r1);
+        const auto flags = mem_props.memoryTypes[type_index].propertyFlags;
+        LOG_INFO(Render_Vulkan,
+                 "UMAPROBE-P0C type {} flags={} write={} MB/s read={} MB/s ({}) sum={:#x}",
+                 type_index, vk::to_string(flags), write_mbs, read_mbs,
+                 read_mbs >= 1000 ? "WB-cacheable" : "WC/uncached", sum & 0xff);
+
+        // Offset-mmap test on this fd: map at +1MB, alias against the full map.
+        u8* map_off = static_cast<u8*>(
+            mmap(nullptr, 1_MB, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 1_MB));
+        if (map_off == MAP_FAILED) {
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} offset-mmap FAILED: {}", type_index,
+                     strerror(errno));
+        } else {
+            map[1_MB + 128] = 0xab;
+            const bool off_ok = map_off[128] == 0xab;
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} offset-mmap {}", type_index,
+                     off_ok ? "OK" : "MISMATCH");
+            munmap(map_off, 1_MB);
+        }
+
+        // Exec-mmap support (mapping only, nothing executed).
+        void* map_exec = mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+        if (map_exec == MAP_FAILED) {
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} exec-mmap FAILED: {}", type_index,
+                     strerror(errno));
+        } else {
+            LOG_INFO(Render_Vulkan, "UMAPROBE-P0C type {} exec-mmap OK", type_index);
+            munmap(map_exec, 4096);
+        }
+        munmap(map, bench_size);
+        close(fd);
+    };
+
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        const auto flags = mem_props.memoryTypes[i].propertyFlags;
+        const bool visible = bool(flags & vk::MemoryPropertyFlagBits::eHostVisible);
+        const bool coherent = bool(flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        if (visible && coherent) {
+            bench_type(i);
+        }
+    }
+}
+#endif
+
+#ifndef _WIN32
 // P0b: the inverted direction - allocate device memory, export as dma-buf,
 // mmap it into CPU address space (twice, to prove dmem-style aliasing), and
 // round-trip data through the mapping. This is the native-UMA mechanism that
@@ -381,6 +513,93 @@ void RunNativeUmaProbe(const Vulkan::Instance& instance) {
     std::memcpy(backing + src_off, saved_src, test_size);
     std::memcpy(backing + dst_off, saved_dst, test_size);
     device.freeCommandBuffers(*pool, cmdbuf);
+
+    // P0c(d): two concurrent chunked imports with an interior host pointer -
+    // the Windows P1 mechanism. Free the primary import first to stay in
+    // budget, then import [0, chunk) and [chunk, 2*chunk), GPU-fill inside
+    // the second, and verify through guest memory.
+    buffer.reset();
+    memory.reset();
+    const u64 chunk_size =
+        Common::AlignDown(std::min<u64>(512_MB, heap_cap / 4), min_align);
+    if (chunk_size >= 128_MB && backing_size >= 2 * chunk_size) {
+        const auto import_chunk = [&](u64 offset) {
+            const vk::ImportMemoryHostPointerInfoEXT import_info{
+                .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+                .pHostPointer = backing + offset,
+            };
+            const vk::MemoryAllocateInfo alloc_info{
+                .pNext = &import_info,
+                .allocationSize = chunk_size,
+                .memoryTypeIndex = static_cast<u32>(chosen_type),
+            };
+            auto [result, mem_handle] = device.allocateMemoryUnique(alloc_info);
+            if (result != vk::Result::eSuccess) {
+                LOG_INFO(Render_Vulkan, "UMAPROBE chunk import at {:#x} failed: {}", offset,
+                         vk::to_string(result));
+            }
+            return std::move(mem_handle);
+        };
+        auto chunk_a = import_chunk(0);
+        auto chunk_b = import_chunk(chunk_size);
+        if (chunk_a && chunk_b) {
+            const vk::ExternalMemoryBufferCreateInfo ext_buf2{
+                .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+            };
+            const vk::BufferCreateInfo buf2_info{
+                .pNext = &ext_buf2,
+                .size = 64_MB,
+                .usage = vk::BufferUsageFlagBits::eTransferDst,
+            };
+            auto [buf2_res, buf2] = device.createBufferUnique(buf2_info);
+            if (buf2_res == vk::Result::eSuccess &&
+                device.bindBufferMemory(*buf2, *chunk_b, 0) == vk::Result::eSuccess) {
+                constexpr u64 fill_off = 0x30000;
+                constexpr u64 fill_size = 64;
+                u8 saved_fill[fill_size];
+                std::memcpy(saved_fill, backing + chunk_size + fill_off, fill_size);
+                const vk::CommandBufferAllocateInfo cmd2_info{
+                    .commandPool = *pool,
+                    .level = vk::CommandBufferLevel::ePrimary,
+                    .commandBufferCount = 1,
+                };
+                auto [cmd2_res, cmds2] = device.allocateCommandBuffers(cmd2_info);
+                if (cmd2_res == vk::Result::eSuccess) {
+                    const auto cmdbuf2 = cmds2[0];
+                    void(cmdbuf2.begin(vk::CommandBufferBeginInfo{
+                        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+                    cmdbuf2.fillBuffer(*buf2, fill_off, fill_size, 0xC0FFEE55u);
+                    const vk::MemoryBarrier host_barrier2{
+                        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                        .dstAccessMask = vk::AccessFlagBits::eHostRead,
+                    };
+                    cmdbuf2.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                            vk::PipelineStageFlagBits::eHost,
+                                            vk::DependencyFlags{}, host_barrier2, {}, {});
+                    void(cmdbuf2.end());
+                    auto [fence2_res, fence2] = device.createFenceUnique({});
+                    if (fence2_res == vk::Result::eSuccess) {
+                        const vk::SubmitInfo submit2{.commandBufferCount = 1,
+                                                     .pCommandBuffers = &cmdbuf2};
+                        if (instance.GetGraphicsQueue().submit(submit2, *fence2) ==
+                            vk::Result::eSuccess) {
+                            void(device.waitForFences(*fence2, true, UINT64_MAX));
+                            bool fill_ok = true;
+                            const u32* words =
+                                reinterpret_cast<const u32*>(backing + chunk_size + fill_off);
+                            for (u32 i = 0; i < fill_size / 4; ++i) {
+                                fill_ok &= words[i] == 0xC0FFEE55u;
+                            }
+                            LOG_INFO(Render_Vulkan, "UMAPROBE chunk2 roundtrip {} (chunk={:#x})",
+                                     fill_ok ? "OK" : "MISMATCH", chunk_size);
+                        }
+                    }
+                    device.freeCommandBuffers(*pool, cmdbuf2);
+                }
+                std::memcpy(backing + chunk_size + fill_off, saved_fill, fill_size);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -399,6 +618,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     RunNativeUmaProbe(instance);
 #ifndef _WIN32
     RunNativeUmaProbeInverted(instance);
+    RunNativeUmaProbeCacheability(instance);
 #endif
 }
 
