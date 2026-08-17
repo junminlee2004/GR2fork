@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <map>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -829,7 +830,17 @@ struct AddressSpace::Impl {
         }
 #endif
         int ret = mprotect(reinterpret_cast<void*>(virtual_addr), size, flags);
-        ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+        if (ret != 0) {
+            // dma-buf backed mappings (native UMA) can reject protection
+            // changes the memfd pages always allowed. Survive and report:
+            // the affected tracking degrades instead of aborting.
+            static std::atomic<u64> failures{0};
+            const u64 n = ++failures;
+            if ((n & (n - 1)) == 0) {
+                LOG_ERROR(Kernel_Vmm, "mprotect failure #{}: addr={:#x} size={:#x} flags={}: {}",
+                          n, virtual_addr, size, flags, strerror(errno));
+            }
+        }
     }
 
     int backing_fd;
