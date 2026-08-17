@@ -322,14 +322,13 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
             return;
         }
     }
-    Buffer* buffer = [&] {
-        if (is_gds) {
-            return &gds_buffer;
-        }
-        const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
-        return buffer;
-    }();
-    buffer->Fill(buffer->Offset(address), num_bytes, value);
+    if (is_gds) {
+        gds_buffer.Fill(address, num_bytes, value);
+        return;
+    }
+    const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
+    DEBUG_ASSERT(offset + num_bytes <= buffer->SizeBytes());
+    buffer->Fill(offset, num_bytes, value);
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
