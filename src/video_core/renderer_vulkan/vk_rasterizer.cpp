@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#ifndef _WIN32
+#include <cerrno>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "common/alignment.h"
 #include "common/debug.h"
@@ -37,6 +42,175 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 
 
 namespace {
+
+#ifndef _WIN32
+// P0b: the inverted direction - allocate device memory, export as dma-buf,
+// mmap it into CPU address space (twice, to prove dmem-style aliasing), and
+// round-trip data through the mapping. This is the native-UMA mechanism that
+// survives RADV rejecting host-pointer imports of file-backed memory.
+void RunNativeUmaProbeInverted(const Vulkan::Instance& instance) {
+    LOG_INFO(Render_Vulkan, "UMAPROBE-INV dma_buf={}", instance.IsExternalMemoryDmaBufSupported());
+    if (!instance.IsExternalMemoryDmaBufSupported()) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    const auto physical = instance.GetPhysicalDevice();
+    constexpr u64 alloc_size = 256_MB;
+
+    const vk::ExternalMemoryBufferCreateInfo ext_buf{
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+    };
+    const vk::BufferCreateInfo buf_info{
+        .pNext = &ext_buf,
+        .size = alloc_size,
+        .usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+                 vk::BufferUsageFlagBits::eTransferDst,
+    };
+    auto [buf_result, buffer] = device.createBufferUnique(buf_info);
+    if (buf_result != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV buffer creation failed: {}",
+                 vk::to_string(buf_result));
+        return;
+    }
+    const auto reqs = device.getBufferMemoryRequirements(*buffer);
+
+    const auto mem_props = physical.getMemoryProperties();
+    s32 chosen_type = -1;
+    bool chosen_local = false;
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if (!(reqs.memoryTypeBits & (1u << i))) {
+            continue;
+        }
+        const auto flags = mem_props.memoryTypes[i].propertyFlags;
+        const bool visible = bool(flags & vk::MemoryPropertyFlagBits::eHostVisible);
+        const bool coherent = bool(flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        const bool local = bool(flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+        if (!visible || !coherent) {
+            continue;
+        }
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV candidate type {} flags={} heap_size={:#x}", i,
+                 vk::to_string(flags),
+                 mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size);
+        if (chosen_type < 0 || (local && !chosen_local)) {
+            chosen_type = static_cast<s32>(i);
+            chosen_local = local;
+        }
+    }
+    if (chosen_type < 0) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV no host-visible coherent type; aborting");
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "UMAPROBE-INV chosen type {} device_local={}", chosen_type,
+             chosen_local);
+
+    const vk::MemoryDedicatedAllocateInfo dedicated{
+        .buffer = *buffer,
+    };
+    const vk::ExportMemoryAllocateInfo export_info{
+        .pNext = &dedicated,
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+    };
+    const vk::MemoryAllocateInfo alloc_info{
+        .pNext = &export_info,
+        .allocationSize = reqs.size,
+        .memoryTypeIndex = static_cast<u32>(chosen_type),
+    };
+    auto [alloc_result, memory] = device.allocateMemoryUnique(alloc_info);
+    if (alloc_result != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV allocation failed: {}", vk::to_string(alloc_result));
+        return;
+    }
+    if (device.bindBufferMemory(*buffer, *memory, 0) != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV bind failed");
+        return;
+    }
+
+    const vk::MemoryGetFdInfoKHR fd_info{
+        .memory = *memory,
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+    };
+    auto [fd_result, fd] = device.getMemoryFdKHR(fd_info);
+    if (fd_result != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV getMemoryFd failed: {}", vk::to_string(fd_result));
+        return;
+    }
+    LOG_INFO(Render_Vulkan, "UMAPROBE-INV exported dma-buf fd={}", fd);
+
+    void* map_a = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* map_b = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    LOG_INFO(Render_Vulkan, "UMAPROBE-INV mmap a={} b={}", fmt::ptr(map_a), fmt::ptr(map_b));
+    if (map_a == MAP_FAILED || map_b == MAP_FAILED) {
+        LOG_INFO(Render_Vulkan, "UMAPROBE-INV mmap failed: {}", strerror(errno));
+        if (map_a != MAP_FAILED) {
+            munmap(map_a, alloc_size);
+        }
+        if (map_b != MAP_FAILED) {
+            munmap(map_b, alloc_size);
+        }
+        close(fd);
+        return;
+    }
+
+    // CPU writes via mapping A; GPU copies src->dst; CPU reads via mapping B.
+    constexpr u64 src_off = 0x10000;
+    constexpr u64 dst_off = 0x20000;
+    constexpr u64 test_size = 64;
+    u64 pattern[test_size / 8];
+    for (u32 i = 0; i < test_size / 8; ++i) {
+        pattern[i] = 0xA11A5ED00DF00D00ULL + i;
+    }
+    std::memcpy(static_cast<u8*>(map_a) + src_off, pattern, test_size);
+    std::memset(static_cast<u8*>(map_a) + dst_off, 0, test_size);
+    // Alias check before any GPU work: B must see A's bytes.
+    const bool alias_ok =
+        std::memcmp(static_cast<u8*>(map_b) + src_off, pattern, test_size) == 0;
+    LOG_INFO(Render_Vulkan, "UMAPROBE-INV alias {}", alias_ok ? "OK" : "MISMATCH");
+
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const vk::CommandPoolCreateInfo pool_info{.queueFamilyIndex = family};
+    auto [pool_res, pool] = device.createCommandPoolUnique(pool_info);
+    if (pool_res == vk::Result::eSuccess) {
+        const vk::CommandBufferAllocateInfo cmd_info{
+            .commandPool = *pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+        auto [cmd_res, cmds] = device.allocateCommandBuffers(cmd_info);
+        if (cmd_res == vk::Result::eSuccess) {
+            const auto cmdbuf = cmds[0];
+            void(cmdbuf.begin(vk::CommandBufferBeginInfo{
+                .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+            const vk::BufferCopy copy{
+                .srcOffset = src_off, .dstOffset = dst_off, .size = test_size};
+            cmdbuf.copyBuffer(*buffer, *buffer, copy);
+            const vk::MemoryBarrier host_read_barrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eHostRead,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                   vk::PipelineStageFlagBits::eHost, vk::DependencyFlags{},
+                                   host_read_barrier, {}, {});
+            void(cmdbuf.end());
+            auto [fence_res, fence] = device.createFenceUnique({});
+            if (fence_res == vk::Result::eSuccess) {
+                const vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmdbuf};
+                if (instance.GetGraphicsQueue().submit(submit, *fence) ==
+                    vk::Result::eSuccess) {
+                    void(device.waitForFences(*fence, true, UINT64_MAX));
+                    const bool roundtrip_ok =
+                        std::memcmp(static_cast<u8*>(map_b) + dst_off, pattern, test_size) == 0;
+                    LOG_INFO(Render_Vulkan, "UMAPROBE-INV roundtrip {}",
+                             roundtrip_ok ? "OK" : "MISMATCH");
+                }
+            }
+            device.freeCommandBuffers(*pool, cmdbuf);
+        }
+    }
+    munmap(map_a, alloc_size);
+    munmap(map_b, alloc_size);
+    close(fd);
+}
+#endif
 
 // P0 feasibility probe for native UMA: attempts to import the guest memory
 // backing as Vulkan device memory and round-trip data through it on the GPU.
@@ -215,6 +389,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     }
     memory->SetRasterizer(this);
     RunNativeUmaProbe(instance);
+#ifndef _WIN32
+    RunNativeUmaProbeInverted(instance);
+#endif
 }
 
 Rasterizer::~Rasterizer() = default;

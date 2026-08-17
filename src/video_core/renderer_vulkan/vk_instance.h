@@ -305,6 +305,11 @@ public:
         return external_memory_host;
     }
 
+    /// Returns true when dma-buf export of device memory can be used.
+    bool IsExternalMemoryDmaBufSupported() const {
+        return external_memory_dma_buf;
+    }
+
     /// Returns if the device is an integrated GPU.
     bool IsIntegrated() const {
         return properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
@@ -522,6 +527,7 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool maintenance_8{};
     bool external_memory_host{};
+    bool external_memory_dma_buf{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
