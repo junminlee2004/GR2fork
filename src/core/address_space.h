@@ -33,6 +33,15 @@ public:
         return backing_base;
     }
 
+    [[nodiscard]] u64 GetBackingSize() const noexcept {
+        return backing_size;
+    }
+
+    /// Rebacks the first `size` bytes of guest physical memory with the given
+    /// file descriptor (native UMA). Must be called before guest mappings
+    /// exist. Returns false when unsupported.
+    bool AdoptUnifiedBackingPrefix(int fd, u64 size);
+
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);
     }
@@ -91,6 +100,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
     u8* backing_base{};
+    u64 backing_size{};
     u8* system_managed_base{};
     u64 system_managed_size{};
     u8* system_reserved_base{};

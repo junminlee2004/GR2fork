@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <map>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -506,6 +507,10 @@ struct AddressSpace::Impl {
         CoalesceFreeRegions(virtual_addr);
     }
 
+    bool AdoptUnifiedBackingPrefix(int, u64) {
+        return false; // Native UMA backing swap is Linux-only.
+    }
+
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
         std::scoped_lock lk{mutex};
         DWORD new_flags{};
@@ -738,6 +743,21 @@ struct AddressSpace::Impl {
         }
     }
 
+    bool AdoptUnifiedBackingPrefix(int fd, u64 size) {
+        if (any_phys_mapped) {
+            LOG_WARNING(Kernel_Vmm, "Adopting unified backing after guest mappings exist");
+        }
+        void* ret = mmap(backing_base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        if (ret == MAP_FAILED) {
+            LOG_ERROR(Kernel_Vmm, "Unified backing mirror remap failed: {}", strerror(errno));
+            return false;
+        }
+        unified_fd = fd;
+        unified_size = size;
+        LOG_INFO(Kernel_Vmm, "Unified backing adopted for phys [0, {:#x})", size);
+        return true;
+    }
+
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, PosixPageProtection prot,
               int fd = -1) {
         m_free_regions.subtract({virtual_addr, virtual_addr + size});
@@ -747,7 +767,26 @@ struct AddressSpace::Impl {
             phys_addr = -1;
         }
 #endif
-        const int handle = phys_addr != -1 ? (fd == -1 ? backing_fd : fd) : -1;
+        if (phys_addr != -1) {
+            any_phys_mapped = true;
+        }
+        // Dmem-backed mappings may straddle the unified/memfd tier boundary,
+        // in which case the view is stitched from two fixed mappings.
+        if (phys_addr != -1 && fd == -1 && unified_fd >= 0 &&
+            static_cast<u64>(phys_addr) < unified_size && phys_addr + size > unified_size) {
+            const u64 head = unified_size - phys_addr;
+            void* ret = mmap(reinterpret_cast<void*>(virtual_addr), head, prot,
+                             MAP_FIXED | MAP_SHARED, unified_fd, phys_addr);
+            ASSERT_MSG(ret != MAP_FAILED, "mmap failed: {}", strerror(errno));
+            void* tail = mmap(reinterpret_cast<void*>(virtual_addr + head), size - head, prot,
+                              MAP_FIXED | MAP_SHARED, backing_fd, unified_size);
+            ASSERT_MSG(tail != MAP_FAILED, "mmap failed: {}", strerror(errno));
+            return ret;
+        }
+        const bool use_unified = phys_addr != -1 && fd == -1 && unified_fd >= 0 &&
+                                 static_cast<u64>(phys_addr) + size <= unified_size;
+        const int handle =
+            phys_addr != -1 ? (fd == -1 ? (use_unified ? unified_fd : backing_fd) : fd) : -1;
         const off_t host_offset = phys_addr != -1 ? phys_addr : 0;
         const int flag = phys_addr != -1 ? MAP_SHARED : (MAP_ANONYMOUS | MAP_PRIVATE);
         void* ret = mmap(reinterpret_cast<void*>(virtual_addr), size, prot, MAP_FIXED | flag,
@@ -791,10 +830,23 @@ struct AddressSpace::Impl {
         }
 #endif
         int ret = mprotect(reinterpret_cast<void*>(virtual_addr), size, flags);
-        ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+        if (ret != 0) {
+            // dma-buf backed mappings (native UMA) can reject protection
+            // changes the memfd pages always allowed. Survive and report:
+            // the affected tracking degrades instead of aborting.
+            static std::atomic<u64> failures{0};
+            const u64 n = ++failures;
+            if ((n & (n - 1)) == 0) {
+                LOG_ERROR(Kernel_Vmm, "mprotect failure #{}: addr={:#x} size={:#x} flags={}: {}",
+                          n, virtual_addr, size, flags, strerror(errno));
+            }
+        }
     }
 
     int backing_fd;
+    int unified_fd = -1;
+    u64 unified_size = 0;
+    bool any_phys_mapped = false;
     u8* backing_base{};
     u8* system_managed_base{};
     u64 system_managed_size{};
@@ -806,8 +858,13 @@ struct AddressSpace::Impl {
 };
 #endif
 
+bool AddressSpace::AdoptUnifiedBackingPrefix(int fd, u64 size) {
+    return impl->AdoptUnifiedBackingPrefix(fd, size);
+}
+
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
     backing_base = impl->backing_base;
+    backing_size = BackingSize;
     system_managed_base = impl->system_managed_base;
     system_managed_size = impl->system_managed_size;
     system_reserved_base = impl->system_reserved_base;

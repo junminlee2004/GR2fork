@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <span>
 #include <unordered_map>
 
@@ -16,6 +17,10 @@ class WindowSDL;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
+
+namespace VideoCore {
+class UnifiedGuestMemory;
+}
 
 namespace Vulkan {
 
@@ -300,6 +305,21 @@ public:
         return properties.deviceName;
     }
 
+    /// Returns true when VK_EXT_external_memory_host can be used.
+    bool IsExternalMemoryHostSupported() const {
+        return external_memory_host;
+    }
+
+    /// Returns true when dma-buf export of device memory can be used.
+    bool IsExternalMemoryDmaBufSupported() const {
+        return external_memory_dma_buf;
+    }
+
+    /// Returns the native UMA provider, or nullptr when inactive.
+    VideoCore::UnifiedGuestMemory* GetUnifiedGuestMemory() const {
+        return unified_guest_memory.get();
+    }
+
     /// Returns if the device is an integrated GPU.
     bool IsIntegrated() const {
         return properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
@@ -516,6 +536,9 @@ private:
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
     bool maintenance_8{};
+    bool external_memory_host{};
+    bool external_memory_dma_buf{};
+    std::unique_ptr<VideoCore::UnifiedGuestMemory> unified_guest_memory;
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
