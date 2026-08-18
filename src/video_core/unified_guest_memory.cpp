@@ -59,10 +59,11 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     // stale simulation feedback. The whole backing must fit in the heap.
     constexpr u64 heap_headroom = 1_GB;
     if (chosen_heap < backing_size + heap_headroom) {
-        LOG_WARNING(Render_Vulkan,
-                    "Native UMA: heap {:#x} cannot cover backing {:#x} plus headroom; "
-                    "raise the GTT size (amdgpu.gttsize) to enable",
-                    chosen_heap, backing_size);
+        LOG_CRITICAL(Render_Vulkan,
+                     "Native UMA requested but NOT ACTIVE: heap {:#x} cannot cover backing "
+                     "{:#x} plus headroom. Raise the GTT size (e.g. amdgpu.gttsize=12288 "
+                     "kernel argument) to enable; running without unified memory.",
+                     chosen_heap, backing_size);
         return;
     }
 
