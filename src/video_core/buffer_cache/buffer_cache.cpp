@@ -155,22 +155,16 @@ bool BufferCache::TryRatchetRelease(VAddr device_addr, u64 size) {
     const VAddr win_begin = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     const VAddr win_end = Common::AlignUp(device_addr + size, CACHING_PAGESIZE);
     const u64 win_size = win_end - win_begin;
-    constexpr u64 DenyPageShift = 16;
     constexpr u32 MaxGenerations = 4;
-    const VAddr deny_first = win_begin >> DenyPageShift;
-    const VAddr deny_last = (win_end - 1) >> DenyPageShift;
-    for (VAddr page = deny_first; page <= deny_last; ++page) {
-        if (const auto it = ratchet_generations.find(page);
-            it != ratchet_generations.end() && it->second >= MaxGenerations) {
-            return false;
-        }
+    // Range-granular deny bookkeeping: giant clamped binds would otherwise
+    // walk thousands of per-page entries on every rejected bind.
+    if (ratchet_denied.Intersects(device_addr, size)) {
+        return false;
     }
     const auto win_phys = UmaResolve(win_begin, win_size);
     if (!win_phys) {
         // Uncoverable or crossing a mapping seam: permanent legacy.
-        for (VAddr page = deny_first; page <= deny_last; ++page) {
-            ratchet_generations[page] = MaxGenerations;
-        }
+        ratchet_denied.Add(win_begin, win_size);
         const u64 n = uma_migration_denies.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((n & (n - 1)) == 0) {
             LOG_INFO(Render_Vulkan, "Native UMA migration deny #{}: addr={:#x} size={:#x}", n,
@@ -185,8 +179,11 @@ bool BufferCache::TryRatchetRelease(VAddr device_addr, u64 size) {
         return false;
     }
     pending_release.Subtract(win_begin, win_size);
-    for (VAddr page = deny_first; page <= deny_last; ++page) {
-        ++ratchet_generations[page];
+    const u32 generation = ++ratchet_generations[win_begin];
+    if (generation >= MaxGenerations) {
+        // A legacy writer keeps re-marking this window; migrating it every
+        // cadence is worse than leaving it legacy.
+        ratchet_denied.Add(win_begin, win_size);
     }
 
     // Gather the legacy-held pieces. CPU-dirty pages are skipped: guest RAM

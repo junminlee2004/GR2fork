@@ -358,6 +358,7 @@ private:
     std::atomic<u64> uma_migration_denies{};
     SplitRangeMap<u64> unified_pending;
     RangeSet pending_release;
+    RangeSet ratchet_denied;
     std::map<VAddr, u32> ratchet_generations;
     boost::container::small_vector<std::pair<VAddr, u32>, 8> written_serves;
     std::mutex uma_phys_mutex;
