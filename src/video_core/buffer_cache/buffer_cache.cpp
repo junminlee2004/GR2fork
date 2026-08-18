@@ -365,7 +365,10 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
-        gpu_modified_ranges.Add(dst, num_bytes);
+        {
+            std::scoped_lock lk{gpu_modified_mutex};
+            gpu_modified_ranges.Add(dst, num_bytes);
+        }
         if (HairDiagHit(dst, num_bytes)) {
             static std::atomic<u64> diag_copy{0};
             const u64 diag_n = diag_copy.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -461,7 +464,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        {
+            std::scoped_lock lk{gpu_modified_mutex};
+            gpu_modified_ranges.Add(device_addr, size);
+        }
         if (HairDiagHit(device_addr, size)) {
             static std::atomic<u64> diag_mark{0};
             const u64 diag_n = diag_mark.fetch_add(1, std::memory_order_relaxed) + 1;
