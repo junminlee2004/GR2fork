@@ -1672,6 +1672,17 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
+void Rasterizer::LandGdsRange(VAddr dst, u32 gds_offset, u32 num_bytes) {
+    // Host fallback for GDS exports whose destination the unified wrapper
+    // could not cover: at fence completion the mapped GDS buffer holds the
+    // final values, so guest RAM can be written directly.
+    const u8* gds = buffer_cache.GetGdsBuffer()->mapped_data.data() + gds_offset;
+    auto* memory = Core::Memory::Instance();
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(dst), gds, num_bytes)) {
+        std::memcpy(std::bit_cast<void*>(dst), gds, num_bytes);
+    }
+}
+
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.

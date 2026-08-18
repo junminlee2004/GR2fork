@@ -702,10 +702,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                     });
                 };
-                if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0 &&
-                    event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
-                    rasterizer->DeferUnifiedFence(
-                        [signal_eos, cmd = *event_eos] { signal_eos(cmd); });
+                if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0) {
+                    if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+                        ASSERT(event_eos->size == 1);
+                        // Sample GDS at fence completion instead of stalling
+                        // the whole pipeline with a parse-time Finish.
+                        rasterizer->DeferUnifiedFence([rz = rasterizer, cmd = *event_eos] {
+                            const u32 value = rz->ReadDataFromGds(cmd.gds_index);
+                            auto* memory = Core::Memory::Instance();
+                            u32* const address = cmd.Address();
+                            if (!memory->TryWriteBacking(address, &value, sizeof(value))) {
+                                *address = value;
+                            }
+                        });
+                    } else {
+                        rasterizer->DeferUnifiedFence(
+                            [signal_eos, cmd = *event_eos] { signal_eos(cmd); });
+                    }
                     break;
                 }
                 signal_eos(*event_eos);
@@ -1176,13 +1189,48 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
+            const auto write_backing = [](void* address, const void* data, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                if (!memory->TryWriteBacking(address, data, num_bytes)) {
+                    memcpy(address, data, num_bytes);
+                }
+            };
+            const auto signal_irq = [pipe_id = queue.pipe_id] {
+                Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+            };
+            if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0) {
+                // A parse-time signal wakes the CPU consumer before the
+                // fenced dispatches executed; land label and IRQ together
+                // at completion, data strictly before interrupt.
+                if (release_mem->data_sel.Value() == DataSelect::GdsMemStore) {
+                    // The GDS export is stream-ordered GPU work: record the
+                    // copy now, defer only the publication.
+                    const bool landed = rasterizer->CopyBuffer(
+                        release_mem->Address<VAddr>(), release_mem->gds_index,
+                        release_mem->num_dw * sizeof(u32), false, true);
+                    rasterizer->DeferUnifiedFence(
+                        [rz = rasterizer, signal_irq, cmd = *release_mem, landed] {
+                            if (!landed) {
+                                rz->LandGdsRange(cmd.Address<VAddr>(), cmd.gds_index,
+                                                 cmd.num_dw * sizeof(u32));
+                            }
+                            cmd.SignalFence([](void*, const void*, u32) {}, signal_irq,
+                                            [](VAddr, u16, u16) {});
+                        });
+                } else {
+                    rasterizer->DeferUnifiedFence([write_backing, signal_irq,
+                                                   cmd = *release_mem] {
+                        cmd.SignalFence(write_backing, signal_irq, [](VAddr, u16, u16) {});
+                    });
+                }
+                break;
+            }
+            release_mem->SignalFence(write_backing, signal_irq,
+                                     [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                                         rasterizer->CopyBuffer(dst, gds_index,
+                                                                num_dwords * sizeof(u32), false,
+                                                                true);
+                                     });
             break;
         }
         case PM4ItOpcode::EventWrite: {
