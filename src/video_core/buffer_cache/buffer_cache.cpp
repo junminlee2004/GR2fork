@@ -742,6 +742,16 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             uma_gpu_owned = false;
         }
     }
+    if (uma_eligible && !uma_gpu_owned && (EmulatorSettings.GetNativeUmaMode() & 16) &&
+        !is_written && !is_texel_buffer && size <= CACHING_PAGESIZE) {
+        // Placement fork (bit 4): small read-only binds return to the
+        // device-local stream ring. Settle makes the bind-time snapshot
+        // safe against in-flight unified writes; the residual risk is the
+        // same snapshot-staleness mainline ships with.
+        SettleIfUnifiedPending(device_addr, size);
+        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        return {&stream_buffer, offset};
+    }
     if (uma_eligible && !uma_gpu_owned) {
         if (const auto phys = UmaResolve(device_addr, size)) {
             const u64 n = uma_hits.fetch_add(1, std::memory_order_relaxed) + 1;
