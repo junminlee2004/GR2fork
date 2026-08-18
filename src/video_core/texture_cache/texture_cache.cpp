@@ -66,18 +66,16 @@ bool TextureCache::UseUmaWriteback() const {
 }
 
 bool TextureCache::IsUmaWritebackCandidate(const Image& image) const {
-    // v1 scope: color, single sample, real guest backing. Linear surfaces
-    // are always cheap; tiled ones go through the tiler compute, so only
-    // small CPU-feedback-sized surfaces qualify - full-size render targets
-    // are never consumed by the CPU and would burn bandwidth every fence.
-    constexpr u64 TiledWritebackLimit = 8_MB;
-    if (image.info.guest_address == 0 || image.info.props.is_depth || image.info.num_samples != 1) {
-        return false;
-    }
-    if (!image.info.props.is_tiled || image.info.size.width <= 8) {
-        return true;
-    }
-    return image.info.guest_size <= TiledWritebackLimit;
+    // v1 scope: small low-bit-depth color surfaces - the CPU-feedback shape
+    // (visibility maps, classification grids, composite masks). Anything
+    // wider is an ordinary render target the CPU never consumes; writing
+    // those back at every fence drowns the frame in copies and, for tiled
+    // layouts, in per-writeback scratch allocations.
+    constexpr u64 WritebackSizeLimit = 8_MB;
+    constexpr u32 WritebackMaxBits = 16;
+    return image.info.guest_address != 0 && !image.info.props.is_depth &&
+           image.info.num_samples == 1 && image.info.num_bits <= WritebackMaxBits &&
+           image.info.guest_size <= WritebackSizeLimit;
 }
 
 void TextureCache::ProcessDownloadImages() {
@@ -151,6 +149,9 @@ void TextureCache::WritebackImageUma(ImageId image_id) {
     // straight download and for tiled ones via the tiler compute pass.
     tile_manager.TileImage(image, copies, wrapper, *phys, copy_size);
     buffer_cache.MarkUnifiedSelfSynced(*phys, image.info.guest_size);
+    // Legacy consumers of the range (image re-uploads, staging snapshots)
+    // must settle against this in-flight write.
+    buffer_cache.TagUnifiedPending(image.info.guest_address, image.info.guest_size);
     const u64 n = uma_wb.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((n & (n - 1)) == 0) {
         LOG_INFO(Render_Vulkan, "Native UMA image write-back #{}: addr={:#x} size={:#x} tiled={}",
@@ -1079,7 +1080,7 @@ void TextureCache::GarbageCollectImages() {
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        const bool uma_wb_evict = UseUmaWriteback();
+        const bool uma_wb_evict = UseUmaWriteback() && IsUmaWritebackCandidate(image);
         if (tiled && download && !uma_wb_evict) {
             // This is a workaround for now. We can't handle non-linear image downloads.
             return false;

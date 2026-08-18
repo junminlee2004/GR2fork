@@ -210,6 +210,12 @@ public:
     /// predate the tick the draw actually recorded into.
     void RetagWrittenServes();
 
+public:
+    /// Registers an externally recorded unified write (image write-back)
+    /// so legacy consumers of the range settle against it.
+    void TagUnifiedPending(VAddr addr, u64 size);
+
+private:
 private:
     void RemovePhysRange(VAddr addr, u64 size);
 

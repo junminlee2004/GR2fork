@@ -260,6 +260,11 @@ bool BufferCache::TryRatchetRelease(VAddr device_addr, u64 size) {
     return true;
 }
 
+void BufferCache::TagUnifiedPending(VAddr addr, u64 size) {
+    unified_pending.Subtract(addr, size);
+    unified_pending.Add(addr, size, scheduler.CurrentTick());
+}
+
 void BufferCache::RetagWrittenServes() {
     if (written_serves.empty()) {
         return;
