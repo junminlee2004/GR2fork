@@ -249,6 +249,11 @@ public:
     /// Resolves a guest range to its unified wrapper physical offset.
     [[nodiscard]] std::optional<u64> UmaResolve(VAddr device_addr, u64 size);
 
+    /// Returns the unified wrapper buffer handle, or null when inactive.
+    [[nodiscard]] vk::Buffer UnifiedWrapperHandle() const {
+        return unified_wrapper ? unified_wrapper->Handle() : vk::Buffer{};
+    }
+
     /// Obtains a buffer for the specified region.
     [[nodiscard]] std::pair<Buffer*, u64> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,

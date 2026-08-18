@@ -60,12 +60,105 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 
 TextureCache::~TextureCache() = default;
 
+bool TextureCache::UseUmaWriteback() const {
+    const u32 mode = EmulatorSettings.GetNativeUmaMode();
+    return mode != 0 && !(mode & 64);
+}
+
+bool TextureCache::IsUmaWritebackCandidate(const Image& image) const {
+    // v1 scope: color, single sample, real guest backing. Linear surfaces
+    // are always cheap; tiled ones go through the tiler compute, so only
+    // small CPU-feedback-sized surfaces qualify - full-size render targets
+    // are never consumed by the CPU and would burn bandwidth every fence.
+    constexpr u64 TiledWritebackLimit = 8_MB;
+    if (image.info.guest_address == 0 || image.info.props.is_depth ||
+        image.info.num_samples != 1) {
+        return false;
+    }
+    if (!image.info.props.is_tiled || image.info.size.width <= 8) {
+        return true;
+    }
+    return image.info.guest_size <= TiledWritebackLimit;
+}
+
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    const bool uma = UseUmaWriteback();
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        if (uma) {
+            WritebackImageUma(image_id);
+        } else {
+            DownloadImageMemory(image_id, true);
+        }
     }
     download_images.clear();
+}
+
+void TextureCache::WritebackImageUma(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    const auto phys = buffer_cache.UmaResolve(image.info.guest_address, image.info.guest_size);
+    const vk::Buffer wrapper = buffer_cache.UnifiedWrapperHandle();
+    if (!phys || !wrapper) {
+        const u64 n = uma_wb_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Native UMA image write-back fallback #{}: addr={:#x} size={:#x}", n,
+                     image.info.guest_address, image.info.guest_size);
+        }
+        return;
+    }
+    boost::container::small_vector<vk::BufferImageCopy, 8> copies;
+    u32 copy_size = 0;
+    for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
+        const auto& mip_info = image.info.mips_layout[mip];
+        const u32 width = std::max(image.info.size.width >> mip, 1u);
+        const u32 height = std::max(image.info.size.height >> mip, 1u);
+        const u32 depth = std::max(image.info.size.depth >> mip, 1u);
+        if (mip_info.offset + mip_info.size > image.info.guest_size) {
+            break;
+        }
+        copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = mip_info.offset,
+            .bufferRowLength = mip_info.pitch,
+            .bufferImageHeight = mip_info.height,
+            .imageSubresource{
+                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, depth},
+        });
+        copy_size += mip_info.size;
+    }
+    if (copies.empty() || copy_size == 0) {
+        return;
+    }
+    scheduler.EndRendering();
+    if (auto barrier = buffer_cache.RequestUnifiedBarrier(*phys, image.info.guest_size,
+                                                          vk::AccessFlagBits2::eTransferWrite,
+                                                          vk::PipelineStageFlagBits2::eTransfer,
+                                                          true)) {
+        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier.value(),
+        });
+    }
+    // TileImage reproduces the guest byte layout for linear surfaces via a
+    // straight download and for tiled ones via the tiler compute pass.
+    tile_manager.TileImage(image, copies, wrapper, *phys, copy_size);
+    buffer_cache.MarkUnifiedSelfSynced(*phys, image.info.guest_size);
+    const u64 n = uma_wb.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_INFO(Render_Vulkan, "Native UMA image write-back #{}: addr={:#x} size={:#x} tiled={}",
+                 n, image.info.guest_address, image.info.guest_size,
+                 image.info.props.is_tiled != 0);
+    }
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
@@ -622,8 +715,10 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
+        const bool legacy_enroll = readback_linear_images &&
+                                   (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+                                   image.info.guest_address != 0;
+        if (legacy_enroll || (UseUmaWriteback() && IsUmaWritebackCandidate(image))) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -635,7 +730,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    const bool legacy_enroll =
+        readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8);
+    if (legacy_enroll || (UseUmaWriteback() && IsUmaWritebackCandidate(image))) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
@@ -984,7 +1081,8 @@ void TextureCache::GarbageCollectImages() {
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
+        const bool uma_wb_evict = UseUmaWriteback();
+        if (tiled && download && !uma_wb_evict) {
             // This is a workaround for now. We can't handle non-linear image downloads.
             return false;
         }
@@ -992,7 +1090,11 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         if (download) {
-            DownloadImageMemory(image_id);
+            if (uma_wb_evict) {
+                WritebackImageUma(image_id);
+            } else {
+                DownloadImageMemory(image_id);
+            }
         }
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
