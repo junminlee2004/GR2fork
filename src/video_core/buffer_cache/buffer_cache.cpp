@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <xxhash.h>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -441,6 +442,31 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
+    if (!is_written && HairDiagHit(device_addr, size) && size >= 1_MB) {
+        // HAIRDIAG3: torn-snapshot detector. The slot upload copies the
+        // block at parse time; if the hash changes by the time the
+        // submission leaves for the GPU, live execution-time reads (what
+        // real hardware and native UMA do) would have seen different
+        // bytes than this snapshot delivered.
+        static std::atomic<u64> diag_hash_n{0};
+        const u64 hash_n = diag_hash_n.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (hash_n <= 128 || (hash_n & (hash_n - 1)) == 0) {
+            const u64 span = std::min<u64>(size, 1_MB);
+            const u64 h0 = XXH3_64bits(reinterpret_cast<const void*>(device_addr), span);
+            scheduler.DeferOperation([device_addr, span, h0, hash_n] {
+                const u64 h1 = XXH3_64bits(reinterpret_cast<const void*>(device_addr), span);
+                if (h1 != h0) {
+                    LOG_INFO(Render_Vulkan,
+                             "HAIRDIAG3 TORN snapshot #{}: addr={:#x} span={:#x} changed "
+                             "between parse and submit",
+                             hash_n, device_addr, span);
+                } else if (hash_n <= 32) {
+                    LOG_INFO(Render_Vulkan, "HAIRDIAG3 intact snapshot #{}: addr={:#x}", hash_n,
+                             device_addr);
+                }
+            });
+        }
+    }
     if (!is_written && HairDiagHit(device_addr, size)) {
         static std::atomic<u64> diag_read{0};
         const u64 diag_n = diag_read.fetch_add(1, std::memory_order_relaxed) + 1;
