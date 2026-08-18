@@ -238,8 +238,12 @@ public:
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
 
-    /// Performs buffer to buffer data copy on the GPU.
-    void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// Performs buffer to buffer data copy on the GPU. Returns true when the
+    /// destination bytes land in guest RAM (host copy or unified wrapper).
+    bool CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+
+    /// Resolves a guest range to its unified wrapper physical offset.
+    [[nodiscard]] std::optional<u64> UmaResolve(VAddr device_addr, u64 size);
 
     /// Obtains a buffer for the specified region.
     [[nodiscard]] std::pair<Buffer*, u64> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
@@ -329,6 +333,7 @@ private:
     std::atomic<u64> uma_barrier_emits{};
     std::atomic<u64> uma_settles{};
     std::atomic<u64> uma_written_serves{};
+    std::atomic<u64> uma_cp_lands{};
     SplitRangeMap<u64> unified_pending;
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;

@@ -1661,8 +1661,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
 }
 
-void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
+bool Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    return buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {

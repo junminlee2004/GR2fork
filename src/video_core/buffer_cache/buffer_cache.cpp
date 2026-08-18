@@ -153,6 +153,27 @@ void BufferCache::TrimLandedUnifiedWrites() {
     }
 }
 
+std::optional<u64> BufferCache::UmaResolve(VAddr device_addr, u64 size) {
+    if (!unified_wrapper) {
+        return std::nullopt;
+    }
+    std::scoped_lock lk{uma_phys_mutex};
+    auto it = uma_phys_map.upper_bound(device_addr);
+    if (it == uma_phys_map.begin()) {
+        return std::nullopt;
+    }
+    --it;
+    const u64 delta = device_addr - it->first;
+    if (delta >= it->second.second || it->second.second - delta < size) {
+        return std::nullopt;
+    }
+    const u64 phys = it->second.first + delta;
+    if (phys + size > unified_wrapper->SizeBytes()) {
+        return std::nullopt;
+    }
+    return phys;
+}
+
 std::optional<vk::BufferMemoryBarrier2> BufferCache::RequestUnifiedBarrier(
     u64 offset, u64 size, vk::AccessFlags2 access, vk::PipelineStageFlagBits2 stage,
     bool is_write) {
@@ -435,84 +456,118 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     buffer->Fill(offset, num_bytes, value);
 }
 
-void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    if (!src_gds) {
-        SettleIfUnifiedPending(src, num_bytes);
-    }
-    if (!dst_gds) {
-        SettleIfUnifiedPending(dst, num_bytes);
-    }
+bool BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            SettleIfUnifiedPending(src, num_bytes);
+            SettleIfUnifiedPending(dst, num_bytes);
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
-            return;
+            return true;
         }
-        // Without a readback there's nothing we can do with this
-        // Fallback to creating dst buffer on GPU to at least have this data there
+        // The destination can still land in guest RAM when the unified
+        // wrapper covers it: record the copy against the wrapper at the
+        // physical offset and the CPU sees it at fence granularity.
     }
+    const bool uma_write = EmulatorSettings.GetNativeUmaMode() & 2;
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
-    auto& src_buffer = [&] -> const Buffer& {
-        if (src_gds) {
-            return gds_buffer;
+
+    boost::container::static_vector<vk::BufferMemoryBarrier2, 4> pre_barriers;
+    const Buffer* src_buffer{};
+    u64 src_offset{};
+    if (src_gds) {
+        src_buffer = &gds_buffer;
+        src_offset = src;
+    } else if (const auto phys = !IsRegionGpuModified(src, num_bytes)
+                                     ? UmaResolve(src, num_bytes)
+                                     : std::nullopt) {
+        // Wrapper read: pending unified writes to the source are GPU-ordered
+        // ahead of this copy, so no settle is needed.
+        src_buffer = &*unified_wrapper;
+        src_offset = *phys;
+        if (auto barrier = RequestUnifiedBarrier(src_offset, num_bytes,
+                                                 vk::AccessFlagBits2::eTransferRead,
+                                                 vk::PipelineStageFlagBits2::eTransfer, false)) {
+            pre_barriers.push_back(*barrier);
         }
-        const auto buffer_id = FindBuffer(src, num_bytes);
-        auto& buffer = slot_buffers[buffer_id];
+    } else {
+        SettleIfUnifiedPending(src, num_bytes);
+        auto& buffer = slot_buffers[FindBuffer(src, num_bytes)];
         SynchronizeBuffer(buffer, src, num_bytes, false, true);
-        return buffer;
-    }();
-    auto& dst_buffer = [&] -> const Buffer& {
-        if (dst_gds) {
-            return gds_buffer;
+        src_buffer = &buffer;
+        src_offset = buffer.Offset(src);
+    }
+
+    const Buffer* dst_buffer{};
+    u64 dst_offset{};
+    bool landed = false;
+    if (dst_gds) {
+        dst_buffer = &gds_buffer;
+        dst_offset = dst;
+    } else if (const auto phys = (uma_write && !IsRegionGpuModified(dst, num_bytes))
+                                     ? UmaResolve(dst, num_bytes)
+                                     : std::nullopt) {
+        dst_buffer = &*unified_wrapper;
+        dst_offset = *phys;
+        landed = true;
+        unified_pending.Subtract(dst, num_bytes);
+        unified_pending.Add(dst, num_bytes, scheduler.CurrentTick());
+        if (auto barrier = RequestUnifiedBarrier(dst_offset, num_bytes,
+                                                 vk::AccessFlagBits2::eTransferWrite,
+                                                 vk::PipelineStageFlagBits2::eTransfer, true)) {
+            pre_barriers.push_back(*barrier);
         }
-        const auto buffer_id = FindBuffer(dst, num_bytes);
-        auto& buffer = slot_buffers[buffer_id];
+    } else {
+        // Settle before the record-time sync below snapshots guest RAM, so
+        // an in-flight unified write cannot land after and invert order.
+        SettleIfUnifiedPending(dst, num_bytes);
+        auto& buffer = slot_buffers[FindBuffer(dst, num_bytes)];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
         gpu_modified_ranges.Add(dst, num_bytes);
-        return buffer;
-    }();
+        dst_buffer = &buffer;
+        dst_offset = buffer.Offset(dst);
+    }
+
     const vk::BufferCopy region = {
-        .srcOffset = src_buffer.Offset(src),
-        .dstOffset = dst_buffer.Offset(dst),
+        .srcOffset = src_offset,
+        .dstOffset = dst_offset,
         .size = num_bytes,
     };
-    const vk::BufferMemoryBarrier2 buf_barriers_before[2] = {
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .buffer = dst_buffer.Handle(),
-            .offset = dst_buffer.Offset(dst),
-            .size = num_bytes,
-        },
-        {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-            .buffer = src_buffer.Handle(),
-            .offset = src_buffer.Offset(src),
-            .size = num_bytes,
-        },
-    };
+    pre_barriers.push_back(vk::BufferMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = dst_buffer->Handle(),
+        .offset = dst_offset,
+        .size = num_bytes,
+    });
+    pre_barriers.push_back(vk::BufferMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = src_buffer->Handle(),
+        .offset = src_offset,
+        .size = num_bytes,
+    });
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 2,
-        .pBufferMemoryBarriers = buf_barriers_before,
+        .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+        .pBufferMemoryBarriers = pre_barriers.data(),
     });
-    cmdbuf.copyBuffer(src_buffer.Handle(), dst_buffer.Handle(), region);
+    cmdbuf.copyBuffer(src_buffer->Handle(), dst_buffer->Handle(), region);
     const vk::BufferMemoryBarrier2 buf_barriers_after[2] = {
         {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-            .buffer = dst_buffer.Handle(),
-            .offset = dst_buffer.Offset(dst),
+            .buffer = dst_buffer->Handle(),
+            .offset = dst_offset,
             .size = num_bytes,
         },
         {
@@ -520,8 +575,8 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
             .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-            .buffer = src_buffer.Handle(),
-            .offset = src_buffer.Offset(src),
+            .buffer = src_buffer->Handle(),
+            .offset = src_offset,
             .size = num_bytes,
         },
     };
@@ -530,6 +585,16 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         .bufferMemoryBarrierCount = 2,
         .pBufferMemoryBarriers = buf_barriers_after,
     });
+    if (landed) {
+        // The explicit post barrier already published the write.
+        MarkUnifiedSelfSynced(dst_offset, num_bytes);
+        const u64 n = uma_cp_lands.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA CP-write landed #{}: dst={:#x} size={:#x}", n, dst,
+                     num_bytes);
+        }
+    }
+    return landed;
 }
 
 std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
@@ -541,21 +606,7 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     if (unified_wrapper && !is_texel_buffer &&
         (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2)) &&
         !IsRegionGpuModified(device_addr, size)) {
-        const auto lookup = [&]() -> std::optional<PAddr> {
-            std::scoped_lock lk{uma_phys_mutex};
-            auto it = uma_phys_map.upper_bound(device_addr);
-            if (it == uma_phys_map.begin()) {
-                return std::nullopt;
-            }
-            --it;
-            const u64 delta = device_addr - it->first;
-            if (delta >= it->second.second || it->second.second - delta < size) {
-                return std::nullopt;
-            }
-            return it->second.first + delta;
-        };
-        if (const auto phys = lookup();
-            phys && *phys + size <= unified_wrapper->SizeBytes()) {
+        if (const auto phys = UmaResolve(device_addr, size)) {
             const u64 n = uma_hits.fetch_add(1, std::memory_order_relaxed) + 1;
             // Self-check: a correct resolution refers to the same physical
             // pages, so guest VA and mirror+phys can never differ.
