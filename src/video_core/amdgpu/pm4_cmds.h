@@ -934,22 +934,26 @@ struct PM4CmdReleaseMem {
         return data_lo | u64(data_hi) << 32;
     }
 
-    void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+    void SignalFence(auto&& write_mem, auto&& signal_irq, auto&& gds_to_mem) const {
         switch (data_sel.Value()) {
         case DataSelect::Data32Low: {
-            *Address<u32*>() = DataDWord();
+            const u32 value = DataDWord();
+            write_mem(Address<void*>(), &value, sizeof(value));
             break;
         }
         case DataSelect::Data64: {
-            *Address<u64*>() = DataQWord();
+            const u64 value = DataQWord();
+            write_mem(Address<void*>(), &value, sizeof(value));
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            const u64 value = GetGpuClock64();
+            write_mem(Address<void*>(), &value, sizeof(value));
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            const u64 value = GetGpuPerfCounter();
+            write_mem(Address<void*>(), &value, sizeof(value));
             break;
         }
         case DataSelect::GdsMemStore: {
