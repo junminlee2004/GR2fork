@@ -195,6 +195,11 @@ public:
         return flexible_base;
     }
 
+    /// Direct memory size for the running title's memory mode, computed
+    /// the same way SetupMemoryRegions configures it - valid even before
+    /// that configuration runs.
+    u64 GetConfiguredDirectSize() const;
+
     /// Native UMA: physical addresses below the split prefer the garlic
     /// (device-local) pool; allocations declare their bus with the sce
     /// memory type, and the allocator places them accordingly.

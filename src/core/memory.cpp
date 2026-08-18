@@ -102,6 +102,27 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
              total_flexible_size, total_direct_size);
 }
 
+u64 MemoryManager::GetConfiguredDirectSize() const {
+    // Mirrors the SetupMemoryRegions computation without mutating state,
+    // for callers that run before the linker configures the regions.
+    const bool is_neo = ::Libraries::Kernel::sceKernelIsNeoMode();
+    u64 total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_PRO : ORBIS_KERNEL_TOTAL_MEM;
+    if (EmulatorSettings.IsDevKit()) {
+        total_size = is_neo ? ORBIS_KERNEL_TOTAL_MEM_DEV_PRO : ORBIS_KERNEL_TOTAL_MEM_DEV;
+    }
+    u64 flexible_size = ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE;
+    const s32 extra_dmem = EmulatorSettings.GetExtraDmemInMBytes();
+    if (extra_dmem != 0) {
+        total_size += extra_dmem * 1_MB;
+    }
+    const s32 extra_fmem = EmulatorSettings.GetExtraFmemInMBytes();
+    if (extra_fmem != 0) {
+        total_size += extra_fmem * 1_MB;
+        flexible_size += extra_fmem * 1_MB;
+    }
+    return total_size - flexible_size;
+}
+
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     static constexpr u64 MinSizeToClamp = 1_GB;
     // Dont bother with clamping if the size is small so we dont pay a map lookup on every buffer.

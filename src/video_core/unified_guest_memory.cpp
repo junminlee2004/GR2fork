@@ -24,6 +24,10 @@ constexpr vk::BufferUsageFlags WindowUsage =
 // the swapchain and pipelines.
 constexpr u64 RendererCarveReserve = 2_GB;
 constexpr u64 OnionHeapHeadroom = 1_GB;
+// Direct memory kept out of the garlic pool so the game's own CPU-side
+// (WB_ONION) allocations land on cached pages instead of spilling onto
+// write-combined ones.
+constexpr u64 OnionDirectReserve = 1_GB + 512_MB;
 
 UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
 #ifdef _WIN32
@@ -45,7 +49,7 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     // The provider is created at Gnm initialization, after the game's
     // memory regions are configured, so these are the real totals the
     // title can address - not the dev-kit maximum.
-    const u64 direct_total = Common::AlignUp(memory_manager->GetTotalDirectSize(), 64_KB);
+    const u64 direct_total = Common::AlignUp(memory_manager->GetConfiguredDirectSize(), 64_KB);
     const PAddr flex_base = memory_manager->GetFlexibleBase();
     const u64 flex_size = Common::AlignUp(memory_manager->GetTotalFlexibleSize(), 64_KB);
 
@@ -92,9 +96,10 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     // after the renderer's own needs; the remainder plus the flexible band
     // is the onion pool in host-cached memory.
     u64 garlic_pool = 0;
-    if (garlic_type >= 0 && garlic_heap > RendererCarveReserve) {
-        garlic_pool =
-            Common::AlignDown(std::min(direct_total, garlic_heap - RendererCarveReserve), 64_KB);
+    if (garlic_type >= 0 && garlic_heap > RendererCarveReserve &&
+        direct_total > OnionDirectReserve) {
+        garlic_pool = Common::AlignDown(
+            std::min(direct_total - OnionDirectReserve, garlic_heap - RendererCarveReserve), 64_KB);
     }
     const u64 onion_pool = (direct_total - garlic_pool) + flex_size;
     if (onion_heap < onion_pool + OnionHeapHeadroom) {
@@ -202,7 +207,9 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     if (garlic_pool != 0) {
         regions.push_back({0, garlic_pool, garlic_fd, 0});
     }
-    regions.push_back({garlic_pool, direct_total - garlic_pool, onion_fd, 0});
+    if (direct_total > garlic_pool) {
+        regions.push_back({garlic_pool, direct_total - garlic_pool, onion_fd, 0});
+    }
     regions.push_back({flex_base, flex_size, onion_fd, direct_total - garlic_pool});
     if (!aspace.AdoptUnifiedRegions(regions)) {
         if (garlic_pool == 0) {
