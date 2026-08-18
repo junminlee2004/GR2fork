@@ -119,6 +119,40 @@ void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
     RemovePhysRange(addr, size);
 }
 
+void BufferCache::SettleUnifiedWrites(VAddr device_addr, u64 size) {
+    u64 wait_tick = 0;
+    unified_pending.ForEachInRange(device_addr, size,
+                                   [&](VAddr, VAddr, u64 tick) { //
+                                       wait_tick = std::max(wait_tick, tick);
+                                   });
+    if (wait_tick == 0) {
+        return;
+    }
+    scheduler.Wait(wait_tick);
+    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    unified_pending.Subtract(device_addr, size);
+    const u64 n = uma_settles.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_INFO(Render_Vulkan, "Native UMA settle #{}: addr={:#x} size={:#x} tick={}", n,
+                 device_addr, size, wait_tick);
+    }
+}
+
+void BufferCache::TrimLandedUnifiedWrites() {
+    boost::container::small_vector<std::pair<VAddr, u64>, 64> landed;
+    unified_pending.ForEach([&](VAddr addr, VAddr end, u64 tick) {
+        if (scheduler.IsFree(tick)) {
+            landed.emplace_back(addr, end - addr);
+        }
+    });
+    for (const auto& [addr, len] : landed) {
+        // The legacy slot for the range may still hold pre-write bytes;
+        // marking CPU-dirty forces the next legacy sync to re-read RAM.
+        memory_tracker->MarkRegionAsCpuModified(addr, len);
+        unified_pending.Subtract(addr, len);
+    }
+}
+
 std::optional<vk::BufferMemoryBarrier2> BufferCache::RequestUnifiedBarrier(
     u64 offset, u64 size, vk::AccessFlags2 access, vk::PipelineStageFlagBits2 stage,
     bool is_write) {
@@ -368,6 +402,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
+        SettleIfUnifiedPending(address, num_bytes);
         if (!IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
@@ -401,6 +436,12 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
 }
 
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!src_gds) {
+        SettleIfUnifiedPending(src, num_bytes);
+    }
+    if (!dst_gds) {
+        SettleIfUnifiedPending(dst, num_bytes);
+    }
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -529,7 +570,13 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 }
             }
             if (is_written) {
-                unified_gpu_ranges.Add(device_addr, size);
+                // Subtract first so a newer tick replaces any older tag.
+                unified_pending.Subtract(device_addr, size);
+                unified_pending.Add(device_addr, size, scheduler.CurrentTick());
+                const u64 w = uma_written_serves.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((w & 4095) == 0) {
+                    TrimLandedUnifiedWrites();
+                }
             }
             return {&*unified_wrapper, *phys};
         }
@@ -546,6 +593,9 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                      device_addr, size);
         }
     }
+    // Legacy service consumes guest RAM; in-flight unified writes to the
+    // range must land first or the bytes read here are pre-write.
+    SettleIfUnifiedPending(device_addr, size);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
@@ -563,6 +613,7 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 }
 
 std::pair<Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+    SettleIfUnifiedPending(gpu_addr, size);
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {
@@ -937,6 +988,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
 }
 
 void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
+    SettleIfUnifiedPending(device_addr, size);
     const VAddr device_addr_end = device_addr + size;
     ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
         RENDERER_TRACE;

@@ -208,6 +208,20 @@ public:
 private:
     void RemovePhysRange(VAddr addr, u64 size);
 
+    /// Waits for in-flight unified wrapper writes covering the range, then
+    /// marks it CPU-dirty: guest RAM holds the GPU result and legacy
+    /// machinery must re-read it.
+    void SettleUnifiedWrites(VAddr device_addr, u64 size);
+
+    void SettleIfUnifiedPending(VAddr device_addr, u64 size) {
+        if (unified_wrapper && unified_pending.Intersects(device_addr, size)) {
+            SettleUnifiedWrites(device_addr, size);
+        }
+    }
+
+    /// Drops pending-write entries whose tick the GPU already completed.
+    void TrimLandedUnifiedWrites();
+
 public:
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
@@ -313,7 +327,9 @@ private:
     std::atomic<u64> uma_fallbacks{};
     std::atomic<u64> uma_guard_rejects{};
     std::atomic<u64> uma_barrier_emits{};
-    RangeSet unified_gpu_ranges;
+    std::atomic<u64> uma_settles{};
+    std::atomic<u64> uma_written_serves{};
+    SplitRangeMap<u64> unified_pending;
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
     TextureCache& texture_cache;
