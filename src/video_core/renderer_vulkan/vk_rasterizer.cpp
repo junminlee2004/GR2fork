@@ -708,9 +708,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     buffer_barriers.emplace_back(*barrier);
                 }
             } else if (auto barrier =
-                           vk_buffer->GetBarrier(desc.is_written
-                                                     ? vk::AccessFlagBits2::eShaderWrite
-                                                     : vk::AccessFlagBits2::eShaderRead,
+                           vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
+                                                                 : vk::AccessFlagBits2::eShaderRead,
                                                  vk::PipelineStageFlagBits2::eAllCommands)) {
                 buffer_barriers.emplace_back(*barrier);
             }

@@ -837,8 +837,8 @@ struct AddressSpace::Impl {
             static std::atomic<u64> failures{0};
             const u64 n = ++failures;
             if ((n & (n - 1)) == 0) {
-                LOG_ERROR(Kernel_Vmm, "mprotect failure #{}: addr={:#x} size={:#x} flags={}: {}",
-                          n, virtual_addr, size, flags, strerror(errno));
+                LOG_ERROR(Kernel_Vmm, "mprotect failure #{}: addr={:#x} size={:#x} flags={}: {}", n,
+                          virtual_addr, size, flags, strerror(errno));
             }
         }
     }

@@ -148,8 +148,9 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     dmabuf_fd = fd;
     total_size = backing_size;
     active = true;
-    LOG_INFO(Render_Vulkan, "Native UMA active: type {} covers all {:#x} guest physical bytes "
-                            "through {} windows",
+    LOG_INFO(Render_Vulkan,
+             "Native UMA active: type {} covers all {:#x} guest physical bytes "
+             "through {} windows",
              chosen_type, total_size, buffers.size());
 #else
     (void)instance;

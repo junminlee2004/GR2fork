@@ -1446,8 +1446,8 @@ std::vector<std::tuple<VAddr, PAddr, u64>> MemoryManager::GetPhysRuns(VAddr va, 
             auto prev = std::prev(phys);
             const u64 delta = offset_in_vma - prev->first;
             if (delta < prev->second.size) {
-                const u64 run = std::min<u64>({prev->second.size - delta, vma_end - cursor,
-                                               end - cursor});
+                const u64 run =
+                    std::min<u64>({prev->second.size - delta, vma_end - cursor, end - cursor});
                 runs.emplace_back(cursor, prev->second.base + delta, run);
                 cursor += run;
                 continue;

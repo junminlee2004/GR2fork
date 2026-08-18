@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -271,6 +272,17 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
+    /// Native UMA: writes image contents into unified guest memory on the
+    /// GPU timeline - no Finish, no CPU copy; the bytes are CPU-visible at
+    /// fence granularity.
+    void WritebackImageUma(ImageId image_id);
+
+    /// Returns true when native UMA image write-back replaces downloads.
+    [[nodiscard]] bool UseUmaWriteback() const;
+
+    /// Returns true when the image qualifies for UMA write-back enrollment.
+    [[nodiscard]] bool IsUmaWritebackCandidate(const Image& image) const;
+
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
 
@@ -334,6 +346,8 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
+    std::atomic<u64> uma_wb{};
+    std::atomic<u64> uma_wb_fallbacks{};
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;

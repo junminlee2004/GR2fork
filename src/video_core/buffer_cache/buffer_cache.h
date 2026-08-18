@@ -55,8 +55,8 @@ public:
     /// Requests access to physical range [phys, phys+size); returns a
     /// barrier on the given window when the request conflicts with a
     /// pending write or, for writes, prior reads.
-    std::optional<vk::BufferMemoryBarrier2> Request(vk::Buffer window, u64 window_offset, PAddr phys,
-                                                    u64 size, vk::AccessFlags2 access,
+    std::optional<vk::BufferMemoryBarrier2> Request(vk::Buffer window, u64 window_offset,
+                                                    PAddr phys, u64 size, vk::AccessFlags2 access,
                                                     vk::PipelineStageFlags2 stage, bool is_write) {
         const u64 first = phys >> BUCKET_SHIFT;
         const u64 last = std::min((phys + size - 1) >> BUCKET_SHIFT, buckets.size() - 1);
@@ -217,8 +217,8 @@ public:
 
     /// Requests a hazard-tracked barrier for a unified window access.
     [[nodiscard]] std::optional<vk::BufferMemoryBarrier2> RequestUnifiedBarrier(
-        u32 window, u64 offset, u64 size, vk::AccessFlags2 access,
-        vk::PipelineStageFlagBits2 stage, bool is_write);
+        u32 window, u64 offset, u64 size, vk::AccessFlags2 access, vk::PipelineStageFlagBits2 stage,
+        bool is_write);
 
     /// Records an already-synchronized unified write.
     void MarkUnifiedSelfSynced(u32 window, u64 offset, u64 size);

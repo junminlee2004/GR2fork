@@ -12,8 +12,8 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/unified_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/unified_guest_memory.h"
 
 #include <vk_mem_alloc.h>
 

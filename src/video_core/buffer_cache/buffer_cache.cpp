@@ -5,9 +5,9 @@
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
-#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -406,10 +406,9 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
                 // Stream-ordered GPU fill; a parse-time CPU store would run
                 // ahead of recorded work that still reads these bytes live.
                 const auto [window, offset] = *resolved;
-                if (auto barrier = RequestUnifiedBarrier(window, offset, num_bytes,
-                                                         vk::AccessFlagBits2::eTransferWrite,
-                                                         vk::PipelineStageFlagBits2::eTransfer,
-                                                         true)) {
+                if (auto barrier = RequestUnifiedBarrier(
+                        window, offset, num_bytes, vk::AccessFlagBits2::eTransferWrite,
+                        vk::PipelineStageFlagBits2::eTransfer, true)) {
                     scheduler.EndRendering();
                     scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
                         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -438,8 +437,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     buffer->Fill(buffer->Offset(address), num_bytes, value);
 }
 
-bool BufferCache::SynchronizeUnifiedFromImage(u32 window, u64 offset, VAddr device_addr,
-                                              u32 size) {
+bool BufferCache::SynchronizeUnifiedFromImage(u32 window, u64 offset, VAddr device_addr, u32 size) {
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
     if (!image_id) {
         return false;
@@ -477,9 +475,9 @@ bool BufferCache::SynchronizeUnifiedFromImage(u32 window, u64 offset, VAddr devi
         return false;
     }
     scheduler.EndRendering();
-    if (auto barrier = RequestUnifiedBarrier(window, offset, copy_size,
-                                             vk::AccessFlagBits2::eTransferWrite,
-                                             vk::PipelineStageFlagBits2::eTransfer, true)) {
+    if (auto barrier =
+            RequestUnifiedBarrier(window, offset, copy_size, vk::AccessFlagBits2::eTransferWrite,
+                                  vk::PipelineStageFlagBits2::eTransfer, true)) {
         scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = 1,
@@ -506,18 +504,16 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             const u64 dst_offset = dst_gds ? dst : dst_r->second;
             boost::container::static_vector<vk::BufferMemoryBarrier2, 4> pre_barriers;
             if (src_r) {
-                if (auto barrier = RequestUnifiedBarrier(src_r->first, src_r->second, num_bytes,
-                                                         vk::AccessFlagBits2::eTransferRead,
-                                                         vk::PipelineStageFlagBits2::eTransfer,
-                                                         false)) {
+                if (auto barrier = RequestUnifiedBarrier(
+                        src_r->first, src_r->second, num_bytes, vk::AccessFlagBits2::eTransferRead,
+                        vk::PipelineStageFlagBits2::eTransfer, false)) {
                     pre_barriers.push_back(*barrier);
                 }
             }
             if (dst_r) {
-                if (auto barrier = RequestUnifiedBarrier(dst_r->first, dst_r->second, num_bytes,
-                                                         vk::AccessFlagBits2::eTransferWrite,
-                                                         vk::PipelineStageFlagBits2::eTransfer,
-                                                         true)) {
+                if (auto barrier = RequestUnifiedBarrier(
+                        dst_r->first, dst_r->second, num_bytes, vk::AccessFlagBits2::eTransferWrite,
+                        vk::PipelineStageFlagBits2::eTransfer, true)) {
                     pre_barriers.push_back(*barrier);
                 }
             }
