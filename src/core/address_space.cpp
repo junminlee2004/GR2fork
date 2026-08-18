@@ -511,6 +511,10 @@ struct AddressSpace::Impl {
         return false; // Native UMA backing swap is Linux-only.
     }
 
+    u64 UnifiedPrefixSize() const noexcept {
+        return 0;
+    }
+
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
         std::scoped_lock lk{mutex};
         DWORD new_flags{};
@@ -758,6 +762,10 @@ struct AddressSpace::Impl {
         return true;
     }
 
+    u64 UnifiedPrefixSize() const noexcept {
+        return unified_fd >= 0 ? unified_size : 0;
+    }
+
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, PosixPageProtection prot,
               int fd = -1) {
         m_free_regions.subtract({virtual_addr, virtual_addr + size});
@@ -860,6 +868,10 @@ struct AddressSpace::Impl {
 
 bool AddressSpace::AdoptUnifiedBackingPrefix(int fd, u64 size) {
     return impl->AdoptUnifiedBackingPrefix(fd, size);
+}
+
+u64 AddressSpace::UnifiedPrefixSize() const noexcept {
+    return impl->UnifiedPrefixSize();
 }
 
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {

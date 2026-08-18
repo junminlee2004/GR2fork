@@ -251,26 +251,45 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 16_KB;
 
-    auto dmem_area = FindDmemArea(search_start);
-    auto mapping_start =
-        Common::AlignUp(std::max<PAddr>(search_start, dmem_area->second.base), alignment);
-    auto mapping_end = mapping_start + size;
+    // Finds the first free, large enough dmem area in the range.
+    const auto find_free = [&](PAddr start, PAddr end) {
+        auto dmem_area = FindDmemArea(start);
+        auto mapping_start =
+            Common::AlignUp(std::max<PAddr>(start, dmem_area->second.base), alignment);
+        auto mapping_end = mapping_start + size;
+        while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
+               dmem_area->second.GetEnd() < mapping_end) {
+            // The current dmem_area isn't suitable, move to the next one.
+            dmem_area++;
+            if (dmem_area == dmem_map.end()) {
+                break;
+            }
 
-    // Find the first free, large enough dmem area in the range.
-    while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
-           dmem_area->second.GetEnd() < mapping_end) {
-        // The current dmem_area isn't suitable, move to the next one.
-        dmem_area++;
-        if (dmem_area == dmem_map.end()) {
-            break;
+            // Update local variables based on the new dmem_area
+            mapping_start = Common::AlignUp(dmem_area->second.base, alignment);
+            mapping_end = mapping_start + size;
         }
+        if (dmem_area == dmem_map.end() || mapping_end > end) {
+            dmem_area = dmem_map.end();
+        }
+        return std::make_pair(dmem_area, mapping_start);
+    };
 
-        // Update local variables based on the new dmem_area
-        mapping_start = Common::AlignUp(dmem_area->second.base, alignment);
-        mapping_end = mapping_start + size;
-    }
+    // Native UMA: prefer physical placement inside the unified covered
+    // prefix, so GPU-written data in this allocation can land in guest RAM
+    // through the wrapper instead of being stranded in the uncovered tail.
+    auto [dmem_area, mapping_start] = [&] {
+        if (const u64 unified = impl.UnifiedPrefixSize();
+            unified > 0 && search_start < unified && search_end > unified) {
+            if (auto found = find_free(search_start, std::min<PAddr>(search_end, unified));
+                found.first != dmem_map.end()) {
+                return found;
+            }
+        }
+        return find_free(search_start, search_end);
+    }();
 
-    if (dmem_area == dmem_map.end() || mapping_end > search_end) {
+    if (dmem_area == dmem_map.end()) {
         // There are no suitable mappings in this range
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;
