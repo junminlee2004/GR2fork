@@ -79,9 +79,13 @@ public:
     }
 
 private:
+    bool AdoptDmaBuf(const Vulkan::Instance& instance, u64 backing_size, s32 chosen_type);
+    bool ImportHostBacking(const Vulkan::Instance& instance, u64 backing_size);
+
     bool active{};
     u64 total_size{};
     vk::UniqueDeviceMemory memory;
+    std::vector<vk::UniqueDeviceMemory> window_memories;
     std::vector<vk::UniqueBuffer> buffers;
     int dmabuf_fd{-1};
 };
