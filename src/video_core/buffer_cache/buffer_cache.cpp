@@ -470,7 +470,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             }
             if (clean) {
                 const u64 h0 = XXH3_64bits(reinterpret_cast<const void*>(span_addr), HashSpan);
-                scheduler.DeferOperation([this, span_addr, h0, hash_n] {
+                // Completion-time rehash: covers the whole parse-to-execution
+                // window, not just parse-to-submit.
+                scheduler.DeferPriorityOperation([this, span_addr, h0, hash_n] {
                     if (!memory->IsValidMapping(span_addr)) {
                         return;
                     }
@@ -484,7 +486,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                     if (h1 != h0) {
                         LOG_INFO(Render_Vulkan,
                                  "HAIRDIAG3 TORN snapshot #{}: addr={:#x} changed between "
-                                 "parse and submit",
+                                 "parse and execution",
                                  hash_n, span_addr);
                     } else if (hash_n <= 32) {
                         LOG_INFO(Render_Vulkan, "HAIRDIAG3 intact snapshot #{}: addr={:#x}",
