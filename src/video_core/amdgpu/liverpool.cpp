@@ -1199,30 +1199,47 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
             };
             if (rasterizer && EmulatorSettings.GetNativeUmaMode() != 0) {
-                // A parse-time signal wakes the CPU consumer before the
-                // fenced dispatches executed; land label and IRQ together
-                // at completion, data strictly before interrupt.
+                // Compute runs as a serial CPU-waited job graph, hundreds of
+                // fences per frame; a host roundtrip per fence multiplies a
+                // microsecond hardware cost into milliseconds and collapses
+                // the frame rate. Labels stay parse-time by default; bit 7
+                // (128) opts into full completion deferral for experiments.
+                const bool defer_acb = EmulatorSettings.GetNativeUmaMode() & 128;
                 if (release_mem->data_sel.Value() == DataSelect::GdsMemStore) {
                     // The GDS export is stream-ordered GPU work: record the
-                    // copy now, defer only the publication.
+                    // copy now so covered destinations land in guest RAM on
+                    // the GPU timeline with no fence roundtrip at all.
                     const bool landed = rasterizer->CopyBuffer(
                         release_mem->Address<VAddr>(), release_mem->gds_index,
                         release_mem->num_dw * sizeof(u32), false, true);
-                    rasterizer->DeferUnifiedFence(
-                        [rz = rasterizer, signal_irq, cmd = *release_mem, landed] {
-                            if (!landed) {
-                                rz->LandGdsRange(cmd.Address<VAddr>(), cmd.gds_index,
-                                                 cmd.num_dw * sizeof(u32));
-                            }
-                            cmd.SignalFence([](void*, const void*, u32) {}, signal_irq,
-                                            [](VAddr, u16, u16) {});
+                    if (defer_acb) {
+                        rasterizer->DeferUnifiedFence(
+                            [rz = rasterizer, signal_irq, cmd = *release_mem, landed] {
+                                if (!landed) {
+                                    rz->LandGdsRange(cmd.Address<VAddr>(), cmd.gds_index,
+                                                     cmd.num_dw * sizeof(u32));
+                                }
+                                cmd.SignalFence([](void*, const void*, u32) {}, signal_irq,
+                                                [](VAddr, u16, u16) {});
+                            });
+                        break;
+                    }
+                    if (!landed) {
+                        rasterizer->DeferUnifiedFence([rz = rasterizer, cmd = *release_mem] {
+                            rz->LandGdsRange(cmd.Address<VAddr>(), cmd.gds_index,
+                                             cmd.num_dw * sizeof(u32));
                         });
-                } else {
+                    }
+                    release_mem->SignalFence([](void*, const void*, u32) {}, signal_irq,
+                                             [](VAddr, u16, u16) {});
+                    break;
+                }
+                if (defer_acb) {
                     rasterizer->DeferUnifiedFence([write_backing, signal_irq, cmd = *release_mem] {
                         cmd.SignalFence(write_backing, signal_irq, [](VAddr, u16, u16) {});
                     });
+                    break;
                 }
-                break;
             }
             release_mem->SignalFence(
                 write_backing, signal_irq, [this](VAddr dst, u16 gds_index, u16 num_dwords) {
