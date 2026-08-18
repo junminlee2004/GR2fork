@@ -100,10 +100,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         constexpr u64 WindowSize = 512_KB;
         const VAddr buf_start = buffer.CpuAddr();
         const VAddr buf_end = buf_start + buffer.SizeBytes();
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
-        const VAddr window_end = std::min<VAddr>(
+        VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
+        VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
+        if (is_write) {
+            // A write only needs GPU data that intersects the written bytes
+            // themselves. Widening would drain the pipeline and unmark
+            // half a megabyte around every small CPU store - job-system
+            // markers pay that several times per frame - while delivering
+            // nothing the CPU asked to read.
+            window_start = device_addr;
+            window_end = device_addr + size;
+        }
         DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
