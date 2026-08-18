@@ -138,6 +138,129 @@ void BufferCache::SettleUnifiedWrites(VAddr device_addr, u64 size) {
     }
 }
 
+bool BufferCache::TryRatchetRelease(VAddr device_addr, u64 size) {
+    // With readbacks disabled nothing ever clears GPU-modified state, so a
+    // range once written through a legacy slot is barred from unified
+    // service forever and its guest RAM copy is permanently stale. Migrate
+    // such ranges: copy the legacy bytes into the wrapper (device-side, at
+    // record time), release the marking, and let unified service own them.
+    const VAddr win_begin = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+    const VAddr win_end = Common::AlignUp(device_addr + size, CACHING_PAGESIZE);
+    const u64 win_size = win_end - win_begin;
+    constexpr u64 DenyPageShift = 16;
+    constexpr u32 MaxGenerations = 4;
+    const VAddr deny_first = win_begin >> DenyPageShift;
+    const VAddr deny_last = (win_end - 1) >> DenyPageShift;
+    for (VAddr page = deny_first; page <= deny_last; ++page) {
+        if (const auto it = ratchet_generations.find(page);
+            it != ratchet_generations.end() && it->second >= MaxGenerations) {
+            return false;
+        }
+    }
+    const auto win_phys = UmaResolve(win_begin, win_size);
+    if (!win_phys) {
+        // Uncoverable or crossing a mapping seam: permanent legacy.
+        for (VAddr page = deny_first; page <= deny_last; ++page) {
+            ratchet_generations[page] = MaxGenerations;
+        }
+        const u64 n = uma_migration_denies.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA migration deny #{}: addr={:#x} size={:#x}", n,
+                     device_addr, size);
+        }
+        return false;
+    }
+    if (!pending_release.Intersects(device_addr, size)) {
+        // Nominate now, migrate at the next eligible obtain: by then the
+        // producer's current cadence has usually finished with the range.
+        pending_release.Add(win_begin, win_size);
+        return false;
+    }
+    pending_release.Subtract(win_begin, win_size);
+    for (VAddr page = deny_first; page <= deny_last; ++page) {
+        ++ratchet_generations[page];
+    }
+
+    // Gather the legacy-held pieces. CPU-dirty pages are skipped: guest RAM
+    // already holds newer bytes there, matching legacy upload resolution.
+    struct MigrationCopy {
+        vk::Buffer src;
+        u64 src_offset;
+        u64 dst_offset;
+        u64 len;
+    };
+    boost::container::small_vector<MigrationCopy, 8> copies;
+    boost::container::small_vector<vk::BufferMemoryBarrier2, 4> pre_barriers;
+    gpu_modified_ranges.ForEachInRange(win_begin, win_size, [&](VAddr addr, VAddr end) {
+        ForEachBufferInRange(addr, end - addr, [&](BufferId id, Buffer& buffer) {
+            const VAddr clip_a = std::max(addr, buffer.CpuAddr());
+            const VAddr clip_b = std::min(end, buffer.CpuAddr() + buffer.SizeBytes());
+            if (clip_a >= clip_b || IsRegionCpuModified(clip_a, clip_b - clip_a)) {
+                return;
+            }
+            copies.push_back({
+                .src = buffer.Handle(),
+                .src_offset = buffer.Offset(clip_a),
+                .dst_offset = *win_phys + (clip_a - win_begin),
+                .len = clip_b - clip_a,
+            });
+            if (auto barrier = buffer.GetBarrier(vk::AccessFlagBits2::eTransferRead,
+                                                 vk::PipelineStageFlagBits2::eTransfer)) {
+                pre_barriers.push_back(*barrier);
+            }
+        });
+    });
+    if (!copies.empty()) {
+        if (auto barrier =
+                RequestUnifiedBarrier(*win_phys, win_size, vk::AccessFlagBits2::eTransferWrite,
+                                      vk::PipelineStageFlagBits2::eTransfer, true)) {
+            pre_barriers.push_back(*barrier);
+        }
+        scheduler.EndRendering();
+        const auto cmdbuf = scheduler.CommandBuffer();
+        if (!pre_barriers.empty()) {
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+                .pBufferMemoryBarriers = pre_barriers.data(),
+            });
+        }
+        for (const auto& copy : copies) {
+            const vk::BufferCopy region = {
+                .srcOffset = copy.src_offset,
+                .dstOffset = copy.dst_offset,
+                .size = copy.len,
+            };
+            cmdbuf.copyBuffer(copy.src, unified_wrapper->Handle(), region);
+        }
+        const vk::BufferMemoryBarrier2 post_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .buffer = unified_wrapper->Handle(),
+            .offset = *win_phys,
+            .size = win_size,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &post_barrier,
+        });
+        MarkUnifiedSelfSynced(*win_phys, win_size);
+        unified_pending.Subtract(win_begin, win_size);
+        unified_pending.Add(win_begin, win_size, scheduler.CurrentTick());
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(win_begin, win_size);
+    gpu_modified_ranges.Subtract(win_begin, win_size);
+    const u64 n = uma_migrations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0) {
+        LOG_INFO(Render_Vulkan, "Native UMA migration #{}: addr={:#x} size={:#x} pieces={}", n,
+                 device_addr, size, copies.size());
+    }
+    return true;
+}
+
 void BufferCache::TrimLandedUnifiedWrites() {
     boost::container::small_vector<std::pair<VAddr, u64>, 64> landed;
     unified_pending.ForEach([&](VAddr addr, VAddr end, u64 tick) {
@@ -603,9 +726,17 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // memory - the GPU reads and writes the guest's own bytes, coherently.
     // Bypasses the stream fast path deliberately: bind-time copies are the
     // snapshot-staleness class this path exists to eliminate.
-    if (unified_wrapper && !is_texel_buffer &&
-        (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2)) &&
-        !IsRegionGpuModified(device_addr, size)) {
+    const bool uma_eligible = unified_wrapper && !is_texel_buffer &&
+                              (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2));
+    bool uma_gpu_owned = false;
+    if (uma_eligible) {
+        uma_gpu_owned = IsRegionGpuModified(device_addr, size);
+        if (uma_gpu_owned && !(EmulatorSettings.GetNativeUmaMode() & 32) &&
+            TryRatchetRelease(device_addr, size)) {
+            uma_gpu_owned = false;
+        }
+    }
+    if (uma_eligible && !uma_gpu_owned) {
         if (const auto phys = UmaResolve(device_addr, size)) {
             const u64 n = uma_hits.fetch_add(1, std::memory_order_relaxed) + 1;
             // Self-check: a correct resolution refers to the same physical
@@ -636,8 +767,7 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             LOG_INFO(Render_Vulkan, "Native UMA fallback #{}: addr={:#x} size={:#x} (hits={})", n,
                      device_addr, size, uma_hits.load(std::memory_order_relaxed));
         }
-    } else if (unified_wrapper && !is_texel_buffer &&
-               (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2))) {
+    } else if (uma_eligible) {
         const u64 n = uma_guard_rejects.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((n & (n - 1)) == 0) {
             LOG_INFO(Render_Vulkan, "Native UMA ownership reject #{}: addr={:#x} size={:#x}", n,

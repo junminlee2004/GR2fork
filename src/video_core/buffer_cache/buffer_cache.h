@@ -222,6 +222,10 @@ private:
     /// Drops pending-write entries whose tick the GPU already completed.
     void TrimLandedUnifiedWrites();
 
+    /// Attempts to migrate a legacy-GPU-written range into unified memory.
+    /// Returns true when the range is unified-serviceable afterwards.
+    bool TryRatchetRelease(VAddr device_addr, u64 size);
+
 public:
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
@@ -334,7 +338,11 @@ private:
     std::atomic<u64> uma_settles{};
     std::atomic<u64> uma_written_serves{};
     std::atomic<u64> uma_cp_lands{};
+    std::atomic<u64> uma_migrations{};
+    std::atomic<u64> uma_migration_denies{};
     SplitRangeMap<u64> unified_pending;
+    RangeSet pending_release;
+    std::map<VAddr, u32> ratchet_generations;
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
     TextureCache& texture_cache;
