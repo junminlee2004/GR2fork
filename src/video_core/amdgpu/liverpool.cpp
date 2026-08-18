@@ -1218,19 +1218,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                             [](VAddr, u16, u16) {});
                         });
                 } else {
-                    rasterizer->DeferUnifiedFence([write_backing, signal_irq,
-                                                   cmd = *release_mem] {
+                    rasterizer->DeferUnifiedFence([write_backing, signal_irq, cmd = *release_mem] {
                         cmd.SignalFence(write_backing, signal_irq, [](VAddr, u16, u16) {});
                     });
                 }
                 break;
             }
-            release_mem->SignalFence(write_backing, signal_irq,
-                                     [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                                         rasterizer->CopyBuffer(dst, gds_index,
-                                                                num_dwords * sizeof(u32), false,
-                                                                true);
-                                     });
+            release_mem->SignalFence(
+                write_backing, signal_irq, [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                });
             break;
         }
         case PM4ItOpcode::EventWrite: {

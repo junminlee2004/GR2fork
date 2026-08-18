@@ -121,10 +121,9 @@ void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
 
 void BufferCache::SettleUnifiedWrites(VAddr device_addr, u64 size) {
     u64 wait_tick = 0;
-    unified_pending.ForEachInRange(device_addr, size,
-                                   [&](VAddr, VAddr, u64 tick) { //
-                                       wait_tick = std::max(wait_tick, tick);
-                                   });
+    unified_pending.ForEachInRange(device_addr, size, [&](VAddr, VAddr, u64 tick) { //
+        wait_tick = std::max(wait_tick, tick);
+    });
     if (wait_tick == 0) {
         return;
     }
@@ -304,8 +303,8 @@ std::optional<vk::BufferMemoryBarrier2> BufferCache::RequestUnifiedBarrier(
         // Escape hatch: the previous single-state whole-wrapper rule.
         return unified_wrapper->GetBarrier(access, stage, offset);
     }
-    auto barrier = unified_hazards.Request(unified_wrapper->Handle(), offset, size, access, stage,
-                                           is_write);
+    auto barrier =
+        unified_hazards.Request(unified_wrapper->Handle(), offset, size, access, stage, is_write);
     if (barrier) {
         const u64 n = uma_barrier_emits.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((n & (n - 1)) == 0) {
@@ -463,10 +462,9 @@ void BufferCache::BindVertexBuffers(
         if (buffer->is_unified) {
             // Unified writes never mark the memory tracker; the hazard
             // tracker is the only fence between them and this fetch.
-            if (auto barrier =
-                    RequestUnifiedBarrier(offset, size, vk::AccessFlagBits2::eVertexAttributeRead,
-                                          vk::PipelineStageFlagBits2::eVertexAttributeInput,
-                                          false)) {
+            if (auto barrier = RequestUnifiedBarrier(
+                    offset, size, vk::AccessFlagBits2::eVertexAttributeRead,
+                    vk::PipelineStageFlagBits2::eVertexAttributeInput, false)) {
                 barriers.emplace_back(*barrier);
             }
         } else if (IsRegionGpuModified(range.base_address, size)) {
@@ -562,9 +560,9 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     if (buffer->is_unified) {
         // Fill publishes itself with explicit pre/post barriers; the tracker
         // only needs to order it against a pending shader writer first.
-        if (auto barrier = RequestUnifiedBarrier(offset, num_bytes,
-                                                 vk::AccessFlagBits2::eTransferWrite,
-                                                 vk::PipelineStageFlagBits2::eTransfer, true)) {
+        if (auto barrier =
+                RequestUnifiedBarrier(offset, num_bytes, vk::AccessFlagBits2::eTransferWrite,
+                                      vk::PipelineStageFlagBits2::eTransfer, true)) {
             scheduler.EndRendering();
             scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
                 .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -602,16 +600,15 @@ bool BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     if (src_gds) {
         src_buffer = &gds_buffer;
         src_offset = src;
-    } else if (const auto phys = !IsRegionGpuModified(src, num_bytes)
-                                     ? UmaResolve(src, num_bytes)
-                                     : std::nullopt) {
+    } else if (const auto phys = !IsRegionGpuModified(src, num_bytes) ? UmaResolve(src, num_bytes)
+                                                                      : std::nullopt) {
         // Wrapper read: pending unified writes to the source are GPU-ordered
         // ahead of this copy, so no settle is needed.
         src_buffer = &*unified_wrapper;
         src_offset = *phys;
-        if (auto barrier = RequestUnifiedBarrier(src_offset, num_bytes,
-                                                 vk::AccessFlagBits2::eTransferRead,
-                                                 vk::PipelineStageFlagBits2::eTransfer, false)) {
+        if (auto barrier =
+                RequestUnifiedBarrier(src_offset, num_bytes, vk::AccessFlagBits2::eTransferRead,
+                                      vk::PipelineStageFlagBits2::eTransfer, false)) {
             pre_barriers.push_back(*barrier);
         }
     } else {
@@ -636,9 +633,9 @@ bool BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         landed = true;
         unified_pending.Subtract(dst, num_bytes);
         unified_pending.Add(dst, num_bytes, scheduler.CurrentTick());
-        if (auto barrier = RequestUnifiedBarrier(dst_offset, num_bytes,
-                                                 vk::AccessFlagBits2::eTransferWrite,
-                                                 vk::PipelineStageFlagBits2::eTransfer, true)) {
+        if (auto barrier =
+                RequestUnifiedBarrier(dst_offset, num_bytes, vk::AccessFlagBits2::eTransferWrite,
+                                      vk::PipelineStageFlagBits2::eTransfer, true)) {
             pre_barriers.push_back(*barrier);
         }
     } else {

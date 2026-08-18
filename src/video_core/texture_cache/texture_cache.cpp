@@ -71,8 +71,7 @@ bool TextureCache::IsUmaWritebackCandidate(const Image& image) const {
     // small CPU-feedback-sized surfaces qualify - full-size render targets
     // are never consumed by the CPU and would burn bandwidth every fence.
     constexpr u64 TiledWritebackLimit = 8_MB;
-    if (image.info.guest_address == 0 || image.info.props.is_depth ||
-        image.info.num_samples != 1) {
+    if (image.info.guest_address == 0 || image.info.props.is_depth || image.info.num_samples != 1) {
         return false;
     }
     if (!image.info.props.is_tiled || image.info.size.width <= 8) {
@@ -139,10 +138,9 @@ void TextureCache::WritebackImageUma(ImageId image_id) {
         return;
     }
     scheduler.EndRendering();
-    if (auto barrier = buffer_cache.RequestUnifiedBarrier(*phys, image.info.guest_size,
-                                                          vk::AccessFlagBits2::eTransferWrite,
-                                                          vk::PipelineStageFlagBits2::eTransfer,
-                                                          true)) {
+    if (auto barrier = buffer_cache.RequestUnifiedBarrier(
+            *phys, image.info.guest_size, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eTransfer, true)) {
         scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = 1,
