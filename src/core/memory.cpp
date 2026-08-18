@@ -297,21 +297,41 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
         return std::make_pair(dmem_area, mapping_start);
     };
 
-    // Native UMA: garlic-typed allocations live below the split (the
-    // device-local pool), onion-typed above it, matching the bus the game
-    // declared. A full-range pass satisfies spill when a pool is full.
+    // Finds the highest free, large enough placement in the range.
+    const auto find_free_topdown = [&](PAddr start, PAddr end) {
+        auto best = dmem_map.end();
+        PAddr best_start = 0;
+        for (auto it = dmem_map.begin(); it != dmem_map.end(); ++it) {
+            const auto& area = it->second;
+            if (area.dma_type != PhysicalMemoryType::Free) {
+                continue;
+            }
+            const PAddr lo = std::max<PAddr>(area.base, start);
+            const PAddr hi = std::min<PAddr>(area.GetEnd(), end);
+            if (hi <= lo || hi - lo < size) {
+                continue;
+            }
+            const PAddr place = Common::AlignDown(hi - size, alignment);
+            if (place < lo) {
+                continue;
+            }
+            best = it;
+            best_start = place;
+        }
+        return std::make_pair(best, best_start);
+    };
+
+    // Native UMA: garlic-typed allocations pack bottom-up exactly like the
+    // stock allocator, onion-typed ones pack top-down from the far end -
+    // the cached side of the split. One central hole shrinks from both
+    // ends, so a mid-space pool boundary never fragments a large request,
+    // and spill across the split emerges naturally when either side fills.
+    constexpr s32 SceKernelWcGarlic = 3;
     auto [dmem_area, mapping_start] = [&] {
-        if (unified_garlic_split != 0) {
-            constexpr s32 SceKernelWcGarlic = 3;
-            const bool wants_garlic = memory_type == SceKernelWcGarlic;
-            const PAddr pref_start =
-                wants_garlic ? search_start : std::max<PAddr>(search_start, unified_garlic_split);
-            const PAddr pref_end =
-                wants_garlic ? std::min<PAddr>(search_end, unified_garlic_split) : search_end;
-            if (pref_start < pref_end) {
-                if (auto found = find_free(pref_start, pref_end); found.first != dmem_map.end()) {
-                    return found;
-                }
+        if (unified_garlic_split != 0 && memory_type != SceKernelWcGarlic) {
+            if (auto found = find_free_topdown(search_start, search_end);
+                found.first != dmem_map.end()) {
+                return found;
             }
         }
         return find_free(search_start, search_end);
