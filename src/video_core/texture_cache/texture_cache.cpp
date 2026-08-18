@@ -61,7 +61,14 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 TextureCache::~TextureCache() = default;
 
 bool TextureCache::UseUmaWriteback() const {
-    return buffer_cache.UmaActive();
+    // Opt-in (native_uma bit 1). Writing rendered surfaces back into guest
+    // memory changes the very bytes MarkAsMaybeDirty hashes to decide
+    // whether the CPU touched an image, so the cache concludes the guest
+    // rewrote it and re-uploads - detiling what was just tiled, every
+    // frame, amplifying any imprecision. Buffer-class coherence alone
+    // rendered inFAMOUS correctly, so this stays off until a title is
+    // shown to need it and the dirty-detection interaction is resolved.
+    return buffer_cache.UmaActive() && (EmulatorSettings.GetNativeUmaMode() & 2);
 }
 
 bool TextureCache::IsUmaWritebackCandidate(const Image& image) const {
