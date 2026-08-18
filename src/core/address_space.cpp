@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <map>
+#include <vector>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -507,7 +508,7 @@ struct AddressSpace::Impl {
         CoalesceFreeRegions(virtual_addr);
     }
 
-    bool AdoptUnifiedBackingPrefix(int, u64) {
+    bool AdoptUnifiedRegions(std::span<const AddressSpace::UnifiedRegion>) {
         return false; // Native UMA backing swap is Linux-only.
     }
 
@@ -743,19 +744,51 @@ struct AddressSpace::Impl {
         }
     }
 
-    bool AdoptUnifiedBackingPrefix(int fd, u64 size) {
+    bool AdoptUnifiedRegions(std::span<const AddressSpace::UnifiedRegion> regions) {
         if (any_phys_mapped) {
             LOG_WARNING(Kernel_Vmm, "Adopting unified backing after guest mappings exist");
         }
-        void* ret = mmap(backing_base, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-        if (ret == MAP_FAILED) {
-            LOG_ERROR(Kernel_Vmm, "Unified backing mirror remap failed: {}", strerror(errno));
-            return false;
+        for (const auto& region : regions) {
+            void* ret =
+                mmap(backing_base + region.phys_base, region.size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_FIXED, region.fd, static_cast<off_t>(region.fd_offset));
+            if (ret == MAP_FAILED) {
+                LOG_ERROR(Kernel_Vmm, "Unified backing mirror remap failed at {:#x}: {}",
+                          region.phys_base, strerror(errno));
+                return false;
+            }
+            LOG_INFO(Kernel_Vmm, "Unified backing adopted for phys [{:#x}, {:#x})",
+                     region.phys_base, region.phys_base + region.size);
         }
-        unified_fd = fd;
-        unified_size = size;
-        LOG_INFO(Kernel_Vmm, "Unified backing adopted for phys [0, {:#x})", size);
+        unified_regions.assign(regions.begin(), regions.end());
         return true;
+    }
+
+    // Returns the backing source for one physical byte: the covering
+    // unified region, or the memfd for holes.
+    std::pair<int, u64> UnifiedSource(PAddr phys) const {
+        for (const auto& region : unified_regions) {
+            if (phys >= region.phys_base && phys < region.phys_base + region.size) {
+                return {region.fd, region.fd_offset + (phys - region.phys_base)};
+            }
+        }
+        return {backing_fd, phys};
+    }
+
+    // Largest span from phys whose backing source stays contiguous.
+    u64 UnifiedSpan(PAddr phys, u64 size) const {
+        for (const auto& region : unified_regions) {
+            if (phys >= region.phys_base && phys < region.phys_base + region.size) {
+                return std::min<u64>(size, region.phys_base + region.size - phys);
+            }
+        }
+        u64 next = size;
+        for (const auto& region : unified_regions) {
+            if (region.phys_base > phys) {
+                next = std::min<u64>(next, region.phys_base - phys);
+            }
+        }
+        return next;
     }
 
     void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, PosixPageProtection prot,
@@ -770,23 +803,22 @@ struct AddressSpace::Impl {
         if (phys_addr != -1) {
             any_phys_mapped = true;
         }
-        // Dmem-backed mappings may straddle the unified/memfd tier boundary,
-        // in which case the view is stitched from two fixed mappings.
-        if (phys_addr != -1 && fd == -1 && unified_fd >= 0 &&
-            static_cast<u64>(phys_addr) < unified_size && phys_addr + size > unified_size) {
-            const u64 head = unified_size - phys_addr;
-            void* ret = mmap(reinterpret_cast<void*>(virtual_addr), head, prot,
-                             MAP_FIXED | MAP_SHARED, unified_fd, phys_addr);
-            ASSERT_MSG(ret != MAP_FAILED, "mmap failed: {}", strerror(errno));
-            void* tail = mmap(reinterpret_cast<void*>(virtual_addr + head), size - head, prot,
-                              MAP_FIXED | MAP_SHARED, backing_fd, unified_size);
-            ASSERT_MSG(tail != MAP_FAILED, "mmap failed: {}", strerror(errno));
-            return ret;
+        // Dmem-backed mappings may span several unified regions (or holes
+        // between them); the view is stitched from fixed mappings per span.
+        if (phys_addr != -1 && fd == -1 && !unified_regions.empty()) {
+            u64 done = 0;
+            while (done < size) {
+                const PAddr piece_phys = phys_addr + done;
+                const u64 piece = UnifiedSpan(piece_phys, size - done);
+                const auto [piece_fd, piece_off] = UnifiedSource(piece_phys);
+                void* ret = mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
+                                 MAP_FIXED | MAP_SHARED, piece_fd, static_cast<off_t>(piece_off));
+                ASSERT_MSG(ret != MAP_FAILED, "mmap failed: {}", strerror(errno));
+                done += piece;
+            }
+            return reinterpret_cast<void*>(virtual_addr);
         }
-        const bool use_unified = phys_addr != -1 && fd == -1 && unified_fd >= 0 &&
-                                 static_cast<u64>(phys_addr) + size <= unified_size;
-        const int handle =
-            phys_addr != -1 ? (fd == -1 ? (use_unified ? unified_fd : backing_fd) : fd) : -1;
+        const int handle = phys_addr != -1 ? (fd == -1 ? backing_fd : fd) : -1;
         const off_t host_offset = phys_addr != -1 ? phys_addr : 0;
         const int flag = phys_addr != -1 ? MAP_SHARED : (MAP_ANONYMOUS | MAP_PRIVATE);
         void* ret = mmap(reinterpret_cast<void*>(virtual_addr), size, prot, MAP_FIXED | flag,
@@ -844,8 +876,7 @@ struct AddressSpace::Impl {
     }
 
     int backing_fd;
-    int unified_fd = -1;
-    u64 unified_size = 0;
+    std::vector<AddressSpace::UnifiedRegion> unified_regions;
     bool any_phys_mapped = false;
     u8* backing_base{};
     u8* system_managed_base{};
@@ -858,8 +889,8 @@ struct AddressSpace::Impl {
 };
 #endif
 
-bool AddressSpace::AdoptUnifiedBackingPrefix(int fd, u64 size) {
-    return impl->AdoptUnifiedBackingPrefix(fd, size);
+bool AddressSpace::AdoptUnifiedRegions(std::span<const UnifiedRegion> regions) {
+    return impl->AdoptUnifiedRegions(regions);
 }
 
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {

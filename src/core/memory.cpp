@@ -45,6 +45,7 @@ MemoryManager::MemoryManager() {
 
     // Pre-initialize flexible backing
     total_flexible_size = ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE + extra_fmem;
+    flexible_base = total_size;
     fmem_map.clear();
     fmem_map.emplace(total_size, PhysicalMemoryArea{total_size, total_flexible_size});
 
@@ -251,26 +252,51 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
     std::scoped_lock lk{mutex, unmap_mutex};
     alignment = alignment > 0 ? alignment : 16_KB;
 
-    auto dmem_area = FindDmemArea(search_start);
-    auto mapping_start =
-        Common::AlignUp(std::max<PAddr>(search_start, dmem_area->second.base), alignment);
-    auto mapping_end = mapping_start + size;
+    // Finds the first free, large enough dmem area in the range.
+    const auto find_free = [&](PAddr start, PAddr end) {
+        auto dmem_area = FindDmemArea(start);
+        auto mapping_start =
+            Common::AlignUp(std::max<PAddr>(start, dmem_area->second.base), alignment);
+        auto mapping_end = mapping_start + size;
+        while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
+               dmem_area->second.GetEnd() < mapping_end) {
+            // The current dmem_area isn't suitable, move to the next one.
+            dmem_area++;
+            if (dmem_area == dmem_map.end()) {
+                break;
+            }
 
-    // Find the first free, large enough dmem area in the range.
-    while (dmem_area->second.dma_type != PhysicalMemoryType::Free ||
-           dmem_area->second.GetEnd() < mapping_end) {
-        // The current dmem_area isn't suitable, move to the next one.
-        dmem_area++;
-        if (dmem_area == dmem_map.end()) {
-            break;
+            // Update local variables based on the new dmem_area
+            mapping_start = Common::AlignUp(dmem_area->second.base, alignment);
+            mapping_end = mapping_start + size;
         }
+        if (dmem_area == dmem_map.end() || mapping_end > end) {
+            dmem_area = dmem_map.end();
+        }
+        return std::make_pair(dmem_area, mapping_start);
+    };
 
-        // Update local variables based on the new dmem_area
-        mapping_start = Common::AlignUp(dmem_area->second.base, alignment);
-        mapping_end = mapping_start + size;
-    }
+    // Native UMA: garlic-typed allocations live below the split (the
+    // device-local pool), onion-typed above it, matching the bus the game
+    // declared. A full-range pass satisfies spill when a pool is full.
+    auto [dmem_area, mapping_start] = [&] {
+        if (unified_garlic_split != 0) {
+            constexpr s32 SceKernelWcGarlic = 3;
+            const bool wants_garlic = memory_type == SceKernelWcGarlic;
+            const PAddr pref_start =
+                wants_garlic ? search_start : std::max<PAddr>(search_start, unified_garlic_split);
+            const PAddr pref_end =
+                wants_garlic ? std::min<PAddr>(search_end, unified_garlic_split) : search_end;
+            if (pref_start < pref_end) {
+                if (auto found = find_free(pref_start, pref_end); found.first != dmem_map.end()) {
+                    return found;
+                }
+            }
+        }
+        return find_free(search_start, search_end);
+    }();
 
-    if (dmem_area == dmem_map.end() || mapping_end > search_end) {
+    if (dmem_area == dmem_map.end()) {
         // There are no suitable mappings in this range
         LOG_ERROR(Kernel_Vmm, "Unable to find free direct memory area: size = {:#x}", size);
         return -1;

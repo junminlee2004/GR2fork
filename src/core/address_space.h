@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <span>
+
 #include <memory>
 #include <boost/icl/separate_interval_set.hpp>
 #include "common/arch.h"
@@ -37,10 +39,19 @@ public:
         return backing_size;
     }
 
-    /// Rebacks the first `size` bytes of guest physical memory with the given
-    /// file descriptor (native UMA). Must be called before guest mappings
-    /// exist. Returns false when unsupported.
-    bool AdoptUnifiedBackingPrefix(int fd, u64 size);
+    /// A contiguous span of guest physical memory rebacked by an exported
+    /// device memory file descriptor (native UMA).
+    struct UnifiedRegion {
+        PAddr phys_base;
+        u64 size;
+        int fd;
+        u64 fd_offset;
+    };
+
+    /// Rebacks the given guest physical regions with exported device
+    /// memory. Must be called before guest mappings exist. Returns false
+    /// when unsupported.
+    bool AdoptUnifiedRegions(std::span<const UnifiedRegion> regions);
 
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);

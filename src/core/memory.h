@@ -190,6 +190,18 @@ public:
         return total_flexible_size - flexible_usage;
     }
 
+    /// Physical base of the flexible memory band.
+    PAddr GetFlexibleBase() const {
+        return flexible_base;
+    }
+
+    /// Native UMA: physical addresses below the split prefer the garlic
+    /// (device-local) pool; allocations declare their bus with the sce
+    /// memory type, and the allocator places them accordingly.
+    void SetUnifiedGarlicSplit(PAddr split) {
+        unified_garlic_split = split;
+    }
+
     VAddr SystemReservedVirtualBase() noexcept {
         return impl.SystemReservedVirtualBase();
     }
@@ -350,6 +362,8 @@ private:
     u64 total_direct_size{};
     u64 total_flexible_size{};
     u64 flexible_usage{};
+    PAddr flexible_base{};
+    PAddr unified_garlic_split{};
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
