@@ -726,8 +726,14 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // memory - the GPU reads and writes the guest's own bytes, coherently.
     // Bypasses the stream fast path deliberately: bind-time copies are the
     // snapshot-staleness class this path exists to eliminate.
-    const bool uma_eligible = unified_wrapper && !is_texel_buffer &&
-                              (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2));
+    bool uma_eligible =
+        unified_wrapper && (!is_written || (EmulatorSettings.GetNativeUmaMode() & 2));
+    if (uma_eligible && is_texel_buffer) {
+        // Formatted ops are lowered to raw loads/stores with inline
+        // pack/unpack, so the wrapper can serve them - unless an image owns
+        // the range, which must keep the legacy image-redirect path.
+        uma_eligible = !texture_cache.FindImageFromRange(device_addr, size);
+    }
     bool uma_gpu_owned = false;
     if (uma_eligible) {
         uma_gpu_owned = IsRegionGpuModified(device_addr, size);
