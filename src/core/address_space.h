@@ -37,9 +37,6 @@ public:
         return backing_size;
     }
 
-    /// Returns the size of the unified backing prefix, 0 when inactive.
-    [[nodiscard]] u64 UnifiedPrefixSize() const noexcept;
-
     /// Rebacks the first `size` bytes of guest physical memory with the given
     /// file descriptor (native UMA). Must be called before guest mappings
     /// exist. Returns false when unsupported.
