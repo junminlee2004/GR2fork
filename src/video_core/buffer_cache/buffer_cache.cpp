@@ -260,6 +260,18 @@ bool BufferCache::TryRatchetRelease(VAddr device_addr, u64 size) {
     return true;
 }
 
+void BufferCache::RetagWrittenServes() {
+    if (written_serves.empty()) {
+        return;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    for (const auto& [addr, len] : written_serves) {
+        unified_pending.Subtract(addr, len);
+        unified_pending.Add(addr, len, tick);
+    }
+    written_serves.clear();
+}
+
 void BufferCache::TrimLandedUnifiedWrites() {
     boost::container::small_vector<std::pair<VAddr, u64>, 64> landed;
     unified_pending.ForEach([&](VAddr addr, VAddr end, u64 tick) {
@@ -768,6 +780,7 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 // Subtract first so a newer tick replaces any older tag.
                 unified_pending.Subtract(device_addr, size);
                 unified_pending.Add(device_addr, size, scheduler.CurrentTick());
+                written_serves.emplace_back(device_addr, size);
                 const u64 w = uma_written_serves.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((w & 4095) == 0) {
                     TrimLandedUnifiedWrites();

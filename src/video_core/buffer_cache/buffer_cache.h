@@ -205,6 +205,11 @@ public:
         unified_hazards.MarkSelfSynced(offset, size);
     }
 
+    /// Re-tags written serves of the draw that just recorded. A settle or
+    /// stream wrap can flush mid-bind, so the tick tagged at bind time may
+    /// predate the tick the draw actually recorded into.
+    void RetagWrittenServes();
+
 private:
     void RemovePhysRange(VAddr addr, u64 size);
 
@@ -348,6 +353,7 @@ private:
     SplitRangeMap<u64> unified_pending;
     RangeSet pending_release;
     std::map<VAddr, u32> ratchet_generations;
+    boost::container::small_vector<std::pair<VAddr, u32>, 8> written_serves;
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
     TextureCache& texture_cache;
