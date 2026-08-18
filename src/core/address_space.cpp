@@ -748,13 +748,21 @@ struct AddressSpace::Impl {
         if (any_phys_mapped) {
             LOG_WARNING(Kernel_Vmm, "Adopting unified backing after guest mappings exist");
         }
-        for (const auto& region : regions) {
+        for (size_t i = 0; i < regions.size(); ++i) {
+            const auto& region = regions[i];
             void* ret =
                 mmap(backing_base + region.phys_base, region.size, PROT_READ | PROT_WRITE,
                      MAP_SHARED | MAP_FIXED, region.fd, static_cast<off_t>(region.fd_offset));
             if (ret == MAP_FAILED) {
                 LOG_ERROR(Kernel_Vmm, "Unified backing mirror remap failed at {:#x}: {}",
                           region.phys_base, strerror(errno));
+                // Restore the memfd view over anything already remapped so
+                // the mirror never dangles over freed device memory.
+                for (size_t j = 0; j < i; ++j) {
+                    mmap(backing_base + regions[j].phys_base, regions[j].size,
+                         PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, backing_fd,
+                         static_cast<off_t>(regions[j].phys_base));
+                }
                 return false;
             }
             LOG_INFO(Kernel_Vmm, "Unified backing adopted for phys [{:#x}, {:#x})",

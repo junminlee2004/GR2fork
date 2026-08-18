@@ -72,7 +72,11 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
                 onion_heap = heap;
             }
         } else if ((flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
-                   !(flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+                   (flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                   !(flags & vk::MemoryPropertyFlagBits::eHostCached)) {
+            // Host-visible carve memory: the CPU view is write-combined
+            // (garlic semantics) and, critically, the driver keeps the
+            // allocation CPU-accessible so its dma-buf can be mapped.
             if (garlic_type < 0 || heap > garlic_heap) {
                 garlic_type = static_cast<s32>(i);
                 garlic_heap = heap;
@@ -201,8 +205,39 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     regions.push_back({garlic_pool, direct_total - garlic_pool, onion_fd, 0});
     regions.push_back({flex_base, flex_size, onion_fd, direct_total - garlic_pool});
     if (!aspace.AdoptUnifiedRegions(regions)) {
-        LOG_WARNING(Render_Vulkan, "Native UMA: backing adoption failed");
-        return;
+        if (garlic_pool == 0) {
+            LOG_WARNING(Render_Vulkan, "Native UMA: backing adoption failed");
+            return;
+        }
+        // The carve export could not be CPU-mapped on this driver; retry
+        // with everything in the onion pool when the heap allows it.
+        LOG_WARNING(Render_Vulkan, "Native UMA: garlic adoption failed; retrying onion-only");
+        windows.clear();
+        garlic_memory.reset();
+        onion_memory.reset();
+        garlic_fd = -1;
+        onion_fd = -1;
+        garlic_pool = 0;
+        const u64 all_onion = direct_total + flex_size;
+        if (onion_heap < all_onion + OnionHeapHeadroom) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Native UMA requested but NOT ACTIVE: host-cached heap {:#x} cannot "
+                         "hold the full onion pool {:#x}; running without unified memory.",
+                         onion_heap, all_onion);
+            return;
+        }
+        if (!allocate_pool(all_onion, onion_type, onion_memory) ||
+            !add_windows(*onion_memory, all_onion, 0, onion_type) ||
+            !export_fd(*onion_memory, onion_fd)) {
+            return;
+        }
+        regions.clear();
+        regions.push_back({0, direct_total, onion_fd, 0});
+        regions.push_back({flex_base, flex_size, onion_fd, direct_total});
+        if (!aspace.AdoptUnifiedRegions(regions)) {
+            LOG_WARNING(Render_Vulkan, "Native UMA: backing adoption failed");
+            return;
+        }
     }
     memory_manager->SetUnifiedGarlicSplit(garlic_pool);
 
