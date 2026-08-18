@@ -3,6 +3,13 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <vector>
+
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -29,8 +36,88 @@ namespace VideoCore {
 using BufferId = Common::SlotId;
 
 class TextureCache;
+class UnifiedGuestMemory;
 class MemoryTracker;
 class PageManager;
+
+/// Hazard state for unified guest memory, tracked per 4MiB bucket of
+/// physical address space. The overlapping buffer windows alias the same
+/// allocation, so tracking is keyed by physical offset - one shared state
+/// per window would turn bind count into barrier count.
+class UnifiedHazardTracker {
+public:
+    static constexpr u64 BUCKET_SHIFT = 22;
+
+    void Init(u64 total_size) {
+        buckets.resize((total_size >> BUCKET_SHIFT) + 1);
+    }
+
+    /// Requests access to physical range [phys, phys+size); returns a
+    /// barrier on the given window when the request conflicts with a
+    /// pending write or, for writes, prior reads.
+    std::optional<vk::BufferMemoryBarrier2> Request(vk::Buffer window, u64 window_offset, PAddr phys,
+                                                    u64 size, vk::AccessFlags2 access,
+                                                    vk::PipelineStageFlags2 stage, bool is_write) {
+        const u64 first = phys >> BUCKET_SHIFT;
+        const u64 last = std::min((phys + size - 1) >> BUCKET_SHIFT, buckets.size() - 1);
+        vk::PipelineStageFlags2 src_stages{};
+        vk::AccessFlags2 src_access{};
+        for (u64 i = first; i <= last; ++i) {
+            auto& bucket = buckets[i];
+            if (bucket.wr_stages) {
+                src_stages |= bucket.wr_stages;
+                src_access |= bucket.wr_access;
+            }
+            if (is_write) {
+                if (bucket.read_since_write) {
+                    // Write-after-read only needs execution ordering.
+                    src_stages |= vk::PipelineStageFlagBits2::eAllCommands;
+                }
+                bucket.wr_stages = stage;
+                bucket.wr_access = access;
+                bucket.read_since_write = false;
+            } else {
+                // Publish to every later reader at once, then retire the
+                // writer: one barrier per producer->consumer edge.
+                bucket.wr_stages = {};
+                bucket.wr_access = {};
+                bucket.read_since_write = true;
+            }
+        }
+        if (!src_stages) {
+            return std::nullopt;
+        }
+        return vk::BufferMemoryBarrier2{
+            .srcStageMask = src_stages,
+            .srcAccessMask = src_access,
+            .dstStageMask = is_write ? stage : vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = is_write ? access : vk::AccessFlagBits2::eMemoryRead,
+            .buffer = window,
+            .offset = window_offset,
+            .size = size,
+        };
+    }
+
+    /// Records a write that already published itself with explicit pre/post
+    /// barriers (Buffer::Fill, copy helpers, image write-back transports).
+    void MarkSelfSynced(PAddr phys, u64 size) {
+        const u64 first = phys >> BUCKET_SHIFT;
+        const u64 last = std::min((phys + size - 1) >> BUCKET_SHIFT, buckets.size() - 1);
+        for (u64 i = first; i <= last; ++i) {
+            buckets[i].wr_stages = {};
+            buckets[i].wr_access = {};
+            buckets[i].read_since_write = true;
+        }
+    }
+
+private:
+    struct Bucket {
+        vk::AccessFlags2 wr_access{};
+        vk::PipelineStageFlags2 wr_stages{};
+        bool read_since_write{};
+    };
+    std::vector<Bucket> buckets;
+};
 
 class BufferCache {
 public:
@@ -106,6 +193,36 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size);
 
+    /// Returns true when unified guest memory serves all guest-backed data.
+    [[nodiscard]] bool UmaActive() const noexcept {
+        return !window_wrappers.empty();
+    }
+
+    /// Native UMA map notifications (called outside the memory lock).
+    void NotifyMapped(VAddr addr, u64 size);
+    void NotifyUnmapped(VAddr addr, u64 size);
+
+    /// Resolves a guest virtual range to (window index, window offset).
+    [[nodiscard]] std::optional<std::pair<u32, u64>> ResolveGuest(VAddr addr, u64 size);
+
+    /// Returns the wrapper for a unified window.
+    [[nodiscard]] Buffer& UnifiedWindow(u32 window) noexcept {
+        return window_wrappers[window];
+    }
+
+    /// Returns the window index of a unified wrapper pointer.
+    [[nodiscard]] u32 WindowIndex(const Buffer* buffer) const noexcept {
+        return static_cast<u32>(buffer - window_wrappers.data());
+    }
+
+    /// Requests a hazard-tracked barrier for a unified window access.
+    [[nodiscard]] std::optional<vk::BufferMemoryBarrier2> RequestUnifiedBarrier(
+        u32 window, u64 offset, u64 size, vk::AccessFlags2 access,
+        vk::PipelineStageFlagBits2 stage, bool is_write);
+
+    /// Records an already-synchronized unified write.
+    void MarkUnifiedSelfSynced(u32 window, u64 offset, u64 size);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
@@ -124,12 +241,12 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
 
     /// Obtains a buffer for the specified region.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
+    [[nodiscard]] std::pair<Buffer*, u64> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
                                                        BufferId buffer_id = {});
 
     /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
+    [[nodiscard]] std::pair<Buffer*, u64> ObtainBufferForImage(VAddr gpu_addr, u32 size);
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);
@@ -169,6 +286,10 @@ private:
         return !buffer_id || slot_buffers[buffer_id].is_deleted;
     }
 
+    void RemovePhysRange(VAddr addr, u64 size);
+
+    bool SynchronizeUnifiedFromImage(u32 window, u64 offset, VAddr device_addr, u32 size);
+
     template <bool async>
     void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
 
@@ -203,6 +324,14 @@ private:
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
+    const VideoCore::UnifiedGuestMemory* unified{};
+    std::vector<Buffer> window_wrappers;
+    UnifiedHazardTracker unified_hazards;
+    std::mutex uma_phys_mutex;
+    std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;
+    std::atomic<u64> uma_hits{};
+    std::atomic<u64> uma_unmapped_fallbacks{};
+    std::atomic<u64> uma_barrier_emits{};
     TextureCache& texture_cache;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;

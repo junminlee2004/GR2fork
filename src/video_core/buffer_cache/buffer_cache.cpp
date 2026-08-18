@@ -7,12 +7,14 @@
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/unified_guest_memory.h"
 
 namespace VideoCore {
 
@@ -41,6 +43,18 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
 
+    if (auto* provider = instance.GetUnifiedGuestMemory(); provider && provider->IsActive()) {
+        unified = provider;
+        unified_hazards.Init(provider->TotalSize());
+        window_wrappers.reserve(provider->NumWindows());
+        for (u32 i = 0; i < provider->NumWindows(); ++i) {
+            window_wrappers.emplace_back(instance, scheduler, provider->WindowHandle(i),
+                                         provider->WindowSize(i));
+            Vulkan::SetObjectName(instance.GetDevice(), provider->WindowHandle(i),
+                                  fmt::format("Unified Guest Memory W{}", i));
+        }
+    }
+
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
     // Set up garbage collection parameters
@@ -66,7 +80,97 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() = default;
 
+void BufferCache::RemovePhysRange(VAddr addr, u64 size) {
+    // Erase [addr, addr+size) from the table, preserving trimmed head/tail
+    // survivors of partially covered runs.
+    const VAddr end = addr + size;
+    auto it = uma_phys_map.lower_bound(addr);
+    if (it != uma_phys_map.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second.second > addr) {
+            it = prev;
+        }
+    }
+    while (it != uma_phys_map.end() && it->first < end) {
+        const VAddr run_va = it->first;
+        const auto [run_phys, run_size] = it->second;
+        const VAddr run_end = run_va + run_size;
+        it = uma_phys_map.erase(it);
+        if (run_va < addr) {
+            uma_phys_map[run_va] = {run_phys, addr - run_va};
+        }
+        if (run_end > end) {
+            uma_phys_map[end] = {run_phys + (end - run_va), run_end - end};
+        }
+    }
+}
+
+void BufferCache::NotifyMapped(VAddr addr, u64 size) {
+    if (!unified) {
+        return;
+    }
+    const auto runs = memory->GetPhysRuns(addr, size);
+    std::scoped_lock lk{uma_phys_mutex};
+    RemovePhysRange(addr, size);
+    for (const auto& [va, phys, run] : runs) {
+        uma_phys_map[va] = {phys, run};
+    }
+}
+
+void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
+    if (!unified) {
+        return;
+    }
+    std::scoped_lock lk{uma_phys_mutex};
+    RemovePhysRange(addr, size);
+}
+
+std::optional<std::pair<u32, u64>> BufferCache::ResolveGuest(VAddr addr, u64 size) {
+    if (!unified) {
+        return std::nullopt;
+    }
+    PAddr phys{};
+    {
+        std::scoped_lock lk{uma_phys_mutex};
+        auto it = uma_phys_map.upper_bound(addr);
+        if (it == uma_phys_map.begin()) {
+            return std::nullopt;
+        }
+        --it;
+        const u64 delta = addr - it->first;
+        if (delta >= it->second.second || it->second.second - delta < size) {
+            return std::nullopt;
+        }
+        phys = it->second.first + delta;
+    }
+    return unified->Resolve(phys, size);
+}
+
+std::optional<vk::BufferMemoryBarrier2> BufferCache::RequestUnifiedBarrier(
+    u32 window, u64 offset, u64 size, vk::AccessFlags2 access, vk::PipelineStageFlagBits2 stage,
+    bool is_write) {
+    auto barrier = unified_hazards.Request(unified->WindowHandle(window), offset,
+                                           unified->WindowBase(window) + offset, size, access,
+                                           stage, is_write);
+    if (barrier) {
+        const u64 n = uma_barrier_emits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA hazard barrier #{}: window={} offset={:#x}", n,
+                     window, offset);
+        }
+    }
+    return barrier;
+}
+
+void BufferCache::MarkUnifiedSelfSynced(u32 window, u64 offset, u64 size) {
+    unified_hazards.MarkSelfSynced(unified->WindowBase(window) + offset, size);
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
+    if (unified) {
+        // Guest RAM is the buffer storage; there is no snapshot to refresh.
+        return;
+    }
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
@@ -75,6 +179,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    if (unified) {
+        // CPU reads see GPU writes at fence granularity; no download exists.
+        return;
+    }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -210,7 +318,13 @@ void BufferCache::BindVertexBuffers(
         const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        if (IsRegionGpuModified(range.base_address, size)) {
+        if (buffer->is_unified) {
+            if (auto barrier = RequestUnifiedBarrier(
+                    WindowIndex(buffer), offset, size, vk::AccessFlagBits2::eVertexAttributeRead,
+                    vk::PipelineStageFlagBits2::eVertexAttributeInput, false)) {
+                barriers.emplace_back(*barrier);
+            }
+        } else if (IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -267,7 +381,13 @@ void BufferCache::BindIndexBuffer(
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
-    if (IsRegionGpuModified(index_address, index_buffer_size)) {
+    if (vk_buffer->is_unified) {
+        if (auto barrier = RequestUnifiedBarrier(WindowIndex(vk_buffer), offset, index_buffer_size,
+                                                 vk::AccessFlagBits2::eIndexRead,
+                                                 vk::PipelineStageFlagBits2::eIndexInput, false)) {
+            barriers.emplace_back(*barrier);
+        }
+    } else if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -281,6 +401,27 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
+        if (unified) {
+            if (const auto resolved = ResolveGuest(address, num_bytes)) {
+                // Stream-ordered GPU fill; a parse-time CPU store would run
+                // ahead of recorded work that still reads these bytes live.
+                const auto [window, offset] = *resolved;
+                if (auto barrier = RequestUnifiedBarrier(window, offset, num_bytes,
+                                                         vk::AccessFlagBits2::eTransferWrite,
+                                                         vk::PipelineStageFlagBits2::eTransfer,
+                                                         true)) {
+                    scheduler.EndRendering();
+                    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                        .bufferMemoryBarrierCount = 1,
+                        .pBufferMemoryBarriers = &barrier.value(),
+                    });
+                }
+                window_wrappers[window].Fill(offset, num_bytes, value);
+                MarkUnifiedSelfSynced(window, offset, num_bytes);
+                return;
+            }
+        }
         if (!IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
@@ -297,7 +438,152 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     buffer->Fill(buffer->Offset(address), num_bytes, value);
 }
 
+bool BufferCache::SynchronizeUnifiedFromImage(u32 window, u64 offset, VAddr device_addr,
+                                              u32 size) {
+    const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
+    if (!image_id) {
+        return false;
+    }
+    Image& image = texture_cache.GetImage(image_id);
+    ASSERT_MSG(device_addr == image.info.guest_address,
+               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
+               image.info.guest_address);
+    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+    u32 copy_size = 0;
+    for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
+        const auto& mip_info = image.info.mips_layout[mip];
+        const u32 width = std::max(image.info.size.width >> mip, 1u);
+        const u32 height = std::max(image.info.size.height >> mip, 1u);
+        const u32 depth = std::max(image.info.size.depth >> mip, 1u);
+        if (offset + mip_info.offset + mip_info.size > unified->WindowSize(window)) {
+            break;
+        }
+        buffer_copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = mip_info.offset,
+            .bufferRowLength = mip_info.pitch,
+            .bufferImageHeight = mip_info.height,
+            .imageSubresource{
+                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, depth},
+        });
+        copy_size += mip_info.size;
+    }
+    if (copy_size == 0) {
+        return false;
+    }
+    scheduler.EndRendering();
+    if (auto barrier = RequestUnifiedBarrier(window, offset, copy_size,
+                                             vk::AccessFlagBits2::eTransferWrite,
+                                             vk::PipelineStageFlagBits2::eTransfer, true)) {
+        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier.value(),
+        });
+    }
+    auto& tile_manager = texture_cache.GetTileManager();
+    tile_manager.TileImage(image, buffer_copies, unified->WindowHandle(window), offset, copy_size);
+    MarkUnifiedSelfSynced(window, offset, copy_size);
+    return true;
+}
+
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (unified) {
+        const auto src_r =
+            src_gds ? std::optional<std::pair<u32, u64>>{} : ResolveGuest(src, num_bytes);
+        const auto dst_r =
+            dst_gds ? std::optional<std::pair<u32, u64>>{} : ResolveGuest(dst, num_bytes);
+        if ((src_gds || src_r) && (dst_gds || dst_r)) {
+            texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+            const Buffer* src_buffer = src_gds ? &gds_buffer : &window_wrappers[src_r->first];
+            const u64 src_offset = src_gds ? src : src_r->second;
+            const Buffer* dst_buffer = dst_gds ? &gds_buffer : &window_wrappers[dst_r->first];
+            const u64 dst_offset = dst_gds ? dst : dst_r->second;
+            boost::container::static_vector<vk::BufferMemoryBarrier2, 4> pre_barriers;
+            if (src_r) {
+                if (auto barrier = RequestUnifiedBarrier(src_r->first, src_r->second, num_bytes,
+                                                         vk::AccessFlagBits2::eTransferRead,
+                                                         vk::PipelineStageFlagBits2::eTransfer,
+                                                         false)) {
+                    pre_barriers.push_back(*barrier);
+                }
+            }
+            if (dst_r) {
+                if (auto barrier = RequestUnifiedBarrier(dst_r->first, dst_r->second, num_bytes,
+                                                         vk::AccessFlagBits2::eTransferWrite,
+                                                         vk::PipelineStageFlagBits2::eTransfer,
+                                                         true)) {
+                    pre_barriers.push_back(*barrier);
+                }
+            }
+            pre_barriers.push_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .buffer = dst_buffer->Handle(),
+                .offset = dst_offset,
+                .size = num_bytes,
+            });
+            pre_barriers.push_back(vk::BufferMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .buffer = src_buffer->Handle(),
+                .offset = src_offset,
+                .size = num_bytes,
+            });
+            scheduler.EndRendering();
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+                .pBufferMemoryBarriers = pre_barriers.data(),
+            });
+            const vk::BufferCopy region = {
+                .srcOffset = src_offset,
+                .dstOffset = dst_offset,
+                .size = num_bytes,
+            };
+            cmdbuf.copyBuffer(src_buffer->Handle(), dst_buffer->Handle(), region);
+            const vk::BufferMemoryBarrier2 buf_barriers_after[2] = {
+                {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                    .buffer = dst_buffer->Handle(),
+                    .offset = dst_offset,
+                    .size = num_bytes,
+                },
+                {
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .buffer = src_buffer->Handle(),
+                    .offset = src_offset,
+                    .size = num_bytes,
+                },
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 2,
+                .pBufferMemoryBarriers = buf_barriers_after,
+            });
+            if (dst_r) {
+                MarkUnifiedSelfSynced(dst_r->first, dst_r->second, num_bytes);
+            }
+            return;
+        }
+        // A participant is unmapped guest memory; the legacy path handles it.
+    }
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -388,8 +674,36 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
-std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
+std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
+    // Native UMA: guest memory is the buffer storage. The GPU reads and
+    // writes the guest's own bytes coherently; no snapshot, slot or stream
+    // copy of guest data exists.
+    if (unified) {
+        u32 uma_size = size;
+        auto resolved = ResolveGuest(device_addr, uma_size);
+        if (!resolved && size > VideoCore::UnifiedGuestMemory::MaxRange) {
+            // Oversized clamped binds cannot span a window; truncating
+            // matches mapping-end clamping behavior for robustness reads.
+            uma_size = static_cast<u32>(VideoCore::UnifiedGuestMemory::MaxRange);
+            resolved = ResolveGuest(device_addr, uma_size);
+        }
+        if (resolved) {
+            const auto [window, offset] = *resolved;
+            if (is_texel_buffer && !is_written) {
+                // A formatted view over an image-owned range reads the
+                // image's bytes: tile them into guest memory GPU-side.
+                SynchronizeUnifiedFromImage(window, offset, device_addr, uma_size);
+            }
+            uma_hits.fetch_add(1, std::memory_order_relaxed);
+            return {&window_wrappers[window], offset};
+        }
+        const u64 n = uma_unmapped_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA unmapped fallback #{}: addr={:#x} size={:#x}", n,
+                     device_addr, size);
+        }
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
@@ -406,7 +720,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     return {&buffer, buffer.Offset(device_addr)};
 }
 
-std::pair<Buffer*, u32> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+std::pair<Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr gpu_addr, u32 size) {
+    if (unified) {
+        if (const auto resolved = ResolveGuest(gpu_addr, size)) {
+            return {&window_wrappers[resolved->first], resolved->second};
+        }
+    }
     // Check if any buffer contains the full requested range.
     const BufferId buffer_id = page_table[gpu_addr >> CACHING_PAGEBITS].buffer_id;
     if (buffer_id) {

@@ -63,7 +63,7 @@ UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
     : device{device_}, allocator{allocator_} {}
 
 UniqueBuffer::~UniqueBuffer() {
-    if (buffer) {
+    if (buffer && allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     }
 }
@@ -98,6 +98,14 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
         ASSERT_MSG(bda_result != 0, "Failed to get buffer device address");
         bda_addr = bda_result;
     }
+}
+
+Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
+               vk::Buffer external_buffer, u64 size_bytes_)
+    : size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
+      usage{MemoryUsage::DeviceLocal}, buffer{instance->GetDevice(), instance->GetAllocator()} {
+    buffer.buffer = external_buffer;
+    is_unified = true;
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,

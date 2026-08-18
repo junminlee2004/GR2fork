@@ -265,18 +265,33 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
 
     VideoCore::Buffer* count_buffer{};
-    u32 count_base{};
+    u64 count_base{};
     if (count_address != 0) {
         std::tie(count_buffer, count_base) = buffer_cache.ObtainBuffer(count_address, 4, false);
     }
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
+    if (buffer->is_unified) {
+        if (auto barrier = buffer_cache.RequestUnifiedBarrier(
+                buffer_cache.WindowIndex(buffer), base, stride * max_count,
+                vk::AccessFlagBits2::eIndirectCommandRead,
+                vk::PipelineStageFlagBits2::eDrawIndirect, false)) {
+            buffer_barriers.emplace_back(*barrier);
+        }
+    } else if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
+                                                 vk::PipelineStageFlagBits2::eDrawIndirect)) {
         buffer_barriers.emplace_back(*barrier);
     }
     if (count_buffer) {
-        if (auto barrier = count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                                    vk::PipelineStageFlagBits2::eDrawIndirect)) {
+        if (count_buffer->is_unified) {
+            if (auto barrier = buffer_cache.RequestUnifiedBarrier(
+                    buffer_cache.WindowIndex(count_buffer), count_base, 4,
+                    vk::AccessFlagBits2::eIndirectCommandRead,
+                    vk::PipelineStageFlagBits2::eDrawIndirect, false)) {
+                buffer_barriers.emplace_back(*barrier);
+            }
+        } else if (auto barrier =
+                       count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
+                                                vk::PipelineStageFlagBits2::eDrawIndirect)) {
             buffer_barriers.emplace_back(*barrier);
         }
     }
@@ -364,8 +379,15 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
+    if (buffer->is_unified) {
+        if (auto barrier = buffer_cache.RequestUnifiedBarrier(
+                buffer_cache.WindowIndex(buffer), base, size,
+                vk::AccessFlagBits2::eIndirectCommandRead,
+                vk::PipelineStageFlagBits2::eDrawIndirect, false)) {
+            buffer_barriers.emplace_back(*barrier);
+        }
+    } else if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
+                                                 vk::PipelineStageFlagBits2::eDrawIndirect)) {
         buffer_barriers.emplace_back(*barrier);
     }
 
@@ -672,15 +694,24 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         } else {
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
-            const u32 offset_aligned = Common::AlignDown(offset, alignment);
-            const u32 adjust = offset - offset_aligned;
+            const u64 offset_aligned = Common::AlignDown(offset, alignment);
+            const u32 adjust = static_cast<u32>(offset - offset_aligned);
             ASSERT(adjust % 4 == 0);
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
-            if (auto barrier =
-                    vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
-                                                          : vk::AccessFlagBits2::eShaderRead,
-                                          vk::PipelineStageFlagBits2::eAllCommands)) {
+            if (vk_buffer->is_unified) {
+                if (auto barrier = buffer_cache.RequestUnifiedBarrier(
+                        buffer_cache.WindowIndex(vk_buffer), offset, size,
+                        desc.is_written ? vk::AccessFlagBits2::eShaderWrite
+                                        : vk::AccessFlagBits2::eShaderRead,
+                        vk::PipelineStageFlagBits2::eAllCommands, desc.is_written)) {
+                    buffer_barriers.emplace_back(*barrier);
+                }
+            } else if (auto barrier =
+                           vk_buffer->GetBarrier(desc.is_written
+                                                     ? vk::AccessFlagBits2::eShaderWrite
+                                                     : vk::AccessFlagBits2::eShaderRead,
+                                                 vk::PipelineStageFlagBits2::eAllCommands)) {
                 buffer_barriers.emplace_back(*barrier);
             }
             if (desc.is_written && desc.is_formatted) {
@@ -1111,9 +1142,11 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
     page_manager.OnGpuMap(addr, size);
+    buffer_cache.NotifyMapped(addr, size);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    buffer_cache.NotifyUnmapped(addr, size);
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     page_manager.OnGpuUnmap(addr, size);
