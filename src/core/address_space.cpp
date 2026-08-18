@@ -811,9 +811,13 @@ struct AddressSpace::Impl {
         if (phys_addr != -1) {
             any_phys_mapped = true;
         }
+        // Executable mappings keep the memfd backing: device-memory VMAs
+        // reject PROT_EXEC, and guest code is CPU-domain data the GPU does
+        // not read through the unified windows.
+        const bool wants_exec = (prot & PROT_EXEC) != 0;
         // Dmem-backed mappings may span several unified regions (or holes
         // between them); the view is stitched from fixed mappings per span.
-        if (phys_addr != -1 && fd == -1 && !unified_regions.empty()) {
+        if (phys_addr != -1 && fd == -1 && !unified_regions.empty() && !wants_exec) {
             u64 done = 0;
             while (done < size) {
                 const PAddr piece_phys = phys_addr + done;

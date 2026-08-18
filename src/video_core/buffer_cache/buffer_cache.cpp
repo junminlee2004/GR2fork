@@ -686,10 +686,20 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         }
         if (resolved) {
             const auto [window, offset] = *resolved;
-            if (is_texel_buffer && !is_written) {
+            if (is_texel_buffer && !is_written &&
+                (size > CACHING_PAGESIZE || IsRegionGpuModified(device_addr, size))) {
                 // A formatted view over an image-owned range reads the
                 // image's bytes: tile them into guest memory GPU-side.
-                SynchronizeUnifiedFromImage(window, offset, device_addr, uma_size);
+                // Small clean texel binds skip this to match the mainline
+                // stream path, which never consulted images - tiling per
+                // bind for those collapses the frame rate.
+                if (SynchronizeUnifiedFromImage(window, offset, device_addr, uma_size)) {
+                    const u64 n = uma_texel_tiles.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((n & (n - 1)) == 0) {
+                        LOG_INFO(Render_Vulkan, "Native UMA texel image tile #{}: addr={:#x}", n,
+                                 device_addr);
+                    }
+                }
             }
             uma_hits.fetch_add(1, std::memory_order_relaxed);
             return {&window_wrappers[window], offset};

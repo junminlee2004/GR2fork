@@ -332,6 +332,7 @@ private:
     std::atomic<u64> uma_hits{};
     std::atomic<u64> uma_unmapped_fallbacks{};
     std::atomic<u64> uma_barrier_emits{};
+    std::atomic<u64> uma_texel_tiles{};
     TextureCache& texture_cache;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
