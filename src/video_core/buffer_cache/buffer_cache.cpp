@@ -442,29 +442,56 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
-    if (!is_written && HairDiagHit(device_addr, size) && size >= 1_MB) {
+    if (!is_written && HairDiagHit(device_addr, size) && size >= 2_MB) {
         // HAIRDIAG3: torn-snapshot detector. The slot upload copies the
         // block at parse time; if the hash changes by the time the
         // submission leaves for the GPU, live execution-time reads (what
         // real hardware and native UMA do) would have seen different
-        // bytes than this snapshot delivered.
+        // bytes than this snapshot delivered. Hashing must avoid
+        // GPU-modified sub-ranges: their pages are read-protected under
+        // precise readbacks and a fault on this thread cannot be serviced.
         static std::atomic<u64> diag_hash_n{0};
         const u64 hash_n = diag_hash_n.fetch_add(1, std::memory_order_relaxed) + 1;
         if (hash_n <= 128 || (hash_n & (hash_n - 1)) == 0) {
-            const u64 span = std::min<u64>(size, 1_MB);
-            const u64 h0 = XXH3_64bits(reinterpret_cast<const void*>(device_addr), span);
-            scheduler.DeferOperation([device_addr, span, h0, hash_n] {
-                const u64 h1 = XXH3_64bits(reinterpret_cast<const void*>(device_addr), span);
-                if (h1 != h0) {
-                    LOG_INFO(Render_Vulkan,
-                             "HAIRDIAG3 TORN snapshot #{}: addr={:#x} span={:#x} changed "
-                             "between parse and submit",
-                             hash_n, device_addr, span);
-                } else if (hash_n <= 32) {
-                    LOG_INFO(Render_Vulkan, "HAIRDIAG3 intact snapshot #{}: addr={:#x}", hash_n,
-                             device_addr);
+            constexpr u64 HashSpan = 1_MB;
+            // Protection is page-granular: test whole pages so an edge page
+            // shared with GPU-modified bytes outside the span cannot fault.
+            VAddr span_addr = Common::AlignUp(device_addr + HashSpan, 4_KB);
+            bool clean = false;
+            {
+                std::scoped_lock lk{gpu_modified_mutex};
+                for (int tries = 0; tries < 4 && span_addr + HashSpan + 4_KB <= device_addr + size;
+                     ++tries, span_addr += HashSpan) {
+                    if (!gpu_modified_ranges.Intersects(span_addr - 4_KB, HashSpan + 8_KB)) {
+                        clean = true;
+                        break;
+                    }
                 }
-            });
+            }
+            if (clean) {
+                const u64 h0 = XXH3_64bits(reinterpret_cast<const void*>(span_addr), HashSpan);
+                scheduler.DeferOperation([this, span_addr, h0, hash_n] {
+                    if (!memory->IsValidMapping(span_addr)) {
+                        return;
+                    }
+                    {
+                        std::scoped_lock lk{gpu_modified_mutex};
+                        if (gpu_modified_ranges.Intersects(span_addr, HashSpan)) {
+                            return;
+                        }
+                    }
+                    const u64 h1 = XXH3_64bits(reinterpret_cast<const void*>(span_addr), HashSpan);
+                    if (h1 != h0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "HAIRDIAG3 TORN snapshot #{}: addr={:#x} changed between "
+                                 "parse and submit",
+                                 hash_n, span_addr);
+                    } else if (hash_n <= 32) {
+                        LOG_INFO(Render_Vulkan, "HAIRDIAG3 intact snapshot #{}: addr={:#x}",
+                                 hash_n, span_addr);
+                    }
+                });
+            }
         }
     }
     if (!is_written && HairDiagHit(device_addr, size)) {
