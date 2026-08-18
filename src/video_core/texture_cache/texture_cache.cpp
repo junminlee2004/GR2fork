@@ -68,12 +68,75 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
+// Tiled CPU-feedback surfaces the readback system can deliver through the
+// tiler compute pass: small, low bit depth, color, single sample - the shape
+// games read back for simulation results, not full render targets.
+static bool IsTiledReadbackCandidate(const ImageInfo& info) {
+    constexpr u64 SizeLimit = 8_MB;
+    constexpr u32 MaxBits = 16;
+    return info.props.is_tiled && info.size.width > 8 && info.guest_address != 0 &&
+           !info.props.is_depth && info.num_samples == 1 && info.num_bits <= MaxBits &&
+           info.guest_size <= SizeLimit;
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+    if (image.info.props.is_tiled && image.info.size.width > 8) {
+        // The guest expects GCN-tiled bytes, which the tiler compute pass
+        // produces into the download buffer.
+        boost::container::small_vector<vk::BufferImageCopy, 8> copies;
+        u32 copy_size = 0;
+        for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
+            const auto& mip_info = image.info.mips_layout[mip];
+            const u32 width = std::max(image.info.size.width >> mip, 1u);
+            const u32 height = std::max(image.info.size.height >> mip, 1u);
+            const u32 depth = std::max(image.info.size.depth >> mip, 1u);
+            if (mip_info.offset + mip_info.size > image.info.guest_size) {
+                break;
+            }
+            copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = mip_info.offset,
+                .bufferRowLength = mip_info.pitch,
+                .bufferImageHeight = mip_info.height,
+                .imageSubresource{
+                    .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                    .mipLevel = mip,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {width, height, depth},
+            });
+            copy_size += mip_info.size;
+        }
+        if (copies.empty() || copy_size == 0) {
+            return;
+        }
+        // The tiler binds its output as a storage buffer and its dispatch
+        // covers the full guest layout including padding, so the mapped
+        // slice must span guest_size at storage alignment.
+        const auto [download, offset] =
+            download_buffer.Map(image.info.guest_size, instance.StorageMinAlignment());
+        download_buffer.Commit();
+        scheduler.EndRendering();
+        tile_manager.TileImage(image, copies, download_buffer.Handle(), offset, copy_size);
+        if (sync) {
+            scheduler.Finish();
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+                                                      download, copy_size);
+        } else {
+            scheduler.DeferPriorityOperation(
+                [device_addr = image.info.guest_address, download, copy_size] {
+                    Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                              download, copy_size);
+                });
+        }
+        return;
+    }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
@@ -622,7 +685,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        if (readback_linear_images &&
+            (!image.info.props.is_tiled || image.info.size.width <= 8 ||
+             IsTiledReadbackCandidate(image.info)) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
@@ -635,7 +700,8 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8 ||
+                                   IsTiledReadbackCandidate(image.info))) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
