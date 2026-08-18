@@ -75,6 +75,17 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    // HAIRDIAG: verbose head of the fault-service stream. Which accesses
+    // fault, what the windows deliver, and where the GPU was at service
+    // time distinguish a delivery hole from an ordering race.
+    static std::atomic<u64> diag_serial{0};
+    const u64 diag_n = diag_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_n <= 128 || (diag_n & (diag_n - 1)) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "HAIRDIAG fault-service #{}: addr={:#x} size={:#x} write={} tick={} gpu={}",
+                 diag_n, device_addr, size, is_write, scheduler.CurrentTick(),
+                 scheduler.GetMasterSemaphore()->KnownGpuTick());
+    }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -117,7 +128,21 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
+        static std::atomic<u64> diag_empty{0};
+        const u64 diag_n = diag_empty.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "HAIRDIAG empty download #{}: addr={:#x} size={:#x} (no gpu-modified "
+                     "intersection - the faulting range had nothing to deliver)",
+                     diag_n, device_addr, size);
+        }
         return;
+    }
+    static std::atomic<u64> diag_dl{0};
+    const u64 diag_n = diag_dl.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (diag_n <= 128 || (diag_n & (diag_n - 1)) == 0) {
+        LOG_INFO(Render_Vulkan, "HAIRDIAG download #{}: addr={:#x} size={:#x} pieces={} bytes={:#x}",
+                 diag_n, device_addr, size, copies.size(), total_size_bytes);
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
     for (auto& copy : copies) {
