@@ -4,12 +4,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <type_traits>
 #include <vector>
 
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -56,6 +58,14 @@ public:
 
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        if (dirty_cpu_addr < 0x1027500000ULL && dirty_cpu_addr + query_size > 0x1026b00000ULL) {
+            static std::atomic<u64> diag_unmark{0};
+            const u64 diag_n = diag_unmark.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
+                LOG_INFO(Render_Vulkan, "HAIRDIAG2 unmark #{}: addr={:#x} size={:#x}", diag_n,
+                         dirty_cpu_addr, query_size);
+            }
+        }
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};

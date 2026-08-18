@@ -16,6 +16,13 @@
 
 namespace VideoCore {
 
+// HAIRDIAG2: the hair sim output region observed in the fault stream.
+static constexpr VAddr HairDiagBegin = 0x1026b00000ULL;
+static constexpr VAddr HairDiagEnd = 0x1027500000ULL;
+static bool HairDiagHit(VAddr addr, u64 size) {
+    return addr < HairDiagEnd && addr + size > HairDiagBegin;
+}
+
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
@@ -351,6 +358,14 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
         gpu_modified_ranges.Add(dst, num_bytes);
+        if (HairDiagHit(dst, num_bytes)) {
+            static std::atomic<u64> diag_copy{0};
+            const u64 diag_n = diag_copy.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
+                LOG_INFO(Render_Vulkan, "HAIRDIAG2 copy dst #{}: addr={:#x} size={:#x}", diag_n,
+                         dst, num_bytes);
+            }
+        }
         return buffer;
     }();
     const vk::BufferCopy region = {
@@ -415,6 +430,18 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
+    if (!is_written && HairDiagHit(device_addr, size)) {
+        static std::atomic<u64> diag_read{0};
+        const u64 diag_n = diag_read.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (diag_n <= 96 || (diag_n & (diag_n - 1)) == 0) {
+            const bool stream_path = size <= CACHING_PAGESIZE &&
+                                     !IsRegionGpuModified(device_addr, size);
+            LOG_INFO(Render_Vulkan,
+                     "HAIRDIAG2 read bind #{}: addr={:#x} size={:#x} stream={} texel={} tick={}",
+                     diag_n, device_addr, size, stream_path, is_texel_buffer,
+                     scheduler.CurrentTick());
+        }
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
@@ -427,6 +454,15 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        if (HairDiagHit(device_addr, size)) {
+            static std::atomic<u64> diag_mark{0};
+            const u64 diag_n = diag_mark.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "HAIRDIAG2 written bind #{}: addr={:#x} size={:#x} texel={}", diag_n,
+                         device_addr, size, is_texel_buffer);
+            }
+        }
     }
     return {&buffer, buffer.Offset(device_addr)};
 }
