@@ -120,20 +120,29 @@ void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
 }
 
 void BufferCache::SettleUnifiedWrites(VAddr device_addr, u64 size) {
+    // Only the intersecting pending pieces settle. Marking the whole query
+    // range would flag every byte of a giant clamped bind CPU-dirty and
+    // force full re-uploads of every legacy buffer under it.
     u64 wait_tick = 0;
-    unified_pending.ForEachInRange(device_addr, size, [&](VAddr, VAddr, u64 tick) { //
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> pieces;
+    unified_pending.ForEachInRange(device_addr, size, [&](VAddr addr, VAddr end, u64 tick) {
         wait_tick = std::max(wait_tick, tick);
+        pieces.emplace_back(addr, end - addr);
     });
-    if (wait_tick == 0) {
+    if (pieces.empty()) {
         return;
     }
     scheduler.Wait(wait_tick);
-    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-    unified_pending.Subtract(device_addr, size);
+    u64 settled_bytes = 0;
+    for (const auto& [addr, len] : pieces) {
+        memory_tracker->MarkRegionAsCpuModified(addr, len);
+        unified_pending.Subtract(addr, len);
+        settled_bytes += len;
+    }
     const u64 n = uma_settles.fetch_add(1, std::memory_order_relaxed) + 1;
     if ((n & (n - 1)) == 0) {
-        LOG_INFO(Render_Vulkan, "Native UMA settle #{}: addr={:#x} size={:#x} tick={}", n,
-                 device_addr, size, wait_tick);
+        LOG_INFO(Render_Vulkan, "Native UMA settle #{}: addr={:#x} bytes={:#x} tick={}", n,
+                 device_addr, settled_bytes, wait_tick);
     }
 }
 
