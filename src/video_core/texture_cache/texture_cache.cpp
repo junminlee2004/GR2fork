@@ -775,8 +775,14 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
-                                             vk::PipelineStageFlagBits2::eTransfer)) {
+    const auto barrier =
+        in_buffer->is_unified
+            ? buffer_cache.RequestUnifiedBarrier(in_offset, image.info.guest_size,
+                                                 vk::AccessFlagBits2::eTransferRead,
+                                                 vk::PipelineStageFlagBits2::eTransfer, false)
+            : in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
+                                    vk::PipelineStageFlagBits2::eTransfer);
+    if (barrier) {
         scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = 1,

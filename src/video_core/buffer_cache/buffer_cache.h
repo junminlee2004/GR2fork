@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
@@ -36,6 +38,84 @@ using BufferId = Common::SlotId;
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+
+/// Hazard state for the unified wrapper buffer, tracked per 4MiB bucket.
+/// One shared (access, stage) pair for the whole 4+GB wrapper would turn
+/// bind count into barrier count; per-bucket last-writer state keeps
+/// emissions proportional to actual producer->consumer edges instead.
+class UnifiedHazardTracker {
+public:
+    static constexpr u64 BUCKET_SHIFT = 22;
+
+    void Init(u64 covered_size) {
+        buckets.resize((covered_size >> BUCKET_SHIFT) + 1);
+    }
+
+    /// Requests access to [offset, offset+size); returns a barrier when the
+    /// request conflicts with a pending write or, for writes, prior reads.
+    std::optional<vk::BufferMemoryBarrier2> Request(vk::Buffer buffer, u64 offset, u64 size,
+                                                    vk::AccessFlags2 access,
+                                                    vk::PipelineStageFlags2 stage, bool is_write) {
+        const u64 first = offset >> BUCKET_SHIFT;
+        const u64 last = std::min((offset + size - 1) >> BUCKET_SHIFT, buckets.size() - 1);
+        vk::PipelineStageFlags2 src_stages{};
+        vk::AccessFlags2 src_access{};
+        for (u64 i = first; i <= last; ++i) {
+            auto& bucket = buckets[i];
+            if (bucket.wr_stages) {
+                src_stages |= bucket.wr_stages;
+                src_access |= bucket.wr_access;
+            }
+            if (is_write) {
+                if (bucket.read_since_write) {
+                    // Write-after-read only needs execution ordering.
+                    src_stages |= vk::PipelineStageFlagBits2::eAllCommands;
+                }
+                bucket.wr_stages = stage;
+                bucket.wr_access = access;
+                bucket.read_since_write = false;
+            } else {
+                // Publish to every later reader at once, then retire the
+                // writer: one barrier per producer->consumer edge.
+                bucket.wr_stages = {};
+                bucket.wr_access = {};
+                bucket.read_since_write = true;
+            }
+        }
+        if (!src_stages) {
+            return std::nullopt;
+        }
+        return vk::BufferMemoryBarrier2{
+            .srcStageMask = src_stages,
+            .srcAccessMask = src_access,
+            .dstStageMask = is_write ? stage : vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = is_write ? access : vk::AccessFlagBits2::eMemoryRead,
+            .buffer = buffer,
+            .offset = offset,
+            .size = size,
+        };
+    }
+
+    /// Records a write that already published itself with explicit pre/post
+    /// barriers (Buffer::Fill, copy helpers, image write-back transports).
+    void MarkSelfSynced(u64 offset, u64 size) {
+        const u64 first = offset >> BUCKET_SHIFT;
+        const u64 last = std::min((offset + size - 1) >> BUCKET_SHIFT, buckets.size() - 1);
+        for (u64 i = first; i <= last; ++i) {
+            buckets[i].wr_stages = {};
+            buckets[i].wr_access = {};
+            buckets[i].read_since_write = true;
+        }
+    }
+
+private:
+    struct Bucket {
+        vk::AccessFlags2 wr_access{};
+        vk::PipelineStageFlags2 wr_stages{};
+        bool read_since_write{};
+    };
+    std::vector<Bucket> buckets;
+};
 
 class BufferCache {
 public:
@@ -114,6 +194,16 @@ public:
     /// Native UMA map notifications (called outside the memory lock).
     void NotifyMapped(VAddr addr, u64 size);
     void NotifyUnmapped(VAddr addr, u64 size);
+
+    /// Requests a hazard-tracked barrier for a unified wrapper access.
+    [[nodiscard]] std::optional<vk::BufferMemoryBarrier2> RequestUnifiedBarrier(
+        u64 offset, u64 size, vk::AccessFlags2 access, vk::PipelineStageFlagBits2 stage,
+        bool is_write);
+
+    /// Records an already-synchronized unified wrapper write.
+    void MarkUnifiedSelfSynced(u64 offset, u64 size) {
+        unified_hazards.MarkSelfSynced(offset, size);
+    }
 
 private:
     void RemovePhysRange(VAddr addr, u64 size);
@@ -218,9 +308,11 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     std::optional<Buffer> unified_wrapper;
+    UnifiedHazardTracker unified_hazards;
     std::atomic<u64> uma_hits{};
     std::atomic<u64> uma_fallbacks{};
     std::atomic<u64> uma_guard_rejects{};
+    std::atomic<u64> uma_barrier_emits{};
     RangeSet unified_gpu_ranges;
     std::mutex uma_phys_mutex;
     std::map<VAddr, std::pair<PAddr, u64>> uma_phys_map;

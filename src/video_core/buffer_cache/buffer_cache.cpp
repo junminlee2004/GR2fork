@@ -45,6 +45,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     if (auto* unified = instance.GetUnifiedGuestMemory(); unified && unified->IsActive()) {
         unified_wrapper.emplace(instance, scheduler, unified->Handle(), unified->CoveredSize());
+        unified_hazards.Init(unified->CoveredSize());
         Vulkan::SetObjectName(instance.GetDevice(), unified->Handle(), "Unified Guest Memory");
     }
 
@@ -116,6 +117,25 @@ void BufferCache::NotifyUnmapped(VAddr addr, u64 size) {
     }
     std::scoped_lock lk{uma_phys_mutex};
     RemovePhysRange(addr, size);
+}
+
+std::optional<vk::BufferMemoryBarrier2> BufferCache::RequestUnifiedBarrier(
+    u64 offset, u64 size, vk::AccessFlags2 access, vk::PipelineStageFlagBits2 stage,
+    bool is_write) {
+    if (EmulatorSettings.GetNativeUmaMode() & 8) {
+        // Escape hatch: the previous single-state whole-wrapper rule.
+        return unified_wrapper->GetBarrier(access, stage, offset);
+    }
+    auto barrier = unified_hazards.Request(unified_wrapper->Handle(), offset, size, access, stage,
+                                           is_write);
+    if (barrier) {
+        const u64 n = uma_barrier_emits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Native UMA hazard barrier #{}: phys={:#x} size={:#x}", n,
+                     offset, size);
+        }
+    }
+    return barrier;
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
@@ -262,7 +282,16 @@ void BufferCache::BindVertexBuffers(
         const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        if (IsRegionGpuModified(range.base_address, size)) {
+        if (buffer->is_unified) {
+            // Unified writes never mark the memory tracker; the hazard
+            // tracker is the only fence between them and this fetch.
+            if (auto barrier =
+                    RequestUnifiedBarrier(offset, size, vk::AccessFlagBits2::eVertexAttributeRead,
+                                          vk::PipelineStageFlagBits2::eVertexAttributeInput,
+                                          false)) {
+                barriers.emplace_back(*barrier);
+            }
+        } else if (IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -319,7 +348,13 @@ void BufferCache::BindIndexBuffer(
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
-    if (IsRegionGpuModified(index_address, index_buffer_size)) {
+    if (vk_buffer->is_unified) {
+        if (auto barrier =
+                RequestUnifiedBarrier(offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead,
+                                      vk::PipelineStageFlagBits2::eIndexInput, false)) {
+            barriers.emplace_back(*barrier);
+        }
+    } else if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -345,6 +380,23 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     }
     const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
     DEBUG_ASSERT(offset + num_bytes <= buffer->SizeBytes());
+    if (buffer->is_unified) {
+        // Fill publishes itself with explicit pre/post barriers; the tracker
+        // only needs to order it against a pending shader writer first.
+        if (auto barrier = RequestUnifiedBarrier(offset, num_bytes,
+                                                 vk::AccessFlagBits2::eTransferWrite,
+                                                 vk::PipelineStageFlagBits2::eTransfer, true)) {
+            scheduler.EndRendering();
+            scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+                .bufferMemoryBarrierCount = 1,
+                .pBufferMemoryBarriers = &barrier.value(),
+            });
+        }
+        buffer->Fill(offset, num_bytes, value);
+        MarkUnifiedSelfSynced(offset, num_bytes);
+        return;
+    }
     buffer->Fill(offset, num_bytes, value);
 }
 
