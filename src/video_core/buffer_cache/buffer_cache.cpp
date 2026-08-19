@@ -95,16 +95,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                  scheduler.GetMasterSemaphore()->KnownGpuTick());
     }
     if (is_write) {
-        // Authorship of exactly the bytes the guest writes returns to it, while
-        // the rest of the page stays GPU authored so the page granular upload
-        // cannot put a stale copy of shader output back over live bytes.
+        // A write fault means the guest may author anything in the page, so the
+        // download releases the page and only GPU writes that follow it are
+        // held back from later uploads.
         const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
         const u64 page_size =
             Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
         bool page_has_gpu_data{};
         {
             std::scoped_lock lk{gpu_modified_mutex};
-            gpu_modified_ranges.Subtract(device_addr, size);
             page_has_gpu_data = gpu_modified_ranges.Intersects(page, page_size);
         }
         if (!page_has_gpu_data) {
@@ -165,6 +164,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             };
             std::scoped_lock lk{gpu_modified_mutex};
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+            gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
         // The byte-granular ranges for these pages were already dropped above;
