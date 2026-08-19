@@ -167,10 +167,10 @@ void BufferCache::MarkUnifiedSelfSynced(u32 window, u64 offset, u64 size) {
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
-    if (unified) {
-        // Guest RAM is the buffer storage; there is no snapshot to refresh.
-        return;
-    }
+    // Ranges the unified windows cannot serve keep their cached buffers, and
+    // those buffers keep the page protection that reports guest writes. The
+    // report has to be acted on: a write fault whose page is left protected
+    // repeats forever on the faulting thread.
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
@@ -179,10 +179,9 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    if (unified) {
-        // CPU reads see GPU writes at fence granularity; no download exists.
-        return;
-    }
+    // Only cached buffers ever mark a region GPU modified, so this delivers
+    // exactly what the fallback path produced; unified serving never gets
+    // here because it leaves the tracker untouched.
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
