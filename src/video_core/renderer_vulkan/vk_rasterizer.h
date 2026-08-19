@@ -5,7 +5,6 @@
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
-#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -64,8 +63,6 @@ public:
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
-    void SignalAtCompletion(Common::UniqueFunction<void>&& fn);
-    void ProcessCompletedFences();
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();

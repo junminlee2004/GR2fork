@@ -719,27 +719,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
-                const auto signal_eop = [](const PM4CmdEventWriteEop& cmd) {
-                    cmd.SignalFence(
-                        [](void* address, u64 data, u32 num_bytes) {
-                            auto* memory = Core::Memory::Instance();
-                            if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                                memcpy(address, &data, num_bytes);
-                            }
-                        },
-                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                };
-                if (rasterizer) {
-                    // The label reports the end of pipe, so it has to be written
-                    // when the work retires. Writing it as the packet is parsed
-                    // tells the guest its buffers are free while the draws that
-                    // read them are still queued, and the guest overwrites data
-                    // the GPU has yet to fetch.
-                    rasterizer->SignalAtCompletion(
-                        [signal_eop, cmd = *event_eop] { signal_eop(cmd); });
-                    break;
-                }
-                signal_eop(*event_eop);
+                event_eop->SignalFence(
+                    [](void* address, u64 data, u32 num_bytes) {
+                        auto* memory = Core::Memory::Instance();
+                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                            memcpy(address, &data, num_bytes);
+                        }
+                    },
+                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -839,11 +826,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                u32 wait_spins = 0;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
-                    if (rasterizer && (++wait_spins & 63) == 0) {
-                        rasterizer->ProcessCompletedFences();
-                    }
                     YIELD_GFX();
                 }
                 break;
