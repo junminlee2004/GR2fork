@@ -47,6 +47,7 @@ struct Profile {
     bool needs_manual_interpolation{};
     bool needs_lds_barriers{};
     bool needs_buffer_offsets{};
+    bool emulate_fp32_denorm_flush{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};

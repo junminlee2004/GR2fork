@@ -6,6 +6,22 @@
 
 namespace Shader::Backend::SPIRV {
 
+namespace {
+/// GCN flushes float32 denormals, and hosts that cannot honor the DenormFlushToZero
+/// execution mode keep them instead. A denormal reaching a reciprocal yields a huge
+/// finite result where the guest expects infinity, so flush the inputs of the
+/// operations that amplify it.
+Id FlushDenormF32(EmitContext& ctx, Id value) {
+    if (!ctx.profile.emulate_fp32_denorm_flush) {
+        return value;
+    }
+    const Id smallest_normal{ctx.ConstF32(1.17549435e-38f)};
+    const Id is_denorm{
+        ctx.OpFOrdLessThan(ctx.U1[1], ctx.OpFAbs(ctx.F32[1], value), smallest_normal)};
+    return ctx.OpSelect(ctx.F32[1], is_denorm, ctx.ConstF32(0.0f), value);
+}
+} // Anonymous namespace
+
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
@@ -126,7 +142,7 @@ Id EmitFPLog2(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecip32(EmitContext& ctx, Id value) {
-    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
+    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), FlushDenormF32(ctx, value));
 }
 
 Id EmitFPRecip64(EmitContext& ctx, Id value) {
@@ -134,7 +150,7 @@ Id EmitFPRecip64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecipSqrt32(EmitContext& ctx, Id value) {
-    return ctx.OpInverseSqrt(ctx.F32[1], value);
+    return ctx.OpInverseSqrt(ctx.F32[1], FlushDenormF32(ctx, value));
 }
 
 Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {

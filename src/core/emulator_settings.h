@@ -38,6 +38,17 @@ enum GpuReadbacksMode : int {
     Precise,
 };
 
+// Float32 denormal handling. GCN flushes float32 denormals to zero, and hosts that cannot
+// be asked for that mode keep them instead.
+enum Fp32DenormalMode : int {
+    // Flush when the host advertises the mode, otherwise keep denormals.
+    HostDefault,
+    // Never ask the host to flush, so denormals survive everywhere.
+    Preserve,
+    // Flush everywhere, emulating the mode on hosts that lack it.
+    Flush,
+};
+
 // Windows static guest red-zone protection
 NLOHMANN_JSON_SERIALIZE_ENUM(WindowsGuestRedZoneProtectionMode,
                              {{WindowsGuestRedZoneProtectionMode::Disabled, "Disabled"},
@@ -426,6 +437,8 @@ struct GPUSettings {
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
+    Setting<u32> fp32_denormal_mode{Fp32DenormalMode::HostDefault};
+    Setting<bool> poison_new_buffers{false};
     Setting<u32> vblank_frequency{60};
     Setting<bool> full_screen{false};
     Setting<std::string> full_screen_mode{"Windowed"};
@@ -456,6 +469,8 @@ struct GPUSettings {
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
+            make_override<GPUSettings>("fp32_denormal_mode", &GPUSettings::fp32_denormal_mode),
+            make_override<GPUSettings>("poison_new_buffers", &GPUSettings::poison_new_buffers),
         };
     }
 };
@@ -463,7 +478,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
+                                   fp32_denormal_mode, poison_new_buffers, vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
@@ -743,6 +758,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
+    SETTING_FORWARD(m_gpu, Fp32DenormalMode, fp32_denormal_mode)
+    SETTING_FORWARD_BOOL(m_gpu, PoisonNewBuffers, poison_new_buffers)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
