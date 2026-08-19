@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <thread>
+
 #include <boost/container/small_vector.hpp>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -35,6 +38,9 @@
 #endif
 
 namespace VideoCore {
+
+std::atomic<size_t> g_cp_thread_marker{0};
+
 
 constexpr size_t PM_PAGE_SIZE = 4_KB;
 constexpr size_t PM_PAGE_BITS = 12;
@@ -177,8 +183,9 @@ struct PageManager::Impl {
             {
                 static std::atomic<u64> n{0};
                 const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (i <= 20000 || (i & (i - 1)) == 0) {
-                    LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write=uffd", i, addr);
+                if (i <= 2000 || (i & 1023) == 0) {
+                    LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write=uffd cp=false", i,
+                             addr);
                 }
             }
             rasterizer->InvalidateMemory(addr, 1);
@@ -217,11 +224,15 @@ struct PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         {
+            const bool from_cp = std::hash<std::thread::id>{}(std::this_thread::get_id()) ==
+                                 g_cp_thread_marker.load(std::memory_order_relaxed);
             static std::atomic<u64> n{0};
             const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (i <= 20000 || (i & (i - 1)) == 0) {
-                LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write={}", i, addr,
-                         Common::IsWriteError(context));
+            // Every command processor fault is reported for the whole session;
+            // guest faults are sampled, since they arrive in the thousands.
+            if (from_cp || i <= 2000 || (i & 1023) == 0) {
+                LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write={} cp={}", i, addr,
+                         Common::IsWriteError(context), from_cp);
             }
         }
         if (Common::IsWriteError(context)) {

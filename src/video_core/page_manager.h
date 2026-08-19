@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <cstddef>
 #include <memory>
 #include "common/alignment.h"
@@ -14,6 +16,10 @@ class Rasterizer;
 }
 
 namespace VideoCore {
+
+/// Identifies the command processor thread to the fault handler.
+extern std::atomic<size_t> g_cp_thread_marker;
+
 
 class PageManager {
     // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!

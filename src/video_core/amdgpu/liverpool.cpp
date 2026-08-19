@@ -15,6 +15,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -92,6 +93,8 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    VideoCore::g_cp_thread_marker.store(std::hash<std::thread::id>{}(gpu_id),
+                                        std::memory_order_relaxed);
 
     while (!stoken.stop_requested()) {
         {
@@ -715,7 +718,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 {
                     static std::atomic<u64> n{0};
                     const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-                    if (i <= 200 || (i & (i - 1)) == 0) {
+                    if (i <= 2000 || (i & 255) == 0) {
                         LOG_INFO(Render_Vulkan, "LABELPROBE eop #{}: addr={:#x}", i,
                                  reinterpret_cast<VAddr>(event_eop->Address<u64>()));
                     }
@@ -1157,7 +1160,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             {
                 static std::atomic<u64> n{0};
                 const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (i <= 20000 || (i & (i - 1)) == 0) {
+                if (i <= 2000 || (i & 255) == 0) {
                     LOG_INFO(Render_Vulkan, "LABELPROBE releasemem #{}: addr={:#x} sel={}", i,
                              release_mem->Address<VAddr>(),
                              static_cast<u32>(release_mem->data_sel.Value()));
