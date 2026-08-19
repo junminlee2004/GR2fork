@@ -23,7 +23,9 @@ constexpr vk::BufferUsageFlags WindowUsage =
 // Device memory the renderer itself needs from the carve heap for images,
 // the swapchain and pipelines.
 constexpr u64 RendererCarveReserve = 2_GB;
-constexpr u64 OnionHeapHeadroom = 256_MB;
+// The cached heap is system memory rather than a fixed carve, so it only needs
+// enough slack for the driver's own transient allocations.
+constexpr u64 OnionHeapHeadroom = 64_MB;
 // Direct memory kept out of the garlic pool so the game's own CPU-side
 // (WB_ONION) allocations land on cached pages instead of spilling onto
 // write-combined ones.
