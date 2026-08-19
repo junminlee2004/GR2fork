@@ -5,7 +5,6 @@
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
-#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -593,12 +592,6 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
     auto& new_buffer = slot_buffers[new_buffer_id];
-    // Fills a new allocation with a large finite float before any guest data lands in it,
-    // so a read past the end of a bound range returns that pattern instead of whatever the
-    // driver left behind, which on some hosts is zero and hides the read.
-    if (EmulatorSettings.IsPoisonNewBuffers()) {
-        new_buffer.Fill(0, size, 0x7F7FFFFFu);
-    }
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }

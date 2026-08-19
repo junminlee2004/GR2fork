@@ -258,12 +258,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
-    const auto denormal_mode =
-        static_cast<Fp32DenormalMode>(EmulatorSettings.GetFp32DenormalMode());
-    LOG_INFO(Render_Vulkan, "Float32 denormal mode {}, host flush {}, emulated flush {}",
-             u32(denormal_mode), bool(vk12_props.shaderDenormFlushToZeroFloat32),
-             denormal_mode == Fp32DenormalMode::Flush &&
-                 !bool(vk12_props.shaderDenormFlushToZeroFloat32));
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
@@ -283,8 +277,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_fp16_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat16),
         .support_fp16_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat16),
         .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
-        .support_fp32_denorm_flush = denormal_mode != Fp32DenormalMode::Preserve &&
-                                     bool(vk12_props.shaderDenormFlushToZeroFloat32),
+        .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
         .support_fp64_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat64),
         .support_fp64_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat64),
@@ -313,8 +306,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
-        .emulate_fp32_denorm_flush = denormal_mode == Fp32DenormalMode::Flush &&
-                                     !bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),

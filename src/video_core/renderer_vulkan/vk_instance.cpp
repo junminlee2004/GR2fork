@@ -8,7 +8,6 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
-#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -157,12 +156,14 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     available_extensions = GetSupportedExtensions(physical_device);
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
-    // A larger storage buffer alignment than the device asks for is still valid, and makes
-    // hosts with a small requirement take the same descriptor rebasing path as hosts with
-    // a large one.
-    storage_min_alignment = std::max<vk::DeviceSize>(
-        properties.limits.minStorageBufferOffsetAlignment,
-        EmulatorSettings.GetForceStorageAlignment());
+    // Guest buffers are bound at an offset rounded down to this alignment, with the
+    // remainder re-applied inside the shader. A host that asks for no more than four bytes
+    // always has a remainder of zero and never exercises that path, so hold the alignment
+    // at the value the hosts that do require it report.
+    storage_min_alignment =
+        std::max<vk::DeviceSize>(properties.limits.minStorageBufferOffsetAlignment, 32);
+    LOG_INFO(Render_Vulkan, "Storage buffer offset alignment {} (device reports {})",
+             storage_min_alignment, properties.limits.minStorageBufferOffsetAlignment);
     memory_properties = physical_device.getMemoryProperties();
     CollectDeviceParameters();
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
