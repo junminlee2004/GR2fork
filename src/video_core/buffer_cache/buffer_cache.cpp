@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <xxhash.h>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -70,11 +71,29 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
-    memory_tracker->InvalidateRegion(
-        device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
+    memory_tracker->InvalidateRegion(device_addr, size,
+                                     [this](VAddr addr, u64 sz) { ReadMemory(addr, sz, true); });
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    if (is_write) {
+        // A page may only become guest writable once guest memory holds
+        // everything the GPU wrote into it. Deliveries are page granular, so
+        // what decides that is whether these pages still owe anything - not
+        // where inside them the store landed. Owing nothing, they can be handed
+        // over here, on the faulting thread, with no marshal and no drain.
+        const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+        const u64 page_size = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
+        bool page_owes_data{};
+        {
+            std::scoped_lock lk{gpu_modified_mutex};
+            page_owes_data = gpu_modified_ranges.Intersects(page, page_size);
+        }
+        if (!page_owes_data) {
+            memory_tracker->ReleaseRegionToCpu(device_addr, size);
+            return;
+        }
+    }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -82,10 +101,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         constexpr u64 WindowSize = 512_KB;
         const VAddr buf_start = buffer.CpuAddr();
         const VAddr buf_end = buf_start + buffer.SizeBytes();
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
-        const VAddr window_end = std::min<VAddr>(
+        VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
+        VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
+        if (is_write) {
+            // A write only needs GPU data that intersects the written bytes
+            // themselves. Widening would drain the pipeline and unmark
+            // half a megabyte around every small CPU store - job-system
+            // markers pay that several times per frame - while delivering
+            // nothing the CPU asked to read.
+            window_start = device_addr;
+            window_end = device_addr + size;
+        }
         DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -113,10 +140,14 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 constexpr u64 mask = ~(align - 1ULL);
                 total_size_bytes += (new_size + align - 1) & mask;
             };
+            std::scoped_lock lk{gpu_modified_mutex};
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
+        // The byte-granular ranges for these pages were already dropped above;
+        // drop the page-granular bits with them, or the region stays GPU-marked
+        // forever with nothing left to deliver.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         return;
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
@@ -135,6 +166,16 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             const u64 dst_offset = copy.dstOffset - offset;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
+        }
+        {
+            // Ownership ends where delivery lands, byte for byte. Retiring
+            // earlier would strand bytes the guest never received; retiring
+            // later would leave a claim on a page the guest already owns, and
+            // the next delivery would roll its stores back.
+            std::scoped_lock lk{gpu_modified_mutex};
+            for (const auto& copy : copies) {
+                gpu_modified_ranges.Subtract(buffer.CpuAddr() + copy.srcOffset, copy.size);
+            }
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
     };
@@ -325,7 +366,6 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
-        gpu_modified_ranges.Add(dst, num_bytes);
         return buffer;
     }();
     const vk::BufferCopy region = {
@@ -400,9 +440,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
-    if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
-    }
     return {&buffer, buffer.Offset(device_addr)};
 }
 
@@ -657,10 +694,28 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
+            // Modified ranges are page granular, but a page is not owned by one
+            // side: guests park job-system flags in the same page as records
+            // their shaders write. Uploading the whole page pushes the guest's
+            // copy of that shader output - which nothing but a readback ever
+            // refreshes - back over the live bytes, resetting whatever state the
+            // shader keeps there. Upload only what guest memory is authoritative
+            // for.
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
-        [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+        [&] {
+            src_buffer = UploadCopies(buffer, copies, total_size_bytes);
+            if (is_written) {
+                // Claim the range while the upload still holds the region locks and
+                // before it sets the GPU page bits. A fault landing between the two
+                // would otherwise find a GPU marked page with nothing claimed, hand
+                // it to the guest as though nothing were owed, and let the next
+                // upload overwrite the shader output that follows.
+                std::scoped_lock lk{gpu_modified_mutex};
+                gpu_modified_ranges.Add(device_addr, size);
+            }
+        });
 
     if (src_buffer) {
         scheduler.EndRendering();

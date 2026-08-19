@@ -4,12 +4,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <type_traits>
 #include <vector>
 
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -55,6 +57,20 @@ public:
     }
 
     /// Unmark region as modified from the host GPU
+    /// Hands a region back to the guest: drops the GPU marking and marks it CPU
+    /// modified under one lock, so the pair is never observed half applied. GPU
+    /// first, because the intermediate state is read-only rather than the
+    /// write-only permission x86 cannot express.
+    void ReleaseRegionToCpu(VAddr addr, u64 size) {
+        IteratePages<false>(addr, size, [](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            manager->template ChangeRegionState<Type::GPU, false>(manager->GetCpuAddr() + offset,
+                                                                  size);
+            manager->template ChangeRegionState<Type::CPU, true>(manager->GetCpuAddr() + offset,
+                                                                 size);
+        });
+    }
+
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
@@ -74,8 +90,12 @@ public:
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
-                        manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                    // A guest store into a page the GPU wrote is a coherence event rather than a
+                    // readback feature: the page is about to become guest owned, so what the
+                    // shader left there has to reach guest memory first, or the next upload puts
+                    // the guest's stale copy back over it. Read protection stays gated on the
+                    // readback mode, so guest reads are unaffected.
+                    if (manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
                     }
                     manager->template ChangeRegionState<Type::CPU, true>(
@@ -83,7 +103,7 @@ public:
                     return false;
                 }();
                 if (should_flush) {
-                    on_flush();
+                    on_flush(manager->GetCpuAddr() + offset, size);
                 }
             });
     }

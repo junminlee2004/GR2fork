@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -218,6 +220,9 @@ private:
     u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
+    // Guards gpu_modified_ranges: written on the GPU thread, consulted by
+    // guest threads to answer write faults without a cross-thread marshal.
+    std::mutex gpu_modified_mutex;
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
