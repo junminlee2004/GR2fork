@@ -495,12 +495,29 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             src_gds ? std::optional<std::pair<u32, u64>>{} : ResolveGuest(src, num_bytes);
         const auto dst_r =
             dst_gds ? std::optional<std::pair<u32, u64>>{} : ResolveGuest(dst, num_bytes);
-        if ((src_gds || src_r) && (dst_gds || dst_r)) {
+        // Each side is taken from the windows on its own. Requiring both to
+        // resolve would send a whole copy down the cached path whenever one
+        // participant is fragmented, and a copy that lands in a cached buffer
+        // never reaches guest memory: the counters and records the command
+        // processor exports this way would keep their stale values.
+        if (src_gds || src_r || dst_gds || dst_r) {
             texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
-            const Buffer* src_buffer = src_gds ? &gds_buffer : &window_wrappers[src_r->first];
-            const u64 src_offset = src_gds ? src : src_r->second;
-            const Buffer* dst_buffer = dst_gds ? &gds_buffer : &window_wrappers[dst_r->first];
-            const u64 dst_offset = dst_gds ? dst : dst_r->second;
+            const auto cached_side = [&](VAddr addr, bool is_written) -> const Buffer* {
+                auto& buffer = slot_buffers[FindBuffer(addr, num_bytes)];
+                SynchronizeBuffer(buffer, addr, num_bytes, is_written, true);
+                if (is_written) {
+                    gpu_modified_ranges.Add(addr, num_bytes);
+                }
+                return &buffer;
+            };
+            const Buffer* src_buffer = src_gds ? &gds_buffer
+                                       : src_r ? &window_wrappers[src_r->first]
+                                               : cached_side(src, false);
+            const u64 src_offset = src_gds ? src : src_r ? src_r->second : src_buffer->Offset(src);
+            const Buffer* dst_buffer = dst_gds ? &gds_buffer
+                                       : dst_r ? &window_wrappers[dst_r->first]
+                                               : cached_side(dst, true);
+            const u64 dst_offset = dst_gds ? dst : dst_r ? dst_r->second : dst_buffer->Offset(dst);
             boost::container::static_vector<vk::BufferMemoryBarrier2, 4> pre_barriers;
             if (src_r) {
                 if (auto barrier = RequestUnifiedBarrier(
@@ -674,11 +691,10 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // Native UMA: guest memory is the buffer storage. The GPU reads and
     // writes the guest's own bytes coherently; no snapshot, slot or stream
     // copy of guest data exists.
-    // Diagnostic narrowing of what unified memory serves: bit 3 keeps written
-    // binds on cached buffers, bit 4 keeps formatted ones there.
-    const u32 uma_mode = EmulatorSettings.GetNativeUmaMode();
-    const bool uma_serves = unified && !(is_written && (uma_mode & 8)) &&
-                            !(is_texel_buffer && (uma_mode & 16));
+    // Bit 4 keeps formatted binds on cached buffers. Reads and writes of a
+    // range must agree on where it lives, so the split is by bind kind only.
+    const bool uma_serves =
+        unified && !(is_texel_buffer && (EmulatorSettings.GetNativeUmaMode() & 16));
     if (uma_serves) {
         u32 uma_size = size;
         auto resolved = ResolveGuest(device_addr, uma_size);
