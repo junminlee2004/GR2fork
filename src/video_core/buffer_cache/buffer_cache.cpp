@@ -107,6 +107,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         bool page_has_gpu_data{};
         {
             std::scoped_lock lk{gpu_modified_mutex};
+            cpu_written_ranges.Add(device_addr, size);
             if (gpu_modified_ranges.Intersects(device_addr, size)) {
                 gpu_modified_ranges.Subtract(page, page_size);
             }
@@ -837,10 +838,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             bool any_held = false;
             gpu_modified_ranges.ForEachInRange(
                 device_addr_out, range_size, [&](VAddr start, VAddr end) {
-                    if (end - start <= MaxHeldSpan) {
-                        held.Add(start, end - start);
-                        any_held = true;
+                    if (end - start > MaxHeldSpan ||
+                        cpu_written_ranges.Intersects(start, end - start)) {
+                        return;
                     }
+                    held.Add(start, end - start);
+                    any_held = true;
                 });
             u64 emitted = 0;
             const auto emit = [&](VAddr start, u64 part_size) {
