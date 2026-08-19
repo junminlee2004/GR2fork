@@ -680,9 +680,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+                        auto* memory = Core::Memory::Instance();
                         u64* results = event->Address<u64*>();
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                            const u64 value = pixel_counter | OcclusionCounterValidMask;
+                            if (!memory->TryWriteBackingIfMapped(results, &value, sizeof(value))) {
+                                *results = value;
+                            }
                         }
                         pixel_counter += OcclusionCounterStep;
                     }
@@ -771,7 +775,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
-                    std::memcpy(address, write_data->data, data_size);
+                    auto* memory = Core::Memory::Instance();
+                    if (!memory->TryWriteBackingIfMapped(address, write_data->data, data_size)) {
+                        std::memcpy(address, write_data->data, data_size);
+                    }
                 } else {
                     UNREACHABLE();
                 }
@@ -1119,7 +1126,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                auto* memory = Core::Memory::Instance();
+                if (!memory->TryWriteBackingIfMapped(write_data->Address<void*>(), write_data->data,
+                                                     data_size)) {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                }
             } else {
                 UNREACHABLE();
             }

@@ -169,7 +169,20 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
+    return WriteBackingLocked(address, data, size);
+}
 
+bool MemoryManager::TryWriteBackingIfMapped(void* address, const void* data, u64 size) {
+    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+    return WriteBackingLocked(address, data, size);
+}
+
+bool MemoryManager::WriteBackingLocked(void* address, const void* data, u64 size) {
+    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::vector<VirtualMemoryArea> vmas_to_write;
     auto current_vma = FindVMA(virtual_addr);
     while (current_vma->second.Overlaps(virtual_addr, size)) {

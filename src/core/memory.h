@@ -242,6 +242,10 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
+    /// Same as TryWriteBacking, but reports failure rather than asserting when the range is
+    /// not mapped, for writes whose destination the guest chooses freely.
+    bool TryWriteBackingIfMapped(void* address, const void* data, u64 size);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -291,6 +295,8 @@ public:
     void InvalidateMemory(VAddr addr, u64 size) const;
 
 private:
+    bool WriteBackingLocked(void* address, const void* data, u64 size);
+
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
     }
