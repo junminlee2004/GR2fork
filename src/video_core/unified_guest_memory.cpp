@@ -101,23 +101,34 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
     // pages. Default therefore keeps every guest page cached; the carve
     // split is opt-in (native_uma bit 2) for placement experiments.
     const bool want_garlic = (EmulatorSettings.GetNativeUmaMode() & 4) != 0;
+    const u64 cached_need = direct_total + flex_size + OnionHeapHeadroom;
+    const u64 carve_budget =
+        garlic_type >= 0 && garlic_heap > RendererCarveReserve
+            ? Common::AlignDown(std::min(direct_total / 2, garlic_heap - RendererCarveReserve),
+                                64_KB)
+            : 0;
     u64 garlic_pool = 0;
-    if (want_garlic && garlic_type >= 0 && garlic_heap > RendererCarveReserve &&
-        direct_total > OnionDirectReserve) {
-        // Halve direct memory at most: the onion side must be able to hold
-        // the title's whole cached-memory demand, which is unknowable here.
-        garlic_pool =
-            Common::AlignDown(std::min({direct_total / 2, direct_total - OnionDirectReserve,
-                                        garlic_heap - RendererCarveReserve}),
-                              64_KB);
+    if (want_garlic) {
+        // Halve direct memory at most: the cached side must hold the title's
+        // whole cached-memory demand, which is unknowable here.
+        garlic_pool = carve_budget;
+    } else if (cached_need > onion_heap && carve_budget > 0) {
+        // The carve also absorbs whatever the cached heap cannot hold, so a
+        // stock GTT size does not veto unified memory: only the overflow
+        // lands on write-combined pages, and the strict placement rule keeps
+        // the guest's cached-typed allocations above it.
+        garlic_pool = std::min(Common::AlignUp(cached_need - onion_heap, 64_MB), carve_budget);
+        LOG_INFO(Render_Vulkan,
+                 "Native UMA: cached heap {:#x} is short of {:#x}; the carve absorbs {:#x}",
+                 onion_heap, cached_need, garlic_pool);
     }
     const u64 onion_pool = (direct_total - garlic_pool) + flex_size;
     if (onion_heap < onion_pool + OnionHeapHeadroom) {
         LOG_CRITICAL(Render_Vulkan,
                      "Native UMA requested but NOT ACTIVE: host-cached heap {:#x} cannot hold "
-                     "the onion pool {:#x} plus headroom (direct {:#x}, garlic split {:#x}, "
-                     "flexible {:#x}); running without unified memory.",
-                     onion_heap, onion_pool, direct_total, garlic_pool, flex_size);
+                     "{:#x} even with the carve absorbing {:#x} (direct {:#x}, flexible {:#x}); "
+                     "running without unified memory.",
+                     onion_heap, onion_pool, garlic_pool, direct_total, flex_size);
         return;
     }
 
