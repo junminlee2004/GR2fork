@@ -140,10 +140,15 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 constexpr u64 mask = ~(align - 1ULL);
                 total_size_bytes += (new_size + align - 1) & mask;
             };
+            std::scoped_lock lk{gpu_modified_mutex};
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
+        // The byte-granular ranges for these pages were already dropped above;
+        // drop the page-granular bits with them, or the region stays GPU-marked
+        // forever with nothing left to deliver.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         static std::atomic<u64> diag_empty{0};
         const u64 diag_n = diag_empty.fetch_add(1, std::memory_order_relaxed) + 1;
         if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
@@ -787,8 +792,19 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
-            copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
-            total_size_bytes += range_size;
+            // Modified ranges are page granular, but a page is not owned by one
+            // side: guests park job-system flags in the same page as records
+            // their shaders write. Uploading the whole page pushes the guest's
+            // copy of that shader output - which nothing but a readback ever
+            // refreshes - back over the live bytes, resetting whatever state the
+            // shader keeps there. Upload only what guest memory is authoritative
+            // for.
+            std::scoped_lock lk{gpu_modified_mutex};
+            gpu_modified_ranges.ForEachNotInRange(
+                device_addr_out, range_size, [&](VAddr start, u64 part_size) {
+                    copies.emplace_back(total_size_bytes, start - buffer_start, part_size);
+                    total_size_bytes += part_size;
+                });
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
