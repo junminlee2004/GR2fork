@@ -705,7 +705,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        *event_eos->Address() = value;
+                        auto* memory = Core::Memory::Instance();
+                        u32* const address = event_eos->Address();
+                        if (!memory->TryWriteBacking(address, &value, sizeof(value))) {
+                            *address = value;
+                        }
                     }
                 }
                 break;
@@ -1164,6 +1168,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->ProcessDownloadImages();
             }
             release_mem->SignalFence(
+                [](void* address, const void* data, u32 num_bytes) {
+                    auto* memory = Core::Memory::Instance();
+                    if (!memory->TryWriteBacking(address, data, num_bytes)) {
+                        memcpy(address, data, num_bytes);
+                    }
+                },
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
                 },
