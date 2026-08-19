@@ -317,7 +317,7 @@ public:
 
     /// Returns the minimum required alignment for storage buffers
     vk::DeviceSize StorageMinAlignment() const {
-        return properties.limits.minStorageBufferOffsetAlignment;
+        return storage_min_alignment;
     }
 
     /// Returns the minimum alignemt required for accessing host-mapped device memory
@@ -466,6 +466,7 @@ private:
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
     vk::PhysicalDeviceProperties properties;
+    vk::DeviceSize storage_min_alignment{};
     vk::PhysicalDeviceMemoryProperties memory_properties;
     vk::PhysicalDeviceVulkan11Properties vk11_props;
     vk::PhysicalDeviceVulkan12Properties vk12_props;

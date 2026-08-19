@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -156,6 +157,12 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     available_extensions = GetSupportedExtensions(physical_device);
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
+    // A larger storage buffer alignment than the device asks for is still valid, and makes
+    // hosts with a small requirement take the same descriptor rebasing path as hosts with
+    // a large one.
+    storage_min_alignment = std::max<vk::DeviceSize>(
+        properties.limits.minStorageBufferOffsetAlignment,
+        EmulatorSettings.GetForceStorageAlignment());
     memory_properties = physical_device.getMemoryProperties();
     CollectDeviceParameters();
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,

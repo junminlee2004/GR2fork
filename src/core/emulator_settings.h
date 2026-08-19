@@ -439,6 +439,7 @@ struct GPUSettings {
     Setting<bool> patch_shaders{false};
     Setting<u32> fp32_denormal_mode{Fp32DenormalMode::HostDefault};
     Setting<bool> poison_new_buffers{false};
+    Setting<u32> force_storage_alignment{0};
     Setting<u32> vblank_frequency{60};
     Setting<bool> full_screen{false};
     Setting<std::string> full_screen_mode{"Windowed"};
@@ -471,6 +472,8 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("fp32_denormal_mode", &GPUSettings::fp32_denormal_mode),
             make_override<GPUSettings>("poison_new_buffers", &GPUSettings::poison_new_buffers),
+            make_override<GPUSettings>("force_storage_alignment",
+                                       &GPUSettings::force_storage_alignment),
         };
     }
 };
@@ -478,7 +481,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   fp32_denormal_mode, poison_new_buffers, vblank_frequency, full_screen, full_screen_mode, present_mode,
+                                   fp32_denormal_mode, poison_new_buffers,
+                                   force_storage_alignment, vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
@@ -760,6 +764,7 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD(m_gpu, Fp32DenormalMode, fp32_denormal_mode)
     SETTING_FORWARD_BOOL(m_gpu, PoisonNewBuffers, poison_new_buffers)
+    SETTING_FORWARD(m_gpu, ForceStorageAlignment, force_storage_alignment)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
