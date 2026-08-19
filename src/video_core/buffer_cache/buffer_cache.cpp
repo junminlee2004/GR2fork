@@ -17,13 +17,6 @@
 
 namespace VideoCore {
 
-// HAIRDIAG2: the hair sim output region observed in the fault stream.
-static constexpr VAddr HairDiagBegin = 0x1026b00000ULL;
-static constexpr VAddr HairDiagEnd = 0x1027500000ULL;
-static bool HairDiagHit(VAddr addr, u64 size) {
-    return addr < HairDiagEnd && addr + size > HairDiagBegin;
-}
-
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
@@ -78,48 +71,26 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
-    memory_tracker->InvalidateRegion(
-        device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
+    memory_tracker->InvalidateRegion(device_addr, size,
+                                     [this](VAddr addr, u64 sz) { ReadMemory(addr, sz, true); });
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    // HAIRDIAG: verbose head of the fault-service stream. Which accesses
-    // fault, what the windows deliver, and where the GPU was at service
-    // time distinguish a delivery hole from an ordering race.
-    static std::atomic<u64> diag_serial{0};
-    const u64 diag_n = diag_serial.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (diag_n <= 128 || (diag_n & (diag_n - 1)) == 0) {
-        LOG_INFO(Render_Vulkan,
-                 "HAIRDIAG fault-service #{}: addr={:#x} size={:#x} write={} tick={} gpu={}",
-                 diag_n, device_addr, size, is_write, scheduler.CurrentTick(),
-                 scheduler.GetMasterSemaphore()->KnownGpuTick());
-    }
     if (is_write) {
-        // Where the guest writes says who owns the page. A store landing on
-        // bytes the GPU wrote means both sides author this page, and since the
-        // page is unprotected from here on, further guest stores anywhere in it
-        // go unseen - so the page is handed back wholesale. A store that misses
-        // those bytes, as a job flag beside a shader record does, leaves them
-        // GPU owned and out of reach of the page granular upload.
+        // A page may only become guest writable once guest memory holds
+        // everything the GPU wrote into it. Deliveries are page granular, so
+        // what decides that is whether these pages still owe anything - not
+        // where inside them the store landed. Owing nothing, they can be handed
+        // over here, on the faulting thread, with no marshal and no drain.
         const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
-        const u64 page_size =
-            Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
-        bool page_has_gpu_data{};
+        const u64 page_size = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
+        bool page_owes_data{};
         {
             std::scoped_lock lk{gpu_modified_mutex};
-            cpu_written_ranges.Add(device_addr, size);
-            if (gpu_modified_ranges.Intersects(device_addr, size)) {
-                gpu_modified_ranges.Subtract(page, page_size);
-            }
-            page_has_gpu_data = gpu_modified_ranges.Intersects(page, page_size);
+            page_owes_data = gpu_modified_ranges.Intersects(page, page_size);
         }
-        if (!page_has_gpu_data) {
-            // With no GPU authored bytes left in the pages the download would
-            // cover, there is nothing to deliver. Clearing the GPU marking here
-            // keeps the region readable and writable; marking it modified while
-            // it is still GPU marked would request write-only protection.
-            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        if (!page_owes_data) {
+            memory_tracker->ReleaseRegionToCpu(device_addr, size);
             return;
         }
     }
@@ -177,21 +148,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         // drop the page-granular bits with them, or the region stays GPU-marked
         // forever with nothing left to deliver.
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
-        static std::atomic<u64> diag_empty{0};
-        const u64 diag_n = diag_empty.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
-            LOG_INFO(Render_Vulkan,
-                     "HAIRDIAG empty download #{}: addr={:#x} size={:#x} (no gpu-modified "
-                     "intersection - the faulting range had nothing to deliver)",
-                     diag_n, device_addr, size);
-        }
         return;
-    }
-    static std::atomic<u64> diag_dl{0};
-    const u64 diag_n = diag_dl.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (diag_n <= 128 || (diag_n & (diag_n - 1)) == 0) {
-        LOG_INFO(Render_Vulkan, "HAIRDIAG download #{}: addr={:#x} size={:#x} pieces={} bytes={:#x}",
-                 diag_n, device_addr, size, copies.size(), total_size_bytes);
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
     for (auto& copy : copies) {
@@ -209,6 +166,16 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             const u64 dst_offset = copy.dstOffset - offset;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
+        }
+        {
+            // Ownership ends where delivery lands, byte for byte. Retiring
+            // earlier would strand bytes the guest never received; retiring
+            // later would leave a claim on a page the guest already owns, and
+            // the next delivery would roll its stores back.
+            std::scoped_lock lk{gpu_modified_mutex};
+            for (const auto& copy : copies) {
+                gpu_modified_ranges.Subtract(buffer.CpuAddr() + copy.srcOffset, copy.size);
+            }
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
     };
@@ -399,18 +366,6 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
-        {
-            std::scoped_lock lk{gpu_modified_mutex};
-            gpu_modified_ranges.Add(dst, num_bytes);
-        }
-        if (HairDiagHit(dst, num_bytes)) {
-            static std::atomic<u64> diag_copy{0};
-            const u64 diag_n = diag_copy.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
-                LOG_INFO(Render_Vulkan, "HAIRDIAG2 copy dst #{}: addr={:#x} size={:#x}", diag_n,
-                         dst, num_bytes);
-            }
-        }
         return buffer;
     }();
     const vk::BufferCopy region = {
@@ -475,72 +430,6 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
-    if (!is_written && HairDiagHit(device_addr, size) && size >= 2_MB) {
-        // HAIRDIAG3: torn-snapshot detector. The slot upload copies the
-        // block at parse time; if the hash changes by the time the
-        // submission leaves for the GPU, live execution-time reads (what
-        // real hardware and native UMA do) would have seen different
-        // bytes than this snapshot delivered. Hashing must avoid
-        // GPU-modified sub-ranges: their pages are read-protected under
-        // precise readbacks and a fault on this thread cannot be serviced.
-        static std::atomic<u64> diag_hash_n{0};
-        const u64 hash_n = diag_hash_n.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (hash_n <= 128 || (hash_n & (hash_n - 1)) == 0) {
-            constexpr u64 HashSpan = 1_MB;
-            // Protection is page-granular: test whole pages so an edge page
-            // shared with GPU-modified bytes outside the span cannot fault.
-            VAddr span_addr = Common::AlignUp(device_addr + HashSpan, 4_KB);
-            bool clean = false;
-            {
-                std::scoped_lock lk{gpu_modified_mutex};
-                for (int tries = 0; tries < 4 && span_addr + HashSpan + 4_KB <= device_addr + size;
-                     ++tries, span_addr += HashSpan) {
-                    if (!gpu_modified_ranges.Intersects(span_addr - 4_KB, HashSpan + 8_KB)) {
-                        clean = true;
-                        break;
-                    }
-                }
-            }
-            if (clean) {
-                const u64 h0 = XXH3_64bits(reinterpret_cast<const void*>(span_addr), HashSpan);
-                // Completion-time rehash: covers the whole parse-to-execution
-                // window, not just parse-to-submit.
-                scheduler.DeferPriorityOperation([this, span_addr, h0, hash_n] {
-                    if (!memory->IsValidMapping(span_addr)) {
-                        return;
-                    }
-                    {
-                        std::scoped_lock lk{gpu_modified_mutex};
-                        if (gpu_modified_ranges.Intersects(span_addr, HashSpan)) {
-                            return;
-                        }
-                    }
-                    const u64 h1 = XXH3_64bits(reinterpret_cast<const void*>(span_addr), HashSpan);
-                    if (h1 != h0) {
-                        LOG_INFO(Render_Vulkan,
-                                 "HAIRDIAG3 TORN snapshot #{}: addr={:#x} changed between "
-                                 "parse and execution",
-                                 hash_n, span_addr);
-                    } else if (hash_n <= 32) {
-                        LOG_INFO(Render_Vulkan, "HAIRDIAG3 intact snapshot #{}: addr={:#x}",
-                                 hash_n, span_addr);
-                    }
-                });
-            }
-        }
-    }
-    if (!is_written && HairDiagHit(device_addr, size)) {
-        static std::atomic<u64> diag_read{0};
-        const u64 diag_n = diag_read.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (diag_n <= 96 || (diag_n & (diag_n - 1)) == 0) {
-            const bool stream_path = size <= CACHING_PAGESIZE &&
-                                     !IsRegionGpuModified(device_addr, size);
-            LOG_INFO(Render_Vulkan,
-                     "HAIRDIAG2 read bind #{}: addr={:#x} size={:#x} stream={} texel={} tick={}",
-                     diag_n, device_addr, size, stream_path, is_texel_buffer,
-                     scheduler.CurrentTick());
-        }
-    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
@@ -551,21 +440,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
-    if (is_written) {
-        {
-            std::scoped_lock lk{gpu_modified_mutex};
-            gpu_modified_ranges.Add(device_addr, size);
-        }
-        if (HairDiagHit(device_addr, size)) {
-            static std::atomic<u64> diag_mark{0};
-            const u64 diag_n = diag_mark.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
-                LOG_INFO(Render_Vulkan,
-                         "HAIRDIAG2 written bind #{}: addr={:#x} size={:#x} texel={}", diag_n,
-                         device_addr, size, is_texel_buffer);
-            }
-        }
-    }
     return {&buffer, buffer.Offset(device_addr)};
 }
 
@@ -827,45 +701,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             // refreshes - back over the live bytes, resetting whatever state the
             // shader keeps there. Upload only what guest memory is authoritative
             // for.
-            std::scoped_lock lk{gpu_modified_mutex};
-            // A written bind marks its whole range GPU written, not the bytes the
-            // shader reached, so large spans say nothing about who authored them
-            // and guest memory stays the authority there. Small spans are the
-            // records and counters shaders keep between passes, and those the
-            // guest never authors, so they are the only ones worth keeping.
-            constexpr u64 MaxHeldSpan = 16_KB;
-            RangeSet held;
-            bool any_held = false;
-            gpu_modified_ranges.ForEachInRange(
-                device_addr_out, range_size, [&](VAddr start, VAddr end) {
-                    if (end - start > MaxHeldSpan ||
-                        cpu_written_ranges.Intersects(start, end - start)) {
-                        return;
-                    }
-                    held.Add(start, end - start);
-                    any_held = true;
-                });
-            u64 emitted = 0;
-            const auto emit = [&](VAddr start, u64 part_size) {
-                copies.emplace_back(total_size_bytes, start - buffer_start, part_size);
-                total_size_bytes += part_size;
-                emitted += part_size;
-            };
-            if (any_held) {
-                held.ForEachNotInRange(device_addr_out, range_size, emit);
-            } else {
-                emit(device_addr_out, range_size);
-            }
-            if (emitted != range_size) {
-                static std::atomic<u64> held{0};
-                const u64 n = held.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (n <= 32 || (n & (n - 1)) == 0) {
-                    LOG_INFO(Render_Vulkan, "UPLOADGUARD #{}: held back {:#x} of {:#x} at {:#x}",
-                             n, range_size - emitted, range_size, device_addr_out);
-                }
-            }
+            copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
+            total_size_bytes += range_size;
         },
-        [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+        [&] {
+            src_buffer = UploadCopies(buffer, copies, total_size_bytes);
+            if (is_written) {
+                // Claim the range while the upload still holds the region locks and
+                // before it sets the GPU page bits. A fault landing between the two
+                // would otherwise find a GPU marked page with nothing claimed, hand
+                // it to the guest as though nothing were owed, and let the next
+                // upload overwrite the shader output that follows.
+                std::scoped_lock lk{gpu_modified_mutex};
+                gpu_modified_ranges.Add(device_addr, size);
+            }
+        });
 
     if (src_buffer) {
         scheduler.EndRendering();

@@ -57,15 +57,21 @@ public:
     }
 
     /// Unmark region as modified from the host GPU
+    /// Hands a region back to the guest: drops the GPU marking and marks it CPU
+    /// modified under one lock, so the pair is never observed half applied. GPU
+    /// first, because the intermediate state is read-only rather than the
+    /// write-only permission x86 cannot express.
+    void ReleaseRegionToCpu(VAddr addr, u64 size) {
+        IteratePages<false>(addr, size, [](RegionManager* manager, u64 offset, size_t size) {
+            std::scoped_lock lk{manager->lock};
+            manager->template ChangeRegionState<Type::GPU, false>(manager->GetCpuAddr() + offset,
+                                                                  size);
+            manager->template ChangeRegionState<Type::CPU, true>(manager->GetCpuAddr() + offset,
+                                                                 size);
+        });
+    }
+
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
-        if (dirty_cpu_addr < 0x1027500000ULL && dirty_cpu_addr + query_size > 0x1026b00000ULL) {
-            static std::atomic<u64> diag_unmark{0};
-            const u64 diag_n = diag_unmark.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (diag_n <= 64 || (diag_n & (diag_n - 1)) == 0) {
-                LOG_INFO(Render_Vulkan, "HAIRDIAG2 unmark #{}: addr={:#x} size={:#x}", diag_n,
-                         dirty_cpu_addr, query_size);
-            }
-        }
         IteratePages<false>(dirty_cpu_addr, query_size,
                             [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
@@ -84,8 +90,12 @@ public:
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
-                        manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                    // A guest store into a page the GPU wrote is a coherence event rather than a
+                    // readback feature: the page is about to become guest owned, so what the
+                    // shader left there has to reach guest memory first, or the next upload puts
+                    // the guest's stale copy back over it. Read protection stays gated on the
+                    // readback mode, so guest reads are unaffected.
+                    if (manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
                     }
                     manager->template ChangeRegionState<Type::CPU, true>(
@@ -93,7 +103,7 @@ public:
                     return false;
                 }();
                 if (should_flush) {
-                    on_flush();
+                    on_flush(manager->GetCpuAddr() + offset, size);
                 }
             });
     }

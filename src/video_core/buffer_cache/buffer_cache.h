@@ -224,9 +224,6 @@ private:
     // guest threads to answer write faults without a cross-thread marshal.
     std::mutex gpu_modified_mutex;
     RangeSet gpu_modified_ranges;
-    // Byte exact record of what guest write faults reported, so a span the
-    // guest is known to author is never withheld from an upload again.
-    RangeSet cpu_written_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };

@@ -1146,15 +1146,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
-            // HAIRDIAG: compute fence publications, to line up against the
-            // fault-service stream on the consumer side.
-            static std::atomic<u64> diag_rm{0};
-            const u64 diag_n = diag_rm.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (diag_n <= 128 || (diag_n & (diag_n - 1)) == 0) {
-                LOG_INFO(Render_Vulkan, "HAIRDIAG acb release #{}: data_sel={} addr={:#x}", diag_n,
-                         static_cast<u32>(release_mem->data_sel.Value()),
-                         release_mem->Address<VAddr>());
-            }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
