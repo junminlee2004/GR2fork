@@ -104,14 +104,23 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
+            // The command processor may be asleep on a video out label, which
+            // only presentation signals. A caller waiting here would then wait
+            // for a queue nothing is draining, so wake it.
+            WakeVoSleep();
             sem.acquire();
         } else {
-            std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
-            ++num_commands;
-            submit_cv.notify_one();
+            {
+                std::scoped_lock lk{submit_mutex};
+                command_queue.emplace(std::move(func));
+                ++num_commands;
+                submit_cv.notify_one();
+            }
+            WakeVoSleep();
         }
     }
+
+    void WakeVoSleep();
 
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
