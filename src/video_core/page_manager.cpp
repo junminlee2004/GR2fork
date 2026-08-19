@@ -174,6 +174,13 @@ struct PageManager::Impl {
 
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
+            {
+                static std::atomic<u64> n{0};
+                const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (i <= 400 || (i & (i - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write=uffd", i, addr);
+                }
+            }
             rasterizer->InvalidateMemory(addr, 1);
         }
     }
@@ -209,6 +216,14 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        {
+            static std::atomic<u64> n{0};
+            const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (i <= 400 || (i & (i - 1)) == 0) {
+                LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write={}", i, addr,
+                         Common::IsWriteError(context));
+            }
+        }
         if (Common::IsWriteError(context)) {
             return rasterizer->InvalidateMemory(addr, 8);
         } else {

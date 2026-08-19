@@ -712,6 +712,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                {
+                    static std::atomic<u64> n{0};
+                    const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (i <= 200 || (i & (i - 1)) == 0) {
+                        LOG_INFO(Render_Vulkan, "LABELPROBE eop #{}: addr={:#x}", i,
+                                 reinterpret_cast<VAddr>(event_eop->Address<u64>()));
+                    }
+                }
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
@@ -1145,6 +1153,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+            }
+            {
+                static std::atomic<u64> n{0};
+                const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (i <= 400 || (i & (i - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan, "LABELPROBE releasemem #{}: addr={:#x} sel={}", i,
+                             release_mem->Address<VAddr>(),
+                             static_cast<u32>(release_mem->data_sel.Value()));
+                }
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
