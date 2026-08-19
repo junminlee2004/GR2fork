@@ -674,7 +674,12 @@ std::pair<Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // Native UMA: guest memory is the buffer storage. The GPU reads and
     // writes the guest's own bytes coherently; no snapshot, slot or stream
     // copy of guest data exists.
-    if (unified) {
+    // Diagnostic narrowing of what unified memory serves: bit 3 keeps written
+    // binds on cached buffers, bit 4 keeps formatted ones there.
+    const u32 uma_mode = EmulatorSettings.GetNativeUmaMode();
+    const bool uma_serves = unified && !(is_written && (uma_mode & 8)) &&
+                            !(is_texel_buffer && (uma_mode & 16));
+    if (uma_serves) {
         u32 uma_size = size;
         auto resolved = ResolveGuest(device_addr, uma_size);
         if (!resolved && size > VideoCore::UnifiedGuestMemory::MaxRange) {
