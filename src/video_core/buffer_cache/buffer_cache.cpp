@@ -95,20 +95,24 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                  scheduler.GetMasterSemaphore()->KnownGpuTick());
     }
     if (is_write) {
-        // Authorship of exactly the bytes the guest writes returns to it;
-        // everything else in the page stays GPU-authored, so the
-        // page-granular upload cannot push a stale copy of shader output
-        // back over live bytes. When nothing GPU-authored remains in the
-        // faulting range there is also nothing to deliver, so the fault is
-        // answered here instead of marshalling to the GPU thread and
-        // draining the pipeline for an empty download.
-        bool has_gpu_data{};
+        // Authorship of exactly the bytes the guest writes returns to it, while
+        // the rest of the page stays GPU authored so the page granular upload
+        // cannot put a stale copy of shader output back over live bytes.
+        const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+        const u64 page_size =
+            Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
+        bool page_has_gpu_data{};
         {
             std::scoped_lock lk{gpu_modified_mutex};
             gpu_modified_ranges.Subtract(device_addr, size);
-            has_gpu_data = gpu_modified_ranges.Intersects(device_addr, size);
+            page_has_gpu_data = gpu_modified_ranges.Intersects(page, page_size);
         }
-        if (!has_gpu_data) {
+        if (!page_has_gpu_data) {
+            // With no GPU authored bytes left in the pages the download would
+            // cover, there is nothing to deliver. Clearing the GPU marking here
+            // keeps the region readable and writable; marking it modified while
+            // it is still GPU marked would request write-only protection.
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
             return;
         }
