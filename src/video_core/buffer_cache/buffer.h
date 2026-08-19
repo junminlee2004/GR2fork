@@ -129,7 +129,16 @@ public:
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
         if (dst_acess_mask == access_mask && stage == dst_stage) {
-            return {};
+            // Repeating an access only needs no barrier when nothing writes. Two
+            // dispatches that both write this buffer report the same access and
+            // stage, so eliding here leaves them free to overlap and read each
+            // other's half-written results.
+            constexpr vk::AccessFlags2 write_access = vk::AccessFlagBits2::eShaderWrite |
+                                                      vk::AccessFlagBits2::eTransferWrite |
+                                                      vk::AccessFlagBits2::eMemoryWrite;
+            if (!((access_mask | dst_acess_mask) & write_access)) {
+                return {};
+            }
         }
 
         DEBUG_ASSERT(offset < size_bytes);
