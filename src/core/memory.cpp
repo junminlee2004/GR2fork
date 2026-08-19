@@ -329,10 +329,19 @@ PAddr MemoryManager::Allocate(PAddr search_start, PAddr search_end, u64 size, u6
     constexpr s32 SceKernelWcGarlic = 3;
     auto [dmem_area, mapping_start] = [&] {
         if (unified_garlic_split != 0 && memory_type != SceKernelWcGarlic) {
-            if (auto found = find_free_topdown(search_start, search_end);
+            // Cached-memory requests must not be served from the
+            // write-combined pool: the guest's plain stores would linger in
+            // write-combining buffers while the GPU reads through. Confine
+            // them above the split and fall back only when nothing remains.
+            if (auto found =
+                    find_free_topdown(std::max(search_start, unified_garlic_split), search_end);
                 found.first != dmem_map.end()) {
                 return found;
             }
+            LOG_WARNING(Kernel_Vmm,
+                        "Cached memory request of {:#x} does not fit above the unified split; "
+                        "falling back to write-combined pages",
+                        size);
         }
         return find_free(search_start, search_end);
     }();

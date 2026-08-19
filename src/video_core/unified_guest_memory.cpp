@@ -23,7 +23,7 @@ constexpr vk::BufferUsageFlags WindowUsage =
 // Device memory the renderer itself needs from the carve heap for images,
 // the swapchain and pipelines.
 constexpr u64 RendererCarveReserve = 2_GB;
-constexpr u64 OnionHeapHeadroom = 1_GB;
+constexpr u64 OnionHeapHeadroom = 256_MB;
 // Direct memory kept out of the garlic pool so the game's own CPU-side
 // (WB_ONION) allocations land on cached pages instead of spilling onto
 // write-combined ones.
@@ -92,14 +92,24 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
         return;
     }
 
-    // Split: as much of direct memory into the carve as its heap affords
-    // after the renderer's own needs; the remainder plus the flexible band
-    // is the onion pool in host-cached memory.
+    // Placement asymmetry decides the default: a garlic-typed allocation
+    // served from cached memory is merely stricter than asked, but an
+    // onion-typed one served from write-combined memory breaks the guest's
+    // ordering expectations - its plain stores sit in write-combining
+    // buffers while the GPU reads through. Games size those two classes as
+    // they please, so any fixed split can strand onion demand on the wrong
+    // pages. Default therefore keeps every guest page cached; the carve
+    // split is opt-in (native_uma bit 2) for placement experiments.
+    const bool want_garlic = (EmulatorSettings.GetNativeUmaMode() & 4) != 0;
     u64 garlic_pool = 0;
-    if (garlic_type >= 0 && garlic_heap > RendererCarveReserve &&
+    if (want_garlic && garlic_type >= 0 && garlic_heap > RendererCarveReserve &&
         direct_total > OnionDirectReserve) {
-        garlic_pool = Common::AlignDown(
-            std::min(direct_total - OnionDirectReserve, garlic_heap - RendererCarveReserve), 64_KB);
+        // Halve direct memory at most: the onion side must be able to hold
+        // the title's whole cached-memory demand, which is unknowable here.
+        garlic_pool =
+            Common::AlignDown(std::min({direct_total / 2, direct_total - OnionDirectReserve,
+                                        garlic_heap - RendererCarveReserve}),
+                              64_KB);
     }
     const u64 onion_pool = (direct_total - garlic_pool) + flex_size;
     if (onion_heap < onion_pool + OnionHeapHeadroom) {
@@ -194,11 +204,35 @@ UnifiedGuestMemory::UnifiedGuestMemory(const Vulkan::Instance& instance) {
             garlic_pool = 0;
         }
     }
-    const u64 recomputed_onion = (direct_total - garlic_pool) + flex_size;
+    u64 recomputed_onion = (direct_total - garlic_pool) + flex_size;
     if (!allocate_pool(recomputed_onion, onion_type, onion_memory) ||
         !add_windows(*onion_memory, recomputed_onion, garlic_pool, onion_type) ||
         !export_fd(*onion_memory, onion_fd)) {
-        return;
+        if (garlic_pool != 0 || garlic_type < 0 || garlic_heap <= RendererCarveReserve) {
+            return;
+        }
+        // A single allocation spanning all of guest memory exceeded what the
+        // driver grants. Fall back to the split: the carve takes the lower
+        // half, which the strict placement rule reserves for write-combined
+        // requests, and the cached pool covers the rest.
+        LOG_WARNING(Render_Vulkan,
+                    "Native UMA: single cached pool of {:#x} rejected; falling back to a "
+                    "carve split",
+                    recomputed_onion);
+        windows.clear();
+        onion_memory.reset();
+        onion_fd = -1;
+        garlic_pool = Common::AlignDown(
+            std::min(direct_total / 2, garlic_heap - RendererCarveReserve), 64_KB);
+        recomputed_onion = (direct_total - garlic_pool) + flex_size;
+        if (!allocate_pool(garlic_pool, garlic_type, garlic_memory) ||
+            !add_windows(*garlic_memory, garlic_pool, 0, garlic_type) ||
+            !export_fd(*garlic_memory, garlic_fd) ||
+            !allocate_pool(recomputed_onion, onion_type, onion_memory) ||
+            !add_windows(*onion_memory, recomputed_onion, garlic_pool, onion_type) ||
+            !export_fd(*onion_memory, onion_fd)) {
+            return;
+        }
     }
 
     // Reback the guest physical regions: garlic prefix, the rest of direct
