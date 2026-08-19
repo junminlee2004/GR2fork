@@ -27,6 +27,12 @@ Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     return op;
 }
 
+/// The guest mode flushes both the operands and the result of every float32 operation,
+/// so an emulated result is flushed as well as the reciprocal operands below.
+Id DecorateF32(EmitContext& ctx, IR::Inst* inst, Id op) {
+    return FlushDenormF32(ctx, Decorate(ctx, inst, op));
+}
+
 Id EmitFPAbs32(EmitContext& ctx, Id value) {
     return ctx.OpFAbs(ctx.F32[1], value);
 }
@@ -36,7 +42,7 @@ Id EmitFPAbs64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
 }
 
 Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -44,11 +50,11 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
+    return DecorateF32(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
 }
 
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
@@ -94,7 +100,7 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 
 Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -102,7 +108,7 @@ Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPDiv32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
 }
 
 Id EmitFPDiv64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {

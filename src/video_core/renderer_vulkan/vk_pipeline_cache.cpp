@@ -260,6 +260,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const auto& vk12_props = instance.GetVk12Properties();
     const auto denormal_mode =
         static_cast<Fp32DenormalMode>(EmulatorSettings.GetFp32DenormalMode());
+    LOG_INFO(Render_Vulkan, "Float32 denormal mode {}, host flush {}, emulated flush {}",
+             u32(denormal_mode), bool(vk12_props.shaderDenormFlushToZeroFloat32),
+             denormal_mode == Fp32DenormalMode::Flush &&
+                 !bool(vk12_props.shaderDenormFlushToZeroFloat32));
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
