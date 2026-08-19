@@ -230,7 +230,15 @@ public:
 
     /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported() const {
-        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+        // Diagnostic: never take the wide-wave path, so pipelines are pinned to
+        // the narrow size below rather than running the guest's waves natively.
+        return false;
+    }
+
+    /// Returns true when compute pipelines can be pinned to the reported size.
+    bool IsSubgroupSizePinnable() const {
+        return vk13_features.subgroupSizeControl && SubgroupSize() >= vk13_props.minSubgroupSize &&
+               SubgroupSize() <= vk13_props.maxSubgroupSize;
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
@@ -327,7 +335,9 @@ public:
 
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
-        return vk11_props.subgroupSize;
+        // Diagnostic: report the narrow size so the recompiler emulates the
+        // guest's wide waves, matching hosts whose waves are half as wide.
+        return 32;
     }
 
     /// Returns the maximum size of compute shared memory.
