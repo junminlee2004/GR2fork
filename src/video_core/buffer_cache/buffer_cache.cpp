@@ -94,6 +94,25 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                  diag_n, device_addr, size, is_write, scheduler.CurrentTick(),
                  scheduler.GetMasterSemaphore()->KnownGpuTick());
     }
+    if (is_write) {
+        // Authorship of exactly the bytes the guest writes returns to it;
+        // everything else in the page stays GPU-authored, so the
+        // page-granular upload cannot push a stale copy of shader output
+        // back over live bytes. When nothing GPU-authored remains in the
+        // faulting range there is also nothing to deliver, so the fault is
+        // answered here instead of marshalling to the GPU thread and
+        // draining the pipeline for an empty download.
+        bool has_gpu_data{};
+        {
+            std::scoped_lock lk{gpu_modified_mutex};
+            gpu_modified_ranges.Subtract(device_addr, size);
+            has_gpu_data = gpu_modified_ranges.Intersects(device_addr, size);
+        }
+        if (!has_gpu_data) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            return;
+        }
+    }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -142,7 +161,6 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             };
             std::scoped_lock lk{gpu_modified_mutex};
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
         // The byte-granular ranges for these pages were already dropped above;
@@ -800,11 +818,21 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             // shader keeps there. Upload only what guest memory is authoritative
             // for.
             std::scoped_lock lk{gpu_modified_mutex};
+            u64 emitted = 0;
             gpu_modified_ranges.ForEachNotInRange(
                 device_addr_out, range_size, [&](VAddr start, u64 part_size) {
                     copies.emplace_back(total_size_bytes, start - buffer_start, part_size);
                     total_size_bytes += part_size;
+                    emitted += part_size;
                 });
+            if (emitted != range_size) {
+                static std::atomic<u64> held{0};
+                const u64 n = held.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 32 || (n & (n - 1)) == 0) {
+                    LOG_INFO(Render_Vulkan, "UPLOADGUARD #{}: held back {:#x} of {:#x} at {:#x}",
+                             n, range_size - emitted, range_size, device_addr_out);
+                }
+            }
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
