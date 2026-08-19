@@ -177,7 +177,7 @@ struct PageManager::Impl {
             {
                 static std::atomic<u64> n{0};
                 const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (i <= 400 || (i & (i - 1)) == 0) {
+                if (i <= 20000 || (i & (i - 1)) == 0) {
                     LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write=uffd", i, addr);
                 }
             }
@@ -219,7 +219,7 @@ struct PageManager::Impl {
         {
             static std::atomic<u64> n{0};
             const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (i <= 400 || (i & (i - 1)) == 0) {
+            if (i <= 20000 || (i & (i - 1)) == 0) {
                 LOG_INFO(Render_Vulkan, "FAULTPROBE #{}: addr={:#x} write={}", i, addr,
                          Common::IsWriteError(context));
             }

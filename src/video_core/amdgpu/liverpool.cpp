@@ -1157,7 +1157,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             {
                 static std::atomic<u64> n{0};
                 const u64 i = n.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (i <= 400 || (i & (i - 1)) == 0) {
+                if (i <= 20000 || (i & (i - 1)) == 0) {
                     LOG_INFO(Render_Vulkan, "LABELPROBE releasemem #{}: addr={:#x} sel={}", i,
                              release_mem->Address<VAddr>(),
                              static_cast<u32>(release_mem->data_sel.Value()));
