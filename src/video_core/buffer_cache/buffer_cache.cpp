@@ -827,13 +827,32 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             // shader keeps there. Upload only what guest memory is authoritative
             // for.
             std::scoped_lock lk{gpu_modified_mutex};
-            u64 emitted = 0;
-            gpu_modified_ranges.ForEachNotInRange(
-                device_addr_out, range_size, [&](VAddr start, u64 part_size) {
-                    copies.emplace_back(total_size_bytes, start - buffer_start, part_size);
-                    total_size_bytes += part_size;
-                    emitted += part_size;
+            // A written bind marks its whole range GPU written, not the bytes the
+            // shader reached, so large spans say nothing about who authored them
+            // and guest memory stays the authority there. Small spans are the
+            // records and counters shaders keep between passes, and those the
+            // guest never authors, so they are the only ones worth keeping.
+            constexpr u64 MaxHeldSpan = 16_KB;
+            RangeSet held;
+            bool any_held = false;
+            gpu_modified_ranges.ForEachInRange(
+                device_addr_out, range_size, [&](VAddr start, VAddr end) {
+                    if (end - start <= MaxHeldSpan) {
+                        held.Add(start, end - start);
+                        any_held = true;
+                    }
                 });
+            u64 emitted = 0;
+            const auto emit = [&](VAddr start, u64 part_size) {
+                copies.emplace_back(total_size_bytes, start - buffer_start, part_size);
+                total_size_bytes += part_size;
+                emitted += part_size;
+            };
+            if (any_held) {
+                held.ForEachNotInRange(device_addr_out, range_size, emit);
+            } else {
+                emit(device_addr_out, range_size);
+            }
             if (emitted != range_size) {
                 static std::atomic<u64> held{0};
                 const u64 n = held.fetch_add(1, std::memory_order_relaxed) + 1;
