@@ -1105,6 +1105,18 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     return boost::icl::contains(mapped_ranges, range);
 }
 
+void Rasterizer::SignalAtCompletion(Common::UniqueFunction<void>&& fn) {
+    // The priority queue is drained by its own thread as soon as the fence
+    // retires, so a guest thread blocked on the label does not depend on the
+    // command processor reaching another submission.
+    scheduler.DeferPriorityOperation(std::move(fn));
+    scheduler.Flush();
+}
+
+void Rasterizer::ProcessCompletedFences() {
+    scheduler.PopPendingOperations();
+}
+
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
