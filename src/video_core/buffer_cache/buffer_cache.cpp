@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -210,11 +211,32 @@ void BufferCache::BindVertexBuffers(
         const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        if (IsRegionGpuModified(range.base_address, size)) {
+        const bool gpu_modified = IsRegionGpuModified(range.base_address, size);
+        bool emitted = false;
+        if (gpu_modified) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
                 barriers.emplace_back(*barrier);
+                emitted = true;
+            }
+        }
+        // Probe: a range the GPU has written and a draw now fetches vertices from needs a
+        // barrier between the two. Report the cases where none is emitted: the tracker
+        // page bit clear, so the barrier is not even considered, or the buffer already
+        // recorded as vertex read, so the request is folded away. The written set is
+        // consulted rather than the page bit, since the page bit is the thing in doubt.
+        bool gpu_wrote = false;
+        gpu_modified_ranges.ForEachInRange(range.base_address, size,
+                                           [&](VAddr, VAddr) { gpu_wrote = true; });
+        if (gpu_wrote && !emitted) {
+            static std::atomic<u64> skipped{0};
+            const u64 n = skipped.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (n & 0x3FF) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "VBARRIER skipped #{} addr={:#x} size={} page_bit={} reason={}", n,
+                            range.base_address, size, gpu_modified,
+                            gpu_modified ? "already vertex read" : "page bit clear");
             }
         }
     }
