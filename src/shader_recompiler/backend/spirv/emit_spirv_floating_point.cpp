@@ -6,9 +6,30 @@
 
 namespace Shader::Backend::SPIRV {
 
+namespace {
+/// The guest selects a float32 denormal mode that flushes both the operands and the
+/// result of every operation. A host that cannot be asked for that mode keeps them, and
+/// a kept denormal reaching a reciprocal yields a huge finite value where the guest
+/// expects infinity, so flush explicitly where the mode is unavailable.
+Id FlushDenormF32(EmitContext& ctx, Id value) {
+    if (!ctx.profile.emulate_fp32_denorm_flush) {
+        return value;
+    }
+    const Id smallest_normal{ctx.ConstF32(1.17549435e-38f)};
+    const Id is_denorm{
+        ctx.OpFOrdLessThan(ctx.U1[1], ctx.OpFAbs(ctx.F32[1], value), smallest_normal)};
+    return ctx.OpSelect(ctx.F32[1], is_denorm, ctx.ConstF32(0.0f), value);
+}
+} // Anonymous namespace
+
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
+}
+
+/// Float32 arithmetic whose result is flushed as well as decorated.
+Id DecorateF32(EmitContext& ctx, IR::Inst* inst, Id op) {
+    return FlushDenormF32(ctx, Decorate(ctx, inst, op));
 }
 
 Id EmitFPAbs32(EmitContext& ctx, Id value) {
@@ -20,7 +41,7 @@ Id EmitFPAbs64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPAdd32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFAdd(ctx.F32[1], a, b));
 }
 
 Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -28,11 +49,11 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFSub(ctx.F32[1], a, b));
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
-    return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
+    return DecorateF32(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
 }
 
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
@@ -78,7 +99,7 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFMul(ctx.F32[1], a, b));
 }
 
 Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -86,7 +107,7 @@ Id EmitFPMul64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
 }
 
 Id EmitFPDiv32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
-    return Decorate(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
+    return DecorateF32(ctx, inst, ctx.OpFDiv(ctx.F32[1], a, b));
 }
 
 Id EmitFPDiv64(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -126,7 +147,7 @@ Id EmitFPLog2(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecip32(EmitContext& ctx, Id value) {
-    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
+    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), FlushDenormF32(ctx, value));
 }
 
 Id EmitFPRecip64(EmitContext& ctx, Id value) {
@@ -134,7 +155,7 @@ Id EmitFPRecip64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecipSqrt32(EmitContext& ctx, Id value) {
-    return ctx.OpInverseSqrt(ctx.F32[1], value);
+    return ctx.OpInverseSqrt(ctx.F32[1], FlushDenormF32(ctx, value));
 }
 
 Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {
