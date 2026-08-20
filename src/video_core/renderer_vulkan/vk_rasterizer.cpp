@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -675,11 +677,32 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             ASSERT(adjust % 4 == 0);
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
-            if (auto barrier =
-                    vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
-                                                          : vk::AccessFlagBits2::eShaderRead,
-                                          vk::PipelineStageFlagBits2::eAllCommands)) {
+            const auto access = desc.is_written ? vk::AccessFlagBits2::eShaderWrite
+                                                : vk::AccessFlagBits2::eShaderRead;
+            bool emitted = false;
+            if (auto barrier = vk_buffer->GetBarrier(
+                    access, vk::PipelineStageFlagBits2::eAllCommands)) {
                 buffer_barriers.emplace_back(*barrier);
+                emitted = true;
+            }
+            // Probe: the hair reads its skinned vertices through this path rather than
+            // through vertex input, so this is where a compute to draw hand off has to be
+            // ordered. GetBarrier keeps one access class per whole buffer, and the skinned
+            // output for every mesh in the frame shares one buffer, so a read that follows
+            // another read folds away even when a write to a different region sits between
+            // them. Counts every read of a buffer the GPU has written, and how many of
+            // those were ordered, so silence cannot be mistaken for never having run.
+            if (!desc.is_written) {
+                static std::atomic<u64> reads{0};
+                static std::atomic<u64> ordered{0};
+                const u64 n = reads.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (emitted) {
+                    ordered.fetch_add(1, std::memory_order_relaxed);
+                }
+                if ((n & 0xFFFF) == 0) {
+                    LOG_INFO(Render_Vulkan, "SHREAD reads={} ordered={} last_size={}", n,
+                             ordered.load(std::memory_order_relaxed), size);
+                }
             }
             if (desc.is_written && desc.is_formatted) {
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);

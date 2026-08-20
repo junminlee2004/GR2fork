@@ -229,14 +229,22 @@ void BufferCache::BindVertexBuffers(
         bool gpu_wrote = false;
         gpu_modified_ranges.ForEachInRange(range.base_address, size,
                                            [&](VAddr, VAddr) { gpu_wrote = true; });
-        if (gpu_wrote && !emitted) {
-            static std::atomic<u64> skipped{0};
-            const u64 n = skipped.fetch_add(1, std::memory_order_relaxed);
-            if (n < 64 || (n & 0x3FF) == 0) {
-                LOG_WARNING(Render_Vulkan,
-                            "VBARRIER skipped #{} addr={:#x} size={} page_bit={} reason={}", n,
-                            range.base_address, size, gpu_modified,
-                            gpu_modified ? "already vertex read" : "page bit clear");
+        static std::atomic<u64> handoffs{0};
+        static std::atomic<u64> skipped{0};
+        if (gpu_wrote) {
+            const u64 n = handoffs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!emitted) {
+                const u64 k = skipped.fetch_add(1, std::memory_order_relaxed);
+                if (k < 64 || (k & 0x3FF) == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "VBARRIER skipped #{} addr={:#x} size={} page_bit={} reason={}", k,
+                                range.base_address, size, gpu_modified,
+                                gpu_modified ? "already vertex read" : "page bit clear");
+                }
+            }
+            if ((n & 0x3FFF) == 0) {
+                LOG_INFO(Render_Vulkan, "VBARRIER handoffs={} skipped={}", n,
+                         skipped.load(std::memory_order_relaxed));
             }
         }
     }
