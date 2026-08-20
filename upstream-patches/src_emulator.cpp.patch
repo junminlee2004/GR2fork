@@ -1,11 +1,11 @@
 # carried local patch for the upstream mirror
 # file: src/emulator.cpp
-# original base: 555c458c9fdd33cb4686492374519c7bb112a891
+# original base: be21649dd95a0043c8cd2197fa841572e7ef8ab6
 diff --git a/src/emulator.cpp b/src/emulator.cpp
-index 85033bc7..40b8ac77 100644
+index 16de67be..008fc77e 100644
 --- a/src/emulator.cpp
 +++ b/src/emulator.cpp
-@@ -572,17 +572,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+@@ -570,17 +570,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
      std::string remote_host = Common::GetRemoteNameFromLink();
      if (Common::g_is_release) {
          if (remote_host == "shadps4-emu" || remote_url.length() == 0) {

@@ -1,13 +1,13 @@
 # carried local patch for the upstream mirror
 # file: externals/CMakeLists.txt
-# original base: 555c458c9fdd33cb4686492374519c7bb112a891
+# original base: be21649dd95a0043c8cd2197fa841572e7ef8ab6
 diff --git a/externals/CMakeLists.txt b/externals/CMakeLists.txt
-index 1dc6fc65..370237af 100644
+index e7944af6..bdac078d 100644
 --- a/externals/CMakeLists.txt
 +++ b/externals/CMakeLists.txt
-@@ -391,7 +391,17 @@ set(protobuf_WITH_ZLIB                OFF CACHE INTERNAL "")
- set(protobuf_BUILD_SHARED_LIBS        OFF CACHE INTERNAL "")
- set(protobuf_FORCE_FETCH_DEPENDENCIES ON  CACHE INTERNAL "")
+@@ -397,7 +397,17 @@ set(protobuf_BUILD_SHARED_LIBS        OFF CACHE INTERNAL "")
+ set(protobuf_LOCAL_DEPENDENCIES_ONLY  ON  CACHE INTERNAL "")
+ set(protobuf_FORCE_FETCH_DEPENDENCIES OFF CACHE INTERNAL "")
  if(MSVC)
 -set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
 +    # GR2FORK FIX: protobuf derives CMAKE_MSVC_RUNTIME_LIBRARY for its whole

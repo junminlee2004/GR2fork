@@ -5,10 +5,10 @@
 # no tests). The umbrella includes this file; Combine.cmake consumes the
 # CORE_MAIN_* lists via add_core(NAME main ...).
 #
-#   upstream commit : 555c458c 2026-08-15
-#   emulator version: 0.17.1
+#   upstream commit : be21649d 2026-08-20
+#   emulator version: 0.18.1
 
-set(CORE_MAIN_UPSTREAM_SHA "555c458c9fdd33cb4686492374519c7bb112a891")
+set(CORE_MAIN_UPSTREAM_SHA "be21649dd95a0043c8cd2197fa841572e7ef8ab6")
 
 # --- find_package mirror. Gated on ENABLE_SYSTEM_LIBRARIES exactly like upstream
 #     (default OFF): with it off, the vendored externals/ provide every target and
@@ -42,6 +42,7 @@ if(ENABLE_SYSTEM_LIBRARIES)
     find_package(ZLIB 1.3 MODULE)
     find_package(Zydis 5.0.0 MODULE)
     find_package(pugixml 1.14 CONFIG)
+    find_package(absl 20250512.1 CONFIG)
 endif()
 
 # --- on-disk .cpp files upstream does NOT compile (add_core globs, then removes these) ---

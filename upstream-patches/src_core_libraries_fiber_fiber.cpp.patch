@@ -1,6 +1,6 @@
 # carried local patch for the upstream mirror
 # file: src/core/libraries/fiber/fiber.cpp
-# original base: 555c458c9fdd33cb4686492374519c7bb112a891
+# original base: be21649dd95a0043c8cd2197fa841572e7ef8ab6
 diff --git a/src/core/libraries/fiber/fiber.cpp b/src/core/libraries/fiber/fiber.cpp
 index dc34345b..473278e4 100644
 --- a/src/core/libraries/fiber/fiber.cpp
