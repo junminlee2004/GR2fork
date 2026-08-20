@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -388,11 +391,53 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
+// A bone matrix palette holds matrices of three rows of four floats. The rotation part
+// of each row is unit length in a correct palette, so the row length is a scale free
+// signature of corruption: a sound matrix reads 1.0 whatever the pose. Reads only host
+// memory that has already been filled, so it cannot fault or take a lock.
+static void ProbePaletteRows(VAddr base, u32 size, const u8* bytes, const char* path) {
+    constexpr u32 MatrixBytes = 48;
+    if (size != 4368 && size != 14400) {
+        return;
+    }
+    const u32 count = size / MatrixBytes;
+    f32 worst = 1.0f;
+    u32 worst_bone = 0;
+    for (u32 bone = 0; bone < count; ++bone) {
+        for (u32 row = 0; row < 3; ++row) {
+            f32 v[3];
+            std::memcpy(v, bytes + bone * MatrixBytes + row * 16, sizeof(v));
+            const f32 len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (std::fabs(len - 1.0f) > std::fabs(worst - 1.0f)) {
+                worst = len;
+                worst_bone = bone;
+            }
+        }
+    }
+    static std::atomic<u64> clean{0};
+    static std::atomic<u64> bad{0};
+    if (std::fabs(worst - 1.0f) > 0.05f) {
+        const u64 n = bad.fetch_add(1, std::memory_order_relaxed);
+        if (n < 32 || (n & 0xFF) == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PALROW bad #{} base={:#x} size={} via={} worst_bone={} row_len={}", n,
+                        base, size, path, worst_bone, worst);
+        }
+    } else {
+        const u64 n = clean.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & 0x3FF) == 0) {
+            LOG_INFO(Render_Vulkan, "PALROW clean={} bad={} last_row_len={}", n,
+                     bad.load(std::memory_order_relaxed), worst);
+        }
+    }
+}
+
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        ProbePaletteRows(device_addr, size, stream_buffer.mapped_data.data() + offset, "stream");
         return {&stream_buffer, offset};
     }
     if (IsBufferInvalid(buffer_id)) {
@@ -715,6 +760,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+            ProbePaletteRows(device_addr, static_cast<u32>(copy.size), src_pointer, "upload");
             // Apply the staging offset
             copy.srcOffset += offset;
         }
