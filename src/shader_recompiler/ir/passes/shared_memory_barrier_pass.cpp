@@ -90,10 +90,12 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     const u32 shared_memory_size = cs_info.shared_memory_size;
     const u32 threadgroup_size =
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
-    // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup.
-    if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
-        !profile.needs_lds_barriers) {
+    // The guest compiler omits barriers for shared memory traffic that stays within one
+    // wave, which it may do in any workgroup that is a whole number of waves, not only in
+    // one that is a single wave. A host running narrower waves splits each of those into
+    // several, so the omitted ordering has to be restored for every such workgroup.
+    if (shared_memory_size == 0 || threadgroup_size < GcnSubgroupSize ||
+        threadgroup_size % GcnSubgroupSize != 0 || !profile.needs_lds_barriers) {
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;
