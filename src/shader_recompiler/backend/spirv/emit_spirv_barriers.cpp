@@ -25,8 +25,11 @@ void EmitBarrier(EmitContext& ctx) {
         memory_semantics = spv::MemorySemanticsMask::MaskNone;
     } else {
         memory = spv::Scope::Workgroup;
+        // A guest s_barrier is paired with s_waitcnt vmcnt(0), so it orders buffer and
+        // image memory as well as LDS.
         memory_semantics =
-            spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory;
+            spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory |
+            spv::MemorySemanticsMask::UniformMemory | spv::MemorySemanticsMask::ImageMemory;
     }
     ctx.OpControlBarrier(ctx.ConstU32(static_cast<u32>(execution)),
                          ctx.ConstU32(static_cast<u32>(memory)),

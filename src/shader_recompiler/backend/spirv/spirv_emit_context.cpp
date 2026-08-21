@@ -782,6 +782,10 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, u32 elem_shift
     Decorate(id, spv::Decoration::DescriptorSet, 0U);
     if (!is_written) {
         Decorate(id, spv::Decoration::NonWritable);
+    } else {
+        // Guest shaders hand data between invocations through buffer stores around
+        // barriers; Coherent keeps such reads from being served out of registers.
+        Decorate(id, spv::Decoration::Coherent);
     }
     switch (buffer_type) {
     case BufferType::GdsBuffer:
