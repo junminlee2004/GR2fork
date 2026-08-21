@@ -391,47 +391,38 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
-// Measures bone matrix palettes as they are handed to the device. The two sizes are the
-// ones this title uses, 91 and 300 matrices of three rows of four floats. The rotation
-// part of a sound row is unit length whatever the pose, so the row length is a scale free
-// measure of corruption and the unit fraction says how much of the palette is affected.
-// Both are reported unconditionally: an earlier version required most rows to already be
-// unit length before accepting something as a palette, which discarded the corrupt one
-// for being corrupt.
-//
-// A staged copy is page aligned and reaches only part of a palette, so matrices are
-// located from the palette base and only those wholly inside the region are measured.
-// Reads only host memory that has already been filled.
-static bool IsPaletteSize(u32 size) {
-    return size == 4368 || size == 14400;
-}
-
-static void ProbePaletteRows(VAddr pal_base, u32 pal_size, VAddr region_addr,
-                             const u8* region, u64 region_size, const char* path) {
+// Dumps a buffer as bone matrices, three rows of four floats each. Called only for the
+// shader under investigation, identified by its hash at the bind site, so nothing has to
+// be inferred from a buffer's size or contents - every previous attempt guessed at one or
+// the other and either admitted unrelated buffers or discarded the corrupt palette for
+// being corrupt. Reads only host memory that has already been filled.
+static void ProbeMatrices(VAddr base, u32 size, const u8* bytes, const char* path,
+                          VAddr region_addr = 0, u64 region_size = 0) {
     constexpr u32 MatrixBytes = 48;
-    if (!IsPaletteSize(pal_size)) {
+    if (size < MatrixBytes || size % MatrixBytes != 0 || size > 32768) {
         return;
     }
-    const u32 count = pal_size / MatrixBytes;
+    // A staged copy is page aligned and reaches only part of the buffer, so matrices are
+    // located from the base and only those wholly inside the region are read.
+    if (region_size == 0) {
+        region_addr = base;
+        region_size = size;
+    }
+    const u32 count = size / MatrixBytes;
     u32 unit_rows = 0;
-    u32 rows = 0;
     u32 covered = 0;
     f32 worst = 1.0f;
     u32 worst_bone = 0;
-    f32 row63 = 0.0f;
-    bool have63 = false;
     for (u32 bone = 0; bone < count; ++bone) {
-        const VAddr addr = pal_base + bone * MatrixBytes;
+        const VAddr addr = base + bone * MatrixBytes;
         if (addr < region_addr || addr + MatrixBytes > region_addr + region_size) {
             continue;
         }
         ++covered;
-        const u8* m = region + (addr - region_addr);
         for (u32 row = 0; row < 3; ++row) {
             f32 v[3];
-            std::memcpy(v, m + row * 16, sizeof(v));
+            std::memcpy(v, bytes + (addr - region_addr) + row * 16, sizeof(v));
             const f32 len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-            ++rows;
             if (std::fabs(len - 1.0f) <= 0.05f) {
                 ++unit_rows;
             }
@@ -439,47 +430,48 @@ static void ProbePaletteRows(VAddr pal_base, u32 pal_size, VAddr region_addr,
                 worst = len;
                 worst_bone = bone;
             }
-            if (bone == 63 && row == 0) {
-                row63 = len;
-                have63 = true;
-            }
         }
     }
     if (covered == 0) {
         return;
     }
-    // A corrupt palette is always reported, however late in the session it appears. A
-    // shared counter sampled from the start would spend its budget on the palettes bound
-    // during loading and could miss the one that matters entirely.
-    static std::atomic<u64> clean{0};
-    static std::atomic<u64> dirty{0};
-    const bool corrupt = std::fabs(worst - 1.0f) > 0.05f;
-    const u64 n = (corrupt ? dirty : clean).fetch_add(1, std::memory_order_relaxed);
-    if (corrupt ? (n < 256 || (n & 0x3F) == 0) : (n < 8 || (n & 0x7FF) == 0)) {
+    f32 row63 = -1.0f;
+    f32 tx63 = 0.0f;
+    const VAddr a63 = base + 63 * MatrixBytes;
+    if (count > 63 && a63 >= region_addr && a63 + MatrixBytes <= region_addr + region_size) {
+        f32 v[4];
+        std::memcpy(v, bytes + (a63 - region_addr), sizeof(v));
+        row63 = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        tx63 = v[3];
+    }
+    static std::atomic<u64> n{0};
+    const u64 k = n.fetch_add(1, std::memory_order_relaxed);
+    if (k < 400 || (k & 0x3F) == 0) {
         LOG_WARNING(Render_Vulkan,
-                    "PALROW {} #{} base={:#x} size={} via={} bones={}/{} unit={:.3f} "
-                    "worst_bone={} worst_row={} row63={} totals clean={} corrupt={}",
-                    corrupt ? "CORRUPT" : "ok", n, pal_base, pal_size, path, covered, count,
-                    static_cast<f32>(unit_rows) / static_cast<f32>(rows), worst_bone, worst,
-                    have63 ? row63 : -1.0f, clean.load(std::memory_order_relaxed),
-                    dirty.load(std::memory_order_relaxed));
+                    "HAIRBUF #{} base={:#x} size={} matrices={}/{} via={} unit={:.3f} "
+                    "worst_bone={} worst_row={} row63={} tx63={}",
+                    k, base, size, covered, count, path,
+                    static_cast<f32>(unit_rows) / static_cast<f32>(covered * 3), worst_bone, worst,
+                    row63, tx63);
     }
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
-                                                  bool is_texel_buffer, BufferId buffer_id) {
+                                                  bool is_texel_buffer, BufferId buffer_id,
+                                                  bool probe) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        ProbePaletteRows(device_addr, size, device_addr,
-                         stream_buffer.mapped_data.data() + offset, size, "stream");
+        if (probe) {
+            ProbeMatrices(device_addr, size, stream_buffer.mapped_data.data() + offset, "stream");
+        }
         return {&stream_buffer, offset};
     }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[buffer_id];
-    SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
+    SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, probe);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -729,7 +721,7 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer, bool probe) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -742,7 +734,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         },
         [&] {
             src_buffer = UploadCopies(buffer, copies, total_size_bytes,
-                                      IsPaletteSize(size) ? device_addr : 0, size);
+                                      probe ? device_addr : 0, size);
         });
 
     if (src_buffer) {
@@ -788,8 +780,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     size_t total_size_bytes, VAddr palette_base,
-                                     u32 palette_size) {
+                                     size_t total_size_bytes, VAddr probe_base, u32 probe_size) {
     if (copies.empty()) {
         return VK_NULL_HANDLE;
     }
@@ -799,8 +790,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
-            ProbePaletteRows(palette_base, palette_size, device_addr, src_pointer,
-                             copy.size, "upload");
+            if (probe_base) {
+                ProbeMatrices(probe_base, probe_size, src_pointer, "upload", device_addr,
+                              copy.size);
+            }
             // Apply the staging offset
             copy.srcOffset += offset;
         }

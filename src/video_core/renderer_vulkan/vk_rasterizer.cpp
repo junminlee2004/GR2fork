@@ -668,8 +668,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             }
         } else {
+            // The hair skinning shader, so its buffers can be dumped without guessing
+            // which of them is the matrix palette.
+            const bool probe = stage.pgm_hash == 0x22e6e19e;
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
+                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id, probe);
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             ASSERT(adjust % 4 == 0);
