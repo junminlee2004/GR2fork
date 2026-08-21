@@ -152,7 +152,10 @@ Id EmitFPSqrt(EmitContext& ctx, Id value) {
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {
     const Id zero{ctx.ConstF32(f32{0.0})};
     const Id one{ctx.ConstF32(f32{1.0})};
-    return ctx.OpFClamp(ctx.F32[1], value, zero, one);
+    // The GCN clamp modifier forces a NaN operand to zero. FClamp is FMin over FMax, both
+    // of which leave NaN undefined, so a NaN survives the clamp on some devices and not
+    // others. NClamp carries the guest's rule.
+    return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);
 }
 
 Id EmitFPSaturate64(EmitContext& ctx, Id value) {
@@ -162,7 +165,7 @@ Id EmitFPSaturate64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {
-    return ctx.OpFClamp(ctx.F32[1], value, min_value, max_value);
+    return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, min_value), max_value);
 }
 
 Id EmitFPClamp64(EmitContext& ctx, Id value, Id min_value, Id max_value) {
