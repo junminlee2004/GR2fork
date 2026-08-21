@@ -25,8 +25,14 @@ void EmitBarrier(EmitContext& ctx) {
         memory_semantics = spv::MemorySemanticsMask::MaskNone;
     } else {
         memory = spv::Scope::Workgroup;
-        memory_semantics =
-            spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory;
+        // A guest s_barrier is paired with s_waitcnt, and vmcnt covers vector memory, so a
+        // barrier orders buffer and image traffic as well as LDS. Naming only WorkgroupMemory
+        // leaves a shader that hands results between threads through a storage buffer relying
+        // on caches that happen to be shared, which is true of a compute unit but not required.
+        memory_semantics = spv::MemorySemanticsMask::AcquireRelease |
+                           spv::MemorySemanticsMask::WorkgroupMemory |
+                           spv::MemorySemanticsMask::UniformMemory |
+                           spv::MemorySemanticsMask::ImageMemory;
     }
     ctx.OpControlBarrier(ctx.ConstU32(static_cast<u32>(execution)),
                          ctx.ConstU32(static_cast<u32>(memory)),
