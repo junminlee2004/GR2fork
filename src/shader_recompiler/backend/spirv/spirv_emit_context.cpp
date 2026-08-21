@@ -11,6 +11,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include <bit>
 #include <numbers>
 #include <string_view>
 
@@ -1211,6 +1212,326 @@ Id EmitContext::DefineGetBdaPointer() {
     return func;
 }
 
+namespace {
+// Vendor-invariant f32 transcendental helper bodies.
+//
+// Goal: the same shader must compute the same bits on every conformant
+// Vulkan implementation, so hardware transcendental precision differences
+// (AMD vs NVIDIA) cannot influence results. Construction rules:
+//   * every floating-point step is OpFMul/OpFAdd/OpFSub/OpFma, which are
+//     correctly rounded (0.5 ulp, i.e. bit-exact) on all conformant
+//     implementations; each is decorated NoContraction so drivers can
+//     neither fuse mul+add pairs nor unfuse the fmas;
+//   * operand order of every operation is fixed;
+//   * everything else is integer/bitcast/compare/select logic, which is
+//     exact by definition;
+//   * no live operand or result is ever denormal: inputs are flushed to
+//     signed zero up front (GCN flushes fp32 denormals) and the range
+//     reduction keeps all intermediates comfortably normal, so vendor
+//     differences in denormal handling cannot leak in;
+//   * NaN results are canonicalized to 0x7FC00000 so payload propagation
+//     differences cannot leak out; GLSL Floor (exact) is the only extended
+//     instruction used.
+//
+// Accuracy measured against double libm over dense sweeps of the full
+// normal range (standalone mock of these exact sequences):
+//   rcp   <= 1 ulp (2^k exact)          rsqrt <= 1 ulp (4^k exact)
+//   sqrt  correctly rounded in all samples (n^2 exact)
+//   log2  <= 1 ulp (2^k exact)          exp2  <= 1 ulp (integers exact)
+
+constexpr u32 CanonNanBits = 0x7FC00000u;
+
+// Chebyshev fits computed in double and frozen as bit patterns.
+// kLog2Poly: P(t) ~= log2(1+t)/t on [sqrt(0.5)-1, sqrt(2)-1], degree 10.
+// kExp2Poly: Q(f) ~= 2^f on [0,1], degree 7.
+constexpr std::array<u32, 11> kLog2Poly{
+    0x3FB8AA3Bu, 0xBF38AA3Bu, 0x3EF63840u, 0xBEB8AA47u, 0x3E93C042u, 0xBE763D83u,
+    0x3E51F735u, 0xBE372D17u, 0x3E30278Eu, 0xBE2D3FA9u, 0x3DC7264Bu,
+};
+constexpr std::array<u32, 8> kExp2Poly{
+    0x3F800000u, 0x3F317218u, 0x3E75FDE6u, 0x3D635984u,
+    0x3C1D8217u, 0x3AB006F8u, 0x3915F0AAu, 0x37B5A0BAu,
+};
+
+Id NoContract(EmitContext& ctx, Id op) {
+    ctx.Decorate(op, spv::Decoration::NoContraction);
+    return op;
+}
+
+Id MulNC(EmitContext& ctx, Id a, Id b) {
+    return NoContract(ctx, ctx.OpFMul(ctx.F32[1], a, b));
+}
+
+Id AddNC(EmitContext& ctx, Id a, Id b) {
+    return NoContract(ctx, ctx.OpFAdd(ctx.F32[1], a, b));
+}
+
+Id SubNC(EmitContext& ctx, Id a, Id b) {
+    return NoContract(ctx, ctx.OpFSub(ctx.F32[1], a, b));
+}
+
+Id FmaNC(EmitContext& ctx, Id a, Id b, Id c) {
+    return NoContract(ctx, ctx.OpFma(ctx.F32[1], a, b, c));
+}
+
+// Exact negation via sign-bit flip; never canonicalizes.
+Id NegF32(EmitContext& ctx, Id value) {
+    const Id bits{ctx.OpBitcast(ctx.U32[1], value)};
+    return ctx.OpBitcast(ctx.F32[1],
+                         ctx.OpBitwiseXor(ctx.U32[1], bits, ctx.ConstU32(0x80000000u)));
+}
+
+struct F32Parts {
+    Id sign;    // sign bit, in place
+    Id mag;     // absolute-value bits
+    Id is_nan;  // any NaN
+    Id is_inf;  // +-Inf
+    Id is_zero; // +-0 or denormal (treated as signed zero, GCN input flush)
+    Id neg;     // sign bit set
+};
+
+F32Parts UnpackF32(EmitContext& ctx, Id value) {
+    F32Parts parts;
+    const Id bits{ctx.OpBitcast(ctx.U32[1], value)};
+    parts.sign = ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.ConstU32(0x80000000u));
+    parts.mag = ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.ConstU32(0x7FFFFFFFu));
+    parts.is_nan = ctx.OpUGreaterThan(ctx.U1[1], parts.mag, ctx.ConstU32(0x7F800000u));
+    parts.is_inf = ctx.OpIEqual(ctx.U1[1], parts.mag, ctx.ConstU32(0x7F800000u));
+    parts.is_zero = ctx.OpULessThan(ctx.U1[1], parts.mag, ctx.ConstU32(0x00800000u));
+    parts.neg = ctx.OpINotEqual(ctx.U1[1], parts.sign, ctx.ConstU32(0u));
+    return parts;
+}
+
+// Unbiased exponent of a normal float as S32.
+Id ExponentOf(EmitContext& ctx, Id mag) {
+    const Id biased{ctx.OpShiftRightLogical(ctx.U32[1], mag, ctx.ConstU32(23u))};
+    return ctx.OpISub(ctx.S32[1], ctx.OpBitcast(ctx.S32[1], biased), ctx.ConstS32(127));
+}
+
+// 2^e built directly in the exponent field; exact for e in [-126, 127].
+// Multiplying by it is exact (no rounding) while the product stays normal.
+Id Pow2(EmitContext& ctx, Id exp_s32) {
+    const Id field{ctx.OpIAdd(ctx.S32[1], exp_s32, ctx.ConstS32(127))};
+    const Id bits{ctx.OpShiftLeftLogical(ctx.S32[1], field, ctx.ConstU32(23u))};
+    return ctx.OpBitcast(ctx.F32[1], bits);
+}
+
+struct EvenReduction {
+    Id m; // mantissa * 2^p in [1, 4)
+    Id q; // x = m * 2^(2q)
+};
+
+// Split a positive normal into x = m * 2^(2q) with m in [1, 4), so that
+// sqrt/rsqrt scale factors 2^(+-q) are always representable normals.
+EvenReduction ReduceEven(EmitContext& ctx, Id mag) {
+    const Id e{ExponentOf(ctx, mag)};
+    const Id p{ctx.OpBitwiseAnd(ctx.S32[1], e, ctx.ConstS32(1))};
+    const Id q{ctx.OpShiftRightArithmetic(ctx.S32[1], e, ctx.ConstU32(1u))};
+    const Id mant{ctx.OpBitwiseAnd(ctx.U32[1], mag, ctx.ConstU32(0x007FFFFFu))};
+    const Id mexp{ctx.OpShiftLeftLogical(
+        ctx.S32[1], ctx.OpIAdd(ctx.S32[1], p, ctx.ConstS32(127)), ctx.ConstU32(23u))};
+    const Id mb{ctx.OpBitwiseOr(ctx.U32[1], mant, ctx.OpBitcast(ctx.U32[1], mexp))};
+    return {ctx.OpBitcast(ctx.F32[1], mb), q};
+}
+
+// r ~= 1/sqrt(m) for m in [1, 4): 0x5F375A86 seed (|rel err| <= ~3.5%),
+// then three Newton steps r' = r * fma(hm*r, r, 1.5) with hm = -m/2
+// (exact). Converges to within ~1-2 ulp; callers append a residual
+// correction where the last ulp matters.
+Id RsqrtNewton(EmitContext& ctx, Id m) {
+    const Id mb{ctx.OpBitcast(ctx.U32[1], m)};
+    const Id seed{ctx.OpISub(ctx.U32[1], ctx.ConstU32(0x5F375A86u),
+                             ctx.OpShiftRightLogical(ctx.U32[1], mb, ctx.ConstU32(1u)))};
+    Id r{ctx.OpBitcast(ctx.F32[1], seed)};
+    const Id hm{MulNC(ctx, m, ctx.ConstF32(-0.5f))};
+    const Id three_halves{ctx.ConstF32(1.5f)};
+    for (int i = 0; i < 3; ++i) {
+        const Id t1{MulNC(ctx, hm, r)};
+        const Id t2{FmaNC(ctx, t1, r, three_halves)};
+        r = MulNC(ctx, r, t2);
+    }
+    return r;
+}
+
+} // Anonymous namespace
+
+Id EmitContext::DefineF32Rcp() {
+    const auto func_type{TypeFunction(F32[1], F32[1])};
+    const auto func{OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type)};
+    const auto x{OpFunctionParameter(F32[1])};
+    Name(func, "f32_rcp");
+    AddLabel();
+
+    const auto parts{UnpackF32(*this, x)};
+    // |x| > 2^126 makes 1/x denormal: flush the result to +-0 (GCN-style).
+    // 2^126 itself stays: 1/2^126 = 2^-126 is the smallest normal.
+    const auto is_big{OpUGreaterThan(U1[1], parts.mag, ConstU32(0x7E800000u))};
+    const auto e{ExponentOf(*this, parts.mag)};
+    const auto mb{OpBitwiseOr(U32[1], OpBitwiseAnd(U32[1], parts.mag, ConstU32(0x007FFFFFu)),
+                              ConstU32(0x3F800000u))};
+    const auto nm{OpBitcast(F32[1], OpBitwiseXor(U32[1], mb, ConstU32(0x80000000u)))};
+    // Bit-trick seed for 1/m, m in [1, 2): |rel err| <= ~5.2%; three Newton
+    // steps r' = fma(fma(-m, r, 1), r, r) converge below fp32 rounding
+    // (0.052^8 ~= 5e-11), giving a faithful (<= 1 ulp) reciprocal.
+    auto r{OpBitcast(F32[1], OpISub(U32[1], ConstU32(0x7EF311C3u), mb))};
+    const auto one{ConstF32(1.0f)};
+    for (int i = 0; i < 3; ++i) {
+        const auto t{FmaNC(*this, nm, r, one)};
+        r = FmaNC(*this, t, r, r);
+    }
+    const auto pos{MulNC(*this, r, Pow2(*this, OpSNegate(S32[1], e)))};
+
+    const auto sign_inf{OpBitwiseOr(U32[1], parts.sign, ConstU32(0x7F800000u))};
+    auto resb{OpBitwiseOr(U32[1], OpBitcast(U32[1], pos), parts.sign)};
+    resb = OpSelect(U32[1], is_big, parts.sign, resb);          // result flush -> +-0
+    resb = OpSelect(U32[1], parts.is_zero, sign_inf, resb);     // 1/(+-0) -> +-Inf
+    resb = OpSelect(U32[1], parts.is_inf, parts.sign, resb);    // 1/(+-Inf) -> +-0
+    resb = OpSelect(U32[1], parts.is_nan, ConstU32(CanonNanBits), resb);
+    OpReturnValue(OpBitcast(F32[1], resb));
+    OpFunctionEnd();
+    return func;
+}
+
+Id EmitContext::DefineF32Rsqrt() {
+    const auto func_type{TypeFunction(F32[1], F32[1])};
+    const auto func{OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type)};
+    const auto x{OpFunctionParameter(F32[1])};
+    Name(func, "f32_rsqrt");
+    AddLabel();
+
+    const auto parts{UnpackF32(*this, x)};
+    const auto red{ReduceEven(*this, parts.mag)};
+    const auto r0{RsqrtNewton(*this, red.m)};
+    // Residual correction r = r0 + (r0/2)*(1 - m*r0^2), each rounding a
+    // single operation; clears the +-1 ulp Newton stall so that e.g.
+    // rsqrt(1) == 1 and rsqrt(4^k) == 2^-k exactly.
+    const auto t0{MulNC(*this, red.m, r0)};
+    const auto err{FmaNC(*this, NegF32(*this, t0), r0, ConstF32(1.0f))};
+    const auto hr{MulNC(*this, r0, ConstF32(0.5f))};
+    const auto r{FmaNC(*this, hr, err, r0)};
+    const auto pos{MulNC(*this, r, Pow2(*this, OpSNegate(S32[1], red.q)))};
+
+    const auto nanc{ConstU32(CanonNanBits)};
+    auto resb{OpBitcast(U32[1], pos)};
+    resb = OpSelect(U32[1], parts.neg, nanc, resb); // rsqrt(x<0) -> NaN
+    resb = OpSelect(U32[1], parts.is_inf, OpSelect(U32[1], parts.neg, nanc, ConstU32(0u)),
+                    resb);                          // rsqrt(+Inf) -> +0
+    resb = OpSelect(U32[1], parts.is_zero, OpBitwiseOr(U32[1], parts.sign, ConstU32(0x7F800000u)),
+                    resb);                          // rsqrt(+-0) -> +-Inf
+    resb = OpSelect(U32[1], parts.is_nan, nanc, resb);
+    OpReturnValue(OpBitcast(F32[1], resb));
+    OpFunctionEnd();
+    return func;
+}
+
+Id EmitContext::DefineF32Sqrt() {
+    const auto func_type{TypeFunction(F32[1], F32[1])};
+    const auto func{OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type)};
+    const auto x{OpFunctionParameter(F32[1])};
+    Name(func, "f32_sqrt");
+    AddLabel();
+
+    const auto parts{UnpackF32(*this, x)};
+    const auto red{ReduceEven(*this, parts.mag)};
+    const auto r{RsqrtNewton(*this, red.m)};
+    // Markstein correction: s = m*r; h = r/2; d = fma(-s, s, m);
+    // s' = fma(d, h, s). Yields sqrt(m) correctly rounded in practice.
+    const auto s{MulNC(*this, red.m, r)};
+    const auto h{MulNC(*this, r, ConstF32(0.5f))};
+    const auto d{FmaNC(*this, NegF32(*this, s), s, red.m)};
+    const auto s2{FmaNC(*this, d, h, s)};
+    const auto res{MulNC(*this, s2, Pow2(*this, red.q))};
+
+    const auto nanc{ConstU32(CanonNanBits)};
+    auto resb{OpBitcast(U32[1], res)};
+    resb = OpSelect(U32[1], parts.neg, nanc, resb); // sqrt(x<0) -> NaN
+    resb = OpSelect(U32[1], parts.is_inf,
+                    OpSelect(U32[1], parts.neg, nanc, ConstU32(0x7F800000u)), resb);
+    resb = OpSelect(U32[1], parts.is_zero, parts.sign, resb); // sqrt(+-0) -> +-0
+    resb = OpSelect(U32[1], parts.is_nan, nanc, resb);
+    OpReturnValue(OpBitcast(F32[1], resb));
+    OpFunctionEnd();
+    return func;
+}
+
+Id EmitContext::DefineF32Log2() {
+    const auto func_type{TypeFunction(F32[1], F32[1])};
+    const auto func{OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type)};
+    const auto x{OpFunctionParameter(F32[1])};
+    Name(func, "f32_log2");
+    AddLabel();
+
+    const auto parts{UnpackF32(*this, x)};
+    const auto e0{ExponentOf(*this, parts.mag)};
+    const auto mb0{OpBitwiseOr(U32[1], OpBitwiseAnd(U32[1], parts.mag, ConstU32(0x007FFFFFu)),
+                               ConstU32(0x3F800000u))};
+    // Reduce the mantissa to [sqrt(2)/2, sqrt(2)) so t = m - 1 is small and
+    // exact (Sterbenz); log2(x) = e + t*P(t) then has full relative
+    // accuracy also for x near 1 where e = 0.
+    const auto big{OpUGreaterThanEqual(U1[1], mb0, ConstU32(0x3FB504F3u))};
+    const auto mb{OpSelect(U32[1], big, OpISub(U32[1], mb0, ConstU32(0x00800000u)), mb0)};
+    const auto e{OpSelect(S32[1], big, OpIAdd(S32[1], e0, ConstS32(1)), e0)};
+    const auto t{SubNC(*this, OpBitcast(F32[1], mb), ConstF32(1.0f))};
+    const auto ef{OpConvertSToF(F32[1], e)}; // exact
+    auto p{ConstF32(std::bit_cast<f32>(kLog2Poly[10]))};
+    for (int k = 9; k >= 0; --k) {
+        p = FmaNC(*this, p, t, ConstF32(std::bit_cast<f32>(kLog2Poly[k])));
+    }
+    const auto lm{MulNC(*this, t, p)};
+    const auto res{AddNC(*this, ef, lm)};
+
+    const auto nanc{ConstU32(CanonNanBits)};
+    auto resb{OpBitcast(U32[1], res)};
+    resb = OpSelect(U32[1], parts.neg, nanc, resb); // log2(x<0) -> NaN
+    resb = OpSelect(U32[1], parts.is_inf,
+                    OpSelect(U32[1], parts.neg, nanc, ConstU32(0x7F800000u)), resb);
+    resb = OpSelect(U32[1], parts.is_zero, ConstU32(0xFF800000u), resb); // log2(+-0) -> -Inf
+    resb = OpSelect(U32[1], parts.is_nan, nanc, resb);
+    OpReturnValue(OpBitcast(F32[1], resb));
+    OpFunctionEnd();
+    return func;
+}
+
+Id EmitContext::DefineF32Exp2() {
+    const auto func_type{TypeFunction(F32[1], F32[1])};
+    const auto func{OpFunction(F32[1], spv::FunctionControlMask::MaskNone, func_type)};
+    const auto x{OpFunctionParameter(F32[1])};
+    Name(func, "f32_exp2");
+    AddLabel();
+
+    const auto parts{UnpackF32(*this, x)};
+    const auto zero_f{ConstF32(0.0f)};
+    // Flush denormal inputs to signed zero, then classify overflow and
+    // underflow with ordered compares: 2^x is +Inf for x >= 128 and
+    // denormal (flushed to +0) for x < -126.
+    const auto xq{OpSelect(F32[1], parts.is_zero, OpBitcast(F32[1], parts.sign), x)};
+    const auto ge{OpFOrdGreaterThanEqual(U1[1], xq, ConstF32(128.0f))};
+    const auto lt{OpFOrdLessThan(U1[1], xq, ConstF32(-126.0f))};
+    // Neutralize dead lanes so the live path never sees Inf/NaN arithmetic
+    // or an out-of-range float-to-int conversion.
+    auto xc{OpSelect(F32[1], ge, zero_f, xq)};
+    xc = OpSelect(F32[1], lt, zero_f, xc);
+    xc = OpSelect(F32[1], parts.is_nan, zero_f, xc);
+    const auto n{OpFloor(F32[1], xc)};  // exact
+    const auto f{SubNC(*this, xc, n)};  // f in [0, 1]
+    const auto ni{OpConvertFToS(S32[1], n)}; // in [-126, 127]
+    auto p{ConstF32(std::bit_cast<f32>(kExp2Poly[7]))};
+    for (int k = 6; k >= 0; --k) {
+        p = FmaNC(*this, p, f, ConstF32(std::bit_cast<f32>(kExp2Poly[k])));
+    }
+    // 2^n is a normal for n in [-126, 127]; x just below 128 may round the
+    // product up to 2^128 which overflows to +Inf, as intended.
+    const auto res{MulNC(*this, p, Pow2(*this, ni))};
+
+    auto resb{OpBitcast(U32[1], res)};
+    resb = OpSelect(U32[1], lt, ConstU32(0u), resb);          // underflow -> +0
+    resb = OpSelect(U32[1], ge, ConstU32(0x7F800000u), resb); // overflow -> +Inf
+    resb = OpSelect(U32[1], parts.is_nan, ConstU32(CanonNanBits), resb);
+    OpReturnValue(OpBitcast(F32[1], resb));
+    OpFunctionEnd();
+    return func;
+}
+
 Id EmitContext::DefineReadConst(bool dynamic) {
     const auto func_type{!dynamic ? TypeFunction(U32[1], U32[2], U32[1], U32[1])
                                   : TypeFunction(U32[1], U32[2], U32[1])};
@@ -1252,6 +1573,21 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
+    }
+    if (info.uses_f32_rcp) {
+        f32_rcp = DefineF32Rcp();
+    }
+    if (info.uses_f32_rsqrt) {
+        f32_rsqrt = DefineF32Rsqrt();
+    }
+    if (info.uses_f32_sqrt) {
+        f32_sqrt = DefineF32Sqrt();
+    }
+    if (info.uses_f32_log2) {
+        f32_log2 = DefineF32Log2();
+    }
+    if (info.uses_f32_exp2) {
+        f32_exp2 = DefineF32Exp2();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

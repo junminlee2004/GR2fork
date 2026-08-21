@@ -386,6 +386,15 @@ public:
     Id read_const{};
     Id read_const_dynamic{};
 
+    // Vendor-invariant f32 transcendental helpers. Bodies are built solely
+    // from correctly-rounded ops (fma/mul/add/sub) and exact integer ops so
+    // every conformant Vulkan implementation produces identical bits.
+    Id f32_rcp{};
+    Id f32_rsqrt{};
+    Id f32_sqrt{};
+    Id f32_log2{};
+    Id f32_exp2{};
+
 private:
     void DefineArithmeticTypes();
     void DefineInterfaces();
@@ -407,6 +416,12 @@ private:
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 
     Id DefineGetBdaPointer();
+
+    Id DefineF32Rcp();
+    Id DefineF32Rsqrt();
+    Id DefineF32Sqrt();
+    Id DefineF32Log2();
+    Id DefineF32Exp2();
 
     Id DefineReadConst(bool dynamic);
 

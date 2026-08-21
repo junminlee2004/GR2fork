@@ -110,7 +110,8 @@ Id EmitFPCos(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPExp2(EmitContext& ctx, Id value) {
-    return ctx.OpExp2(ctx.F32[1], value);
+    // Vendor-invariant software sequence; see DefineF32Exp2.
+    return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_exp2, value);
 }
 
 Id EmitFPPow(EmitContext& ctx, Id x, Id y) {
@@ -122,11 +123,13 @@ Id EmitFPLdexp(EmitContext& ctx, Id value, Id exp) {
 }
 
 Id EmitFPLog2(EmitContext& ctx, Id value) {
-    return ctx.OpLog2(ctx.F32[1], value);
+    // Vendor-invariant software sequence; see DefineF32Log2.
+    return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_log2, value);
 }
 
 Id EmitFPRecip32(EmitContext& ctx, Id value) {
-    return ctx.OpFDiv(ctx.F32[1], ctx.ConstF32(1.0f), value);
+    // Vendor-invariant software sequence; see DefineF32Rcp.
+    return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_rcp, value);
 }
 
 Id EmitFPRecip64(EmitContext& ctx, Id value) {
@@ -134,7 +137,8 @@ Id EmitFPRecip64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPRecipSqrt32(EmitContext& ctx, Id value) {
-    return ctx.OpInverseSqrt(ctx.F32[1], value);
+    // Vendor-invariant software sequence; see DefineF32Rsqrt.
+    return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_rsqrt, value);
 }
 
 Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {
@@ -142,7 +146,8 @@ Id EmitFPRecipSqrt64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPSqrt(EmitContext& ctx, Id value) {
-    return ctx.OpSqrt(ctx.F32[1], value);
+    // Vendor-invariant software sequence; see DefineF32Sqrt.
+    return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_sqrt, value);
 }
 
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {

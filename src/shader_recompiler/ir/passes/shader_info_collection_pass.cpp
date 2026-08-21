@@ -149,6 +149,21 @@ void Visit(Info& info, const IR::Inst& inst) {
     case IR::Opcode::UnpackUfloat10_11_11:
         info.uses_unpack_10_11_11 = true;
         break;
+    case IR::Opcode::FPRecip32:
+        info.uses_f32_rcp = true;
+        break;
+    case IR::Opcode::FPRecipSqrt32:
+        info.uses_f32_rsqrt = true;
+        break;
+    case IR::Opcode::FPSqrt:
+        info.uses_f32_sqrt = true;
+        break;
+    case IR::Opcode::FPLog2:
+        info.uses_f32_log2 = true;
+        break;
+    case IR::Opcode::FPExp2:
+        info.uses_f32_exp2 = true;
+        break;
     default:
         break;
     }

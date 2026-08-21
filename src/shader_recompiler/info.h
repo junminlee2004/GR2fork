@@ -142,6 +142,11 @@ struct Info : InfoPersistent {
     bool uses_fp64{};
     bool uses_pack_10_11_11{};
     bool uses_unpack_10_11_11{};
+    bool uses_f32_rcp{};
+    bool uses_f32_rsqrt{};
+    bool uses_f32_sqrt{};
+    bool uses_f32_log2{};
+    bool uses_f32_exp2{};
     bool uses_buffer_int64_atomics{};
     bool uses_shared_int64_atomics{};
     bool stores_tess_level_outer{};
