@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -603,6 +605,14 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    // The skinning shader is shared by every skinned mesh, so one invocation's bindings
+    // have to be read as a group and the mesh identified by its output size. Numbering
+    // them here catches every binding whichever path it takes, where reporting from the
+    // upload would miss the output entirely: it is GPU written, so its pages are rarely
+    // dirty and there is usually nothing to upload.
+    const bool probe_stage = stage.pgm_hash == 0x22e6e19e;
+    static std::atomic<u64> probe_seq{0};
+    const u64 seq = probe_stage ? probe_seq.fetch_add(1, std::memory_order_relaxed) : 0;
     buffer_bindings.clear();
 
     for (const auto& desc : stage.buffers) {
@@ -668,9 +678,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             }
         } else {
-            // The hair skinning shader, so its buffers can be dumped without guessing
-            // which of them is the matrix palette.
-            const bool probe = stage.pgm_hash == 0x22e6e19e;
+            if (probe_stage) {
+                LOG_WARNING(Render_Vulkan, "HAIRBIND seq={} addr={:#x} size={} written={}", seq,
+                            vsharp.base_address, size, desc.is_written);
+            }
+            const bool probe = probe_stage;
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id, probe);
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
