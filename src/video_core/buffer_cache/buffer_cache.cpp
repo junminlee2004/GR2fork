@@ -399,7 +399,16 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 static void ProbeMatrices(VAddr base, u32 size, const u8* bytes, const char* path,
                           VAddr region_addr = 0, u64 region_size = 0) {
     constexpr u32 MatrixBytes = 48;
-    if (size < MatrixBytes || size % MatrixBytes != 0 || size > 32768) {
+    // Every buffer is reported so the bindings of one dispatch can be read as a group and
+    // the hair identified by its output size, but only plausible matrix runs are analysed.
+    const bool analyse = size >= MatrixBytes && size % MatrixBytes == 0 && size <= 32768;
+    if (!analyse) {
+        static std::atomic<u64> other{0};
+        const u64 j = other.fetch_add(1, std::memory_order_relaxed);
+        if (j < 400 || (j & 0x3F) == 0) {
+            LOG_WARNING(Render_Vulkan, "HAIRBUF other base={:#x} size={} via={}", base, size,
+                        path);
+        }
         return;
     }
     // A staged copy is page aligned and reaches only part of the buffer, so matrices are
