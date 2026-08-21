@@ -391,16 +391,18 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
-// A bone matrix palette holds matrices of three rows of four floats. The rotation part
-// of each row is unit length in a correct palette, so the row length is a scale free
-// signature of corruption: a sound matrix reads 1.0 whatever the pose. Reads only host
-// memory that has already been filled, so it cannot fault or take a lock.
+// Identifies a bone matrix palette by its own structure rather than by its size, then
+// reports how far the worst matrix strays. The rotation part of each row is unit length
+// in a correct palette, so a run of matrices whose rows are mostly unit is a palette,
+// whatever its size, and the worst row length is a scale free measure of corruption.
+// Reads only host memory that has already been filled, so it cannot fault or take a lock.
 static void ProbePaletteRows(VAddr base, u32 size, const u8* bytes, const char* path) {
     constexpr u32 MatrixBytes = 48;
-    if (size != 4368 && size != 14400) {
+    if (size % MatrixBytes != 0 || size < 48 * 16 || size > 32768) {
         return;
     }
     const u32 count = size / MatrixBytes;
+    u32 unit_rows = 0;
     f32 worst = 1.0f;
     u32 worst_bone = 0;
     for (u32 bone = 0; bone < count; ++bone) {
@@ -408,27 +410,35 @@ static void ProbePaletteRows(VAddr base, u32 size, const u8* bytes, const char* 
             f32 v[3];
             std::memcpy(v, bytes + bone * MatrixBytes + row * 16, sizeof(v));
             const f32 len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-            if (std::fabs(len - 1.0f) > std::fabs(worst - 1.0f)) {
+            if (std::fabs(len - 1.0f) <= 0.05f) {
+                ++unit_rows;
+            } else if (std::fabs(len - 1.0f) > std::fabs(worst - 1.0f)) {
                 worst = len;
                 worst_bone = bone;
             }
         }
     }
-    static std::atomic<u64> clean{0};
+    const u32 rows = count * 3;
+    // Anything that is not mostly unit rows is not a palette and is not reported.
+    if (unit_rows * 4 < rows * 3) {
+        return;
+    }
+    const f32 frac = static_cast<f32>(unit_rows) / static_cast<f32>(rows);
+    static std::atomic<u64> seen{0};
     static std::atomic<u64> bad{0};
-    if (std::fabs(worst - 1.0f) > 0.05f) {
-        const u64 n = bad.fetch_add(1, std::memory_order_relaxed);
-        if (n < 32 || (n & 0xFF) == 0) {
+    const u64 n = seen.fetch_add(1, std::memory_order_relaxed);
+    const bool is_bad = std::fabs(worst - 1.0f) > 0.05f;
+    if (is_bad) {
+        const u64 k = bad.fetch_add(1, std::memory_order_relaxed);
+        if (k < 32 || (k & 0xFF) == 0) {
             LOG_WARNING(Render_Vulkan,
-                        "PALROW bad #{} base={:#x} size={} via={} worst_bone={} row_len={}", n,
-                        base, size, path, worst_bone, worst);
+                        "PALROW bad #{} base={:#x} size={} via={} unit={:.3f} worst_bone={} "
+                        "row_len={}",
+                        k, base, size, path, frac, worst_bone, worst);
         }
-    } else {
-        const u64 n = clean.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((n & 0x3FF) == 0) {
-            LOG_INFO(Render_Vulkan, "PALROW clean={} bad={} last_row_len={}", n,
-                     bad.load(std::memory_order_relaxed), worst);
-        }
+    } else if (n < 16 || (n & 0x3F) == 0) {
+        LOG_INFO(Render_Vulkan, "PALROW ok #{} base={:#x} size={} via={} unit={:.3f} bad_so_far={}",
+                 n, base, size, path, frac, bad.load(std::memory_order_relaxed));
     }
 }
 
