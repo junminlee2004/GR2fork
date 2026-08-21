@@ -448,15 +448,21 @@ static void ProbePaletteRows(VAddr pal_base, u32 pal_size, VAddr region_addr,
     if (covered == 0) {
         return;
     }
-    static std::atomic<u64> seen{0};
-    const u64 n = seen.fetch_add(1, std::memory_order_relaxed);
-    if (n < 48 || (n & 0xFF) == 0) {
+    // A corrupt palette is always reported, however late in the session it appears. A
+    // shared counter sampled from the start would spend its budget on the palettes bound
+    // during loading and could miss the one that matters entirely.
+    static std::atomic<u64> clean{0};
+    static std::atomic<u64> dirty{0};
+    const bool corrupt = std::fabs(worst - 1.0f) > 0.05f;
+    const u64 n = (corrupt ? dirty : clean).fetch_add(1, std::memory_order_relaxed);
+    if (corrupt ? (n < 256 || (n & 0x3F) == 0) : (n < 8 || (n & 0x7FF) == 0)) {
         LOG_WARNING(Render_Vulkan,
-                    "PALROW #{} base={:#x} size={} via={} bones={}/{} unit={:.3f} "
-                    "worst_bone={} worst_row={} row63={}",
-                    n, pal_base, pal_size, path, covered, count,
+                    "PALROW {} #{} base={:#x} size={} via={} bones={}/{} unit={:.3f} "
+                    "worst_bone={} worst_row={} row63={} totals clean={} corrupt={}",
+                    corrupt ? "CORRUPT" : "ok", n, pal_base, pal_size, path, covered, count,
                     static_cast<f32>(unit_rows) / static_cast<f32>(rows), worst_bone, worst,
-                    have63 ? row63 : -1.0f);
+                    have63 ? row63 : -1.0f, clean.load(std::memory_order_relaxed),
+                    dirty.load(std::memory_order_relaxed));
     }
 }
 
