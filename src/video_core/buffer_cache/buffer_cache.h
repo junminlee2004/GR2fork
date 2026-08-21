@@ -189,7 +189,8 @@ private:
                            bool is_texel_buffer);
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                            size_t total_size_bytes);
+                            size_t total_size_bytes, VAddr palette_base = 0,
+                            u32 palette_size = 0);
 
     bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
 
