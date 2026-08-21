@@ -435,8 +435,13 @@ void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const Runtim
         } else {
             static std::once_flag logged;
             std::call_once(logged, [] {
-                LOG_WARNING(Render_Vulkan, "Float32 denorm flushing is not supported by the GPU");
+                LOG_WARNING(Render_Vulkan, "Float32 denorm flushing is not supported by the GPU, "
+                                           "forcing DenormFlushToZero execution mode anyway");
             });
+            // NVIDIA reports shaderDenormFlushToZeroFloat32 = VK_FALSE yet honors the
+            // execution mode in practice; vkd3d-proton ships the same behavior.
+            ctx.AddCapability(spv::Capability::DenormFlushToZero);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormFlushToZero, 32U);
         }
     } else {
         LOG_WARNING(Render_Vulkan, "Unknown FP denorm mode {}", u32(fp32_denorm_mode));
