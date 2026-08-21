@@ -6,8 +6,13 @@
 
 namespace Shader::Backend::SPIRV {
 
+// A register read on a path where it was never written has no defined value, and each
+// driver materializes one differently: some hand back zero, others whatever the previous
+// occupant of the register left. Guest code that reaches such a read then computes a
+// different answer per host. Hand back zero everywhere instead, so the result is at least
+// the same on every host.
 Id EmitUndefU1(EmitContext& ctx) {
-    return ctx.OpUndef(ctx.U1[1]);
+    return ctx.false_value;
 }
 
 Id EmitUndefU8(EmitContext&) {
@@ -19,7 +24,7 @@ Id EmitUndefU16(EmitContext&) {
 }
 
 Id EmitUndefU32(EmitContext& ctx) {
-    return ctx.OpUndef(ctx.U32[1]);
+    return ctx.u32_zero_value;
 }
 
 Id EmitUndefU64(EmitContext&) {
