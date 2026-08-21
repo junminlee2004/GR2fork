@@ -783,8 +783,8 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     if (!is_written) {
         Decorate(id, spv::Decoration::NonWritable);
     } else if (is_coherent) {
-        // The guest V# MTYPE marks this buffer as shared between invocations;
-        // Coherent forbids caching its accesses in registers across barriers.
+        // Coherent forbids caching this buffer's accesses in registers or
+        // per-invocation caches across barriers.
         Decorate(id, spv::Decoration::Coherent);
     }
     switch (buffer_type) {
@@ -817,10 +817,13 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 void EmitContext::DefineBuffers() {
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
-        // MTYPE class 3 marks guest buffers shared between invocations; shared
-        // memory lowered to a storage buffer needs the same guarantee.
-        const bool is_coherent =
-            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3;
+        // A buffer both written and read within one shader can hand data
+        // between invocations of a workgroup through stores ordered by
+        // barriers, so its accesses must stay out of incoherent caches.
+        // Write-only outputs are consumed by later dispatches and need no
+        // coherence. Shared memory lowered to a storage buffer always
+        // needs the guarantee.
+        const bool is_coherent = desc.buffer_type == BufferType::SharedMemory || desc.is_read;
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {

@@ -120,6 +120,7 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
         .inline_cbuf = AmdGpu::Buffer::Null(),
         .buffer_type = BufferType::SharedMemory,
         .is_written = true,
+        .is_read = true,
     });
 
     for (IR::Block* const block : program.blocks) {

@@ -252,6 +252,7 @@ public:
         auto& buffer = buffer_resources[index];
         buffer.used_types |= desc.used_types;
         buffer.is_written |= desc.is_written;
+        buffer.is_read |= desc.is_read;
         buffer.is_formatted |= desc.is_formatted;
         return index;
     }
@@ -526,6 +527,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
             .used_types = BufferDataType(inst, profile, buffer.GetNumberFmt()),
             .buffer_type = BufferType::Guest,
             .is_written = IsBufferStore(inst),
+            .is_read = !IsBufferStore(inst) || IsBufferAtomic(inst),
             .is_formatted = inst.GetOpcode() == IR::Opcode::LoadBufferFormatF32 ||
                             inst.GetOpcode() == IR::Opcode::StoreBufferFormatF32,
         });
@@ -671,6 +673,7 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
         .inline_cbuf = AmdGpu::Buffer::Null(),
         .buffer_type = BufferType::GdsBuffer,
         .is_written = true,
+        .is_read = true,
     });
 
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};

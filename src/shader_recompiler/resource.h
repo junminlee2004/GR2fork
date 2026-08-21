@@ -36,6 +36,7 @@ struct BufferResource {
     BufferType buffer_type;
     u8 instance_attrib{};
     bool is_written{};
+    bool is_read{};
     bool is_formatted{};
 
     bool IsSpecial() const noexcept {

@@ -173,12 +173,14 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             .inline_cbuf = AmdGpu::Buffer::Placeholder(VideoCore::BufferCache::BDA_PAGETABLE_SIZE),
             .buffer_type = BufferType::BdaPagetable,
             .is_written = true,
+            .is_read = true,
         });
         info.buffers.push_back({
             .used_types = IR::Type::U32,
             .inline_cbuf = AmdGpu::Buffer::Placeholder(std::numeric_limits<u32>::max()),
             .buffer_type = BufferType::FaultBuffer,
             .is_written = true,
+            .is_read = true,
         });
     }
 }
