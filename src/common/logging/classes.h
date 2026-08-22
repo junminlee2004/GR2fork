@@ -113,6 +113,7 @@ constexpr auto NpHandler = "NpHandler";                             ///< NpHandl
 constexpr auto Render = "Render";                                   ///< Video Core
 constexpr auto Render_Recompiler = "Render.Recompiler";             ///< Shader recompiler
 constexpr auto Render_Vulkan = "Render.Vulkan";                     ///< Vulkan backend
+constexpr auto Render_Skipcache = "Render.SkipCache";              ///< Adaptive skip caches
 constexpr auto ShadNet = "ShadNet";                                 ///< shadNet binary protocol client
 constexpr auto Tty = "Tty";                                         ///< Debug output from emu
 // clang-format on

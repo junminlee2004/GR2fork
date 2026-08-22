@@ -117,6 +117,8 @@ private:
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
     const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};
+    const std::vector<std::string> adaptiveSkipCachesOptions = {
+        "Disabled", "Adaptive", "Validate only (slower - for testing)"};
     // Windows static guest red-zone protection
     const std::vector<std::string> windowsGuestRedZoneProtectionModeOptions = {"Disabled",
                                                                                "Static Patching"};
@@ -158,6 +160,7 @@ private:
 
     // Experimental tab
     int readbacksModeSetting;
+    int adaptiveSkipCachesSetting;
     bool readbackLinearImagesSetting;
     bool directMemoryAccessSetting;
     // Windows static guest red-zone protection

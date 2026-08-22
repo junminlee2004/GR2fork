@@ -13,6 +13,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
@@ -104,11 +105,13 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         scheduler.Finish();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download, download_size);
+        Skipcache::Framework::Instance().BumpMemGen();
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
                                                           download_size);
+                Skipcache::Framework::Instance().BumpMemGen();
             });
     }
 }
@@ -165,6 +168,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
     });
+    Skipcache::Framework::Instance().BumpImgDirtyGen();
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -460,6 +464,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // bound as render target. In this case we need to rebind render target.
                 if (cache_image.binding.is_target) {
                     cache_image.binding.needs_rebind = 1u;
+                    Skipcache::Framework::Instance().BumpTexGen();
                     if (merged_image_id) {
                         GetImage(merged_image_id).binding.is_target = 1u;
                     }
@@ -494,6 +499,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
+        Skipcache::Framework::Instance().BumpTexGen();
     }
 
     FreeImage(image_id);
@@ -628,7 +634,11 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
             download_images.emplace(image_id);
         }
     }
-    UpdateImage(image_id);
+    if (desc.type == BindingType::Storage) {
+        UpdateImage(image_id);
+    } else {
+        MaybeUpdateImage(image_id);
+    }
     return image.FindView(desc.view_info);
 }
 
@@ -696,6 +706,67 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     }
 
     return image.FindView(desc.view_info, false);
+}
+
+void TextureCache::MaybeUpdateImage(ImageId image_id) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::UpdateImageDedup;
+    if (!sc.Active() || !sc.ShouldProbe(kCache)) {
+        UpdateImage(image_id);
+        return;
+    }
+    auto& ctr = sc.Counters(kCache);
+    ++ctr.eligible;
+    const bool timed = sc.SampleTimer(kCache);
+    const u64 t0 = timed ? sc.Now() : 0;
+    const DrawToken t = sc.Capture(0, scheduler.CurrentTick());
+    const u32 index = image_id.index;
+    const bool would_hit = sc.DedupProbe(index, t);
+    if (timed) {
+        const u64 t1 = sc.Now();
+        ctr.guard_ns += t1 - t0;
+        ++ctr.guard_samples;
+        // The consumed-hit path is the guard plus a return.
+        ctr.hit_ns += t1 - t0;
+        ++ctr.hit_samples;
+    }
+    if (!would_hit) {
+        ++ctr.miss_key;
+        const u64 m0 = timed ? sc.Now() : 0;
+        UpdateImage(image_id);
+        if (timed) {
+            ctr.miss_ns += sc.Now() - m0;
+            ++ctr.miss_samples;
+        }
+        sc.DedupCommit(index, t);
+        return;
+    }
+    ++ctr.hits;
+    if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+        return; // consumed hit: same image, same tick, all lanes unchanged
+    }
+    if (sc.GetState(kCache) == State::Learning) {
+        // Observe-only: instruments never change behavior.
+        UpdateImage(image_id);
+        return;
+    }
+    // Predict-then-execute. Premise (read-only whitelist): the dirty flags a
+    // redundant UpdateImage would find must be clear.
+    const bool premise_clean = False(slot_images[image_id].flags & ImageFlagBits::Dirty);
+    UpdateImage(image_id); // authoritative path, exactly once
+    if (premise_clean) {
+        sc.RecordVerifyClean(kCache);
+    } else {
+        // A racing CPU fault legitimately sets a dirty flag between the
+        // hit-check and here; a moved lane means aborted, not divergence.
+        const DrawToken t2 = sc.Capture(0, scheduler.CurrentTick());
+        if (t2.mem_gen != t.mem_gen || t2.tex_gen != t.tex_gen) {
+            sc.RecordVerifyAborted(kCache);
+        } else {
+            sc.RecordDivergence(kCache, "dirty flags set under equal lanes");
+        }
+    }
 }
 
 void TextureCache::RefreshImage(Image& image) {
@@ -817,6 +888,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+    Skipcache::Framework::Instance().BumpTexGen();
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -840,6 +912,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         }
         image_ids.erase(vector_it);
     });
+    Skipcache::Framework::Instance().BumpTexGen();
 }
 
 void TextureCache::TrackImage(ImageId image_id) {
@@ -1101,6 +1174,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.erase(image_id);
     });
+    Skipcache::Framework::Instance().BumpTexGen();
 }
 
 } // namespace VideoCore

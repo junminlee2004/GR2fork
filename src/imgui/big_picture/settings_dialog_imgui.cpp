@@ -13,6 +13,7 @@
 #include "core/devtools/layer.h"
 #include "imgui/imgui_std.h"
 #include "settings_dialog_imgui.h"
+#include "video_core/skipcache/skipcache.h"
 
 CMRC_DECLARE(res);
 
@@ -79,6 +80,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     /////////// Experimental Tab
     if (isSpecific) {
         readbacksModeSetting = EmulatorSettings.GetReadbacksMode();
+        adaptiveSkipCachesSetting = EmulatorSettings.GetAdaptiveSkipCachesMode();
         readbackLinearImagesSetting = EmulatorSettings.IsReadbackLinearImagesEnabled();
         directMemoryAccessSetting = EmulatorSettings.IsDirectMemoryAccessEnabled();
         // Windows static guest red-zone protection
@@ -143,6 +145,9 @@ void SettingsWindow::SaveSettings(std::string profile) {
     /////////// Experimental Tab
     if (isSpecific) {
         EmulatorSettings.SetReadbacksMode(readbacksModeSetting, true);
+        EmulatorSettings.SetAdaptiveSkipCachesMode(adaptiveSkipCachesSetting, true);
+        VideoCore::Skipcache::Framework::Instance().SetRequestedMode(
+            static_cast<VideoCore::Skipcache::Mode>(adaptiveSkipCachesSetting));
         EmulatorSettings.SetReadbackLinearImagesEnabled(readbackLinearImagesSetting, true);
         EmulatorSettings.SetDirectMemoryAccessEnabled(directMemoryAccessSetting, true);
         // Windows static guest red-zone protection
@@ -756,6 +761,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingSliderInt("Additional DMem Allocation", extraDmemSetting, 0, 20000);
             AddSettingSliderInt("Vblank Frequency", vblankFrequencySetting, 30, 360);
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
+            AddSettingCombo("Adaptive Skip Caches (Experimental)", adaptiveSkipCachesSetting,
+                            adaptiveSkipCachesOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
 #ifdef _WIN32

@@ -111,6 +111,11 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
+    /// UpdateImage with the adaptive dedup skip cache in front. Only sampled
+    /// texture bindings and render-target reuse go through here; storage
+    /// images keep the full path.
+    void MaybeUpdateImage(ImageId image_id);
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         std::scoped_lock lock{mutex};

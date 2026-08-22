@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -20,6 +21,8 @@
 #endif
 
 namespace Vulkan {
+
+namespace Skipcache = VideoCore::Skipcache;
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -43,6 +46,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    auto& skipcache = Skipcache::Framework::Instance();
+    skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
+    skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
+    br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -189,6 +196,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
+    Skipcache::Framework::Instance().OnDraw();
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
@@ -392,6 +400,8 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    Skipcache::Framework::Instance().OnSubmit(DebugState.GetFrameNum(),
+                                              DebugState.IsGuestThreadsPaused());
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -401,11 +411,103 @@ void Rasterizer::OnSubmit() {
     buffer_cache.RunGarbageCollector();
 }
 
+// ---- BindingSkip LEARNING probe (observe-only) ---------------------------
+// Measures whether a per-stage binding replay cache would pay: would-hit =
+// same pipeline, same cmdbuf tick, every stage's pgm_hash and user_data words
+// bit-identical (memcmp, never hash). Data-gates the wave-2 replay build; by
+// the instrument-contamination rule this probe writes nothing and returns
+// nothing.
+enum BsVeto : u8 {
+    BsVetoPipeline = 0,
+    BsVetoTick = 1,
+    BsVetoStageCount = 2,
+    BsVetoPgmHash = 3,
+    BsVetoUserData = 4,
+};
+
+void Rasterizer::BindingSkipProbe(const Pipeline* pipeline) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Skipcache::Framework::Instance();
+    constexpr auto kBS = CacheId::BindingSkipProbe;
+    if (!sc.Active() || !sc.ShouldProbe(kBS)) {
+        return;
+    }
+    auto& ctr = sc.Counters(kBS);
+    ++ctr.eligible;
+    auto& p = bs_probe_;
+    const u64 tick = scheduler.CurrentTick();
+    const auto stages = pipeline->GetStages();
+
+    bool would_hit = false;
+    if (!p.valid) {
+        ++ctr.miss_cold;
+    } else if (p.pipeline != pipeline) {
+        ++ctr.veto[BsVetoPipeline];
+    } else if (p.tick != tick) {
+        ++ctr.veto[BsVetoTick];
+    } else {
+        would_hit = true;
+        u32 idx = 0;
+        for (const auto* stage : stages) {
+            if (!stage) {
+                continue;
+            }
+            if (idx >= p.num_stages) {
+                ++ctr.veto[BsVetoStageCount];
+                would_hit = false;
+                break;
+            }
+            auto& snap = p.stages[idx];
+            if (snap.pgm_hash != stage->pgm_hash) {
+                ++ctr.veto[BsVetoPgmHash];
+                would_hit = false;
+                break;
+            }
+            const size_t words = std::min<size_t>(stage->user_data.size(), snap.user_data.size());
+            if (std::memcmp(snap.user_data.data(), stage->user_data.data(), words * sizeof(u32)) !=
+                0) {
+                ++ctr.veto[BsVetoUserData];
+                would_hit = false;
+                break;
+            }
+            ++idx;
+        }
+        if (would_hit && idx != p.num_stages) {
+            ++ctr.veto[BsVetoStageCount];
+            would_hit = false;
+        }
+    }
+    if (would_hit) {
+        ++ctr.hits;
+        return;
+    }
+    // Refresh the observation snapshot (probe-internal state, not a cache).
+    p.pipeline = pipeline;
+    p.tick = tick;
+    p.num_stages = 0;
+    for (const auto* stage : stages) {
+        if (!stage || p.num_stages >= p.stages.size()) {
+            continue;
+        }
+        auto& snap = p.stages[p.num_stages++];
+        snap.pgm_hash = stage->pgm_hash;
+        const size_t words = std::min<size_t>(stage->user_data.size(), snap.user_data.size());
+        std::memcpy(snap.user_data.data(), stage->user_data.data(), words * sizeof(u32));
+        if (words < snap.user_data.size()) {
+            std::memset(snap.user_data.data() + words, 0,
+                        (snap.user_data.size() - words) * sizeof(u32));
+        }
+    }
+    p.valid = true;
+}
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
     }
+
+    BindingSkipProbe(pipeline);
 
     set_write_index = 0;
     set_writes.clear();
@@ -864,11 +966,302 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+// ---- BeginRendering skip cache -------------------------------------------
+
+// Veto buckets for the BR guard chain (named per cache, reported in SESSION).
+enum BrVeto : u8 {
+    BrVetoMetaClear = 0,
+    BrVetoUid = 1,
+    BrVetoRegistered = 2,
+    BrVetoRebind = 3,
+    BrVetoBacking = 4,
+    BrVetoLayout = 5,
+    BrVetoSubres = 6,
+};
+
+bool Rasterizer::BrGuardAttachment(const BrAttachmentGuard& g,
+                                   VideoCore::Skipcache::CacheCounters& ctr) {
+    // 1. Armed meta clear: compute clear shaders and FillBuffer arm CMASK/HTILE
+    //    without any register write; the stamp cannot see them (read-only).
+    if (g.meta_addr && texture_cache.IsMetaCleared(g.meta_addr, g.slice)) {
+        ++ctr.veto[BrVetoMetaClear];
+        return false;
+    }
+    if (!g.image_id) {
+        return true; // masked slot
+    }
+    auto& image = texture_cache.GetImage(g.image_id);
+    if (image.image_uid != g.image_uid) {
+        ++ctr.veto[BrVetoUid];
+        return false;
+    }
+    if (False(image.flags & VideoCore::ImageFlagBits::Registered)) {
+        // Deleted-but-slot-not-yet-erased (the chance-overlap FreeImage path).
+        ++ctr.veto[BrVetoRegistered];
+        return false;
+    }
+    if (image.binding.needs_rebind) {
+        ++ctr.veto[BrVetoRebind];
+        return false;
+    }
+    if (static_cast<const void*>(image.backing) != g.backing) {
+        // Backing swaps from copy/download paths that pipeline equality never
+        // covered.
+        ++ctr.veto[BrVetoBacking];
+        return false;
+    }
+    if (image.backing->state.layout != g.expected_layout ||
+        image.backing->state.access_mask != g.expected_access) {
+        ++ctr.veto[BrVetoLayout];
+        return false;
+    }
+    if (!image.backing->subresource_states.empty()) {
+        // Ranged verify: every [mip][layer] in the cached view range must match
+        // (partial-view render targets, e.g. cascade shadow slices).
+        const u32 layers = image.info.resources.layers;
+        for (u32 mip = g.base_level; mip < g.base_level + g.num_levels; ++mip) {
+            for (u32 layer = g.base_layer; layer < g.base_layer + g.num_layers; ++layer) {
+                const size_t idx = size_t(mip) * layers + layer;
+                if (idx >= image.backing->subresource_states.size()) {
+                    ++ctr.veto[BrVetoSubres];
+                    return false;
+                }
+                const auto& st = image.backing->subresource_states[idx];
+                if (st.layout != g.expected_layout || st.access_mask != g.expected_access) {
+                    ++ctr.veto[BrVetoSubres];
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
+                         const GraphicsPipeline* pipeline) {
+    using namespace VideoCore::Skipcache;
+    auto& ctr = Skipcache::Framework::Instance().Counters(CacheId::BeginRendering);
+    const auto& c = br_cache_;
+    if (!c.valid) {
+        ++ctr.miss_cold;
+        return false;
+    }
+    if (c.pipeline != pipeline) { // compared, never dereferenced
+        ++ctr.miss_key;
+        return false;
+    }
+    if (c.token.reg_stamp != token.reg_stamp) {
+        ++ctr.miss_gen[LaneReg];
+        return false;
+    }
+    if (c.token.tick != token.tick) {
+        ++ctr.miss_gen[LaneTick];
+        return false;
+    }
+    if (c.token.mem_gen != token.mem_gen) {
+        ++ctr.miss_gen[LaneMem];
+        return false;
+    }
+    if (c.token.tex_gen != token.tex_gen) {
+        ++ctr.miss_gen[LaneTex];
+        return false;
+    }
+    if (c.token.pipe_gen != token.pipe_gen) {
+        ++ctr.miss_gen[LanePipe];
+        return false;
+    }
+    if (c.token.img_dirty_gen != token.img_dirty_gen) {
+        ++ctr.miss_gen[LaneImgDirty];
+        return false;
+    }
+    for (u32 cb = 0; cb < c.cb_count; ++cb) {
+        if (!BrGuardAttachment(c.cb_guard[cb], ctr)) {
+            return false;
+        }
+    }
+    if (c.has_db && !BrGuardAttachment(c.db_guard, ctr)) {
+        return false;
+    }
+    return true;
+}
+
+RenderState Rasterizer::BrReplay(const GraphicsPipeline* pipeline) {
+    // Consumed hit: replay the clear-free snapshot. SetBackingSamples is
+    // cheap and idempotent; re-running it preserves the slow path's every-draw
+    // re-assertion.
+    const auto& key = pipeline->GetGraphicsKey();
+    for (u32 cb = 0; cb < br_cache_.cb_count; ++cb) {
+        const auto& g = br_cache_.cb_guard[cb];
+        if (g.image_id) {
+            texture_cache.GetImage(g.image_id).SetBackingSamples(key.color_samples[cb]);
+        }
+    }
+    attachment_feedback_loop = br_cache_.attachment_feedback_loop;
+    return br_cache_.state;
+}
+
+void Rasterizer::BrVerify(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Skipcache::Framework::Instance();
+    constexpr auto kBR = CacheId::BeginRendering;
+    // Attributed sub-checks first (they name the leaked invalidation channel),
+    // then the whole-struct closer. The snapshot is clear-free by refusal, so
+    // a fresh clear flag on a would-hit IS the caught bug (raw compare).
+    const char* diff = nullptr;
+    for (u32 cb = 0; cb < fresh.num_color_attachments && !diff; ++cb) {
+        if (fresh.color_attachments[cb].is_clear) {
+            diff = "fresh color clear under would-hit (leaked arming channel)";
+        }
+    }
+    if (!diff && (fresh.depth_stencil_attachment.depth_clear ||
+                  fresh.depth_stencil_attachment.stencil_clear)) {
+        diff = "fresh depth/stencil clear under would-hit";
+    }
+    if (!diff && (fresh.width != br_cache_.state.width || fresh.height != br_cache_.state.height ||
+                  fresh.num_layers != br_cache_.state.num_layers ||
+                  fresh.num_color_attachments != br_cache_.state.num_color_attachments)) {
+        diff = "dims/counts";
+    }
+    if (!diff && !(fresh == br_cache_.state)) {
+        diff = "whole-struct";
+    }
+    if (!diff && attachment_feedback_loop != br_cache_.attachment_feedback_loop) {
+        diff = "attachment_feedback_loop";
+    }
+    if (!diff) {
+        sc.RecordVerifyClean(kBR);
+        return;
+    }
+    // Racing cross-thread invalidation between hit-check and compare is an
+    // abort, not a divergence.
+    const DrawToken t2 = sc.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
+    if (t2.mem_gen != token.mem_gen || t2.tex_gen != token.tex_gen ||
+        t2.pipe_gen != token.pipe_gen) {
+        sc.RecordVerifyAborted(kBR);
+        br_cache_.valid = false;
+        return;
+    }
+    sc.RecordDivergence(kBR, diff);
+    br_cache_.valid = false;
+}
+
+void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token,
+                            const GraphicsPipeline* pipeline) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Skipcache::Framework::Instance();
+    auto& ctr = sc.Counters(CacheId::BeginRendering);
+    // Self-invalidate first: any early exit leaves the cache off.
+    br_cache_.valid = false;
+    // Canonicalize-by-refusal: never store a snapshot carrying any clear flag.
+    // The consumed-CMASK populating draw is skipped (one draw of lost populate
+    // per pass); level-triggered register clears keep the flags set every draw
+    // and are therefore never populated while armed.
+    for (u32 cb = 0; cb < fresh.num_color_attachments; ++cb) {
+        if (fresh.color_attachments[cb].is_clear) {
+            ++ctr.populate_refused;
+            return;
+        }
+    }
+    if (fresh.depth_stencil_attachment.depth_clear ||
+        fresh.depth_stencil_attachment.stencil_clear) {
+        ++ctr.populate_refused;
+        return;
+    }
+    // Capture per-attachment guards from post-Transit live state.
+    br_cache_.cb_count = fresh.num_color_attachments;
+    const auto& regs = liverpool->regs;
+    for (u32 cb = 0; cb < fresh.num_color_attachments; ++cb) {
+        auto& g = br_cache_.cb_guard[cb];
+        g = {};
+        const auto& [image_id, desc] = cb_descs[cb];
+        if (!image_id) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(image_id);
+        const auto& col_buf = regs.color_buffers[cb];
+        g.meta_addr = col_buf.CmaskAddress();
+        g.image_id = image_id;
+        g.image_uid = image.image_uid;
+        g.backing = image.backing;
+        g.expected_layout = image.backing->state.layout;
+        g.expected_access = image.backing->state.access_mask;
+        g.base_level = desc.view_info.range.base.level;
+        g.base_layer = desc.view_info.range.base.layer;
+        g.num_levels = desc.view_info.range.extent.levels;
+        g.num_layers = desc.view_info.range.extent.layers;
+        g.slice = g.base_layer;
+    }
+    br_cache_.has_db = db_desc.first.operator bool();
+    if (br_cache_.has_db) {
+        auto& g = br_cache_.db_guard;
+        g = {};
+        const auto& [image_id, desc] = db_desc;
+        auto& image = texture_cache.GetImage(image_id);
+        g.meta_addr = regs.depth_htile_data_base.GetAddress();
+        g.image_id = image_id;
+        g.image_uid = image.image_uid;
+        g.backing = image.backing;
+        g.expected_layout = image.backing->state.layout;
+        g.expected_access = image.backing->state.access_mask;
+        g.base_level = desc.view_info.range.base.level;
+        g.base_layer = desc.view_info.range.base.layer;
+        g.num_levels = desc.view_info.range.extent.levels;
+        g.num_layers = desc.view_info.range.extent.layers;
+        g.slice = g.base_layer;
+    }
+    br_cache_.pipeline = pipeline;
+    br_cache_.state = fresh;
+    br_cache_.attachment_feedback_loop = attachment_feedback_loop;
+    // Commit re-check: a cross-thread invalidation landing mid-build forces
+    // the next probe to miss (seqlock consumer side).
+    const DrawToken t2 = sc.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
+    if (t2.mem_gen != token.mem_gen || t2.tex_gen != token.tex_gen ||
+        t2.pipe_gen != token.pipe_gen) {
+        return; // br_cache_.valid stays false
+    }
+    br_cache_.token = token;
+    br_cache_.valid = true;
+    sc.NotifyPopulated(VideoCore::Skipcache::CacheId::BeginRendering);
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    using VideoCore::Skipcache::CacheId;
+    using VideoCore::Skipcache::DrawToken;
+    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+    const bool br_probing =
+        skipcache.Active() && !br_readback_gate_ && skipcache.ShouldProbe(CacheId::BeginRendering);
+    DrawToken br_token{};
+    bool br_would_hit = false;
+    if (br_probing) {
+        auto& ctr = skipcache.Counters(CacheId::BeginRendering);
+        ++ctr.eligible;
+        const bool timed = skipcache.SampleTimer(CacheId::BeginRendering);
+        const u64 t0 = timed ? skipcache.Now() : 0;
+        br_token = skipcache.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
+        br_would_hit = BrProbe(br_token, pipeline);
+        if (timed) {
+            const u64 t1 = skipcache.Now();
+            ctr.guard_ns += t1 - t0;
+            ++ctr.guard_samples;
+            ctr.hit_ns += t1 - t0;
+            ++ctr.hit_samples;
+        }
+        if (br_would_hit) {
+            ++ctr.hits;
+            if (skipcache.MayConsume(CacheId::BeginRendering) &&
+                !skipcache.ShouldVerify(CacheId::BeginRendering)) {
+                return BrReplay(pipeline);
+            }
+        }
+    }
+    const bool br_timed_miss =
+        br_probing && !br_would_hit && skipcache.SampleTimer(CacheId::BeginRendering);
+    const u64 br_miss_t0 = br_timed_miss ? skipcache.Now() : 0;
+
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
-    RenderState state;
+    RenderState state{};
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -884,7 +1277,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
-        texture_cache.UpdateImage(image_id);
+        texture_cache.MaybeUpdateImage(image_id);
         image->SetBackingSamples(key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
@@ -987,6 +1380,21 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    if (br_probing) {
+        auto& ctr = skipcache.Counters(CacheId::BeginRendering);
+        if (br_timed_miss) {
+            ctr.miss_ns += skipcache.Now() - br_miss_t0;
+            ++ctr.miss_samples;
+        }
+        if (br_would_hit) {
+            if (skipcache.GetState(CacheId::BeginRendering) !=
+                VideoCore::Skipcache::State::Learning) {
+                BrVerify(state, br_token);
+            }
+        } else {
+            BrPopulate(state, br_token, pipeline);
+        }
+    }
     return state;
 }
 
@@ -1088,6 +1496,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     }
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
+    Skipcache::Framework::Instance().BumpMemGen();
     return true;
 }
 
@@ -1097,6 +1506,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         return false;
     }
     buffer_cache.ReadMemory(addr, size);
+    Skipcache::Framework::Instance().BumpMemGen();
     return true;
 }
 
@@ -1135,6 +1545,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    Skipcache::Framework::Instance().BumpMemGen();
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {

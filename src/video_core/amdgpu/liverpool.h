@@ -18,6 +18,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/gfx_state_stamp.h"
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -60,6 +61,11 @@ struct Liverpool {
     };
 
     Regs regs{};
+    GfxStateStamp gfx_stamp{};
+
+    u64 GetGfxStateStamp() const noexcept {
+        return gfx_stamp.value;
+    }
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 

@@ -19,8 +19,11 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/skipcache/skipcache.h"
 
 namespace Vulkan {
+
+namespace Skipcache = VideoCore::Skipcache;
 
 using Shader::LogicalStage;
 using Shader::Output;
@@ -713,6 +716,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             }
         }
     }
+    Skipcache::Framework::Instance().BumpPipeGen();
     return new_module;
 }
 

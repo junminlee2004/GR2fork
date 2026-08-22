@@ -32,6 +32,12 @@ enum UsbBackendType : int {
     DimensionsToypad,
 };
 
+enum AdaptiveSkipCachesMode : int {
+    SkipCachesDisabled = 0,
+    SkipCachesAdaptive = 1,
+    SkipCachesValidateOnly = 2,
+};
+
 enum GpuReadbacksMode : int {
     Disabled,
     Relaxed,
@@ -423,6 +429,7 @@ struct GPUSettings {
     Setting<bool> copy_gpu_buffers{false};
     Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
+    Setting<u32> adaptive_skipcaches_mode{AdaptiveSkipCachesMode::SkipCachesDisabled};
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
@@ -453,6 +460,8 @@ struct GPUSettings {
             make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
             make_override<GPUSettings>("readback_linear_images_enabled",
                                        &GPUSettings::readback_linear_images_enabled),
+            make_override<GPUSettings>("adaptive_skipcaches_mode",
+                                       &GPUSettings::adaptive_skipcaches_mode),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
@@ -462,9 +471,10 @@ struct GPUSettings {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+                                   adaptive_skipcaches_mode, direct_memory_access_enabled,
+                                   dump_shaders, patch_shaders, vblank_frequency, full_screen,
+                                   full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
+                                   rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -725,6 +735,7 @@ public:
     SETTING_FORWARD(m_debug, ConfigVersion, config_version)
 
     // GPU Settings
+    SETTING_FORWARD(m_gpu, AdaptiveSkipCachesMode, adaptive_skipcaches_mode)
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CopyGpuBuffers, copy_gpu_buffers)

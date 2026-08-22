@@ -8,6 +8,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace AmdGpu {
@@ -116,6 +117,62 @@ private:
     bool IsComputeImageClear(const Pipeline* pipeline);
 
 private:
+    // =========================================================================
+    // BeginRendering skip cache (adaptive framework; see SKIPCACHE_DESIGN.md
+    // and the verify contract in skipcache.h). The snapshot is always a
+    // clear-free state: populate is refused whenever the freshly built state
+    // carries any clear flag, which structurally subsumes both the
+    // consumed-on-read CMASK trap and the level-triggered register-clear trap.
+    // Guards are read-only and run BEFORE the slow path can consume meta.
+    // =========================================================================
+    struct BrAttachmentGuard {
+        VAddr meta_addr{}; // 0 = no metadata
+        u32 slice{};
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        const void* backing{};
+        vk::ImageLayout expected_layout{};
+        vk::AccessFlags2 expected_access{};
+        u32 base_level{}, base_layer{}, num_levels{}, num_layers{};
+    };
+    struct BeginRenderingCache {
+        bool valid{};
+        bool attachment_feedback_loop{};
+        bool has_db{};
+        u32 cb_count{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        VideoCore::Skipcache::DrawToken token{};
+        RenderState state{}; // clear-free by populate refusal
+        std::array<BrAttachmentGuard, AmdGpu::NUM_COLOR_BUFFERS> cb_guard{};
+        BrAttachmentGuard db_guard{};
+    };
+    bool BrProbe(const VideoCore::Skipcache::DrawToken& token, const GraphicsPipeline* pipeline);
+    bool BrGuardAttachment(const BrAttachmentGuard& g, VideoCore::Skipcache::CacheCounters& ctr);
+    RenderState BrReplay(const GraphicsPipeline* pipeline);
+    void BrVerify(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token);
+    void BrPopulate(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token,
+                    const GraphicsPipeline* pipeline);
+    static void BrInvalidateThunk(void* self) {
+        static_cast<Rasterizer*>(self)->br_cache_.valid = false;
+    }
+    BeginRenderingCache br_cache_{};
+    bool br_readback_gate_{}; // readbackLinearImages snapshot: cache off when set
+
+    // BindingSkip LEARNING probe state (observation snapshot, not a cache).
+    struct BindingSkipProbeState {
+        struct StageSnap {
+            u64 pgm_hash{};
+            std::array<u32, 16> user_data{};
+        };
+        const Pipeline* pipeline{};
+        u64 tick{};
+        u32 num_stages{};
+        std::array<StageSnap, 8> stages{};
+        bool valid{};
+    };
+    void BindingSkipProbe(const Pipeline* pipeline);
+    BindingSkipProbeState bs_probe_{};
+
     friend class VideoCore::BufferCache;
 
     const Instance& instance;
