@@ -868,7 +868,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
-    RenderState state;
+    RenderState state{};
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -1330,35 +1330,55 @@ void Rasterizer::UpdateDepthStencilState() const {
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so a face whose stencil ops
-        // include ReplaceOp takes its Vulkan reference from op_val.
+        const u32 front_wm = stencil_clear ? 0U : front.stencil_write_mask;
+        const u32 back_wm = stencil_clear ? 0U : back.stencil_write_mask;
+        // GCN has two per-face reference registers: STENCILTESTVAL feeds the compare and
+        // ReplaceTest, STENCILOPVAL feeds ReplaceOp. Vulkan has a single reference for both
+        // roles, but the compare observes it only through the compare mask and Replace writes
+        // it only through the write mask, so splicing the registers by write mask serves both
+        // roles exactly. Only bits in the overlap of both masks where the registers disagree
+        // are unrepresentable; the splice favors the written value there.
         const auto& sc = regs.stencil_control;
-        const auto uses_op_val = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
-                                    AmdGpu::StencilFunc zfail) {
-            return fail == AmdGpu::StencilFunc::ReplaceOp ||
-                   zpass == AmdGpu::StencilFunc::ReplaceOp ||
-                   zfail == AmdGpu::StencilFunc::ReplaceOp;
+        const auto has_op = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
+                               AmdGpu::StencilFunc zfail, AmdGpu::StencilFunc op) {
+            return fail == op || zpass == op || zfail == op;
         };
-        const bool front_op =
-            uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
-            regs.depth_control.backface_enable
-                ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
-        const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref) {
+        const bool front_op = has_op(sc.stencil_fail_front, sc.stencil_zpass_front,
+                                     sc.stencil_zfail_front, AmdGpu::StencilFunc::ReplaceOp);
+        const bool back_op = regs.depth_control.backface_enable
+                                 ? has_op(sc.stencil_fail_back, sc.stencil_zpass_back,
+                                          sc.stencil_zfail_back, AmdGpu::StencilFunc::ReplaceOp)
+                                 : front_op;
+        const auto splice = [](const AmdGpu::StencilRefMask& ref, u32 write_mask, bool op) -> u32 {
+            if (!op) {
+                return ref.stencil_test_val;
+            }
+            return (ref.stencil_test_val & ~write_mask) | (ref.stencil_op_val & write_mask);
+        };
+        const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref,
+                                     u32 write_mask) {
             return func != AmdGpu::CompareFunc::Always && func != AmdGpu::CompareFunc::Never &&
-                   ref.stencil_test_val != ref.stencil_op_val;
+                   ((ref.stencil_test_val ^ ref.stencil_op_val) & ref.stencil_mask & write_mask) !=
+                       0;
         };
-        if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
+        const bool front_mixed =
+            front_op && has_op(sc.stencil_fail_front, sc.stencil_zpass_front,
+                               sc.stencil_zfail_front, AmdGpu::StencilFunc::ReplaceTest);
+        const bool back_mixed = back_op && regs.depth_control.backface_enable &&
+                                has_op(sc.stencil_fail_back, sc.stencil_zpass_back,
+                                       sc.stencil_zfail_back, AmdGpu::StencilFunc::ReplaceTest);
+        if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front, front_wm)) ||
             (back_op && regs.depth_control.backface_enable &&
-             ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
+             ref_conflict(regs.depth_control.stencil_bf_func, back, back_wm)) ||
+            ((front_mixed && ((front.stencil_test_val ^ front.stencil_op_val) & front_wm) != 0) ||
+             (back_mixed && ((back.stencil_test_val ^ back.stencil_op_val) & back_wm) != 0))) {
+            LOG_WARNING(Render_Vulkan,
+                        "Unrepresentable stencil state: test and op values disagree within "
+                        "overlapping compare/write masks");
         }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
+        dynamic_state.SetStencilReferences(splice(front, front_wm, front_op),
+                                           splice(back, back_wm, back_op));
+        dynamic_state.SetStencilWriteMasks(front_wm, back_wm);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
     }
 }

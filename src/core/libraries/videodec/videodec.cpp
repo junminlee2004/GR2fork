@@ -136,7 +136,16 @@ int PS4_SYSV_ABI sceVideodecMapMemory() {
 
 int PS4_SYSV_ABI sceVideodecQueryResourceInfo(const OrbisVideodecConfigInfo* pCfgInfoIn,
                                               OrbisVideodecResourceInfo* pRsrcInfoOut) {
-    LOG_INFO(Lib_Videodec, "called");
+    if (pCfgInfoIn) {
+        LOG_INFO(
+            Lib_Videodec,
+            "called codec={} profile={} level={} maxWidth={} maxHeight={} maxDpb={} flags={:#x}",
+            pCfgInfoIn->codecType, pCfgInfoIn->profile, pCfgInfoIn->maxLevel,
+            pCfgInfoIn->maxFrameWidth, pCfgInfoIn->maxFrameHeight, pCfgInfoIn->maxDpbFrameCount,
+            pCfgInfoIn->videodecFlags);
+    } else {
+        LOG_INFO(Lib_Videodec, "called");
+    }
 
     if (!pCfgInfoIn || !pRsrcInfoOut) {
         LOG_ERROR(Lib_Videodec, "Invalid arguments");
@@ -183,6 +192,10 @@ int PS4_SYSV_ABI sceVideodecQueryResourceInfo(const OrbisVideodecConfigInfo* pCf
     pRsrcInfoOut->maxFrameBufferSize = max_frame_buffer;
     pRsrcInfoOut->frameBufferAlignment = 0x100;
 
+    LOG_INFO(Lib_Videodec,
+             "resources: cpuMemorySize={:#x} cpuGpuMemorySize={:#x} maxFrameBufferSize={:#x} "
+             "dpbCount={}",
+             cpu_size, cpu_gpu_size, max_frame_buffer, dpb_count);
     return ORBIS_OK;
 }
 
