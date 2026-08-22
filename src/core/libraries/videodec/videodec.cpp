@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
@@ -30,6 +32,50 @@ static s32 ComputeDpbCount(const OrbisVideodecConfigInfo& cfg) {
     }
 
     return 8;
+}
+
+// Frames the decoder may hold, per H.264 Annex A, as tabulated by the
+// libSceVdecsw level table.
+static u32 MaxDpbMbs(u32 level) {
+    switch (level) {
+    case 10:
+        return 396;
+    case 11:
+        return 900;
+    case 12:
+    case 13:
+    case 20:
+        return 2376;
+    case 21:
+        return 4752;
+    case 22:
+    case 30:
+        return 8100;
+    case 31:
+        return 18000;
+    case 32:
+        return 20480;
+    case 40:
+    case 41:
+        return 32768;
+    case 42:
+        return 34816;
+    case 50:
+        return 110400;
+    default:
+        return 184320;
+    }
+}
+
+// Working set of the software AVC decoder, which dominates the CPU size and is
+// mostly independent of the frame dimensions.
+static u64 SavcWorkingSet(u64 mb_width, u64 mb_height, u64 slots) {
+    return mb_height * mb_width * 0xc0 + Common::AlignUp<u64>(slots, 32) +
+           Common::AlignUp<u64>(slots * 0x18, 32) + Common::AlignUp<u64>(slots * 0x38, 32) +
+           Common::AlignUp<u64>(slots * 0x28 + 0x5edce0, 32) +
+           (mb_width * 0x80 + Common::AlignUp<u64>(mb_width, 128)) * ((mb_height + 1) & ~1ull) *
+               slots +
+           Common::AlignUp<u64>((mb_width + 1 + ((mb_height + 1) >> 1)) * 0x98, 32) * 6 + 0xbfcd8;
 }
 
 static void ComputeWorstCaseDimensions(const OrbisVideodecConfigInfo& cfg, s32& out_width,
@@ -170,7 +216,23 @@ int PS4_SYSV_ABI sceVideodecQueryResourceInfo(const OrbisVideodecConfigInfo* pCf
         max_frame_buffer = padded_frame;
 
         cpu_gpu_size = (padded_frame * surfaces) + 8_MB;
-        cpu_size = 16_MB;
+        // Records of the decoder instance, each aligned to 128 bytes, plus the
+        // codec constant and the fixed pads the library appends. The record
+        // counts are fixed for the titles that use this entry point.
+        const u64 mb_width = ((u64)width + 15) / 16;
+        const u64 mb_height = ((u64)height + 15) / 16;
+        const u64 dpb =
+            pCfgInfoIn->maxDpbFrameCount >= 0
+                ? std::min<u64>((u64)pCfgInfoIn->maxDpbFrameCount, 16)
+                : std::min<u64>(MaxDpbMbs(pCfgInfoIn->maxLevel) / (mb_width * mb_height), 16);
+        const u64 num_refs = pCfgInfoIn->profile == 128 ? 18 : 17;
+        const u64 num_slots = 16 + num_refs;
+
+        cpu_size = Common::AlignUp<u64>(num_refs * 0x110, 128) +
+                   Common::AlignUp<u64>(num_slots * 0x2b0, 128) +
+                   Common::AlignUp<u64>(18 * 0xe0, 128) +
+                   Common::AlignUp<u64>(SavcWorkingSet(mb_width, mb_height, 17 + dpb), 128) +
+                   (num_slots + 1) * 0xff80 * 2 + 0x1ce100 + 0x81000;
     }
 
     pRsrcInfoOut->thisSize = sizeof(OrbisVideodecResourceInfo);
