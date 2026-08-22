@@ -171,7 +171,7 @@ int PS4_SYSV_ABI sceVideodecQueryResourceInfo(const OrbisVideodecConfigInfo* pCf
         max_frame_buffer = padded_frame;
 
         cpu_gpu_size = (padded_frame * surfaces) + std::clamp<u64>(padded_frame * 2, 1_MB, 8_MB);
-        cpu_size = std::clamp<u64>(padded_frame * 4, 1_MB, 16_MB);
+        cpu_size = 16_MB;
     }
 
     pRsrcInfoOut->thisSize = sizeof(OrbisVideodecResourceInfo);
