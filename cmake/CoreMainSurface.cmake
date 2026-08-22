@@ -5,10 +5,10 @@
 # no tests). The umbrella includes this file; Combine.cmake consumes the
 # CORE_MAIN_* lists via add_core(NAME main ...).
 #
-#   upstream commit : be21649d 2026-08-20
+#   upstream commit : 0aea6ef3 2026-08-22
 #   emulator version: 0.18.1
 
-set(CORE_MAIN_UPSTREAM_SHA "be21649dd95a0043c8cd2197fa841572e7ef8ab6")
+set(CORE_MAIN_UPSTREAM_SHA "0aea6ef36f6202104bdb7777cf5682333991d185")
 
 # --- find_package mirror. Gated on ENABLE_SYSTEM_LIBRARIES exactly like upstream
 #     (default OFF): with it off, the vendored externals/ provide every target and

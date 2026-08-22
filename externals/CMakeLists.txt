@@ -383,19 +383,6 @@ if (APPLE AND NOT ENABLE_SYSTEM_VULKAN AND NOT ENABLE_TESTS)
 endif()
 
 # abseil (for protobuf)
-if(MSVC)
-    # GR2FORK FIX: abseil's own CMakeLists overwrites CMAKE_MSVC_RUNTIME_LIBRARY for
-    # its whole subtree from this option, ignoring the umbrella's value, and defaults
-    # to the DLL runtime. The Windows cores build everything with the static CRT, so
-    # leaving it OFF makes the absl objects the lone /MD set and protoc fails to link
-    # ("/failifmismatch: mismatch detected for 'RuntimeLibrary'"). Follow the umbrella
-    # CRT choice, the same way protobuf_MSVC_STATIC_RUNTIME does.
-    if(CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
-        set(ABSL_MSVC_STATIC_RUNTIME ON  CACHE BOOL "" FORCE)
-    else()
-        set(ABSL_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
-    endif()
-endif()
 if (NOT TARGET absl::strings)
     add_subdirectory(abseil-cpp EXCLUDE_FROM_ALL)
 endif()
