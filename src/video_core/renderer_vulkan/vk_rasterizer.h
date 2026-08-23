@@ -142,6 +142,8 @@ private:
         u32 cb_count{};
         const GraphicsPipeline* pipeline{}; // compared, never dereferenced
         VideoCore::Skipcache::DrawToken token{};
+        u64 meta_gen{};
+        u64 layout_gen{};
         RenderState state{}; // clear-free by populate refusal
         std::array<BrAttachmentGuard, AmdGpu::NUM_COLOR_BUFFERS> cb_guard{};
         BrAttachmentGuard db_guard{};

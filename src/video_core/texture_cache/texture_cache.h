@@ -15,6 +15,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -201,7 +202,10 @@ public:
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
-            it.value().clear_mask = u32(-1);
+            if (it.value().clear_mask != u32(-1)) {
+                it.value().clear_mask = u32(-1);
+                VideoCore::Skipcache::Framework::Instance().BumpMetaGen();
+            }
             return true;
         }
         return false;
@@ -211,10 +215,11 @@ public:
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
-            if (is_clear) {
-                it.value().clear_mask |= 1u << slice;
-            } else {
-                it.value().clear_mask &= ~(1u << slice);
+            const u32 mask = it.value().clear_mask;
+            const u32 new_mask = is_clear ? mask | (1u << slice) : mask & ~(1u << slice);
+            if (new_mask != mask) {
+                it.value().clear_mask = new_mask;
+                VideoCore::Skipcache::Framework::Instance().BumpMetaGen();
             }
             return true;
         }

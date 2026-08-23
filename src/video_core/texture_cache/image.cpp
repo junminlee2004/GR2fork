@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -284,6 +285,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
+                    Skipcache::Framework::Instance().BumpLayoutGen();
                 }
             }
         }
@@ -322,6 +324,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
+    Skipcache::Framework::Instance().BumpLayoutGen();
     last_state.pl_stage = dst_stage;
 
     return barriers;
@@ -858,6 +861,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         // Update current layout in tracker to new backings layout
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
+        Skipcache::Framework::Instance().BumpLayoutGen();
         new_backing->state.pl_stage = dst_stage;
     }
 

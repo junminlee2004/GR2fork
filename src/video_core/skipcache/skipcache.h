@@ -108,6 +108,8 @@ struct ValidityGens {
     std::atomic<u64> tex_gen{1};  // texture-cache identity/lifecycle
     std::atomic<u64> pipe_gen{1}; // pipeline object destroyed/replaced
     u64 img_dirty_gen{1};         // GPU-thread confined: GPU-side image dirtying
+    u64 layout_gen{1};            // GPU-thread confined: any image layout/backing state write
+    u64 meta_gen{1};              // GPU-thread confined: real CMASK/HTILE arm/disarm changes
 };
 
 struct DrawToken {
@@ -384,6 +386,12 @@ public:
     }
     void BumpImgDirtyGen() {
         ++gens_.img_dirty_gen;
+    }
+    void BumpLayoutGen() {
+        ++gens_.layout_gen;
+    }
+    void BumpMetaGen() {
+        ++gens_.meta_gen;
     }
 
 private:

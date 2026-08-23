@@ -1262,6 +1262,16 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
         ++ctr.miss_gen[LaneImgDirty];
         return false;
     }
+    // Generation short-circuit: with the meta and layout lanes unchanged
+    // since the last populate or verified pass, every per-attachment guard
+    // below would pass identically (arming is meta_gen; uid/Registered/
+    // rebind/backing identity are tex_gen in the token; layout, access,
+    // subresource states and backing swaps are layout_gen). Three compares
+    // replace the guard loop.
+    auto& gens = Skipcache::Framework::Instance().Gens();
+    if (c.meta_gen == gens.meta_gen && c.layout_gen == gens.layout_gen) {
+        return true;
+    }
     for (u32 cb = 0; cb < c.cb_count; ++cb) {
         if (!BrGuardAttachment(c.cb_guard[cb], ctr)) {
             return false;
@@ -1270,6 +1280,10 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
     if (c.has_db && !BrGuardAttachment(c.db_guard, ctr)) {
         return false;
     }
+    // The guard loop passed against the live world: re-stamp so subsequent
+    // stamp-equal draws take the three-compare exit.
+    br_cache_.meta_gen = gens.meta_gen;
+    br_cache_.layout_gen = gens.layout_gen;
     return true;
 }
 
@@ -1400,6 +1414,11 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     br_cache_.pipeline = pipeline;
     br_cache_.state = fresh;
     br_cache_.attachment_feedback_loop = attachment_feedback_loop;
+    {
+        const auto& gens = sc.Gens();
+        br_cache_.meta_gen = gens.meta_gen;
+        br_cache_.layout_gen = gens.layout_gen;
+    }
     // Commit re-check: a cross-thread invalidation landing mid-build forces
     // the next probe to miss (seqlock consumer side).
     const DrawToken t2 = sc.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
