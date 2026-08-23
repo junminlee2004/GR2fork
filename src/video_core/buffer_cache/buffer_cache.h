@@ -206,6 +206,24 @@ private:
     TextureCache& texture_cache;
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
+
+    // Vertex/index bind memos (adaptive skip caches, inline form). Validity
+    // requires same submission tick (stream ring offsets are only stable
+    // within one command buffer) and unchanged mem_gen (no CPU write reached
+    // the emulator since the recorded bind).
+    u64 vertex_bind_sig_{};
+    u64 vertex_input_sig_{};
+    u64 vertex_bind_tick_{};
+    u64 vertex_input_tick_{};
+    u64 vertex_bind_mem_gen_{};
+    bool vertex_bind_valid_{};
+    bool vertex_input_valid_{};
+    VAddr index_bind_addr_{};
+    u32 index_bind_size_{};
+    u32 index_bind_type_{};
+    u64 index_bind_tick_{};
+    u64 index_bind_mem_gen_{};
+    bool index_bind_valid_{};
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;

@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace VideoCore {
@@ -173,10 +174,80 @@ void BufferCache::BindVertexBuffers(
     pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
+    // Signatures over the RESOLVED inputs: the vertex input layout feeds
+    // setVertexInputEXT and depends only on bindings/attributes/divisors; the
+    // full bind signature adds the guest V# contents. Content-keyed, so the
+    // user_data churn that defeats raw-register memos does not apply.
+    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+    const bool memo_active = skipcache.Active();
+    u64 input_sig = 0xcbf29ce484222325ULL;
+    u64 bind_sig = 0;
+    if (memo_active) {
+        const auto mix = [](u64& h, u64 v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
+        mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
+        mix(input_sig, reinterpret_cast<u64>(&pipeline));
+        for (const auto& b : bindings) {
+            mix(input_sig, (static_cast<u64>(b.binding) << 32) | static_cast<u64>(b.stride));
+            mix(input_sig, static_cast<u64>(static_cast<u32>(b.inputRate)));
+        }
+        for (const auto& a : attributes) {
+            mix(input_sig, (static_cast<u64>(a.location) << 32) | static_cast<u64>(a.binding));
+            mix(input_sig,
+                (static_cast<u64>(static_cast<u32>(a.format)) << 32) | static_cast<u64>(a.offset));
+        }
+        for (const auto& d : divisors) {
+            mix(input_sig, (static_cast<u64>(d.binding) << 32) | static_cast<u64>(d.divisor));
+        }
+        bind_sig = input_sig;
+        for (const auto& gb : guest_buffers) {
+            mix(bind_sig, static_cast<u64>(gb.base_address));
+            mix(bind_sig, static_cast<u64>(gb.GetSize()));
+            mix(bind_sig, static_cast<u64>(gb.GetStride()));
+        }
+        const u64 tick = scheduler.CurrentTick();
+        const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+        if (vertex_bind_valid_ && bind_sig == vertex_bind_sig_ && tick == vertex_bind_tick_ &&
+            mem_gen == vertex_bind_mem_gen_) {
+            // Identical resolved layout and buffer contents descriptors on the
+            // same command buffer with no intervening CPU write. GPU writes do
+            // not move mem_gen, so a skip additionally requires that no bound
+            // range is GPU modified (else the re-bind's barrier is required).
+            VAddr span_lo = ~VAddr{0};
+            VAddr span_hi = 0;
+            for (const auto& gb : guest_buffers) {
+                if (gb.base_address != 0 && gb.GetSize() > 0) {
+                    span_lo = std::min<VAddr>(span_lo, gb.base_address);
+                    span_hi = std::max<VAddr>(span_hi, gb.base_address + gb.GetSize());
+                }
+            }
+            if (span_hi <= span_lo || !IsRegionGpuModified(span_lo, span_hi - span_lo)) {
+                return;
+            }
+        }
+        vertex_bind_sig_ = bind_sig;
+        vertex_bind_tick_ = tick;
+        vertex_bind_mem_gen_ = mem_gen;
+        vertex_bind_valid_ = true;
+    } else {
+        vertex_bind_valid_ = false;
+        vertex_input_valid_ = false;
+    }
+
     if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        // Update current vertex inputs, unless the layout is unchanged on
+        // this command buffer.
+        const u64 input_tick = scheduler.CurrentTick();
+        if (!memo_active || !vertex_input_valid_ || input_sig != vertex_input_sig_ ||
+            vertex_input_tick_ != input_tick) {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            vertex_input_sig_ = input_sig;
+            vertex_input_tick_ = input_tick;
+            vertex_input_valid_ = memo_active;
+        }
     }
 
     if (bindings.empty()) {
@@ -282,6 +353,28 @@ void BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+    if (skipcache.Active()) {
+        const u64 tick = scheduler.CurrentTick();
+        const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+        if (index_bind_valid_ && index_bind_addr_ == index_address &&
+            index_bind_size_ == index_buffer_size &&
+            index_bind_type_ == static_cast<u32>(index_type) && index_bind_tick_ == tick &&
+            index_bind_mem_gen_ == mem_gen &&
+            !IsRegionGpuModified(index_address, index_buffer_size)) {
+            // Same resolved index range already bound on this command buffer,
+            // no intervening CPU write, and no GPU write requiring a barrier.
+            return;
+        }
+        index_bind_addr_ = index_address;
+        index_bind_size_ = index_buffer_size;
+        index_bind_type_ = static_cast<u32>(index_type);
+        index_bind_tick_ = tick;
+        index_bind_mem_gen_ = mem_gen;
+        index_bind_valid_ = true;
+    } else {
+        index_bind_valid_ = false;
+    }
     const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
     if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
