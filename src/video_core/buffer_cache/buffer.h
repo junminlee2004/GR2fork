@@ -47,14 +47,22 @@ struct UniqueBuffer {
     UniqueBuffer(const UniqueBuffer&) = delete;
     UniqueBuffer& operator=(const UniqueBuffer&) = delete;
 
+    // Moves must carry device and bda_addr: a dropped bda_addr leaves the
+    // moved buffer with address zero (the assert in BufferDeviceAddress is
+    // compiled out under NDEBUG), the BDA page table gets near-null entries
+    // and shader writes through them fault. A Buffer moves whenever
+    // slot_buffers grows on new resource creation.
     UniqueBuffer(UniqueBuffer&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          buffer{std::exchange(other.buffer, VK_NULL_HANDLE)} {}
+          buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
+          bda_addr{std::exchange(other.bda_addr, 0)} {}
     UniqueBuffer& operator=(UniqueBuffer&& other) {
+        device = other.device;
         buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+        bda_addr = std::exchange(other.bda_addr, 0);
         return *this;
     }
 

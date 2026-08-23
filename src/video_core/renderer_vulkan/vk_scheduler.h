@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bit>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -213,7 +214,11 @@ struct DynamicState {
     }
 
     void SetDepthBounds(const float min, const float max) {
-        if (depth_bounds_min != min || depth_bounds_max != max) {
+        // Games can leave the depth bounds registers non-finite; NaN != NaN
+        // makes a float compare re-arm the dirty bit and re-emit
+        // vkCmdSetDepthBounds every draw. Compare bit patterns instead.
+        if (std::bit_cast<u32>(depth_bounds_min) != std::bit_cast<u32>(min) ||
+            std::bit_cast<u32>(depth_bounds_max) != std::bit_cast<u32>(max)) {
             depth_bounds_min = min;
             depth_bounds_max = max;
             dirty_state.depth_bounds = true;
