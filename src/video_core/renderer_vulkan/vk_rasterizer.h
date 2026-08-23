@@ -213,6 +213,8 @@ private:
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
+    // Generation for IsMapped's per-thread interval cache.
+    std::atomic<u64> mapped_ranges_gen_{0};
     PipelineCache pipeline_cache;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;

@@ -1699,19 +1699,66 @@ void Rasterizer::ProcessDownloadImages() {
     texture_cache.ProcessDownloadImages();
 }
 
+// Async-signal-safe per-thread cache of recent positive IsMapped intervals:
+// the fault handler and per-binding validation both hammer this at high rate,
+// and the shared lock costs far more than the lookup. Map/Unmap bump the
+// generation (release); an acquire load drops stale hits.
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     if (size == 0) {
         // There is no memory, so not mapped.
         return false;
     }
-    if (static_cast<u64>(addr) > std::numeric_limits<u64>::max() - size) {
-        // Memory range wrapped the address space, cannot be mapped.
+    struct CacheEntry {
+        VAddr base; // [base, limit) - 0,0 means empty slot
+        VAddr limit;
+    };
+    static constexpr size_t kCacheSize = 4;
+    thread_local std::array<CacheEntry, kCacheSize> tls_cache{};
+    thread_local u64 tls_gen = ~u64{0};
+
+    const VAddr query_end = addr + size;
+    if (query_end < addr) [[unlikely]] {
+        // Wrapped the address space (a failed upstream resolve can pass -1);
+        // a wrapped end would defeat the limit and straddle checks below.
         return false;
     }
-    const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+    const bool cache_active = Skipcache::Framework::Instance().Active();
+    const u64 cur_gen = mapped_ranges_gen_.load(std::memory_order_acquire);
+    if (cache_active) {
+        if (cur_gen == tls_gen) [[likely]] {
+            for (const auto& e : tls_cache) {
+                if (addr >= e.base && query_end <= e.limit) {
+                    return true;
+                }
+            }
+        } else {
+            tls_cache.fill({0, 0});
+            tls_gen = cur_gen;
+        }
+    }
 
+    // Miss: find(addr) instead of contains(range) - the iterator returns the
+    // containing interval bounds for free, which seed future hits in the same
+    // neighborhood.
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-    return boost::icl::contains(mapped_ranges, range);
+    const auto it = mapped_ranges.find(addr);
+    if (it == mapped_ranges.end()) {
+        return false;
+    }
+    const VAddr lo = it->lower();
+    const VAddr hi = it->upper();
+    if (query_end > hi) {
+        // In a tracked interval but straddling its upper bound; entries cache
+        // only fully contained ranges.
+        return false;
+    }
+    if (cache_active) {
+        for (size_t i = kCacheSize - 1; i > 0; --i) {
+            tls_cache[i] = tls_cache[i - 1];
+        }
+        tls_cache[0] = CacheEntry{lo, hi};
+    }
+    return true;
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
@@ -1719,6 +1766,10 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    // Bump after the mutation is committed; release pairs with IsMapped's
+    // acquire load so a thread observing the new generation observes the
+    // new interval.
+    mapped_ranges_gen_.fetch_add(1, std::memory_order_release);
     page_manager.OnGpuMap(addr, size);
 }
 
@@ -1730,6 +1781,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+    mapped_ranges_gen_.fetch_add(1, std::memory_order_release);
     Skipcache::Framework::Instance().BumpMemGen();
 }
 
