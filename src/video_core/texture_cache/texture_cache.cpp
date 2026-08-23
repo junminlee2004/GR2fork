@@ -724,12 +724,8 @@ void TextureCache::MaybeUpdateImage(ImageId image_id) {
     const u32 index = image_id.index;
     const bool would_hit = sc.DedupProbe(index, t);
     if (timed) {
-        const u64 t1 = sc.Now();
-        ctr.guard_ns += t1 - t0;
+        ctr.guard_ns += sc.Now() - t0;
         ++ctr.guard_samples;
-        // The consumed-hit path is the guard plus a return.
-        ctr.hit_ns += t1 - t0;
-        ++ctr.hit_samples;
     }
     if (!would_hit) {
         ++ctr.miss_key;

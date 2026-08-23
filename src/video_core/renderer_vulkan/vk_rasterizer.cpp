@@ -1243,11 +1243,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         br_token = skipcache.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
         br_would_hit = BrProbe(br_token, pipeline);
         if (timed) {
-            const u64 t1 = skipcache.Now();
-            ctr.guard_ns += t1 - t0;
+            ctr.guard_ns += skipcache.Now() - t0;
             ++ctr.guard_samples;
-            ctr.hit_ns += t1 - t0;
-            ++ctr.hit_samples;
         }
         if (br_would_hit) {
             ++ctr.hits;

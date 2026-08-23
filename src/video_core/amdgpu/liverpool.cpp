@@ -65,6 +65,22 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
+// The per-stage user_data words are excluded from the graphics state stamp by
+// contract: engines rewrite them every draw, and marking them would advance
+// the stamp per draw and starve every stamp-keyed cache for zero correctness
+// benefit (no cache consumes user_data through the stamp; the binding probe
+// compares the words directly). Writes that only partially overlap a block
+// fall through to the stamped path, which is the conservative direction.
+static bool IsGfxUserDataWrite(const Liverpool::Regs& regs, u32 word_addr, u32 num_words) {
+    const u32* base = regs.reg_array.data();
+    const auto in_ud = [&](const ShaderProgram& prog) {
+        const u32 ud = static_cast<u32>(reinterpret_cast<const u32*>(prog.user_data.data()) - base);
+        return word_addr >= ud && word_addr + num_words <= ud + NUM_USER_DATA;
+    };
+    return in_ud(regs.ps_program) || in_ud(regs.vs_program) || in_ud(regs.gs_program) ||
+           in_ud(regs.es_program) || in_ud(regs.hs_program) || in_ud(regs.ls_program);
+}
+
 Liverpool::Liverpool() {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // Stamp dormancy is decided before the process thread can observe work;
@@ -403,9 +419,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                  (set_data->reg_offset - 0x200);
                     std::memcpy(addr, header + 2, set_size);
                 } else {
-                    gfx_stamp.WriteRegs(
-                        &regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], header + 2,
-                        set_size);
+                    const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+                    if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+                        std::memcpy(&regs.reg_array[word], header + 2, set_size);
+                    } else {
+                        gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
+                    }
                 }
                 break;
             }
@@ -1064,9 +1083,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                              (set_data->reg_offset - 0x200);
                 std::memcpy(addr, header + 2, set_size);
             } else {
-                gfx_stamp.WriteRegsImmediate(
-                    &regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], header + 2,
-                    set_size);
+                const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+                if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+                    std::memcpy(&regs.reg_array[word], header + 2, set_size);
+                } else {
+                    gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size);
+                }
             }
             break;
         }
