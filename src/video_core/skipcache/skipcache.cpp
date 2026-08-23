@@ -67,6 +67,7 @@ void Framework::Init(Mode mode) {
         timing_enabled_ = false;
     }
     window_start_ns_ = Now();
+    last_session_log_ns_ = window_start_ns_;
     if (!dedup_invalidate_registered_) {
         dedup_invalidate_registered_ = true;
         RegisterInvalidate([](void* self) { static_cast<Framework*>(self)->DedupInvalidateAll(); },
