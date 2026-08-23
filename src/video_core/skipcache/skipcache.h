@@ -258,6 +258,11 @@ public:
         return timing_enabled_ && ((++cs.timer_decim & mask) == (cs.timer_phase & mask));
     }
     u64 Now() const; // FencedRDTSC in ns (calibrated at Init)
+    // Remove the fenced-pair overhead from a timed interval so tiny sections
+    // are not systematically inflated.
+    u64 CorrectSample(u64 ns) const {
+        return ns > pair_ns_ ? ns - pair_ns_ : 0;
+    }
 
     // ---- Window driver ------------------------------------------------------
     // Runs on the GPU thread at submit-done. Closes the window when >=250 ms
@@ -411,6 +416,7 @@ private:
     bool timing_enabled_{};
     u64 tsc_hz_{};
     u64 tsc_pair_cost_{};
+    u64 pair_ns_{};
     u32 xorshift_state_{0x9E3779B9u};
 
 #ifdef _DEBUG

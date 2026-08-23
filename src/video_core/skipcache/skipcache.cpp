@@ -18,9 +18,9 @@ constexpr u32 WarmupMinWindows = 12;
 constexpr u32 StableWindowsNeeded = 3;
 constexpr u32 LearningMinWindows = 8;
 constexpr u32 LearningLifetimeBudget = 40;
-constexpr f64 PromoteFloorPct = 0.25;
-constexpr f64 ShadowExitFloorPct = 0.10;
-constexpr f64 DemoteFloorPct = 0.08;
+constexpr f64 PromoteFloorPct = 0.10;
+constexpr f64 ShadowExitFloorPct = 0.06;
+constexpr f64 DemoteFloorPct = 0.05;
 constexpr f64 MinHitRate = 0.20;
 constexpr u32 PromoteStreak = 4;
 constexpr u32 DemoteStreakLen = 8;
@@ -58,6 +58,7 @@ void Framework::Init(Mode mode) {
             best = std::min(best, b - a);
         }
         tsc_pair_cost_ = best;
+        pair_ns_ = best * 1'000'000'000 / tsc_hz_;
         timing_enabled_ = true;
     } else {
         // Sub-100MHz timestamp source: counters only; enablement then requires

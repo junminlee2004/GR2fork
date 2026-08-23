@@ -724,7 +724,7 @@ void TextureCache::MaybeUpdateImage(ImageId image_id) {
     const u32 index = image_id.index;
     const bool would_hit = sc.DedupProbe(index, t);
     if (timed) {
-        ctr.guard_ns += sc.Now() - t0;
+        ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
         ++ctr.guard_samples;
     }
     if (!would_hit) {
@@ -732,7 +732,7 @@ void TextureCache::MaybeUpdateImage(ImageId image_id) {
         const u64 m0 = timed ? sc.Now() : 0;
         UpdateImage(image_id);
         if (timed) {
-            ctr.miss_ns += sc.Now() - m0;
+            ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
             ++ctr.miss_samples;
         }
         sc.DedupCommit(index, t);

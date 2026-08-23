@@ -1243,7 +1243,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         br_token = skipcache.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
         br_would_hit = BrProbe(br_token, pipeline);
         if (timed) {
-            ctr.guard_ns += skipcache.Now() - t0;
+            ctr.guard_ns += skipcache.CorrectSample(skipcache.Now() - t0);
             ++ctr.guard_samples;
         }
         if (br_would_hit) {
@@ -1383,7 +1383,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (br_probing) {
         auto& ctr = skipcache.Counters(CacheId::BeginRendering);
         if (br_timed_miss) {
-            ctr.miss_ns += skipcache.Now() - br_miss_t0;
+            ctr.miss_ns += skipcache.CorrectSample(skipcache.Now() - br_miss_t0);
             ++ctr.miss_samples;
         }
         if (br_would_hit) {
