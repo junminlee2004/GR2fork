@@ -111,6 +111,11 @@ public:
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
+    /// FindImage with the adaptive memo skip cache in front, for the shader
+    /// texture binding path. A hit skips the page-table walk and match loops
+    /// but still touches the LRU and re-applies any overlap view rebase.
+    [[nodiscard]] ImageId FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp);
+
     /// UpdateImage with the adaptive dedup skip cache in front. Only sampled
     /// texture bindings and render-target reuse go through here; storage
     /// images keep the full path.
@@ -315,6 +320,18 @@ private:
 
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
+
+    struct FindImageMemoEntry {
+        std::array<u64, 4> tsharp_raw{};
+        u64 image_uid{};
+        u64 tex_gen{};
+        ImageId image_id{};
+        u32 view_base_level{};
+        u32 view_base_layer{};
+        u8 type{};
+        bool valid{};
+    };
+    std::array<FindImageMemoEntry, 1024> find_image_memo_{};
 
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);

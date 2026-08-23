@@ -310,6 +310,13 @@ void Framework::CloseWindow() {
         if (!w.poisoned) {
             StepController(cs, id, w);
         }
+        if (id == CacheId::BindingSkipProbe && (window_id_ & 63) == 0 && c.eligible > 0) {
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] BSPROBE report win={} elig={} wouldhit%={:.1f} "
+                     "veto(pipe/tick/stages/pgm/ud)={},{},{},{},{}",
+                     window_id_, c.eligible, 100.0 * f64(c.hits) / f64(c.eligible), c.veto[0],
+                     c.veto[1], c.veto[2], c.veto[3], c.veto[4]);
+        }
         last_window_[i] = w;
 
         // Full reset per window.
@@ -345,7 +352,7 @@ void Framework::CloseWindow() {
     }
 
     // SESSION block every ~10 minutes.
-    if (timing_enabled_ && now - last_session_log_ns_ > 600'000'000'000ull) {
+    if (timing_enabled_ && now - last_session_log_ns_ > 120'000'000'000ull) {
         last_session_log_ns_ = now;
         LogSessionSummary();
     }

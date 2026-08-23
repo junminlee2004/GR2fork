@@ -48,7 +48,13 @@ namespace VideoCore::Skipcache {
 // =============================================================================
 
 enum class Mode : u8 { Disabled = 0, Adaptive = 1, ValidateOnly = 2 };
-enum class CacheId : u8 { UpdateImageDedup = 0, BeginRendering = 1, BindingSkipProbe = 2, Count };
+enum class CacheId : u8 {
+    UpdateImageDedup = 0,
+    BeginRendering = 1,
+    BindingSkipProbe = 2,
+    FindImage = 3,
+    Count
+};
 enum class State : u8 { Off = 0, Learning, Shadow, Enabled, Quarantined };
 
 constexpr size_t NumCaches = static_cast<size_t>(CacheId::Count);
@@ -60,6 +66,8 @@ constexpr const char* CacheName(CacheId id) {
         return "BR";
     case CacheId::BindingSkipProbe:
         return "BSPROBE";
+    case CacheId::FindImage:
+        return "FINDIMG";
     default:
         return "?";
     }

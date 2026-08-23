@@ -509,6 +509,108 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::FindImage;
+    if (!sc.Active() || !sc.ShouldProbe(kCache)) {
+        return FindImage(desc);
+    }
+    auto& ctr = sc.Counters(kCache);
+    ++ctr.eligible;
+    const bool timed = sc.SampleTimer(kCache);
+    const u64 t0 = timed ? sc.Now() : 0;
+    const u64 tex_gen = sc.Gens().tex_gen.load(std::memory_order_acquire);
+    const auto raw = std::bit_cast<std::array<u64, 4>>(tsharp);
+    const size_t slot = ((raw[0] >> 8) ^ (raw[0] >> 40) ^ raw[1]) & 1023;
+    FindImageMemoEntry& e = find_image_memo_[slot];
+
+    // Hit predicate: identical T#, same binding class, texture-cache structure
+    // untouched since populate (tex_gen covers register/unregister/delete and
+    // both rebind arms, so the slot provably was not reused), and the image
+    // itself still carries the recorded identity.
+    bool would_hit = false;
+    if (!e.valid) {
+        ++ctr.miss_cold;
+    } else if (e.tsharp_raw != raw || e.type != static_cast<u8>(desc.type)) {
+        ++ctr.miss_key;
+    } else if (e.tex_gen != tex_gen) {
+        ++ctr.miss_gen[LaneTex];
+    } else {
+        const Image& image = slot_images[e.image_id];
+        if (image.image_uid != e.image_uid || False(image.flags & ImageFlagBits::Registered)) {
+            ++ctr.veto[0];
+        } else {
+            would_hit = true;
+        }
+    }
+    if (timed) {
+        ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
+        ++ctr.guard_samples;
+    }
+    if (would_hit) {
+        ++ctr.hits;
+        if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+            // Consumed hit: replicate the slow path's residual effects - the
+            // LRU touch and the overlap view rebase captured at populate.
+            {
+                std::scoped_lock lock{mutex};
+                Image& image = slot_images[e.image_id];
+                image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(image);
+            }
+            if (e.view_base_level > 0) {
+                desc.view_info.range.base.level = e.view_base_level;
+            }
+            if (e.view_base_layer > 0) {
+                desc.view_info.range.base.layer = e.view_base_layer;
+            }
+            return e.image_id;
+        }
+    }
+    // Authoritative path, exactly once; prediction is only compared, never
+    // served, outside the consumed-hit flow above.
+    const ImageId predicted = would_hit ? e.image_id : ImageId{};
+    const u64 m0 = timed && !would_hit ? sc.Now() : 0;
+    const ImageId real = FindImage(desc);
+    if (timed && !would_hit) {
+        ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
+        ++ctr.miss_samples;
+    }
+    if (would_hit && sc.GetState(kCache) != State::Learning) {
+        if (predicted == real && e.view_base_level == desc.view_info.range.base.level &&
+            e.view_base_layer == desc.view_info.range.base.layer) {
+            sc.RecordVerifyClean(kCache);
+        } else if (sc.Gens().tex_gen.load(std::memory_order_acquire) != tex_gen) {
+            sc.RecordVerifyAborted(kCache);
+            e.valid = false;
+        } else {
+            sc.RecordDivergence(kCache, "memoized image id or view rebase mismatch");
+            e.valid = false;
+        }
+    }
+    if (!would_hit) {
+        // Populate with commit re-check: a structural mutation racing the
+        // build leaves the entry invalid.
+        e.valid = false;
+        e.tsharp_raw = raw;
+        e.type = static_cast<u8>(desc.type);
+        e.image_id = real;
+        e.view_base_level = desc.view_info.range.base.level;
+        e.view_base_layer = desc.view_info.range.base.layer;
+        {
+            const Image& image = slot_images[real];
+            e.image_uid = image.image_uid;
+        }
+        e.tex_gen = tex_gen;
+        if (sc.Gens().tex_gen.load(std::memory_order_acquire) == tex_gen) {
+            e.valid = true;
+            sc.NotifyPopulated(kCache);
+        }
+    }
+    return real;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
