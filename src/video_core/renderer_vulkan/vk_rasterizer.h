@@ -8,6 +8,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -21,8 +22,6 @@ class MemoryManager;
 
 namespace Vulkan {
 
-class Scheduler;
-class RenderState;
 class GraphicsPipeline;
 
 class Rasterizer {
