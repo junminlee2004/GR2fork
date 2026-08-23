@@ -354,9 +354,14 @@ void Framework::Transition(CacheId id, CacheState& cs, State next, const char* r
     if (cs.state == next) {
         return;
     }
-    LOG_INFO(Render_Skipcache, "[SkipCache] {} {}->{} win={} reason={} vfy={}/{}/{}", CacheName(id),
-             StateName(cs.state), StateName(next), window_id_, reason, cs.counters.verify_clean,
-             cs.counters.verify_diverged, cs.counters.verify_aborted);
+    const CacheCounters& tc = cs.counters;
+    const f64 thr = tc.eligible ? 100.0 * f64(tc.hits) / f64(tc.eligible) : 0.0;
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] {} {}->{} win={} reason={} elig={} hit%={:.1f} samples={}/{}/{} "
+             "vfy={}/{}/{}",
+             CacheName(id), StateName(cs.state), StateName(next), window_id_, reason, tc.eligible,
+             thr, tc.guard_samples, tc.hit_samples, tc.miss_samples, tc.verify_clean,
+             tc.verify_diverged, tc.verify_aborted);
     // Cold-start is required only when entering a state that consumes cached
     // results.
     if (next == State::Enabled || next == State::Quarantined) {
@@ -380,16 +385,24 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         break;
     }
     case State::Learning: {
+        if (id == CacheId::BindingSkipProbe) {
+            break; // measurement-only: never promotes, never exhausts a budget
+        }
         if (!warmed_up_ || w.low_signal) {
             break;
         }
         ++cs.learning_windows_total;
-        const bool qualifies =
-            w.net_pct >= PromoteFloorPct && hit_rate >= MinHitRate && cs.windows_in_state >= 1;
+        // A window with too few timing samples cannot price the trade; promote
+        // on strong hit-rate evidence alone and let Shadow (which probes at
+        // full rate and consumes nothing) price it properly.
+        const bool timing_starved = c.miss_samples < 8;
+        const bool qualifies = cs.windows_in_state >= 1 &&
+                               (w.net_pct >= PromoteFloorPct ? hit_rate >= MinHitRate
+                                                             : timing_starved && hit_rate >= 0.40);
         cs.promote_streak = qualifies ? cs.promote_streak + 1 : 0;
         if (cs.promote_streak >= PromoteStreak && cs.windows_in_state >= LearningMinWindows) {
             // Shadow entry does not cold-clear: nothing was being consumed.
-            Transition(id, cs, State::Shadow, "profit");
+            Transition(id, cs, State::Shadow, w.net_pct >= PromoteFloorPct ? "profit" : "hit-rate");
             cs.shadow_clean_hits_total = 0;
             cs.shadow_frames_total = 0;
             cs.shadow_extensions = 0;

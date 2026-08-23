@@ -252,7 +252,10 @@ public:
     }
     bool SampleTimer(CacheId id) {
         auto& cs = caches_[static_cast<size_t>(id)];
-        return timing_enabled_ && ((++cs.timer_decim & 0xFF) == cs.timer_phase);
+        // Learning probes only ~12.5% of calls in bursts; at 1/256 on top the
+        // cost model would starve. Sample 1/16 inside bursts, 1/256 elsewhere.
+        const u32 mask = cs.state == State::Learning ? 0xF : 0xFF;
+        return timing_enabled_ && ((++cs.timer_decim & mask) == (cs.timer_phase & mask));
     }
     u64 Now() const; // FencedRDTSC in ns (calibrated at Init)
 
