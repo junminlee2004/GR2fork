@@ -452,7 +452,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
-                regs.index_buffer_type.raw = index_type->raw;
+                if (regs.index_buffer_type.raw != index_type->raw) {
+                    regs.index_buffer_type.raw = index_type->raw;
+                    gfx_stamp.MarkDirty();
+                } else {
+                    regs.index_buffer_type.raw = index_type->raw;
+                }
                 break;
             }
             case PM4ItOpcode::DrawIndex2: {

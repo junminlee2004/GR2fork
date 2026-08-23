@@ -973,9 +973,13 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     const bool probing = sc.Active() && sc.ShouldProbe(kCache);
     bool would_hit = false;
     SamplerMemoEntry& e = sampler_memo_[slot];
+    bool timed = false;
+    u64 t0 = 0;
     if (probing) {
         auto& ctr = sc.Counters(kCache);
         ++ctr.eligible;
+        timed = sc.SampleTimer(kCache);
+        t0 = timed ? sc.Now() : 0;
         // The memo mirrors the map key exactly (the raw S# bytes); the
         // generation certifies no sampler was garbage collected since populate.
         if (!e.valid) {
@@ -988,6 +992,10 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
             would_hit = true;
             ++ctr.hits;
         }
+        if (timed) {
+            ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
+            ++ctr.guard_samples;
+        }
         if (would_hit && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
             // Consumed hit still touches the LRU: never starve the GC the
             // cache depends on.
@@ -996,6 +1004,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
             return e.handle;
         }
     }
+    const u64 m0 = timed && !would_hit ? sc.Now() : 0;
     const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
 
     std::scoped_lock lock{samplers_mutex};
@@ -1006,6 +1015,11 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
     const vk::Sampler handle = it->second.Handle();
+    if (timed && !would_hit) {
+        auto& ctr = Framework::Instance().Counters(kCache);
+        ctr.miss_ns += Framework::Instance().CorrectSample(Framework::Instance().Now() - m0);
+        ++ctr.miss_samples;
+    }
     if (probing) {
         auto& sc2 = Framework::Instance();
         if (would_hit && sc2.GetState(kCache) != State::Learning) {
