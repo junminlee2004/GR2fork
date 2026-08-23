@@ -408,9 +408,12 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         // on strong hit-rate evidence alone and let Shadow (which probes at
         // full rate and consumes nothing) price it properly.
         const bool timing_starved = c.miss_samples < 8;
+        // A cache Shadow already priced below the floor may not re-enter on
+        // hit rate alone; only a real profit reading reopens the door.
         const bool qualifies = cs.windows_in_state >= 1 &&
-                               (w.net_pct >= PromoteFloorPct ? hit_rate >= MinHitRate
-                                                             : timing_starved && hit_rate >= 0.40);
+                               (w.net_pct >= PromoteFloorPct
+                                    ? hit_rate >= MinHitRate
+                                    : timing_starved && hit_rate >= 0.40 && !cs.shadow_priced_low);
         cs.promote_streak = qualifies ? cs.promote_streak + 1 : 0;
         if (cs.promote_streak >= PromoteStreak && cs.windows_in_state >= LearningMinWindows) {
             // Shadow entry does not cold-clear: nothing was being consumed.
@@ -431,6 +434,7 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         if (w.net_pct < ShadowExitFloorPct) {
             cs.demote_streak++;
             if (cs.demote_streak >= 4) {
+                cs.shadow_priced_low = true;
                 Transition(id, cs, State::Learning, "below shadow floor");
                 cs.demote_streak = 0;
                 break;

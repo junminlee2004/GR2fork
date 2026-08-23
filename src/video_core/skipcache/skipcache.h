@@ -403,6 +403,7 @@ private:
         u32 shadow_extensions{};
         u64 shadow_residency_ns{};
         bool lane_bump_survived{};
+        bool shadow_priced_low{};
         u32 divergences_total{};
         u64 last_divergence_window{};
         u32 reprobe_countdown{};

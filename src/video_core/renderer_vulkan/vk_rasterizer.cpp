@@ -262,64 +262,6 @@ void Rasterizer::RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pi
     }
 }
 
-const GraphicsPipeline* Rasterizer::GetGraphicsPipelineMemoized() {
-    using namespace VideoCore::Skipcache;
-    auto& sc = Skipcache::Framework::Instance();
-    constexpr auto kCache = CacheId::Pipeline;
-    if (!sc.Active() || !sc.ShouldProbe(kCache)) {
-        return pipeline_cache.GetGraphicsPipeline();
-    }
-    auto& ctr = sc.Counters(kCache);
-    ++ctr.eligible;
-    const u64 reg_stamp = liverpool->GetGfxStateStamp();
-    const u64 pipe_gen = sc.Gens().pipe_gen.load(std::memory_order_acquire);
-    auto& m = pipeline_memo_;
-    bool would_hit = false;
-    if (!m.valid) {
-        ++ctr.miss_cold;
-    } else if (m.reg_stamp != reg_stamp) {
-        ++ctr.miss_gen[LaneReg];
-    } else if (m.pipe_gen != pipe_gen) {
-        ++ctr.miss_gen[LanePipe];
-    } else {
-        would_hit = true;
-        ++ctr.hits;
-        if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
-            return m.pipeline;
-        }
-    }
-    const bool timed = !would_hit && sc.SampleTimer(kCache);
-    const u64 t0 = timed ? sc.Now() : 0;
-    const GraphicsPipeline* real = pipeline_cache.GetGraphicsPipeline();
-    if (timed) {
-        ctr.miss_ns += sc.CorrectSample(sc.Now() - t0);
-        ++ctr.miss_samples;
-        // The guard is a handful of compares; charge one pair cost.
-        ++ctr.guard_samples;
-    }
-    if (would_hit && sc.GetState(kCache) != State::Learning) {
-        if (m.pipeline == real) {
-            sc.RecordVerifyClean(kCache);
-        } else if (sc.Gens().pipe_gen.load(std::memory_order_acquire) != pipe_gen) {
-            sc.RecordVerifyAborted(kCache);
-            m.valid = false;
-        } else {
-            sc.RecordDivergence(kCache, "pipeline pointer mismatch");
-            m.valid = false;
-        }
-    }
-    if (!would_hit && real != nullptr) {
-        m = PipelineMemo{
-            .valid = true,
-            .reg_stamp = reg_stamp,
-            .pipe_gen = pipe_gen,
-            .pipeline = real,
-        };
-        sc.NotifyPopulated(kCache);
-    }
-    return real;
-}
-
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     using VideoCore::Skipcache::CacheId;
     auto& skipcache = Skipcache::Framework::Instance();
@@ -450,7 +392,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->regs;
-    const GraphicsPipeline* pipeline = GetGraphicsPipelineMemoized();
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
         return;
     }
@@ -499,7 +441,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    const GraphicsPipeline* pipeline = GetGraphicsPipelineMemoized();
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
         return;
     }
