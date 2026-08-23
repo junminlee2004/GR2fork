@@ -172,6 +172,34 @@ private:
     void BindingSkipProbe(const Pipeline* pipeline);
     BindingSkipProbeState bs_probe_{};
 
+    // PrepareRenderState memo: with the CB/DB registers, extent hints and
+    // texture-cache structure unchanged, the render-target resolution from the
+    // previous draw replays: cb_descs/db_desc still hold the identically
+    // constructed (and identically rebased) descriptors, so only the image
+    // ids, is_target marks and bound_images entries need re-establishing.
+    struct PrepareRtMemo {
+        bool valid{};
+        u64 reg_stamp{};
+        u64 tex_gen{};
+        u64 pipe_gen{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        u32 cb_count{};
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS> cb_id{};
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS> cb_uid{};
+        VideoCore::ImageId db_id{};
+        u64 db_uid{};
+    };
+    bool RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u64 tex_gen, u64 pipe_gen);
+    void RtMemoReplay();
+    void RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pipeline, u64 reg_stamp,
+                              u64 tex_gen, u64 pipe_gen);
+    PrepareRtMemo rt_memo_{};
+
+    // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
+    void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
+    std::array<vk::Pipeline, 2> last_bound_pipeline_{};
+    u64 last_bound_tick_{};
+
     friend class VideoCore::BufferCache;
 
     const Instance& instance;

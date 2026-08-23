@@ -366,9 +366,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
                         ASSERT_MSG(payload[nop_offset] == 0xc0001000,
                                    "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    } else {
+                        if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
+                            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+                            gfx_stamp.MarkDirty();
+                        }
+                    } else if (last_cb_extent[col_buf_id].raw != 0) {
                         last_cb_extent[col_buf_id].raw = 0;
+                        gfx_stamp.MarkDirty();
                     }
                     break;
                 }
@@ -389,7 +393,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (nop_offset == 0x04) {
                         ASSERT_MSG(payload[nop_offset] == 0xc0001000,
                                    "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+                        if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
+                            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+                            gfx_stamp.MarkDirty();
+                        }
                     }
                     break;
                 }
@@ -397,9 +404,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (header->type3.count == 8) {
                         ASSERT_MSG(payload[20] == 0xc0001000,
                                    "NOP hint is missing in DB setup sequence");
-                        last_db_extent.raw = payload[21];
-                    } else {
+                        if (last_db_extent.raw != payload[21]) {
+                            last_db_extent.raw = payload[21];
+                            gfx_stamp.MarkDirty();
+                        }
+                    } else if (last_db_extent.raw != 0) {
                         last_db_extent.raw = 0;
+                        gfx_stamp.MarkDirty();
                     }
                     break;
                 }

@@ -53,6 +53,7 @@ enum class CacheId : u8 {
     BeginRendering = 1,
     BindingSkipProbe = 2,
     FindImage = 3,
+    PrepareRt = 4,
     Count
 };
 enum class State : u8 { Off = 0, Learning, Shadow, Enabled, Quarantined };
@@ -68,6 +69,8 @@ constexpr const char* CacheName(CacheId id) {
         return "BSPROBE";
     case CacheId::FindImage:
         return "FINDIMG";
+    case CacheId::PrepareRt:
+        return "RTMEMO";
     default:
         return "?";
     }
