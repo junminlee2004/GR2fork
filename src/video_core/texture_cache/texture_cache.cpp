@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <shared_mutex>
-
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -841,33 +839,26 @@ void TextureCache::UpdateImage(ImageId image_id) {
             return; // clean, tracked, recently touched: nothing to do
         }
     }
-    // Shared-lock verify: refresh the fast word when the flags are really
-    // clean, else fall to the working tier.
-    {
-        std::shared_lock lock{mutex};
-        Image& image = slot_images[image_id];
-        const VAddr begin = image.info.guest_address;
-        const VAddr end = begin + image.info.guest_size;
-        const bool tracked_ok =
-            image.IsTracked() && begin == image.track_addr && end == image.track_addr_end;
-        const bool needs_refresh = True(image.flags & ImageFlagBits::Dirty) || !tracked_ok;
-        const bool needs_touch = now_tick - image.tick_accessed_last > kTouchIntervalTicks;
-        if (!needs_refresh && !needs_touch) {
-            image.UpdateFastState(now_tick, tracked_ok);
-            return;
-        }
-    }
+    // Locked tier: verify under the lock; when the flags are really clean
+    // just restamp the fast word, else do the full pass.
     std::scoped_lock lock{mutex};
     Image& image = slot_images[image_id];
+    const auto tracked_ok = [&] {
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        return image.IsTracked() && begin == image.track_addr && end == image.track_addr_end;
+    };
+    const bool needs_refresh = True(image.flags & ImageFlagBits::Dirty) || !tracked_ok();
+    const bool needs_touch = now_tick - image.tick_accessed_last > kTouchIntervalTicks;
+    if (!needs_refresh && !needs_touch) {
+        image.UpdateFastState(now_tick, true);
+        return;
+    }
     TrackImage(image_id);
     TouchImage(image);
     RefreshImage(image);
     image.tick_accessed_last = now_tick;
-    const VAddr begin = image.info.guest_address;
-    const VAddr end = begin + image.info.guest_size;
-    const bool now_tracked =
-        image.IsTracked() && begin == image.track_addr && end == image.track_addr_end;
-    if (False(image.flags & ImageFlagBits::Dirty) && now_tracked) {
+    if (False(image.flags & ImageFlagBits::Dirty) && tracked_ok()) {
         image.UpdateFastState(now_tick, true);
     }
 }
