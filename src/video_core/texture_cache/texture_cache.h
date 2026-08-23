@@ -181,12 +181,32 @@ public:
     };
 
     /// Returns meta type if the specified address is a metadata surface.
+    /// A single-cache-line Bloom filter answers the dominant negative case
+    /// without probing the map. Insert-only: erases leave stale bits, which
+    /// only cause a harmless fall-through to the real map.
     std::optional<MetaType> IsMeta(VAddr address) const {
+        if (VideoCore::Skipcache::Framework::Instance().Active()) {
+            const u64 h = address * 0x9e3779b97f4a7c15ULL;
+            const u32 bit_a = static_cast<u32>(h >> 32) & 511;
+            const u32 bit_b = static_cast<u32>(h >> 48) & 511;
+            if (((meta_bloom_[bit_a >> 6] >> (bit_a & 63)) & 1) == 0 ||
+                ((meta_bloom_[bit_b >> 6] >> (bit_b & 63)) & 1) == 0) {
+                return std::nullopt;
+            }
+        }
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             return it->second.type;
         }
         return std::nullopt;
+    }
+
+    void MetaBloomInsert(VAddr address) {
+        const u64 h = address * 0x9e3779b97f4a7c15ULL;
+        const u32 bit_a = static_cast<u32>(h >> 32) & 511;
+        const u32 bit_b = static_cast<u32>(h >> 48) & 511;
+        meta_bloom_[bit_a >> 6] |= 1ULL << (bit_a & 63);
+        meta_bloom_[bit_b >> 6] |= 1ULL << (bit_b & 63);
     }
 
     /// Returns true if a slice of the specified metadata surface has been cleared.
@@ -384,6 +404,7 @@ private:
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    alignas(64) std::array<u64, 8> meta_bloom_{};
 };
 
 } // namespace VideoCore

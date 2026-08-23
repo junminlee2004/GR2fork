@@ -759,12 +759,14 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
+        MetaBloomInsert(desc.info.meta_info.cmask_addr);
         surface_metas.emplace(desc.info.meta_info.cmask_addr,
                               MetaDataInfo{.type = MetaType::CMask});
         image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
     }
 
     if (desc.info.meta_info.fmask_addr) {
+        MetaBloomInsert(desc.info.meta_info.fmask_addr);
         surface_metas.emplace(desc.info.meta_info.fmask_addr,
                               MetaDataInfo{.type = MetaType::FMask});
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
@@ -781,6 +783,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
+        MetaBloomInsert(desc.info.meta_info.htile_addr);
         surface_metas.emplace(desc.info.meta_info.htile_addr,
                               MetaDataInfo{.type = MetaType::HTile,
                                            .clear_mask = image.info.meta_info.htile_clear_mask});
@@ -1359,6 +1362,12 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
+    // Touch is idempotent within one gc tick; the mirror makes repeat calls
+    // (one per binding per draw) a field compare instead of an LRU update.
+    if (image.lru_touch_tick == gc_tick && VideoCore::Skipcache::Framework::Instance().Active()) {
+        return;
+    }
+    image.lru_touch_tick = gc_tick;
     lru_cache.Touch(image.lru_id, gc_tick);
 }
 

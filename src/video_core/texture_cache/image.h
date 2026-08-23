@@ -210,6 +210,7 @@ public:
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
     u64 lru_id{};
+    mutable u64 lru_touch_tick{~u64{0}};
     u64 tick_accessed_last{};
     u64 hash{};
 
