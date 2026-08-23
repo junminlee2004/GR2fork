@@ -54,6 +54,8 @@ enum class CacheId : u8 {
     BindingSkipProbe = 2,
     FindImage = 3,
     PrepareRt = 4,
+    Pipeline = 5,
+    Sampler = 6,
     Count
 };
 enum class State : u8 { Off = 0, Learning, Shadow, Enabled, Quarantined };
@@ -71,6 +73,10 @@ constexpr const char* CacheName(CacheId id) {
         return "FINDIMG";
     case CacheId::PrepareRt:
         return "RTMEMO";
+    case CacheId::Pipeline:
+        return "PIPEKEY";
+    case CacheId::Sampler:
+        return "SAMPLER";
     default:
         return "?";
     }

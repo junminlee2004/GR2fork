@@ -321,6 +321,16 @@ private:
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
+    struct SamplerMemoEntry {
+        std::array<u64, 2> key{};
+        vk::Sampler handle{};
+        u64 lru_id{};
+        u64 sampler_gen{};
+        bool valid{};
+    };
+    std::array<SamplerMemoEntry, 256> sampler_memo_{};
+    u64 sampler_gen_{1};
+
     struct FindImageMemoEntry {
         std::array<u64, 4> tsharp_raw{};
         u64 image_uid{};

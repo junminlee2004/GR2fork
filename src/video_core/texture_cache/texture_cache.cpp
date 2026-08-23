@@ -964,6 +964,38 @@ void TextureCache::RefreshImage(Image& image) {
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::Sampler;
+    static_assert(sizeof(AmdGpu::Sampler) == 16);
+    const auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
+    const size_t slot = ((raw[0] >> 5) ^ (raw[0] >> 33) ^ raw[1]) & 255;
+    const bool probing = sc.Active() && sc.ShouldProbe(kCache);
+    bool would_hit = false;
+    SamplerMemoEntry& e = sampler_memo_[slot];
+    if (probing) {
+        auto& ctr = sc.Counters(kCache);
+        ++ctr.eligible;
+        // The memo mirrors the map key exactly (the raw S# bytes); the
+        // generation certifies no sampler was garbage collected since populate.
+        if (!e.valid) {
+            ++ctr.miss_cold;
+        } else if (e.key != raw) {
+            ++ctr.miss_key;
+        } else if (e.sampler_gen != sampler_gen_) {
+            ++ctr.miss_gen[LaneTex];
+        } else {
+            would_hit = true;
+            ++ctr.hits;
+        }
+        if (would_hit && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+            // Consumed hit still touches the LRU: never starve the GC the
+            // cache depends on.
+            std::scoped_lock lock{samplers_mutex};
+            sampler_lru_cache.Touch(e.lru_id, gc_tick);
+            return e.handle;
+        }
+    }
     const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
 
     std::scoped_lock lock{samplers_mutex};
@@ -973,8 +1005,29 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     } else {
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
-
-    return it->second.Handle();
+    const vk::Sampler handle = it->second.Handle();
+    if (probing) {
+        auto& sc2 = Framework::Instance();
+        if (would_hit && sc2.GetState(kCache) != State::Learning) {
+            if (e.handle == handle) {
+                sc2.RecordVerifyClean(kCache);
+            } else {
+                sc2.RecordDivergence(kCache, "sampler handle mismatch");
+                e.valid = false;
+            }
+        }
+        if (!would_hit) {
+            e = SamplerMemoEntry{
+                .key = raw,
+                .handle = handle,
+                .lru_id = it->second.lru_id,
+                .sampler_gen = sampler_gen_,
+                .valid = true,
+            };
+            sc2.NotifyPopulated(kCache);
+        }
+    }
+    return handle;
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
@@ -1211,6 +1264,7 @@ void TextureCache::GarbageCollectSamplers() {
         const size_t lru_id = samplers.at(hash).lru_id;
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);
+        ++sampler_gen_;
         return false;
     };
 

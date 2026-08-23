@@ -195,6 +195,19 @@ private:
                               u64 tex_gen, u64 pipe_gen);
     PrepareRtMemo rt_memo_{};
 
+    // GetGraphicsPipeline memo: reg_stamp equality implies an identical
+    // graphics key (the stamp covers every register the key reads), so the
+    // resolved pipeline pointer replays; pipe_gen covers shader replacement
+    // destroying pipelines behind the pointer.
+    struct PipelineMemo {
+        bool valid{};
+        u64 reg_stamp{};
+        u64 pipe_gen{};
+        const GraphicsPipeline* pipeline{};
+    };
+    const GraphicsPipeline* GetGraphicsPipelineMemoized();
+    PipelineMemo pipeline_memo_{};
+
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
     std::array<vk::Pipeline, 2> last_bound_pipeline_{};
