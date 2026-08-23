@@ -98,6 +98,7 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+    bool FilterDrawSlow();
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -212,6 +213,7 @@ private:
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
     std::array<vk::Pipeline, 2> last_bound_pipeline_{};
     u64 last_bound_tick_{};
+    u64 filter_true_stamp_{};
 
     friend class VideoCore::BufferCache;
 

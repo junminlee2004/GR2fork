@@ -89,6 +89,22 @@ void Rasterizer::BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline han
 }
 
 bool Rasterizer::FilterDraw() {
+    // The true verdict is a pure function of the registers; the false paths
+    // perform real work (fast clear elimination, resolves, depth copies) and
+    // must always re-execute, so only true is memoized.
+    if (Skipcache::Framework::Instance().Active()) {
+        const u64 stamp = liverpool->GetGfxStateStamp();
+        if (filter_true_stamp_ == stamp) {
+            return true;
+        }
+        const bool result = FilterDrawSlow();
+        filter_true_stamp_ = result ? stamp : 0;
+        return result;
+    }
+    return FilterDrawSlow();
+}
+
+bool Rasterizer::FilterDrawSlow() {
     const auto& regs = liverpool->regs;
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws

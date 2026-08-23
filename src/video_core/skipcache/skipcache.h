@@ -56,6 +56,7 @@ enum class CacheId : u8 {
     PrepareRt = 4,
     Pipeline = 5,
     Sampler = 6,
+    DescDelta = 7,
     Count
 };
 enum class State : u8 { Off = 0, Learning, Shadow, Enabled, Quarantined };
@@ -77,6 +78,8 @@ constexpr const char* CacheName(CacheId id) {
         return "PIPEKEY";
     case CacheId::Sampler:
         return "SAMPLER";
+    case CacheId::DescDelta:
+        return "DESCDELTA";
     default:
         return "?";
     }
@@ -315,6 +318,23 @@ public:
     // Session summary (called from shutdown path; reads the last snapshot).
     void LogSessionSummary();
 
+    // ---- Descriptor delta storage: the serialized form of the last
+    // descriptor push per bind point (graphics, compute). Fixed capacity;
+    // an oversized serialization fails closed as a veto. ----
+    struct DescDeltaSlot {
+        bool valid{};
+        u64 tick{};
+        u64 layout{};
+        u32 size{};
+        std::array<u8, 16384> blob{};
+    };
+    DescDeltaSlot& DescDeltaState(size_t bind_point_index) {
+        return desc_delta_[bind_point_index];
+    }
+    std::array<u8, 16384>& DescDeltaScratch() {
+        return desc_delta_scratch_;
+    }
+
     // ---- UpdateImageDedup storage (framework-owned: its consumer is the
     // texture cache, which has no rasterizer pointer). 256-slot direct-mapped;
     // collisions overwrite - losing dedup, never skipping required work. ----
@@ -404,6 +424,8 @@ private:
     std::atomic<u8> requested_mode_{0};
     std::array<CacheState, NumCaches> caches_{};
     std::array<DedupEntry, 256> dedup_{};
+    std::array<DescDeltaSlot, 2> desc_delta_{};
+    std::array<u8, 16384> desc_delta_scratch_{};
 
     struct {
         InvalidateFn fn;
