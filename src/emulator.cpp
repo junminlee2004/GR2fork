@@ -488,6 +488,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 #endif
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
+    LOG_INFO(Config, "GPU adaptiveSkipCaches: {}", EmulatorSettings.GetAdaptiveSkipCachesMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
