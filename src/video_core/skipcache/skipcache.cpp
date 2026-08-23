@@ -175,7 +175,7 @@ f64 Framework::ProjectedNetPct(const CacheState& cs, u64 window_ns) const {
         return 0.0;
     }
     const CacheCounters& c = cs.counters;
-    const f64 avg = [](u64 ns, u64 n) { return n ? f64(ns) / f64(n) : 0.0; };
+    const auto avg = [](u64 ns, u64 n) { return n ? f64(ns) / f64(n) : 0.0; };
     const f64 avg_hit = avg(c.hit_ns, c.hit_samples);
     const f64 avg_miss = avg(c.miss_ns, c.miss_samples);
     const f64 avg_guard = avg(c.guard_ns, c.guard_samples);
