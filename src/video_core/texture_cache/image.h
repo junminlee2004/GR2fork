@@ -10,6 +10,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
@@ -153,6 +154,38 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+
+    // Atomic fast state for the lock-free UpdateImage fast path: most calls
+    // find the image clean, tracked and recently touched, yet pay the shared
+    // lock. {dirty, tracked, last_touch_tick} pack into one u64. Wrapped so
+    // the defaulted Image moves keep working (slot storage moves on growth).
+    static constexpr u64 kFastStateDirty = 1ULL << 0;
+    static constexpr u64 kFastStateTracked = 1ULL << 1;
+    static constexpr u64 kFastStateTouchShift = 2;
+    struct MovableAtomicU64 {
+        std::atomic<u64> v;
+        MovableAtomicU64(u64 init) : v(init) {}
+        MovableAtomicU64(MovableAtomicU64&& o) noexcept : v(o.v.load(std::memory_order_relaxed)) {}
+        MovableAtomicU64& operator=(MovableAtomicU64&& o) noexcept {
+            v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    MovableAtomicU64 fast_update_state{kFastStateDirty};
+
+    void MarkFastStateDirty() noexcept {
+        fast_update_state.v.fetch_or(kFastStateDirty, std::memory_order_release);
+    }
+    void UpdateFastState(u64 tick, bool is_tracked) noexcept {
+        u64 state = tick << kFastStateTouchShift;
+        if (is_tracked) {
+            state |= kFastStateTracked;
+        }
+        fast_update_state.v.store(state, std::memory_order_release);
+    }
+    u64 ReadFastState() const noexcept {
+        return fast_update_state.v.load(std::memory_order_acquire);
+    }
     ImageId depth_id{};
     u64 depth_uid{};
 

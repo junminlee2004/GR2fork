@@ -123,6 +123,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    image.MarkFastStateDirty();
     UntrackImage(image_id);
 }
 
@@ -137,6 +138,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            image.MarkFastStateDirty();
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -167,6 +169,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        image.MarkFastStateDirty();
     });
     Skipcache::Framework::Instance().BumpImgDirtyGen();
 }
@@ -810,6 +813,63 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
+void TextureCache::UpdateImage(ImageId image_id) {
+    // Lock-free fast path: this runs per image binding per draw and most calls
+    // find the image clean, tracked and recently touched; the lock alone is a
+    // measurable share of L1 misses on handheld cache hierarchies. Every path
+    // that dirties or (partially) untracks an image marks the fast state, so
+    // a clean read here proves the full pass would be a no-op.
+    auto& sc = VideoCore::Skipcache::Framework::Instance();
+    if (!sc.Active()) {
+        std::scoped_lock lock{mutex};
+        Image& image = slot_images[image_id];
+        TrackImage(image_id);
+        TouchImage(image);
+        RefreshImage(image);
+        return;
+    }
+    const u64 now_tick = scheduler.CurrentTick();
+    constexpr u64 kTouchIntervalTicks = 8192;
+    {
+        const u64 fast = slot_images[image_id].ReadFastState();
+        const bool dirty = (fast & Image::kFastStateDirty) != 0;
+        const bool tracked = (fast & Image::kFastStateTracked) != 0;
+        const u64 last_tick = fast >> Image::kFastStateTouchShift;
+        if (!dirty && tracked && now_tick - last_tick <= kTouchIntervalTicks) {
+            return; // clean, tracked, recently touched: nothing to do
+        }
+    }
+    // Shared-lock verify: refresh the fast word when the flags are really
+    // clean, else fall to the working tier.
+    {
+        std::shared_lock lock{mutex};
+        Image& image = slot_images[image_id];
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        const bool tracked_ok =
+            image.IsTracked() && begin == image.track_addr && end == image.track_addr_end;
+        const bool needs_refresh = True(image.flags & ImageFlagBits::Dirty) || !tracked_ok;
+        const bool needs_touch = now_tick - image.tick_accessed_last > kTouchIntervalTicks;
+        if (!needs_refresh && !needs_touch) {
+            image.UpdateFastState(now_tick, tracked_ok);
+            return;
+        }
+    }
+    std::scoped_lock lock{mutex};
+    Image& image = slot_images[image_id];
+    TrackImage(image_id);
+    TouchImage(image);
+    RefreshImage(image);
+    image.tick_accessed_last = now_tick;
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    const bool now_tracked =
+        image.IsTracked() && begin == image.track_addr && end == image.track_addr_end;
+    if (False(image.flags & ImageFlagBits::Dirty) && now_tracked) {
+        image.UpdateFastState(now_tick, true);
+    }
+}
+
 void TextureCache::MaybeUpdateImage(ImageId image_id) {
     using namespace VideoCore::Skipcache;
     auto& sc = Framework::Instance();
@@ -1139,6 +1199,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
 
 void TextureCache::UntrackImage(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     if (!image.IsTracked()) {
         return;
     }
@@ -1153,6 +1214,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
 
 void TextureCache::UntrackImageHead(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     const auto image_begin = image.info.guest_address;
     if (!image.IsTracked() || image_begin < image.track_addr) {
         return;
@@ -1171,6 +1233,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     const auto image_end = image.info.guest_address + image.info.guest_size;
     if (!image.IsTracked() || image.track_addr_end < image_end) {
         return;
