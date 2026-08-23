@@ -417,6 +417,7 @@ private:
     u64 tsc_hz_{};
     u64 tsc_pair_cost_{};
     u64 pair_ns_{};
+    f64 ns_per_cycle_{};
     u32 xorshift_state_{0x9E3779B9u};
 
 #ifdef _DEBUG

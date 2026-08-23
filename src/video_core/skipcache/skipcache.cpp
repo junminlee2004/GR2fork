@@ -58,7 +58,8 @@ void Framework::Init(Mode mode) {
             best = std::min(best, b - a);
         }
         tsc_pair_cost_ = best;
-        pair_ns_ = best * 1'000'000'000 / tsc_hz_;
+        ns_per_cycle_ = 1.0e9 / static_cast<f64>(tsc_hz_);
+        pair_ns_ = static_cast<u64>(static_cast<f64>(best) * ns_per_cycle_);
         timing_enabled_ = true;
     } else {
         // Sub-100MHz timestamp source: counters only; enablement then requires
@@ -85,7 +86,9 @@ u64 Framework::Now() const {
     if (!timing_enabled_) {
         return 0;
     }
-    return Common::FencedRDTSC() * 1'000'000'000 / tsc_hz_;
+    // Multiply in floating point: cycles * 1e9 overflows u64 after ~5 seconds
+    // of TSC at modern clock rates. A double is exact past 2^53 ns (~104 days).
+    return static_cast<u64>(static_cast<f64>(Common::FencedRDTSC()) * ns_per_cycle_);
 }
 
 bool Framework::ShouldVerify(CacheId id) {
