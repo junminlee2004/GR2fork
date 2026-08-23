@@ -132,12 +132,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             const size_t size = SerializeDescriptorWrites(set_writes, scratch);
             const u64 tick = scheduler.CurrentTick();
             const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(*pipeline_layout));
+            const u64 foreign = sc.ForeignPushGen(idx);
             bool would_hit = false;
             if (size == 0) {
                 ++ctr.veto[0]; // unknown type or overflow: fail closed
             } else if (!slot.valid) {
                 ++ctr.miss_cold;
-            } else if (slot.tick != tick) {
+            } else if (slot.tick != tick || slot.foreign_gen != foreign) {
                 ++ctr.miss_gen[Skipcache::LaneTick];
             } else if (slot.layout != layout) {
                 ++ctr.miss_key;
@@ -172,6 +173,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                 slot.valid = true;
                 slot.tick = tick;
                 slot.layout = layout;
+                slot.foreign_gen = foreign;
                 slot.size = static_cast<u32>(size);
                 std::memcpy(slot.blob.data(), scratch.data(), size);
                 sc.NotifyPopulated(kCache);

@@ -325,6 +325,7 @@ public:
         bool valid{};
         u64 tick{};
         u64 layout{};
+        u64 foreign_gen{};
         u32 size{};
         std::array<u8, 16384> blob{};
     };
@@ -333,6 +334,15 @@ public:
     }
     std::array<u8, 16384>& DescDeltaScratch() {
         return desc_delta_scratch_;
+    }
+    // Any descriptor push issued OUTSIDE Pipeline::BindResources (fault
+    // processing, host passes) overwrites command buffer state behind the
+    // delta cache's back; those sites bump this so the next probe misses.
+    void BumpForeignPushGen(size_t bind_point_index) {
+        ++foreign_push_gen_[bind_point_index];
+    }
+    u64 ForeignPushGen(size_t bind_point_index) const {
+        return foreign_push_gen_[bind_point_index];
     }
 
     // ---- UpdateImageDedup storage (framework-owned: its consumer is the
@@ -426,6 +436,7 @@ private:
     std::array<CacheState, NumCaches> caches_{};
     std::array<DedupEntry, 256> dedup_{};
     std::array<DescDeltaSlot, 2> desc_delta_{};
+    std::array<u64, 2> foreign_push_gen_{};
     std::array<u8, 16384> desc_delta_scratch_{};
 
     struct {

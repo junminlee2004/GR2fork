@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/skipcache/skipcache.h"
 
 #include "video_core/host_shaders/fault_buffer_process_comp.h"
 
@@ -141,6 +142,7 @@ void FaultManager::ProcessFaultBuffer() {
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
     // 1 bit per page, 32 pages per workgroup

@@ -2,6 +2,7 @@
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
+#include "video_core/skipcache/skipcache.h"
 
 #include "common/assert.h"
 #include "core/emulator_settings.h"
@@ -255,6 +256,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                              },
                          });
 
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(0);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
                          &settings);
