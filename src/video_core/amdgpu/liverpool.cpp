@@ -71,7 +71,7 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 // benefit (no cache consumes user_data through the stamp; the binding probe
 // compares the words directly). Writes that only partially overlap a block
 // fall through to the stamped path, which is the conservative direction.
-static bool IsGfxUserDataWrite(const Liverpool::Regs& regs, u32 word_addr, u32 num_words) {
+static bool IsGfxUserDataWrite(const Regs& regs, u32 word_addr, u32 num_words) {
     const u32* base = regs.reg_array.data();
     const auto in_ud = [&](const ShaderProgram& prog) {
         const u32 ud = static_cast<u32>(reinterpret_cast<const u32*>(prog.user_data.data()) - base);
