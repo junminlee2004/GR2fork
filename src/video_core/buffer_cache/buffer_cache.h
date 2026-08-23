@@ -237,6 +237,9 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
+    // Bumped only on clean->dirty coverage transitions; an entry stamped with
+    // the current value is proven GPU-clean without walking the range set.
+    u64 gpu_dirty_generation_{1};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };

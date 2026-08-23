@@ -434,7 +434,10 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
-        gpu_modified_ranges.Add(dst, num_bytes);
+        if (!gpu_modified_ranges.Contains(dst, num_bytes)) {
+            ++gpu_dirty_generation_;
+            gpu_modified_ranges.Add(dst, num_bytes);
+        }
         return buffer;
     }();
     const vk::BufferCopy region = {
@@ -500,9 +503,85 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
-        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        return {&stream_buffer, offset};
+    if (!is_written && size <= CACHING_PAGESIZE) {
+        // Small read-only uploads dominate this function: the same (addr, size)
+        // binds repeat across draws within one command buffer. A hit whose
+        // mem_gen is unchanged proves no CPU write reached the emulator since
+        // the copy, so the previous stream offset still holds the bytes; a
+        // matching gpu epoch proves no range anywhere went GPU-dirty, so the
+        // range walk is skipped too. Unknowns fall to the fresh-copy path.
+        auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+        if (skipcache.Active()) {
+            struct StreamCopyCacheEntry {
+                VAddr addr; // 0 = invalid
+                u64 tick;
+                u64 mem_gen;
+                u64 gpu_gen;
+                u32 offset;
+                u32 size;
+            };
+            constexpr size_t kSets = 4096;
+            constexpr size_t kWays = 2;
+            struct StreamCopyCache {
+                std::array<std::array<StreamCopyCacheEntry, kWays>, kSets> sets{};
+                std::array<u8, kSets> lru{};
+            };
+            // Heap-backed: only the pointer lives in TLS (a large in-TLS array
+            // blows the guest pthread TLS budget at create time).
+            static thread_local std::unique_ptr<StreamCopyCache> storage;
+            if (!storage) {
+                storage = std::make_unique<StreamCopyCache>();
+            }
+            auto& cache = *storage;
+            u64 key = static_cast<u64>(device_addr);
+            key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
+            key ^= key >> 33;
+            key *= 0xff51afd7ed558ccdULL;
+            key ^= key >> 33;
+            const size_t set_idx = key & (kSets - 1);
+            auto& set = cache.sets[set_idx];
+            const u64 tick = scheduler.CurrentTick();
+            const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+
+            StreamCopyCacheEntry* hit = nullptr;
+            if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
+                set[0].mem_gen == mem_gen) {
+                hit = &set[0];
+            } else if (set[1].addr == device_addr && set[1].size == size && set[1].tick == tick &&
+                       set[1].mem_gen == mem_gen) {
+                hit = &set[1];
+            }
+            if (hit) {
+                cache.lru[set_idx] = static_cast<u8>(hit == &set[0] ? 1u : 0u);
+                if (hit->gpu_gen == gpu_dirty_generation_) {
+                    return {&stream_buffer, hit->offset};
+                }
+                if (!IsRegionGpuModified(device_addr, size)) {
+                    hit->gpu_gen = gpu_dirty_generation_;
+                    return {&stream_buffer, hit->offset};
+                }
+                hit->addr = 0; // went GPU-dirty: no longer stream-eligible
+            } else if (!IsRegionGpuModified(device_addr, size)) {
+                const u64 offset =
+                    stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+                const u8 victim = cache.lru[set_idx] & 1u;
+                set[victim] = StreamCopyCacheEntry{
+                    .addr = device_addr,
+                    .tick = tick,
+                    .mem_gen = mem_gen,
+                    .gpu_gen = gpu_dirty_generation_,
+                    .offset = static_cast<u32>(offset),
+                    .size = size,
+                };
+                cache.lru[set_idx] = static_cast<u8>(victim ^ 1u);
+                return {&stream_buffer, static_cast<u32>(offset)};
+            }
+            // GPU-modified: fall through to the slot path below.
+        } else if (!IsRegionGpuModified(device_addr, size)) {
+            const u64 offset =
+                stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+            return {&stream_buffer, offset};
+        }
     }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
@@ -510,7 +589,13 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        // Bump the GPU-clean epoch only on new coverage; steady-state
+        // re-writes of the same ranges skip both the bump and the no-op
+        // interval merge.
+        if (!gpu_modified_ranges.Contains(device_addr, size)) {
+            ++gpu_dirty_generation_;
+            gpu_modified_ranges.Add(device_addr, size);
+        }
     }
     return {&buffer, buffer.Offset(device_addr)};
 }
