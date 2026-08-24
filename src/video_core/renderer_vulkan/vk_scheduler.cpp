@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/rdtsc.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -107,7 +108,19 @@ void Scheduler::Finish() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
+    const u64 t0 = Common::FencedRDTSC();
     Wait(presubmit_tick);
+    RecordWait(WaitSite::Finish, Common::FencedRDTSC() - t0);
+}
+
+void Scheduler::WaitTagged(u64 tick, WaitSite site) {
+    if (master_semaphore.IsFree(tick)) {
+        Wait(tick); // still needs the flush path; it will not block
+        return;
+    }
+    const u64 t0 = Common::FencedRDTSC();
+    Wait(tick);
+    RecordWait(site, Common::FencedRDTSC() - t0);
 }
 
 void Scheduler::Wait(u64 tick) {

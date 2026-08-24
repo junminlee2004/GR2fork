@@ -604,6 +604,14 @@ void Rasterizer::OnSubmit() {
                      "[SkipCache] RING maps={} MiB={} wraps={} blocked_ms={} per300f", st.maps,
                      st.bytes >> 20, st.wraps, hz ? st.blocked_ns * 1000 / hz : 0);
             st = VideoCore::StreamBuffer::RingStats{};
+            auto& ws = scheduler.WaitStats();
+            const auto ms = [hz](u64 ns) { return hz ? ns * 1000 / hz : 0; };
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] WAITS finish={}/{}ms ring={}/{}ms fault={}/{}ms "
+                     "dlbuf={}/{}ms dlimg={}/{}ms per300f",
+                     ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
+                     ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
+            ws = {};
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());

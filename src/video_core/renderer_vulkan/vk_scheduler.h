@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <condition_variable>
 #include <mutex>
@@ -366,6 +367,35 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+    /// Where a blocking wait came from, so the cost can be attributed. Kept
+    /// tiny: one counter pair per site, summed on the waiting thread.
+    enum class WaitSite : u8 {
+        Finish,
+        StreamRing,
+        FaultBuffer,
+        DownloadBuffer,
+        DownloadImage,
+        ResourcePool,
+        DeferredOp,
+        Other,
+        Count,
+    };
+    struct WaitStat {
+        u64 count{};
+        u64 ns{};
+    };
+    std::array<WaitStat, static_cast<size_t>(WaitSite::Count)>& WaitStats() {
+        return wait_stats_;
+    }
+    void RecordWait(WaitSite site, u64 ns) {
+        auto& w = wait_stats_[static_cast<size_t>(site)];
+        ++w.count;
+        w.ns += ns;
+    }
+
+    /// Waits for the given tick, attributing any blocking to a call site.
+    void WaitTagged(u64 tick, WaitSite site);
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
@@ -440,6 +470,7 @@ private:
 
 private:
     const Instance& instance;
+    std::array<WaitStat, static_cast<size_t>(WaitSite::Count)> wait_stats_{};
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;

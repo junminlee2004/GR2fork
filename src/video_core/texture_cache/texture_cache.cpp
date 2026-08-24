@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/rdtsc.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -102,7 +103,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                              download_buffer.Handle(), image_download);
 
     if (sync) {
+        const u64 t0 = Common::FencedRDTSC();
         scheduler.Finish();
+        scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
+                             Common::FencedRDTSC() - t0);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download, download_size);
         Skipcache::Framework::Instance().BumpMemGen();

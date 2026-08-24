@@ -261,7 +261,7 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!scheduler->IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        scheduler->Wait(watch.tick);
+        scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

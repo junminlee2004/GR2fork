@@ -5,6 +5,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/rdtsc.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -160,7 +161,10 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     if constexpr (async) {
         scheduler.DeferOperation(write_data);
     } else {
+        const u64 t0 = Common::FencedRDTSC();
         scheduler.Finish();
+        scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer,
+                             Common::FencedRDTSC() - t0);
         write_data();
     }
 }
