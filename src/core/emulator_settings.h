@@ -434,6 +434,11 @@ struct GPUSettings {
     // thread whenever it wraps, until the GPU drains the previous lap, so a
     // larger ring trades host memory for fewer stalls. 0 keeps the default.
     Setting<u32> stream_buffer_size_mb{64};
+    // Widen each guest readback to cover every GPU-modified range in the
+    // affected buffer instead of a fixed window. The same bytes are copied,
+    // but the whole buffer is serviced by one GPU drain rather than one per
+    // window, which is where the cost of readbacks actually is.
+    Setting<bool> readback_batching_enabled{false};
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
@@ -468,6 +473,8 @@ struct GPUSettings {
                                        &GPUSettings::adaptive_skipcaches_mode),
             make_override<GPUSettings>("stream_buffer_size_mb",
                                        &GPUSettings::stream_buffer_size_mb),
+            make_override<GPUSettings>("readback_batching_enabled",
+                                       &GPUSettings::readback_batching_enabled),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
@@ -478,9 +485,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
                                    adaptive_skipcaches_mode, stream_buffer_size_mb,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+                                   readback_batching_enabled, direct_memory_access_enabled,
+                                   dump_shaders, patch_shaders, vblank_frequency, full_screen,
+                                   full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
+                                   rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -743,6 +751,7 @@ public:
     // GPU Settings
     SETTING_FORWARD(m_gpu, AdaptiveSkipCachesMode, adaptive_skipcaches_mode)
     SETTING_FORWARD(m_gpu, StreamBufferSizeMb, stream_buffer_size_mb)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CopyGpuBuffers, copy_gpu_buffers)

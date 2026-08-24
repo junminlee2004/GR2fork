@@ -87,10 +87,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         constexpr u64 WindowSize = 512_KB;
         const VAddr buf_start = buffer.CpuAddr();
         const VAddr buf_end = buf_start + buffer.SizeBytes();
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
-        const VAddr window_end = std::min<VAddr>(
+        VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
+        VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
+        if (EmulatorSettings.IsReadbackBatchingEnabled()) {
+            // Every readback costs a full GPU drain, so the drain - not the
+            // copy - is what to economise on: service the whole buffer at once
+            // and later faults in it find their data already downloaded. Only
+            // GPU-modified sub-ranges are copied either way, so the number of
+            // bytes moved is unchanged.
+            window_start = buf_start;
+            window_end = buf_end;
+        }
         DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
