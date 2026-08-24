@@ -10,6 +10,10 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/tile.h"
 
+#include <array>
+#include <bit>
+#include <memory>
+
 #include <magic_enum/magic_enum.hpp>
 
 namespace VideoCore {
@@ -117,7 +121,55 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     }
 }
 
+namespace {
+
+/**
+ * Building an ImageInfo from a T# is a pure function of the descriptor's 32
+ * bytes, the depth flag, and Neo mode, but it runs once per texture bind - so
+ * the per-mip tiling walk in UpdateSize is re-derived for every draw that
+ * rebinds the same texture. Keying on the whole descriptor makes a hit exactly
+ * equivalent to constructing, so this is a pure memo rather than a heuristic.
+ */
+struct ImageInfoMemo {
+    static constexpr size_t NumEntries = 256; // direct mapped, power of two
+
+    struct Entry {
+        std::array<u64, 4> tsharp{};
+        ImageInfo info{};
+        bool valid{};
+        bool is_depth{};
+    };
+
+    std::array<Entry, NumEntries> entries{};
+
+    static size_t Index(const std::array<u64, 4>& raw) {
+        u64 key = raw[0] ^ (raw[1] * 0x9e3779b97f4a7c15ULL) ^ (raw[2] << 7) ^ (raw[3] << 13);
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        return static_cast<size_t>(key & (NumEntries - 1));
+    }
+};
+
+// Heap backed so only the pointer occupies thread-local storage.
+ImageInfoMemo& GetImageInfoMemo() {
+    static thread_local std::unique_ptr<ImageInfoMemo> memo;
+    if (!memo) {
+        memo = std::make_unique<ImageInfoMemo>();
+    }
+    return *memo;
+}
+
+} // Anonymous namespace
+
 ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
+    const auto raw = std::bit_cast<std::array<u64, 4>>(image);
+    auto& entry = GetImageInfoMemo().entries[ImageInfoMemo::Index(raw)];
+    if (entry.valid && entry.tsharp == raw && entry.is_depth == desc.is_depth) {
+        *this = entry.info;
+        return;
+    }
+
     tile_mode = image.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::SurfaceFormat(image.GetDataFmt(), image.GetNumberFmt());
@@ -144,6 +196,11 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
     UpdateSize();
+
+    entry.tsharp = raw;
+    entry.is_depth = desc.is_depth;
+    entry.info = *this;
+    entry.valid = true;
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
