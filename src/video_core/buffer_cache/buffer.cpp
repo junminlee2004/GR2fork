@@ -258,7 +258,13 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     }
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        if (!scheduler->IsFree(watch.tick) && !allow_wait) {
+        // allow_wait is tested first so the free check is only performed when
+        // its answer can change what happens. Reaching it costs a semaphore
+        // query, and when waiting is permitted the result was discarded and
+        // then recomputed by the wait below, which performs the same cached
+        // check and refresh itself. Every stream map ran this, which made it
+        // roughly one ioctl per buffer bind.
+        if (!allow_wait && !scheduler->IsFree(watch.tick)) {
             return false;
         }
         scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
