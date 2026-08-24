@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <optional>
+
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -87,6 +90,7 @@ public:
             return;
         }
 
+        WriteScope write_scope{*this};
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
@@ -119,6 +123,12 @@ public:
             return;
         }
 
+        // Only the clearing form mutates the bits; entering the scope
+        // conditionally keeps pure iteration off the writers' path.
+        std::optional<WriteScope> write_scope;
+        if constexpr (clear) {
+            write_scope.emplace(*this);
+        }
         RegionBits& bits = GetRegionBits<type>();
         RegionBits mask(bits, start_page, end_page);
 
@@ -157,6 +167,45 @@ public:
         return test.Any();
     }
 
+    /**
+     * Read whether a range is modified without taking the lock.
+     *
+     * The dirty bits are read optimistically between two reads of a sequence
+     * counter that writers make odd while mutating. An unchanged even counter
+     * proves no writer ran during the read, so the answer is exactly what the
+     * locked query would have returned. Contended acquisitions of this lock
+     * between the GPU thread and the guest fault handler are otherwise the
+     * dominant cost of every buffer bind.
+     */
+    template <Type type>
+    [[nodiscard]] bool PeekRegionModified(u64 offset, u64 size) noexcept {
+        for (u32 attempt = 0; attempt < 4; ++attempt) {
+            const u32 before = seq.load(std::memory_order_acquire);
+            if (before & 1u) {
+                continue; // writer in flight
+            }
+            const bool result = IsRegionModified<type>(offset, size);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq.load(std::memory_order_relaxed) == before) {
+                return result;
+            }
+        }
+        std::scoped_lock lk{lock};
+        return IsRegionModified<type>(offset, size);
+    }
+
+    /// Scope guard marking a mutation of the tracked bits for readers.
+    struct WriteScope {
+        explicit WriteScope(RegionManager& m) : mgr{m} {
+            mgr.seq.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~WriteScope() {
+            mgr.seq.fetch_add(1, std::memory_order_release);
+        }
+        RegionManager& mgr;
+    };
+
+    std::atomic<u32> seq{0};
     LockType lock;
 
 private:

@@ -30,8 +30,7 @@ public:
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<true>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
-                std::scoped_lock lk{manager->lock};
-                return manager->template IsRegionModified<Type::CPU>(offset, size);
+                return manager->template PeekRegionModified<Type::CPU>(offset, size);
             });
     }
 
@@ -39,8 +38,7 @@ public:
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
-                std::scoped_lock lk{manager->lock};
-                return manager->template IsRegionModified<Type::GPU>(offset, size);
+                return manager->template PeekRegionModified<Type::GPU>(offset, size);
             });
     }
 
@@ -93,6 +91,15 @@ public:
                             auto&& on_upload) {
         IteratePages<true>(query_cpu_range, query_size,
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                               // Read-only binds almost never have anything
+                               // to upload, and proving it under the lock is
+                               // the hottest contended site in the frame. The
+                               // peek answers it without one; the write path
+                               // still holds the lock for its GPU marking.
+                               if (!is_written &&
+                                   !manager->template PeekRegionModified<Type::CPU>(offset, size)) {
+                                   return;
+                               }
                                manager->lock.lock();
                                manager->template ForEachModifiedRange<Type::CPU, true>(
                                    manager->GetCpuAddr() + offset, size, func);
