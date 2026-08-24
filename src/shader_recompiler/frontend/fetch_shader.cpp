@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <array>
-#include <cstring>
-#include <memory>
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -48,67 +45,12 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
-namespace {
-
-/**
- * Decoding a fetch shader is a pure function of the instruction bytes, but it
- * runs once per pipeline lookup - that is, once per draw - because the code
- * pointer is resolved from per-draw user data. The same handful of fetch
- * shaders repeat all frame, so the decode is re-derived thousands of times a
- * frame for an answer that never changed.
- *
- * A hit is accepted only after comparing every byte the previous decode
- * consumed, so a guest that rewrites shader code in place still gets a fresh
- * parse. That makes the memo exactly equivalent to decoding, not an
- * approximation of it: bytes past the decoded region cannot affect the result
- * because the decode never read them.
- */
-struct FetchShaderMemo {
-    static constexpr size_t NumEntries = 64; // direct mapped, power of two
-    static constexpr u32 MaxCachedBytes = 4096;
-
-    struct Entry {
-        const u32* code{};
-        std::vector<u32> words; // exact copy of the decoded region
-        FetchShaderData data;
-    };
-
-    std::array<Entry, NumEntries> entries{};
-
-    static size_t Index(const u32* code) {
-        u64 key = reinterpret_cast<uintptr_t>(code);
-        key ^= key >> 33;
-        key *= 0xff51afd7ed558ccdULL;
-        key ^= key >> 33;
-        return static_cast<size_t>(key & (NumEntries - 1));
-    }
-};
-
-// Heap backed: only the pointer lives in thread-local storage, since fetch
-// shaders are also parsed from shader compilation workers.
-FetchShaderMemo& GetFetchShaderMemo() {
-    static thread_local std::unique_ptr<FetchShaderMemo> memo;
-    if (!memo) {
-        memo = std::make_unique<FetchShaderMemo>();
-    }
-    return *memo;
-}
-
-} // Anonymous namespace
-
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
-    auto& memo = GetFetchShaderMemo();
-    auto& entry = memo.entries[FetchShaderMemo::Index(code)];
-    if (entry.code == code && !entry.words.empty() &&
-        std::memcmp(code, entry.words.data(), entry.words.size() * sizeof(u32)) == 0) {
-        return entry.data;
-    }
-
     FetchShaderData data{};
     GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
     GcnDecodeContext decoder;
@@ -166,16 +108,6 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         }
     }
 
-    if (data.size > 0 && data.size <= FetchShaderMemo::MaxCachedBytes &&
-        data.size % sizeof(u32) == 0) {
-        const size_t num_words = data.size / sizeof(u32);
-        entry.words.assign(code, code + num_words);
-        entry.data = data;
-        entry.code = code;
-    } else {
-        entry.code = nullptr;
-        entry.words.clear();
-    }
     return data;
 }
 
