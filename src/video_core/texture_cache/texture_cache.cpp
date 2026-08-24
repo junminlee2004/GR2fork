@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -705,15 +707,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
-        if (image.info.guest_address != address) {
-            return;
+    if (const auto it = images_by_addr.find(address); it != images_by_addr.end()) {
+        for (const ImageId image_id : it->second) {
+            Image& image = slot_images[image_id];
+            if (ensure_valid && !image.SafeToDownload()) {
+                continue;
+            }
+            image_ids.push_back(image_id);
         }
-        if (ensure_valid && !image.SafeToDownload()) {
-            return;
-        }
-        image_ids.push_back(image_id);
-    });
+    }
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
@@ -1113,6 +1115,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+    images_by_addr[image.info.guest_address].push_back(image_id);
     Skipcache::Framework::Instance().BumpTexGen();
 }
 
@@ -1137,6 +1140,16 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         }
         image_ids.erase(vector_it);
     });
+    if (const auto it = images_by_addr.find(image.info.guest_address);
+        it != images_by_addr.end()) {
+        auto& ids = it.value();
+        if (const auto id_it = std::ranges::find(ids, image_id); id_it != ids.end()) {
+            ids.erase(id_it);
+        }
+        if (ids.empty()) {
+            images_by_addr.erase(it);
+        }
+    }
     Skipcache::Framework::Instance().BumpTexGen();
 }
 

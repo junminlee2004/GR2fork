@@ -404,6 +404,10 @@ private:
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    // Images keyed by their exact guest base address. FindImageFromRange only
+    // ever matches on equality, so the page walk it used to do was a range
+    // scan answering an exact-match question.
+    tsl::robin_map<VAddr, boost::container::small_vector<ImageId, 2>> images_by_addr;
     alignas(64) std::array<u64, 8> meta_bloom_{};
 };
 
