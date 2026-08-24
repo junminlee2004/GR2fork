@@ -228,14 +228,37 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     const bool needs_partial_transition =
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
-    const bool partially_transited = !subresource_states.empty();
+    bool partially_transited = !subresource_states.empty();
+
+    constexpr auto uniform_write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                         vk::AccessFlagBits2::eShaderWrite |
+                                         vk::AccessFlagBits2::eMemoryWrite;
+    // A vector with zero divergent entries is equivalent to empty: collapse it
+    // instead of scanning every mip x layer on each call. This scan was
+    // measured at a third of the GPU thread on subresource-heavy scenes.
+    if (partially_transited && backing->subres_divergent == 0) {
+        subresource_states.clear();
+        partially_transited = false;
+    }
+    // A partial transition into the state the whole image is already in would
+    // materialize the vector only to fill it with identical values.
+    if (needs_partial_transition && !partially_transited &&
+        last_state.layout == dst_layout && last_state.access_mask == dst_mask &&
+        !(last_state.access_mask & uniform_write_flags)) {
+        return {};
+    }
 
     Barriers barriers;
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+            backing->subres_divergent = 0;
         }
+        const State base_state = last_state;
+        const bool dst_divergent = dst_layout != base_state.layout ||
+                                   dst_mask != base_state.access_mask ||
+                                   dst_stage != base_state.pl_stage;
 
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
@@ -282,6 +305,11 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                             .layerCount = 1,
                         },
                     });
+                    const bool was_divergent = state.layout != base_state.layout ||
+                                               state.access_mask != base_state.access_mask ||
+                                               state.pl_stage != base_state.pl_stage;
+                    backing->subres_divergent +=
+                        static_cast<u32>(dst_divergent) - static_cast<u32>(was_divergent);
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
@@ -292,6 +320,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
 
         if (!needs_partial_transition) {
             subresource_states.clear();
+            backing->subres_divergent = 0;
         }
     } else { // Full resource transition
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |

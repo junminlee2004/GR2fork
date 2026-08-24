@@ -201,6 +201,10 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
+        // Number of subresource_states entries differing from `state`. While
+        // the vector is alive `state` is frozen, so this is stable; when it
+        // is zero the vector is equivalent to empty and the scan collapses.
+        u32 subres_divergent{};
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
