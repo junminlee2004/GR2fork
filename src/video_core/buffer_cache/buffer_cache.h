@@ -3,12 +3,17 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+#include <vector>
+
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
 
@@ -29,7 +34,6 @@ namespace VideoCore {
 using BufferId = Common::SlotId;
 
 class TextureCache;
-class MemoryTracker;
 class PageManager;
 
 class BufferCache {
@@ -109,6 +113,21 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+    struct OffloadStats {
+        u64 jobs;
+        u64 vetoes;
+        u64 fallbacks;
+        u64 wait_ns;
+    };
+
+    /// Snapshot and reset the offloaded-readback counters (for periodic logs).
+    OffloadStats DrainOffloadStats() {
+        return {offload_jobs_.exchange(0, std::memory_order_relaxed),
+                offload_vetoes_.exchange(0, std::memory_order_relaxed),
+                offload_fallbacks_.exchange(0, std::memory_order_relaxed),
+                offload_wait_ns_.exchange(0, std::memory_order_relaxed)};
+    }
+
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
@@ -171,6 +190,40 @@ private:
 
     template <bool async>
     void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
+
+    /**
+     * One offloaded fault readback in flight. Filled on the GPU command thread
+     * (PrepareFaultDownload), the semaphore wait happens on the faulting guest
+     * thread, and the writeback runs on the GPU command thread again
+     * (FinishFaultDownload). The SendCommand handshake orders every cross-
+     * thread access, so no field needs synchronization of its own.
+     */
+    struct FaultDownloadJob {
+        std::unique_ptr<Buffer> staging; // pool buffer holding the copied data
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+        MemoryTracker::GpuSeqSnapshots snapshots;
+        VAddr buffer_base = 0;  // guest base of the source buffer at record time
+        VAddr window_start = 0; // range whose tracker bits the writeback clears
+        u64 window_size = 0;
+        u64 wait_tick = 0;
+        bool has_download = false;
+        bool fully_cleared = false; // FinishFaultDownload verdict
+    };
+
+    /// Records download copies for an offloaded fault readback and flushes the
+    /// submission. GPU command thread only (reached via SendCommand).
+    void PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size, bool is_write);
+
+    /// Writes the downloaded bytes back to guest memory and clears tracker
+    /// bits for regions with no newer GPU writes. GPU command thread only.
+    void FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size, bool is_write);
+
+    /// Takes a staging buffer of at least the given size from the fault pool.
+    /// GPU command thread only.
+    std::unique_ptr<Buffer> AcquireFaultStaging(u64 size);
+
+    /// Returns a staging buffer to the fault pool. GPU command thread only.
+    void ReleaseFaultStaging(std::unique_ptr<Buffer> staging);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
@@ -242,6 +295,13 @@ private:
     u64 gpu_dirty_generation_{1};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+    // Staging pool for offloaded fault readbacks. GPU command thread only.
+    std::vector<std::unique_ptr<Buffer>> fault_staging_pool_;
+    // Offload counters; wait_ns is written by faulting guest threads.
+    std::atomic<u64> offload_jobs_{};
+    std::atomic<u64> offload_vetoes_{};
+    std::atomic<u64> offload_fallbacks_{};
+    std::atomic<u64> offload_wait_ns_{};
 };
 
 } // namespace VideoCore

@@ -90,6 +90,15 @@ public:
             return;
         }
 
+        if constexpr (type == Type::GPU && enable) {
+            // GPU bits are only ever mutated on the GPU command thread, so this
+            // is a plain counter. It advances on marks alone: an unchanged
+            // value between two points on that thread proves no new GPU write
+            // was recorded for this region in between, which is the guard the
+            // offloaded readback path uses before clearing bits it earlier
+            // snapshotted.
+            ++gpu_write_seq;
+        }
         WriteScope write_scope{*this};
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (enable) {
@@ -231,6 +240,8 @@ public:
     };
 
     std::atomic<u32> seq{0};
+    // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
+    u64 gpu_write_seq{0};
     LockType lock;
 
 private:

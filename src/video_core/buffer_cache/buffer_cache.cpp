@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
+#include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include "common/alignment.h"
 #include "common/debug.h"
@@ -80,6 +83,51 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    // Offloaded form: the faulting thread is blocked until its data arrives no
+    // matter what, so it - not the GPU command thread - should absorb the
+    // semaphore wait. The GPU command thread only records the download and
+    // flushes (PrepareFaultDownload), then writes the bytes back once the
+    // faulting thread has waited out the fence (FinishFaultDownload); between
+    // the two hops it is free to keep translating draws. Measured before this
+    // change, that wait held the GPU command thread for a third of its wall
+    // clock. When this function is reached from the GPU command thread itself
+    // (its own guest-memory read faulting), SendCommand runs the hops inline
+    // and the wait lands where it always did - never worse than the sync form.
+    if (EmulatorSettings.IsReadbackOffloadEnabled()) {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            FaultDownloadJob job;
+            liverpool->SendCommand<true>(
+                [&] { PrepareFaultDownload(job, device_addr, size, is_write); });
+            if (!job.has_download) {
+                // Nothing pending for this window usually means the fault is
+                // resolved, but it also happens when another thread's download
+                // owns the ranges and has not written back yet. Waiting here
+                // instead of returning keeps that thread from re-faulting in a
+                // tight loop and hammering the GPU command thread with empty
+                // download requests while the first one is in flight.
+                for (int spin = 0;
+                     spin < 400 && memory_tracker->IsRegionGpuModified(device_addr, size); ++spin) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                return;
+            }
+            const u64 t0 = Common::FencedRDTSC();
+            scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
+            offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+            liverpool->SendCommand<true>(
+                [&] { FinishFaultDownload(job, device_addr, size, is_write); });
+            // The faulted range itself may sit outside the vetoed regions, in
+            // which case its pages are clear and the fault is resolved even if
+            // part of the window was not.
+            if (job.fully_cleared || !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+                return;
+            }
+        }
+        // Newer GPU writes kept landing in the window while it was in flight.
+        // Fall through to the synchronous form, which blocks the GPU command
+        // thread and therefore cannot be outrun.
+        offload_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -104,6 +152,161 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     });
+}
+
+void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
+                                       bool is_write) {
+    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    // Window widening mirrors the synchronous form above.
+    constexpr u64 WindowSize = 512_KB;
+    const VAddr buf_start = buffer.CpuAddr();
+    const VAddr buf_end = buf_start + buffer.SizeBytes();
+    VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
+    VAddr window_end =
+        std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
+    if (EmulatorSettings.IsReadbackBatchingEnabled()) {
+        window_start = buf_start;
+        window_end = buf_end;
+    }
+
+    // Copy collection mirrors DownloadBufferMemory, except destinations index
+    // the job's dedicated staging from zero. The shared download ring cannot be
+    // used here: its reclamation tracks GPU ticks only, and the bytes must
+    // survive on the host until the faulting thread has consumed them.
+    u64 total_size_bytes = 0;
+    memory_tracker->ForEachDownloadRange<false>(
+        window_start, window_end - window_start, [&](u64 device_addr_out, u64 range_size) {
+            const VAddr buffer_addr = buffer.CpuAddr();
+            const auto add_download = [&](VAddr start, VAddr end) {
+                const u64 new_offset = start - buffer_addr;
+                const u64 new_size = end - start;
+                job.copies.push_back(vk::BufferCopy{
+                    .srcOffset = new_offset,
+                    .dstOffset = total_size_bytes,
+                    .size = new_size,
+                });
+                // Align up to avoid cache conflicts
+                constexpr u64 align = 64ULL;
+                constexpr u64 mask = ~(align - 1ULL);
+                total_size_bytes += (new_size + align - 1) & mask;
+            };
+            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+            gpu_modified_ranges.Subtract(device_addr_out, range_size);
+        });
+    if (total_size_bytes == 0) {
+        // Nothing pending for the window. Unlike the synchronous form, empty
+        // does not imply resolved here: another thread's in-flight job may own
+        // the ranges while the bits are still set. Marking CPU-dirty in that
+        // state would drop the write watcher while the read watcher is armed,
+        // which is an invalid (write-only) protection. Mark only when the
+        // faulted range is actually clear; otherwise the caller's damping loop
+        // and the refault path converge once the owner finishes.
+        if (is_write && !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
+        return;
+    }
+
+    job.staging = AcquireFaultStaging(total_size_bytes);
+    memory_tracker->SnapshotGpuWriteSeq(window_start, window_end - window_start, job.snapshots);
+    job.buffer_base = buffer.CpuAddr();
+    job.window_start = window_start;
+    job.window_size = window_end - window_start;
+
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    // Synchronize prior GPU writes to this buffer before the transfer read
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = buffer.buffer,
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &pre_barrier,
+    });
+    cmdbuf.copyBuffer(buffer.buffer, job.staging->Handle(), job.copies);
+    job.wait_tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    job.has_download = true;
+    offload_jobs_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
+                                      bool is_write) {
+    job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
+    auto* memory = Core::Memory::Instance();
+    const u8* download = job.staging->mapped_data.data();
+
+    // Every copy gets its own verdict. This runs on the GPU command thread, so
+    // between the sequence test and the bit clear nothing can interleave; and
+    // because the sequence advances on every recorded GPU write - including
+    // rebinds of already-dirty regions - a matching sequence proves any other
+    // download of the same range holds byte-identical data, making write-back
+    // order among matching jobs irrelevant. A mismatched copy is written back
+    // by nobody: its bytes may predate the newer write.
+    bool vetoed_any = false;
+    for (const auto& copy : job.copies) {
+        const VAddr copy_device_addr = job.buffer_base + copy.srcOffset;
+        if (memory_tracker->GpuWriteSeqMatches(copy_device_addr, copy.size, job.snapshots)) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + copy.dstOffset,
+                                    copy.size);
+            memory_tracker->UnmarkRegionAsGpuModified(copy_device_addr, copy.size);
+            continue;
+        }
+        vetoed_any = true;
+        // The newer write's own bind restored the range set for its span; put
+        // back only what is still marked and uncovered, so the tracker bits
+        // and the range set stay in lockstep. New dirty coverage expires the
+        // GPU-clean epoch, per the protocol at every other Add site.
+        if (memory_tracker->IsRegionGpuModified(copy_device_addr, copy.size) &&
+            !gpu_modified_ranges.Contains(copy_device_addr, copy.size)) {
+            ++gpu_dirty_generation_;
+            gpu_modified_ranges.Add(copy_device_addr, copy.size);
+        }
+    }
+    job.fully_cleared = !vetoed_any;
+    if (vetoed_any) {
+        offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Same write-only-protection hazard as the empty path in Prepare: the mark
+    // is only legal once the faulted range's GPU bits are clear. When a veto
+    // kept them set, the caller's retry loop resolves the fault instead.
+    if (is_write && !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    }
+    ReleaseFaultStaging(std::move(job.staging));
+}
+
+std::unique_ptr<Buffer> BufferCache::AcquireFaultStaging(u64 size) {
+    for (auto it = fault_staging_pool_.begin(); it != fault_staging_pool_.end(); ++it) {
+        if ((*it)->SizeBytes() >= size) {
+            auto staging = std::move(*it);
+            fault_staging_pool_.erase(it);
+            return staging;
+        }
+    }
+    constexpr u64 MinStagingSize = 512_KB;
+    const u64 wanted = std::max<u64>(std::bit_ceil(size), MinStagingSize);
+    return std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
+                                    vk::BufferUsageFlagBits::eTransferDst, wanted);
+}
+
+void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
+    // The recorded copy into this staging retired before FinishFaultDownload
+    // ran (the faulting thread waited out the tick), so dropping it here is
+    // safe when the pool is full or the buffer is an outlier size.
+    constexpr size_t MaxPooledBuffers = 4;
+    constexpr u64 MaxPooledSize = 16_MB;
+    if (fault_staging_pool_.size() >= MaxPooledBuffers || staging->SizeBytes() > MaxPooledSize) {
+        return;
+    }
+    fault_staging_pool_.push_back(std::move(staging));
 }
 
 template <bool async>

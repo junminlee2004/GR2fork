@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <deque>
+#include <utility>
+
 #include <mutex>
 #include <type_traits>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 
 #include "common/debug.h"
 #include "common/types.h"
@@ -62,6 +65,45 @@ public:
                             });
     }
 
+    /// One region's identity and its gpu_write_seq value at snapshot time.
+    /// GPU-command-thread confined, like the counter it captures.
+    struct GpuSeqSnapshot {
+        RegionManager* manager;
+        u64 seq;
+    };
+    using GpuSeqSnapshots = boost::container::small_vector<GpuSeqSnapshot, 4>;
+
+    /**
+     * Captures each overlapped region's GPU write sequence. Call on the GPU
+     * command thread at the moment download copies are recorded; pass the
+     * result to GpuWriteSeqMatches when deciding whether the copied data may
+     * be written back.
+     */
+    void SnapshotGpuWriteSeq(VAddr cpu_addr, u64 size, GpuSeqSnapshots& out) {
+        IteratePages<false>(cpu_addr, size, [&out](RegionManager* manager, u64, size_t) {
+            out.push_back({manager, manager->gpu_write_seq});
+        });
+    }
+
+    /**
+     * True when every region overlapping the range still carries the GPU write
+     * sequence captured in the snapshot - that is, no new GPU write to those
+     * regions has been recorded since. A changed sequence means downloaded
+     * bytes for the range may be stale and must not be written back or have
+     * their bits cleared. GPU command thread only, so the comparison cannot
+     * race the writers it guards against.
+     */
+    bool GpuWriteSeqMatches(VAddr cpu_addr, u64 size, const GpuSeqSnapshots& snap) {
+        bool matches = true;
+        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64, size_t) {
+            const auto it = std::ranges::find(snap, manager, &GpuSeqSnapshot::manager);
+            if (it == snap.end() || it->seq != manager->gpu_write_seq) {
+                matches = false;
+            }
+        });
+        return matches;
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         IteratePages<false>(
@@ -113,6 +155,12 @@ public:
                 if (skippable) {
                     if (is_written) {
                         skipped |= u64{1} << i;
+                        // The bits stay as they are, but this is still a new
+                        // GPU write to the region: the write sequence must
+                        // advance or a snapshot taken before this bind could
+                        // not tell that its downloaded bytes are now stale.
+                        // GPU-command-thread confined, like the counter.
+                        ++manager->gpu_write_seq;
                     }
                     return;
                 }

@@ -612,6 +612,12 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
+            const auto off = buffer_cache.DrainOffloadStats();
+            if (off.jobs || off.fallbacks) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} per300f",
+                         off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns));
+            }
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());

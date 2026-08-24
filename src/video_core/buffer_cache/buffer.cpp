@@ -125,6 +125,12 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 }
 
+void Buffer::InvalidateForRead(u64 offset, u64 num_bytes) {
+    if (!is_coherent) {
+        vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset, num_bytes);
+    }
+}
+
 void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
     scheduler->EndRendering();
     ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
