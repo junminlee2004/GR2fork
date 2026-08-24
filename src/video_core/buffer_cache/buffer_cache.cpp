@@ -519,17 +519,24 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE) {
         // Small read-only uploads dominate this function: the same (addr, size)
-        // binds repeat across draws within one command buffer. A hit whose
-        // mem_gen is unchanged proves no CPU write reached the emulator since
-        // the copy, so the previous stream offset still holds the bytes; a
-        // matching gpu epoch proves no range anywhere went GPU-dirty, so the
-        // range walk is skipped too. Unknowns fall to the fresh-copy path.
+        // binds repeat across draws within one command buffer, and each miss
+        // costs a full copy of the guest bytes into the ring.
+        //
+        // Reusing a previous copy is sound only while the guest cannot have
+        // written the source unobserved. An entry is therefore recorded only
+        // when the range is CPU-clean at copy time - clean implies the pages
+        // are still write-protected, so the next guest write must fault, and
+        // the fault moves the owning region's sequence counter. An unchanged
+        // counter then proves the bytes are unchanged. A range that is already
+        // CPU-dirty is unprotected and can be written silently, so it is never
+        // cached. The gpu epoch covers the other direction: a matching epoch
+        // proves nothing went GPU-dirty, so the range walk is skipped too.
         auto& skipcache = VideoCore::Skipcache::Framework::Instance();
         if (skipcache.Active()) {
             struct StreamCopyCacheEntry {
                 VAddr addr; // 0 = invalid
-                u64 tick;
-                u64 mem_gen;
+                u64 ring_wraps;
+                u32 region_seq;
                 u64 gpu_gen;
                 u32 offset;
                 u32 size;
@@ -554,16 +561,24 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             key ^= key >> 33;
             const size_t set_idx = key & (kSets - 1);
             auto& set = cache.sets[set_idx];
-            const u64 tick = scheduler.CurrentTick();
-            const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+            // The previous copy stays valid while the ring has not lapped past
+            // it and the guest has not written the source. Keying on the
+            // submission tick instead expired entries about ten times a frame,
+            // and on the global memory generation expired them on any guest
+            // write anywhere; both defeated the cache entirely.
+            const u64 ring_wraps = stream_buffer.Stats().wraps;
+            const u32 region_seq = memory_tracker->SingleRegionSeq(device_addr, size);
+            const bool cacheable = region_seq != 0 && !IsRegionCpuModified(device_addr, size);
 
             StreamCopyCacheEntry* hit = nullptr;
-            if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
-                set[0].mem_gen == mem_gen) {
-                hit = &set[0];
-            } else if (set[1].addr == device_addr && set[1].size == size && set[1].tick == tick &&
-                       set[1].mem_gen == mem_gen) {
-                hit = &set[1];
+            if (cacheable) {
+                if (set[0].addr == device_addr && set[0].size == size &&
+                    set[0].ring_wraps == ring_wraps && set[0].region_seq == region_seq) {
+                    hit = &set[0];
+                } else if (set[1].addr == device_addr && set[1].size == size &&
+                           set[1].ring_wraps == ring_wraps && set[1].region_seq == region_seq) {
+                    hit = &set[1];
+                }
             }
             if (hit) {
                 cache.lru[set_idx] = static_cast<u8>(hit == &set[0] ? 1u : 0u);
@@ -580,9 +595,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                     stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
                 const u8 victim = cache.lru[set_idx] & 1u;
                 set[victim] = StreamCopyCacheEntry{
-                    .addr = device_addr,
-                    .tick = tick,
-                    .mem_gen = mem_gen,
+                    .addr = cacheable ? device_addr : 0,
+                    .ring_wraps = ring_wraps,
+                    .region_seq = region_seq,
                     .gpu_gen = gpu_dirty_generation_,
                     .offset = static_cast<u32>(offset),
                     .size = size,
@@ -859,16 +874,19 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
     // Read-only binds dominate and almost never have anything to upload, but
-    // proving it walks every page of the range under the tracker lock. The
-    // walk's answer only changes when a page becomes CPU dirty, which only
-    // happens on paths that bump the host-memory generation, so an unchanged
-    // generation reproduces the previous empty result exactly. Written binds
-    // are excluded: their walk also marks the range GPU modified.
-    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
-    const bool memo_eligible = skipcache.Active() && !is_written && !is_texel_buffer;
-    const u64 memo_gen =
-        memo_eligible ? skipcache.Gens().mem_gen.load(std::memory_order_acquire) : 0;
-    if (memo_eligible && buffer.sync_noop_mem_gen == memo_gen &&
+    // proving it walks every page of the range. Recording that empty result is
+    // sound because an empty walk means the range held no CPU-dirty page, so
+    // its pages are still write-protected and the next guest write must fault;
+    // the fault moves the owning region's sequence counter. An unchanged
+    // counter therefore reproduces the previous empty result exactly. The
+    // counter is per-region rather than global on purpose: a global generation
+    // moves on a write to any address and expires the memo immediately.
+    // Written binds are excluded - their walk also marks the range GPU
+    // modified.
+    const bool memo_eligible =
+        VideoCore::Skipcache::Framework::Instance().Active() && !is_written && !is_texel_buffer;
+    const u32 memo_gen = memo_eligible ? memory_tracker->SingleRegionSeq(device_addr, size) : 0;
+    if (memo_gen != 0 && buffer.sync_noop_mem_gen == memo_gen &&
         buffer.sync_noop_addr == device_addr && buffer.sync_noop_size == size) {
         return false;
     }
@@ -924,9 +942,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
     }
-    if (memo_eligible && !src_buffer) {
+    if (memo_gen != 0 && !src_buffer) {
         // Nothing was uploaded: record so the next identical query skips the
-        // page walk entirely.
+        // page walk entirely until this region's bits change.
         buffer.sync_noop_addr = device_addr;
         buffer.sync_noop_size = size;
         buffer.sync_noop_mem_gen = memo_gen;
