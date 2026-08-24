@@ -201,10 +201,15 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
-        // Number of subresource_states entries differing from `state`. While
-        // the vector is alive `state` is frozen, so this is stable; when it
-        // is zero the vector is equivalent to empty and the scan collapses.
+        // Number of subresource_states entries whose layout or access differ
+        // from `state`, or that carry write access. While the vector is alive
+        // `state` is frozen, so this is stable; when it is zero every entry
+        // would no-op any matching-state scan and the vector is equivalent to
+        // empty. Stages are deliberately excluded (they do not affect the
+        // scan's skip condition); stage_union tracks them so a collapse can
+        // widen the source stage mask conservatively instead.
         u32 subres_divergent{};
+        vk::PipelineStageFlags2 subres_stage_union{};
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
