@@ -195,6 +195,32 @@ public:
         data.fill(~0ULL);
     }
 
+    /// Whether any bit in [start, end) is set, without materialising a masked
+    /// copy of the array. Equivalent to BitArray(*this, start, end).Any().
+    inline constexpr bool AnyInRange(size_t start, size_t end) const {
+        if (start >= end || end > N) {
+            return false;
+        }
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const size_t start_bit = start % BITS_PER_WORD;
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+        const u64 start_mask = ~((1ULL << start_bit) - 1);
+        const u64 end_mask = end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
+        if (first_word == last_word) {
+            return (data[first_word] & start_mask & end_mask) != 0;
+        }
+        if ((data[first_word] & start_mask) != 0) {
+            return true;
+        }
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            if (data[i] != 0) {
+                return true;
+            }
+        }
+        return (data[last_word] & end_mask) != 0;
+    }
+
     inline constexpr bool None() const {
         u64 result = 0;
         for (const auto& word : data) {

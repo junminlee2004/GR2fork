@@ -162,9 +162,10 @@ public:
             return false;
         }
 
-        const RegionBits& bits = GetRegionBits<type>();
-        RegionBits test(bits, start_page, end_page);
-        return test.Any();
+        // Ask the range directly: materialising a masked copy of the whole
+        // region's bits to answer a yes/no question was the single largest
+        // cost on the bind path.
+        return GetRegionBits<type>().AnyInRange(start_page, end_page);
     }
 
     /**
