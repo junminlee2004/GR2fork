@@ -519,11 +519,21 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE) {
         // Small read-only uploads dominate this function: the same (addr, size)
-        // binds repeat across draws within one command buffer. A hit whose
-        // mem_gen is unchanged proves no CPU write reached the emulator since
-        // the copy, so the previous stream offset still holds the bytes; a
-        // matching gpu epoch proves no range anywhere went GPU-dirty, so the
-        // range walk is skipped too. Unknowns fall to the fresh-copy path.
+        // binds repeat across draws within one command buffer, so a repeat bind
+        // can reuse the offset the previous copy landed at.
+        //
+        // The submission tick is load bearing, not merely a freshness hint. An
+        // unchanged memory generation does NOT prove the guest left the source
+        // alone: under precise readbacks a read fault can drop a page's
+        // protection without setting its CPU dirty bit, after which guest
+        // writes land unobserved. Keying on the tick keeps a reused offset
+        // confined to a single command buffer, which is what actually bounds
+        // the exposure. Widening that window corrupts vertex data.
+        //
+        // The table is deliberately small enough to stay resident in L1: it is
+        // probed on every call with a hashed index, so a large table turns each
+        // probe into a cache miss and evicts hot data for a lookup that rarely
+        // hits.
         auto& skipcache = VideoCore::Skipcache::Framework::Instance();
         if (skipcache.Active()) {
             struct StreamCopyCacheEntry {
@@ -534,7 +544,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 u32 offset;
                 u32 size;
             };
-            constexpr size_t kSets = 4096;
+            constexpr size_t kSets = 64;
             constexpr size_t kWays = 2;
             struct StreamCopyCache {
                 std::array<std::array<StreamCopyCacheEntry, kWays>, kSets> sets{};
