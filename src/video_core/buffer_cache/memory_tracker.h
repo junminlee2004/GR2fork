@@ -128,17 +128,17 @@ public:
             return;
         }
         u32 unlock_index = 0;
-        IteratePages<false>(query_cpu_range, query_size,
-                            [&skipped, &unlock_index](RegionManager* manager, u64 offset,
-                                                      size_t size) {
-                                const u32 i = unlock_index++;
-                                if (i < 64 && (skipped & (u64{1} << i)) != 0) {
-                                    return; // never locked in the first pass
-                                }
-                                manager->template ChangeRegionState<Type::GPU, true>(
-                                    manager->GetCpuAddr() + offset, size);
-                                manager->lock.unlock();
-                            });
+        IteratePages<false>(
+            query_cpu_range, query_size,
+            [&skipped, &unlock_index](RegionManager* manager, u64 offset, size_t size) {
+                const u32 i = unlock_index++;
+                if (i < 64 && (skipped & (u64{1} << i)) != 0) {
+                    return; // never locked in the first pass
+                }
+                manager->template ChangeRegionState<Type::GPU, true>(manager->GetCpuAddr() + offset,
+                                                                     size);
+                manager->lock.unlock();
+            });
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
@@ -153,6 +153,55 @@ public:
     }
 
 private:
+    /**
+     * Resolve a region index to its manager.
+     *
+     * top_tier spans the whole 40 bit guest address space at 4MB granularity,
+     * so it is a 2MB pointer array - larger than the L2 of the handheld parts
+     * this matters on. It is also sparse, so consecutive lookups for unrelated
+     * buffers land on unrelated lines and the load stalls; profiling put ~60%
+     * of SynchronizeBuffer on exactly that load. The live region set is tiny by
+     * comparison, so a small direct mapped memo of resolved indices keeps the
+     * working set in L1.
+     *
+     * This is exactly equivalent to indexing top_tier: a slot only ever goes
+     * from null to a manager and is never cleared or reassigned, so a resolved
+     * mapping stays true for the life of the process. Only non-null results are
+     * recorded, since a null means "not created yet" and can still change.
+     *
+     * Thread local because the tracker is also driven from the guest fault
+     * path; a shared table could tear a key against a neighbouring value and
+     * hand back the wrong manager.
+     */
+    [[nodiscard]] RegionManager* LookupRegion(std::size_t page_index) noexcept {
+        static constexpr std::size_t NUM_SLOTS = 128; // power of two
+        // Keys are stored biased by one so that a zeroed table reads as empty.
+        // That keeps the memo constant initialized, which lets the thread local
+        // be reached directly instead of through an initialization guard.
+        struct LookupMemo {
+            const MemoryTracker* owner;
+            std::array<std::size_t, NUM_SLOTS> keys;
+            std::array<RegionManager*, NUM_SLOTS> vals;
+        };
+        static thread_local LookupMemo memo{};
+        if (memo.owner != this) [[unlikely]] {
+            // Guards against a second tracker aliasing this thread's memo.
+            memo.owner = this;
+            memo.keys.fill(0);
+        }
+        const std::size_t key = page_index + 1;
+        const std::size_t slot = page_index & (NUM_SLOTS - 1);
+        if (memo.keys[slot] == key) {
+            return memo.vals[slot];
+        }
+        RegionManager* const manager = top_tier[page_index];
+        if (manager != nullptr) {
+            memo.keys[slot] = key;
+            memo.vals[slot] = manager;
+        }
+        return manager;
+    }
+
     /**
      * @brief IteratePages Iterates L2 word manager page table.
      * @param cpu_address Start byte cpu address
@@ -171,7 +220,7 @@ private:
         while (remaining_size > 0) {
             const std::size_t copy_amount{
                 std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
-            auto* manager{top_tier[page_index]};
+            auto* manager{LookupRegion(page_index)};
             if (manager) {
                 if constexpr (BOOL_BREAK) {
                     if (func(manager, page_offset, copy_amount)) {
@@ -182,7 +231,7 @@ private:
                 }
             } else if constexpr (create_region_on_fail) {
                 CreateRegion(page_index);
-                manager = top_tier[page_index];
+                manager = LookupRegion(page_index);
                 if constexpr (BOOL_BREAK) {
                     if (func(manager, page_offset, copy_amount)) {
                         return true;
