@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/rdtsc.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -188,7 +189,10 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         offset = Common::AlignUp(offset, alignment);
     }
 
+    ++ring_stats_.maps;
+    ring_stats_.bytes += size;
     if (offset + size > this->size_bytes) {
+        ++ring_stats_.wraps;
         // The buffer would overflow, save the amount of used watches and reset the state.
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
@@ -201,8 +205,17 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     const u64 mapped_upper_bound = offset + size;
-    if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
-        return {nullptr, 0};
+    {
+        // Measure only the blocking case: this is the stall that costs the GPU
+        // command thread whole milliseconds when the ring laps the GPU.
+        const bool may_block = invalidation_mark && mapped_upper_bound > wait_bound;
+        const u64 t0 = may_block ? Common::FencedRDTSC() : 0;
+        if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
+            return {nullptr, 0};
+        }
+        if (may_block) {
+            ring_stats_.blocked_ns += Common::FencedRDTSC() - t0;
+        }
     }
 
     return {mapped_data.data() + offset, offset};

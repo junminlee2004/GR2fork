@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "common/rdtsc.h"
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -588,8 +590,23 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    Skipcache::Framework::Instance().OnSubmit(DebugState.GetFrameNum(),
-                                              DebugState.IsGuestThreadsPaused());
+    auto& skipcache = Skipcache::Framework::Instance();
+    if (skipcache.Active()) {
+        // Ring pressure report: wraps are what block this thread, so surface
+        // them next to the cache accounting rather than in a separate channel.
+        static u64 last_report_frame = 0;
+        const u64 frame = DebugState.GetFrameNum();
+        if (frame - last_report_frame >= 300) {
+            last_report_frame = frame;
+            auto& st = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Stats();
+            const u64 hz = Common::EstimateRDTSCFrequency();
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] RING maps={} MiB={} wraps={} blocked_ms={} per300f", st.maps,
+                     st.bytes >> 20, st.wraps, hz ? st.blocked_ns * 1000 / hz : 0);
+            st = VideoCore::StreamBuffer::RingStats{};
+        }
+    }
+    skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();

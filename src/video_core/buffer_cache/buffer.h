@@ -185,6 +185,19 @@ public:
     /// Reserves a region of memory from the stream buffer.
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 
+    /// Ring statistics: wraps and nanoseconds spent blocked waiting for the GPU
+    /// to drain the previous lap, plus bytes handed out. Reported per window by
+    /// the skip cache framework; zero cost when it is inactive.
+    struct RingStats {
+        u64 wraps{};
+        u64 blocked_ns{};
+        u64 bytes{};
+        u64 maps{};
+    };
+    RingStats& Stats() {
+        return ring_stats_;
+    }
+
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
 
@@ -222,6 +235,7 @@ private:
     std::optional<size_t> invalidation_mark;
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
+    RingStats ring_stats_{};
     u64 wait_bound{};
 };
 
