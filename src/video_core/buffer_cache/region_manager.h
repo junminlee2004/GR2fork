@@ -195,6 +195,30 @@ public:
         return IsRegionModified<type>(offset, size);
     }
 
+    /// Lock-free counterpart of PeekRegionModified for full coverage.
+    template <Type type>
+    [[nodiscard]] bool PeekRegionFullySet(u64 offset, u64 size) noexcept {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return false;
+        }
+        for (u32 attempt = 0; attempt < 4; ++attempt) {
+            const u32 before = seq.load(std::memory_order_acquire);
+            if (before & 1u) {
+                continue;
+            }
+            const bool result = GetRegionBits<type>().AllInRange(start_page, end_page);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq.load(std::memory_order_relaxed) == before) {
+                return result;
+            }
+        }
+        std::scoped_lock lk{lock};
+        return GetRegionBits<type>().AllInRange(start_page, end_page);
+    }
+
     /// Scope guard marking a mutation of the tracked bits for readers.
     struct WriteScope {
         explicit WriteScope(RegionManager& m) : mgr{m} {

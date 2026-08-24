@@ -221,6 +221,32 @@ public:
         return (data[last_word] & end_mask) != 0;
     }
 
+    /// Whether every bit in [start, end) is set, without materialising a copy.
+    inline constexpr bool AllInRange(size_t start, size_t end) const {
+        if (start >= end || end > N) {
+            return false;
+        }
+        const size_t first_word = start / BITS_PER_WORD;
+        const size_t last_word = (end - 1) / BITS_PER_WORD;
+        const size_t start_bit = start % BITS_PER_WORD;
+        const size_t end_bit = (end - 1) % BITS_PER_WORD;
+        const u64 start_mask = ~((1ULL << start_bit) - 1);
+        const u64 end_mask = end_bit == BITS_PER_WORD - 1 ? ~0ULL : (1ULL << (end_bit + 1)) - 1;
+        if (first_word == last_word) {
+            const u64 mask = start_mask & end_mask;
+            return (data[first_word] & mask) == mask;
+        }
+        if ((data[first_word] & start_mask) != start_mask) {
+            return false;
+        }
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            if (data[i] != ~0ULL) {
+                return false;
+            }
+        }
+        return (data[last_word] & end_mask) == end_mask;
+    }
+
     inline constexpr bool None() const {
         u64 result = 0;
         for (const auto& word : data) {

@@ -89,30 +89,52 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
-        IteratePages<true>(query_cpu_range, query_size,
-                           [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
-                               // Read-only binds almost never have anything
-                               // to upload, and proving it under the lock is
-                               // the hottest contended site in the frame. The
-                               // peek answers it without one; the write path
-                               // still holds the lock for its GPU marking.
-                               if (!is_written &&
-                                   !manager->template PeekRegionModified<Type::CPU>(offset, size)) {
-                                   return;
-                               }
-                               manager->lock.lock();
-                               manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, func);
-                               if (!is_written) {
-                                   manager->lock.unlock();
-                               }
-                           });
+        // A written bind holds each region's lock from the upload walk until
+        // the GPU marking below, so a region skipped in the first pass must be
+        // skipped in the second. The skip set is recorded rather than
+        // recomputed: without the lock held the bits can change in between.
+        u64 skipped = 0;
+        u32 index = 0;
+        IteratePages<true>(
+            query_cpu_range, query_size,
+            [&func, is_written, &skipped, &index](RegionManager* manager, u64 offset, size_t size) {
+                // Read-only binds almost never have anything to upload, and
+                // proving it under the lock is the hottest contended site in
+                // the frame. Written binds can skip too when there is nothing
+                // to upload and the range is already marked, which also avoids
+                // re-applying its protection.
+                const u32 i = index++;
+                const bool nothing_to_upload =
+                    !manager->template PeekRegionModified<Type::CPU>(offset, size);
+                const bool skippable =
+                    nothing_to_upload &&
+                    (!is_written ||
+                     (i < 64 && manager->template PeekRegionFullySet<Type::GPU>(offset, size)));
+                if (skippable) {
+                    if (is_written) {
+                        skipped |= u64{1} << i;
+                    }
+                    return;
+                }
+                manager->lock.lock();
+                manager->template ForEachModifiedRange<Type::CPU, true>(
+                    manager->GetCpuAddr() + offset, size, func);
+                if (!is_written) {
+                    manager->lock.unlock();
+                }
+            });
         on_upload();
         if (!is_written) {
             return;
         }
+        u32 unlock_index = 0;
         IteratePages<false>(query_cpu_range, query_size,
-                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                            [&skipped, &unlock_index](RegionManager* manager, u64 offset,
+                                                      size_t size) {
+                                const u32 i = unlock_index++;
+                                if (i < 64 && (skipped & (u64{1} << i)) != 0) {
+                                    return; // never locked in the first pass
+                                }
                                 manager->template ChangeRegionState<Type::GPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                                 manager->lock.unlock();
