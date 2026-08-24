@@ -27,11 +27,12 @@ public:
     ~MemoryTracker() = default;
 
     /**
-     * Sequence counter of the single region containing [addr, addr+size), or
-     * zero when the range spans regions or is untracked. The counter changes
-     * only when that region's dirty bits change, so an unchanged value proves
-     * no guest write to the range was recorded since it was read - the signal
-     * a global generation cannot give, because any write anywhere moves it.
+     * CPU-write sequence counter of the single region containing
+     * [addr, addr+size), or zero when the range spans regions or is untracked.
+     * The counter changes only when that region's CPU dirty bits change, so an
+     * unchanged value proves no guest write to the range was recorded since it
+     * was read - the signal a global generation cannot give, because any write
+     * anywhere moves it.
      */
     [[nodiscard]] u32 SingleRegionSeq(VAddr addr, u64 size) noexcept {
         if (size == 0) {
@@ -47,7 +48,7 @@ public:
             return 0;
         }
         // Reserve zero as the "no answer" marker.
-        const u32 value = manager->seq.load(std::memory_order_acquire);
+        const u32 value = manager->cpu_seq.load(std::memory_order_acquire);
         return value == 0 ? 1 : value;
     }
 

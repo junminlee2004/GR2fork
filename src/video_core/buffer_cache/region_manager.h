@@ -90,6 +90,11 @@ public:
             return;
         }
 
+        if constexpr (type == Type::CPU) {
+            // Bumped before the bits move, so an observer that reads the same
+            // value twice can conclude no CPU bit changed in between.
+            cpu_seq.fetch_add(1, std::memory_order_acq_rel);
+        }
         WriteScope write_scope{*this};
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (enable) {
@@ -127,6 +132,9 @@ public:
         // conditionally keeps pure iteration off the writers' path.
         std::optional<WriteScope> write_scope;
         if constexpr (clear) {
+            if constexpr (type == Type::CPU) {
+                cpu_seq.fetch_add(1, std::memory_order_acq_rel);
+            }
             write_scope.emplace(*this);
         }
         RegionBits& bits = GetRegionBits<type>();
@@ -231,6 +239,10 @@ public:
     };
 
     std::atomic<u32> seq{0};
+    // Counts only CPU-bit mutations. Separate from the seqlock above because
+    // GPU-dirty marking runs on every written bind, and folding it in here
+    // would expire consumers that care solely about guest writes.
+    std::atomic<u32> cpu_seq{0};
     LockType lock;
 
 private:
