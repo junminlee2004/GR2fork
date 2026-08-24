@@ -26,6 +26,7 @@ MemoryManager::MemoryManager() {
                         VirtualMemoryArea{region.lower(), region.upper() - region.lower()});
         LOG_INFO(Kernel_Vmm, "{:#x} - {:#x}", region.lower(), region.upper());
     }
+    RefreshVmaBounds();
 
     // Pre-initialize direct backing
     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
@@ -1491,6 +1492,17 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
     return -1;
 }
 
+void MemoryManager::RefreshVmaBounds() {
+    if (vma_map.empty()) {
+        vma_span_begin = 0;
+        vma_span_end = 0;
+        return;
+    }
+    const auto last = std::prev(vma_map.end());
+    vma_span_begin = vma_map.begin()->first;
+    vma_span_end = last->first + last->second.size;
+}
+
 MemoryManager::VMAHandle MemoryManager::MergeAdjacent(VMAMap& handle_map, VMAHandle iter) {
     const auto next_vma = std::next(iter);
     if (next_vma != handle_map.end() && iter->second.CanMergeWith(next_vma->second)) {
@@ -1515,6 +1527,7 @@ MemoryManager::VMAHandle MemoryManager::MergeAdjacent(VMAMap& handle_map, VMAHan
         }
     }
 
+    RefreshVmaBounds();
     return iter;
 }
 
@@ -1630,7 +1643,9 @@ MemoryManager::VMAHandle MemoryManager::Split(VMAHandle vma_handle, u64 offset_i
         old_vma.phys_areas = old_vma_phys_areas;
     }
 
-    return vma_map.emplace_hint(std::next(vma_handle), new_vma.base, new_vma);
+    const auto inserted = vma_map.emplace_hint(std::next(vma_handle), new_vma.base, new_vma);
+    RefreshVmaBounds();
+    return inserted;
 }
 
 MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_handle,

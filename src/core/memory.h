@@ -198,11 +198,12 @@ public:
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
-        const auto end_it = std::prev(vma_map.end());
-        const VAddr end_addr = end_it->first + end_it->second.size;
-
-        // If the address fails boundary checks, return early.
-        if (virtual_addr < vma_map.begin()->first || virtual_addr >= end_addr) {
+        // Bounds come from cached scalars rather than from the map itself. The
+        // boundary test runs on every guest memory copy, and reaching it through
+        // the map costs two out of line red-black tree steps per call for a span
+        // that only changes when the map is mutated - which carving and merging
+        // never do, and which is refreshed anyway whenever the map changes.
+        if (virtual_addr < vma_span_begin || virtual_addr >= vma_span_end) {
             return false;
         }
 
@@ -313,6 +314,10 @@ private:
 
     VAddr SearchFree(VAddr virtual_addr, u64 size, u32 alignment);
 
+    /// Recompute the cached address span covered by vma_map. Called from every
+    /// site that can change the map's structure.
+    void RefreshVmaBounds();
+
     VMAHandle MergeAdjacent(VMAMap& map, VMAHandle iter);
 
     PhysHandle MergeAdjacent(PhysMap& map, PhysHandle iter);
@@ -334,6 +339,8 @@ private:
     PhysMap dmem_map;
     PhysMap fmem_map;
     VMAMap vma_map;
+    VAddr vma_span_begin{};
+    VAddr vma_span_end{};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};
