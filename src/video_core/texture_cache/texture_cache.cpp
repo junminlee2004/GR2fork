@@ -1140,8 +1140,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         }
         image_ids.erase(vector_it);
     });
-    if (const auto it = images_by_addr.find(image.info.guest_address);
-        it != images_by_addr.end()) {
+    if (const auto it = images_by_addr.find(image.info.guest_address); it != images_by_addr.end()) {
         auto& ids = it.value();
         if (const auto id_it = std::ranges::find(ids, image_id); id_it != ids.end()) {
             ids.erase(id_it);
