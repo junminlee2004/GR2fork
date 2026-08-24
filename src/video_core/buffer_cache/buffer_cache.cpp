@@ -850,6 +850,21 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
+    // Read-only binds dominate and almost never have anything to upload, but
+    // proving it walks every page of the range under the tracker lock. The
+    // walk's answer only changes when a page becomes CPU dirty, which only
+    // happens on paths that bump the host-memory generation, so an unchanged
+    // generation reproduces the previous empty result exactly. Written binds
+    // are excluded: their walk also marks the range GPU modified.
+    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+    const bool memo_eligible = skipcache.Active() && !is_written && !is_texel_buffer;
+    const u64 memo_gen =
+        memo_eligible ? skipcache.Gens().mem_gen.load(std::memory_order_acquire) : 0;
+    if (memo_eligible && buffer.sync_noop_mem_gen == memo_gen &&
+        buffer.sync_noop_addr == device_addr && buffer.sync_noop_size == size) {
+        return false;
+    }
+
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
@@ -900,6 +915,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
+    }
+    if (memo_eligible && !src_buffer) {
+        // Nothing was uploaded: record so the next identical query skips the
+        // page walk entirely.
+        buffer.sync_noop_addr = device_addr;
+        buffer.sync_noop_size = size;
+        buffer.sync_noop_mem_gen = memo_gen;
     }
     return false;
 }
