@@ -124,6 +124,12 @@ struct Image {
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
+    /// Records that the given query needed no barriers, valid until the
+    /// backing's state epoch changes.
+    void RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                           vk::PipelineStageFlags2 dst_stage,
+                           std::optional<SubresourceRange> subres_range);
+
     Barriers GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                          vk::PipelineStageFlags2 dst_stage,
                          std::optional<SubresourceRange> subres_range);
@@ -210,6 +216,19 @@ public:
         // widen the source stage mask conservatively instead.
         u32 subres_divergent{};
         vk::PipelineStageFlags2 subres_stage_union{};
+
+        // Negative-result memo for GetBarriers. Transitioning an image to a
+        // state it already holds is by far the common case (the same textures
+        // are re-bound every draw), but proving it costs a scan over every
+        // mip x layer. state_epoch changes whenever any tracked state does, so
+        // a memo recorded under the current epoch for the same query is exactly
+        // reproducible without the scan.
+        u64 state_epoch{1};
+        u64 noop_epoch{}; // 0 = no memo
+        vk::ImageLayout noop_layout{};
+        vk::AccessFlags2 noop_access{};
+        vk::PipelineStageFlags2 noop_stage{};
+        u64 noop_range{};
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;

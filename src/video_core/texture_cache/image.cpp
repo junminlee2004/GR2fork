@@ -219,6 +219,20 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
+void Image::RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                              vk::PipelineStageFlags2 dst_stage,
+                              std::optional<SubresourceRange> subres_range) {
+    backing->noop_epoch = backing->state_epoch;
+    backing->noop_layout = dst_layout;
+    backing->noop_access = dst_mask;
+    backing->noop_stage = dst_stage;
+    backing->noop_range =
+        subres_range
+            ? (u64{subres_range->base.level} | (u64{subres_range->base.layer} << 16) |
+               (u64{subres_range->extent.levels} << 32) | (u64{subres_range->extent.layers} << 48))
+            : ~u64{0};
+}
+
 Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                                    vk::PipelineStageFlags2 dst_stage,
                                    std::optional<SubresourceRange> subres_range) {
@@ -242,15 +256,30 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
         last_state.pl_stage |= backing->subres_stage_union;
         subresource_states.clear();
         backing->subres_stage_union = {};
+        ++backing->state_epoch;
         partially_transited = false;
     }
     // A partial transition into the state the whole image is already in would
     // materialize the vector only to fill it with identical values.
-    if (needs_partial_transition && !partially_transited &&
-        last_state.layout == dst_layout && last_state.access_mask == dst_mask &&
-        !(last_state.access_mask & uniform_write_flags)) {
+    if (needs_partial_transition && !partially_transited && last_state.layout == dst_layout &&
+        last_state.access_mask == dst_mask && !(last_state.access_mask & uniform_write_flags)) {
+        RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
         return {};
     }
+
+    // Memo probe: an identical query under an unchanged state epoch produced no
+    // barriers, and reproducing that answer costs a full subresource scan.
+    const u64 range_key =
+        subres_range
+            ? (u64{subres_range->base.level} | (u64{subres_range->base.layer} << 16) |
+               (u64{subres_range->extent.levels} << 32) | (u64{subres_range->extent.layers} << 48))
+            : ~u64{0};
+    if (backing->noop_epoch == backing->state_epoch && backing->noop_layout == dst_layout &&
+        backing->noop_access == dst_mask && backing->noop_stage == dst_stage &&
+        backing->noop_range == range_key) {
+        return {};
+    }
+    const bool had_subres = !subresource_states.empty();
 
     Barriers barriers;
     if (needs_partial_transition || partially_transited) {
@@ -323,6 +352,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
+                    ++backing->state_epoch;
                     Skipcache::Framework::Instance().BumpLayoutGen();
                 }
             }
@@ -338,6 +368,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
             subresource_states.clear();
             backing->subres_divergent = 0;
             backing->subres_stage_union = {};
+            ++backing->state_epoch;
         }
     } else { // Full resource transition
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
@@ -345,6 +376,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
                                      vk::AccessFlagBits2::eMemoryWrite;
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+            RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
             return {};
         }
 
@@ -368,6 +400,16 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
         });
     }
 
+    if (barriers.empty() && had_subres == !subresource_states.empty()) {
+        // No work was needed and the structure is as it was: the answer is
+        // reproducible until the state epoch moves.
+        RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
+        return barriers;
+    }
+    if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
+        last_state.pl_stage != dst_stage) {
+        ++backing->state_epoch;
+    }
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     Skipcache::Framework::Instance().BumpLayoutGen();
@@ -907,6 +949,9 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
         // Update current layout in tracker to new backings layout
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
+        // A reused backing keeps its old barrier memo; the state just changed
+        // underneath it.
+        ++new_backing->state_epoch;
         Skipcache::Framework::Instance().BumpLayoutGen();
         new_backing->state.pl_stage = dst_stage;
     }
