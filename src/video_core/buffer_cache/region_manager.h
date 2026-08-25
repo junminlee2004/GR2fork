@@ -99,8 +99,21 @@ public:
             // snapshotted.
             ++gpu_write_seq;
         }
-        WriteScope write_scope{*this};
         RegionBits& bits = GetRegionBits<type>();
+        // A range already in the target state makes the write below an
+        // identity: the bits cannot change, so the protection masks derived
+        // from them cannot change either. Skipping it also leaves the sequence
+        // count stable for concurrent lock-free readers.
+        if constexpr (enable) {
+            if (bits.AllInRange(start_page, end_page)) {
+                return;
+            }
+        } else {
+            if (!bits.AnyInRange(start_page, end_page)) {
+                return;
+            }
+        }
+        WriteScope write_scope{*this};
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
         } else {
