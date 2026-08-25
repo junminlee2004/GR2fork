@@ -356,6 +356,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
+                // DB_COUNT_CONTROL is context register 1; a non-zero write turns
+                // the ZPASS counter on, which only a title using occlusion does.
+                if (set_data->reg_offset == 1 && count > 1 && payload[0] != 0) {
+                    ++packet_stats.db_count_control;
+                }
 
                 gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
 
@@ -749,8 +754,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // immediately
                     regs.cp_strmout_cntl.offset_update_done = 1;
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+                    ++packet_stats.zpass_any;
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        ++packet_stats.occlusion_events;
+                        ++packet_stats.zpass_dump;
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
@@ -764,6 +770,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                if (event_eos->event_index.Value() == static_cast<u32>(EventIndex::ZpassDone)) {
+                    ++packet_stats.zpass_eop_eos;
+                }
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
@@ -785,6 +794,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                if (event_eop->event_index.Value() == static_cast<u32>(EventIndex::ZpassDone)) {
+                    ++packet_stats.zpass_eop_eos;
+                }
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
@@ -1233,7 +1245,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            // Not parsed on this queue, so anything routed here is dropped. Tally
+            // it: a non-zero count means occlusion traffic exists that the
+            // graphics-queue accounting above cannot see.
+            ++packet_stats.acb_event_write;
             break;
         }
         default:

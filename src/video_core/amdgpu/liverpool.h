@@ -161,8 +161,17 @@ public:
         u64 draws;            // graphics draws submitted by the guest
         u64 predicated_draws; // ... of which carry the predicate header bit
         u64 dispatches;       // compute dispatches
-        u64 occlusion_events; // ZpassDone events answered with a fake count
         u64 set_predication;  // SET_PREDICATION packets (currently ignored)
+        // Occlusion accounting, split by path. A query is a PAIR of ZpassDone
+        // events - one latches the counter, one dumps it - so counting only the
+        // dump subtype undercounts, and events routed to other packets or to
+        // the compute queue were previously not seen at all. Each path is
+        // tallied separately so that a zero can actually be trusted.
+        u64 zpass_any;        // any ZpassDone-indexed event, any subtype
+        u64 zpass_dump;       // ... of which are PixelPipeStatDump (answered)
+        u64 zpass_eop_eos;    // ZpassDone carried on EventWriteEop/Eos
+        u64 acb_event_write;  // EventWrite on the compute queue - dropped today
+        u64 db_count_control; // writes enabling the ZPASS counter
     };
     PacketStats packet_stats{};
 
