@@ -262,9 +262,11 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         vetoed_any = true;
         // The newer write's own bind restored the range set for its span; put
         // back only what is still marked and uncovered, so the tracker bits
-        // and the range set stay in lockstep.
+        // and the range set stay in lockstep. New dirty coverage expires the
+        // GPU-clean epoch, per the protocol at every other Add site.
         if (memory_tracker->IsRegionGpuModified(copy_device_addr, copy.size) &&
             !gpu_modified_ranges.Contains(copy_device_addr, copy.size)) {
+            ++gpu_dirty_generation_;
             gpu_modified_ranges.Add(copy_device_addr, copy.size);
         }
     }
@@ -509,14 +511,10 @@ void BufferCache::BindVertexBuffers(
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        // Resolved once and reused: ObtainBuffer would otherwise walk the same
-        // range, and the barrier decision below would walk it a second time.
-        const bool gpu_modified = IsRegionGpuModified(range.base_address, size);
-        const auto [buffer, offset] =
-            ObtainBuffer(range.base_address, size, false, false, {}, gpu_modified);
+        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        if (gpu_modified) {
+        if (IsRegionGpuModified(range.base_address, size)) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -572,10 +570,6 @@ void BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    // Resolved once for the whole function. The memo check below, the acquire
-    // and the barrier decision all ask the same question about the same range;
-    // answering it is a chain of dependent loads, so it is asked once.
-    const bool index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         const u64 tick = scheduler.CurrentTick();
@@ -583,7 +577,8 @@ void BufferCache::BindIndexBuffer(
         if (index_bind_valid_ && index_bind_addr_ == index_address &&
             index_bind_size_ == index_buffer_size &&
             index_bind_type_ == static_cast<u32>(index_type) && index_bind_tick_ == tick &&
-            index_bind_mem_gen_ == mem_gen && !index_gpu_modified) {
+            index_bind_mem_gen_ == mem_gen &&
+            !IsRegionGpuModified(index_address, index_buffer_size)) {
             // Same resolved index range already bound on this command buffer,
             // no intervening CPU write, and no GPU write requiring a barrier.
             return;
@@ -597,9 +592,8 @@ void BufferCache::BindIndexBuffer(
     } else {
         index_bind_valid_ = false;
     }
-    const auto [vk_buffer, offset] =
-        ObtainBuffer(index_address, index_buffer_size, false, false, {}, index_gpu_modified);
-    if (index_gpu_modified) {
+    const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
+    if (IsRegionGpuModified(index_address, index_buffer_size)) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -658,6 +652,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
         if (!gpu_modified_ranges.Contains(dst, num_bytes)) {
+            ++gpu_dirty_generation_;
             gpu_modified_ranges.Add(dst, num_bytes);
         }
         return buffer;
@@ -723,13 +718,93 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
-                                                  bool is_texel_buffer, BufferId buffer_id,
-                                                  std::optional<bool> gpu_modified) {
+                                                  bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE) {
-        const bool is_gpu_modified =
-            gpu_modified.has_value() ? *gpu_modified : IsRegionGpuModified(device_addr, size);
-        if (!is_gpu_modified) {
+        // Small read-only uploads dominate this function: the same (addr, size)
+        // binds repeat across draws within one command buffer, so a repeat bind
+        // can reuse the offset the previous copy landed at.
+        //
+        // The submission tick is load bearing, not merely a freshness hint. An
+        // unchanged memory generation does NOT prove the guest left the source
+        // alone: under precise readbacks a read fault can drop a page's
+        // protection without setting its CPU dirty bit, after which guest
+        // writes land unobserved. Keying on the tick keeps a reused offset
+        // confined to a single command buffer, which is what actually bounds
+        // the exposure. Widening that window corrupts vertex data.
+        //
+        // The table is deliberately small enough to stay resident in L1: it is
+        // probed on every call with a hashed index, so a large table turns each
+        // probe into a cache miss and evicts hot data for a lookup that rarely
+        // hits.
+        auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+        if (skipcache.Active()) {
+            struct StreamCopyCacheEntry {
+                VAddr addr; // 0 = invalid
+                u64 tick;
+                u64 mem_gen;
+                u64 gpu_gen;
+                u32 offset;
+                u32 size;
+            };
+            constexpr size_t kSets = 64;
+            constexpr size_t kWays = 2;
+            struct StreamCopyCache {
+                std::array<std::array<StreamCopyCacheEntry, kWays>, kSets> sets{};
+                std::array<u8, kSets> lru{};
+            };
+            // Heap-backed: only the pointer lives in TLS (a large in-TLS array
+            // blows the guest pthread TLS budget at create time).
+            static thread_local std::unique_ptr<StreamCopyCache> storage;
+            if (!storage) {
+                storage = std::make_unique<StreamCopyCache>();
+            }
+            auto& cache = *storage;
+            u64 key = static_cast<u64>(device_addr);
+            key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
+            key ^= key >> 33;
+            key *= 0xff51afd7ed558ccdULL;
+            key ^= key >> 33;
+            const size_t set_idx = key & (kSets - 1);
+            auto& set = cache.sets[set_idx];
+            const u64 tick = scheduler.CurrentTick();
+            const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+
+            StreamCopyCacheEntry* hit = nullptr;
+            if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
+                set[0].mem_gen == mem_gen) {
+                hit = &set[0];
+            } else if (set[1].addr == device_addr && set[1].size == size && set[1].tick == tick &&
+                       set[1].mem_gen == mem_gen) {
+                hit = &set[1];
+            }
+            if (hit) {
+                cache.lru[set_idx] = static_cast<u8>(hit == &set[0] ? 1u : 0u);
+                if (hit->gpu_gen == gpu_dirty_generation_) {
+                    return {&stream_buffer, hit->offset};
+                }
+                if (!IsRegionGpuModified(device_addr, size)) {
+                    hit->gpu_gen = gpu_dirty_generation_;
+                    return {&stream_buffer, hit->offset};
+                }
+                hit->addr = 0; // went GPU-dirty: no longer stream-eligible
+            } else if (!IsRegionGpuModified(device_addr, size)) {
+                const u64 offset =
+                    stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+                const u8 victim = cache.lru[set_idx] & 1u;
+                set[victim] = StreamCopyCacheEntry{
+                    .addr = device_addr,
+                    .tick = tick,
+                    .mem_gen = mem_gen,
+                    .gpu_gen = gpu_dirty_generation_,
+                    .offset = static_cast<u32>(offset),
+                    .size = size,
+                };
+                cache.lru[set_idx] = static_cast<u8>(victim ^ 1u);
+                return {&stream_buffer, static_cast<u32>(offset)};
+            }
+            // GPU-modified: fall through to the slot path below.
+        } else if (!IsRegionGpuModified(device_addr, size)) {
             const u64 offset =
                 stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
             return {&stream_buffer, offset};
@@ -741,8 +816,11 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
-        // Skip the no-op interval merge when the range is already covered.
+        // Bump the GPU-clean epoch only on new coverage; steady-state
+        // re-writes of the same ranges skip both the bump and the no-op
+        // interval merge.
         if (!gpu_modified_ranges.Contains(device_addr, size)) {
+            ++gpu_dirty_generation_;
             gpu_modified_ranges.Add(device_addr, size);
         }
     }
