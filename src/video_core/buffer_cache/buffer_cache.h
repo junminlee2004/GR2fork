@@ -128,6 +128,17 @@ public:
                 offload_wait_ns_.exchange(0, std::memory_order_relaxed)};
     }
 
+    struct StreamCopyStats {
+        u64 hits;
+        u64 probes;
+    };
+
+    /// Snapshot and reset the stream copy cache counters (for periodic logs).
+    StreamCopyStats DrainStreamCopyStats() {
+        return {stream_copy_hits_.exchange(0, std::memory_order_relaxed),
+                stream_copy_probes_.exchange(0, std::memory_order_relaxed)};
+    }
+
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
@@ -302,6 +313,9 @@ private:
     std::atomic<u64> offload_vetoes_{};
     std::atomic<u64> offload_fallbacks_{};
     std::atomic<u64> offload_wait_ns_{};
+    // Stream copy cache counters; hits count probes that return a cached offset.
+    std::atomic<u64> stream_copy_hits_{};
+    std::atomic<u64> stream_copy_probes_{};
 };
 
 } // namespace VideoCore

@@ -636,6 +636,11 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} per300f",
                          off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns));
             }
+            const auto sc = buffer_cache.DrainStreamCopyStats();
+            if (sc.probes) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] STREAMCOPY hits={} probes={} per300f",
+                         sc.hits, sc.probes);
+            }
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());
