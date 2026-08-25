@@ -602,10 +602,9 @@ void Rasterizer::OnSubmit() {
             last_packet_frame = frame;
             auto& pk = liverpool->packet_stats;
             LOG_INFO(Render,
-                     "PACKETS draws={} predicated={} dispatch={} setpred={} | zpass any={} "
-                     "dump={} eop_eos={} acb_ev={} dbcount={} per300f",
-                     pk.draws, pk.predicated_draws, pk.dispatches, pk.set_predication, pk.zpass_any,
-                     pk.zpass_dump, pk.zpass_eop_eos, pk.acb_event_write, pk.db_count_control);
+                     "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} per300f",
+                     pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
+                     pk.set_predication);
             pk = {};
         }
     }
