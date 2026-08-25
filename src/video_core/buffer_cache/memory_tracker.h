@@ -131,6 +131,52 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
+        // Nearly every bind is a few hundred bytes and lands inside a single
+        // 4MB region. Resolving the manager once up front runs both passes on
+        // it directly, without the second memo probe and the per-region
+        // index and skip-set bookkeeping the generic walk below needs.
+        const std::size_t first_page = query_cpu_range >> TRACKER_HIGHER_PAGE_BITS;
+        if (query_size != 0 && first_page == ((query_cpu_range + query_size - 1) >>
+                                              TRACKER_HIGHER_PAGE_BITS)) [[likely]] {
+            RENDERER_TRACE;
+            RegionManager* manager = LookupRegion(first_page);
+            if (manager == nullptr) [[unlikely]] {
+                CreateRegion(first_page);
+                manager = LookupRegion(first_page);
+            }
+            const u64 offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
+            const bool nothing_to_upload =
+                !manager->template PeekRegionModified<Type::CPU>(offset, query_size);
+            const bool skippable = nothing_to_upload &&
+                                   (!is_written || manager->template PeekRegionFullySet<Type::GPU>(
+                                                       offset, query_size));
+            if (skippable) {
+                if (is_written) {
+                    // The bits stay as they are, but this is still a new GPU
+                    // write to the region: the write sequence must advance or
+                    // a snapshot taken before this bind could not tell that
+                    // its downloaded bytes are now stale.
+                    ++manager->gpu_write_seq;
+                }
+                on_upload();
+                return;
+            }
+            manager->lock.lock();
+            manager->template ForEachModifiedRange<Type::CPU, true>(manager->GetCpuAddr() + offset,
+                                                                    query_size, func);
+            if (!is_written) {
+                manager->lock.unlock();
+                on_upload();
+                return;
+            }
+            // A written bind holds the lock from the upload walk until the
+            // GPU marking below, so the marking observes the bits it covers.
+            on_upload();
+            manager->template ChangeRegionState<Type::GPU, true>(manager->GetCpuAddr() + offset,
+                                                                 query_size);
+            manager->lock.unlock();
+            return;
+        }
         // A written bind holds each region's lock from the upload walk until
         // the GPU marking below, so a region skipped in the first pass must be
         // skipped in the second. The skip set is recorded rather than
@@ -225,27 +271,37 @@ private:
         static constexpr std::size_t NUM_SLOTS = 128; // power of two
         // Keys are stored biased by one so that a zeroed table reads as empty.
         // That keeps the memo constant initialized, which lets the thread local
-        // be reached directly instead of through an initialization guard.
+        // be reached directly instead of through an initialization guard;
+        // constinit turns a regression of that property into a compile error.
+        // A slot carries its key and value together, 16 byte aligned, so a
+        // probe touches exactly one cache line.
+        struct alignas(16) LookupSlot {
+            std::size_t key;
+            RegionManager* val;
+        };
+        static_assert(sizeof(LookupSlot) == 16 && alignof(LookupSlot) == 16,
+                      "a slot must fit one cache line");
         struct LookupMemo {
             const MemoryTracker* owner;
-            std::array<std::size_t, NUM_SLOTS> keys;
-            std::array<RegionManager*, NUM_SLOTS> vals;
+            std::array<LookupSlot, NUM_SLOTS> slots;
         };
-        static thread_local LookupMemo memo{};
+        static thread_local constinit LookupMemo memo{};
         if (memo.owner != this) [[unlikely]] {
             // Guards against a second tracker aliasing this thread's memo.
             memo.owner = this;
-            memo.keys.fill(0);
+            for (LookupSlot& reset_slot : memo.slots) {
+                reset_slot.key = 0;
+            }
         }
         const std::size_t key = page_index + 1;
-        const std::size_t slot = page_index & (NUM_SLOTS - 1);
-        if (memo.keys[slot] == key) {
-            return memo.vals[slot];
+        LookupSlot& slot = memo.slots[page_index & (NUM_SLOTS - 1)];
+        if (slot.key == key) {
+            return slot.val;
         }
         RegionManager* const manager = top_tier[page_index];
         if (manager != nullptr) {
-            memo.keys[slot] = key;
-            memo.vals[slot] = manager;
+            slot.key = key;
+            slot.val = manager;
         }
         return manager;
     }
