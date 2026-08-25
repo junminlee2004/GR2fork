@@ -1113,6 +1113,18 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     }
 }
 
+// Guest upload sources are written by game threads on other cores and read
+// exactly once by the staging copy, so their lines are cold. Requesting the
+// head of an island early overlaps the DRAM latency with the tracker walk,
+// staging map, and barrier setup. Prefetch never faults, so watched or
+// unmapped pages in sparse ranges are safe to request.
+static void PrefetchGuestSource(VAddr device_addr, u64 size) {
+    constexpr u64 prefetch_bytes = 1024;
+    for (u64 i = 0; i < std::min<u64>(size, prefetch_bytes); i += 64) {
+        __builtin_prefetch(reinterpret_cast<const void*>(device_addr + i), 0, 3);
+    }
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
     // Read-only binds dominate and almost never have anything to upload, but
@@ -1137,6 +1149,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
+            PrefetchGuestSource(device_addr_out, range_size);
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
@@ -1198,7 +1211,14 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     }
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
     if (staging) {
-        for (auto& copy : copies) {
+        for (size_t i = 0; i < copies.size(); ++i) {
+            auto& copy = copies[i];
+            // Requesting the next island's source overlaps its misses with this
+            // island's copy. Walk-time prefetches of early islands may already
+            // be evicted on large multi-island syncs, so this repeat is kept.
+            if (i + 1 < copies.size()) {
+                PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
+            }
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
@@ -1214,7 +1234,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
                                      vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
         const vk::Buffer src_buffer = temp_buffer->Handle();
         u8* const staging = temp_buffer->mapped_data.data();
-        for (const auto& copy : copies) {
+        for (size_t i = 0; i < copies.size(); ++i) {
+            const auto& copy = copies[i];
+            if (i + 1 < copies.size()) {
+                PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
+            }
             u8* const src_pointer = staging + copy.srcOffset;
             const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
             memory->CopySparseMemory(device_addr, src_pointer, copy.size);
