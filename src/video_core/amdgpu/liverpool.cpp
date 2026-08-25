@@ -114,6 +114,28 @@ void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
 
+    // This thread translates every guest draw into Vulkan and is the measured
+    // bottleneck, yet by default it floats onto whatever logical CPU the OS
+    // picks - routinely an SMT sibling of a saturated guest core. PS4 firmware
+    // reserves logical core 7, and well-behaved titles confine themselves to
+    // cores 0..6, so on most hosts there is a physical core no guest thread
+    // wants. Claim it, then narrow every other thread out of it so the pin is
+    // real exclusion rather than a preference the scheduler may ignore.
+    //
+    // GetReservedCoreMask returns 0 on hosts too small to give a core away
+    // (under 8 logical CPUs), in which case nothing happens and scheduling is
+    // left to the OS. Every step is best-effort: a failed syscall is logged
+    // and execution continues.
+    if (const u64 mask = Common::GetReservedCoreMask()) {
+        Common::SetCurrentThreadAffinityMask(mask);
+        Common::ExcludeReservedCoresFromAllOtherThreads();
+        // Linux propagates affinity through pthread_create, but Windows does
+        // not: threads the game spawns later arrive with the full host mask
+        // and can land on the reserved core. The re-walk catches them. Cheap
+        // and idempotent, so it is started unconditionally.
+        Common::StartPeriodicAffinityRewalk();
+    }
+
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
