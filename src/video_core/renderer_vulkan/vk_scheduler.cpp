@@ -133,11 +133,18 @@ void Scheduler::Wait(u64 tick) {
 }
 
 void Scheduler::PopPendingOperations() {
+    // Callers poll at draw rate and the queue is empty in steady state; the
+    // count gate spares those polls the lock and the semaphore query ioctl.
+    // Waiters needing a fresher tick refresh on their own miss paths.
+    if (pending_ops_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::unique_lock lk(pending_ops_mutex);
     master_semaphore.Refresh();
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
+        pending_ops_count.fetch_sub(1, std::memory_order_release);
     }
 }
 

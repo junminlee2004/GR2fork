@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <condition_variable>
 #include <mutex>
@@ -447,6 +448,7 @@ public:
     void DeferOperation(Common::UniqueFunction<void>&& func) {
         std::unique_lock lk(pending_ops_mutex);
         pending_ops.emplace(std::move(func), CurrentTick());
+        pending_ops_count.fetch_add(1, std::memory_order_release);
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -481,6 +483,7 @@ private:
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
+    std::atomic<u64> pending_ops_count{};
     std::recursive_mutex pending_ops_mutex;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
