@@ -149,6 +149,23 @@ public:
     };
     Common::SlotVector<AscQueueInfo> asc_queues{};
 
+    /**
+     * Purely diagnostic census of the packets the guest submits, reported
+     * periodically and then reset. Answers whether this title drives the
+     * occlusion path at all - shadPS4 answers every occlusion query with a
+     * large "visible" count and ignores SET_PREDICATION, so a title that
+     * culls from query results would be submitting draws it means to skip.
+     * GPU-parser-thread confined, like the counters above.
+     */
+    struct PacketStats {
+        u64 draws;            // graphics draws submitted by the guest
+        u64 predicated_draws; // ... of which carry the predicate header bit
+        u64 dispatches;       // compute dispatches
+        u64 occlusion_events; // ZpassDone events answered with a fake count
+        u64 set_predication;  // SET_PREDICATION packets (currently ignored)
+    };
+    PacketStats packet_stats{};
+
 private:
     struct Task {
         struct promise_type {

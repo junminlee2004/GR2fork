@@ -612,6 +612,13 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
+            auto& pk = liverpool->packet_stats;
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] PACKETS draws={} predicated={} dispatch={} occl={} setpred={} "
+                     "per300f",
+                     pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
+                     pk.set_predication);
+            pk = {};
             const auto off = buffer_cache.DrainOffloadStats();
             if (off.jobs || off.fallbacks) {
                 LOG_INFO(Render_Skipcache,

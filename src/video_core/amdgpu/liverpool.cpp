@@ -276,6 +276,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             switch (opcode) {
+            case PM4ItOpcode::DrawIndex2:
+            case PM4ItOpcode::DrawIndexOffset2:
+            case PM4ItOpcode::DrawIndexAuto:
+            case PM4ItOpcode::DrawIndirect:
+            case PM4ItOpcode::DrawIndirectMulti:
+            case PM4ItOpcode::DrawIndexIndirect:
+            case PM4ItOpcode::DrawIndexIndirectMulti:
+            case PM4ItOpcode::DrawIndexIndirectCountMulti:
+                ++packet_stats.draws;
+                if (header->type3.predicate.Value() == PM4Predicate::PredEnable) {
+                    ++packet_stats.predicated_draws;
+                }
+                break;
+            default:
+                break;
+            }
+            switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
                 if (nop->header.count.Value() == 0) {
@@ -447,6 +464,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
+                ++packet_stats.set_predication;
                 LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
                 break;
             }
@@ -650,6 +668,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
+                ++packet_stats.dispatches;
                 gfx_stamp.FlushAtDraw();
                 const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
                 auto& cs_program = GetCsRegs();
@@ -731,6 +750,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     regs.cp_strmout_cntl.offset_update_done = 1;
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                        ++packet_stats.occlusion_events;
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
