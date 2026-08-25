@@ -210,15 +210,14 @@ public:
         if (first_word == last_word) {
             return (data[first_word] & start_mask & end_mask) != 0;
         }
-        if ((data[first_word] & start_mask) != 0) {
-            return true;
-        }
+        // Accumulate rather than exit early: without the data-dependent branch
+        // the compiler vectorises the scan, which beats a word-at-a-time loop
+        // on arrays this size even when a hit sits in the first word.
+        u64 result = (data[first_word] & start_mask) | (data[last_word] & end_mask);
         for (size_t i = first_word + 1; i < last_word; ++i) {
-            if (data[i] != 0) {
-                return true;
-            }
+            result |= data[i];
         }
-        return (data[last_word] & end_mask) != 0;
+        return result != 0;
     }
 
     /// Whether every bit in [start, end) is set, without materialising a copy.
@@ -236,15 +235,13 @@ public:
             const u64 mask = start_mask & end_mask;
             return (data[first_word] & mask) == mask;
         }
-        if ((data[first_word] & start_mask) != start_mask) {
-            return false;
-        }
+        // Mirrors AnyInRange's branchless reduction; bits outside the range are
+        // forced set so one full-word comparison decides the whole span.
+        u64 result = (data[first_word] | ~start_mask) & (data[last_word] | ~end_mask);
         for (size_t i = first_word + 1; i < last_word; ++i) {
-            if (data[i] != ~0ULL) {
-                return false;
-            }
+            result &= data[i];
         }
-        return (data[last_word] & end_mask) == end_mask;
+        return result == ~0ULL;
     }
 
     inline constexpr bool None() const {
