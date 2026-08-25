@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -154,9 +155,19 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
 
     /// Obtains a buffer for the specified region.
+    ///
+    /// `gpu_modified` lets a caller that already knows whether the range is GPU
+    /// modified hand that answer in rather than have it recomputed. Resolving it
+    /// is a chain of dependent loads - a 2 MiB pointer table, then the region
+    /// object, then its bitmap - which the out-of-order engine cannot overlap
+    /// and the prefetcher cannot predict, so paying for it twice on the same
+    /// range is worth avoiding. Only valid for read-only queries: a written bind
+    /// marks the range GPU modified as a side effect, so a value sampled
+    /// beforehand would be stale by the time it is used.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
-                                                       BufferId buffer_id = {});
+                                                       BufferId buffer_id = {},
+                                                       std::optional<bool> gpu_modified = {});
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
