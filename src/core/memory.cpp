@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -150,7 +152,42 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
+    // Resolving the area costs a red-black tree descent, and the GPU command
+    // thread copies guest memory thousands of times per frame - enough that the
+    // pointer chasing outweighs both the lock and the copy itself. Remembering
+    // recently resolved areas turns that descent into a couple of compares.
+    //
+    // Caching is safe here precisely because this runs under the shared lock:
+    // the map can only change under the exclusive lock, which cannot be held
+    // while any reader is, so a generation captured inside this scope cannot go
+    // stale before the scope ends. Entries are thread local, so concurrent
+    // readers never share one. Only fully-mapped areas are recorded, since a
+    // sparse hole still needs the zero-filling walk below.
+    struct MappedAreaMemo {
+        u64 generation;
+        VAddr base;
+        VAddr end;
+    };
+    static constexpr size_t NumMemoEntries = 4;
+    static thread_local std::array<MappedAreaMemo, NumMemoEntries> memo{};
+    static thread_local size_t memo_next = 0;
+
+    for (const auto& entry : memo) {
+        if (entry.generation == vma_generation && virtual_addr >= entry.base &&
+            virtual_addr + size <= entry.end) {
+            std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), size);
+            return;
+        }
+    }
+
     auto vma = FindVMA(virtual_addr);
+    if (vma->second.IsMapped()) {
+        const VAddr area_end = vma->first + vma->second.size;
+        if (virtual_addr + size <= area_end) {
+            memo[memo_next] = MappedAreaMemo{vma_generation, vma->first, area_end};
+            memo_next = (memo_next + 1) % NumMemoEntries;
+        }
+    }
     while (size) {
         u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
         if (vma->second.IsMapped()) {
@@ -1493,6 +1530,8 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
 }
 
 void MemoryManager::RefreshVmaBounds() {
+    // Any structural change to the map invalidates every cached lookup.
+    ++vma_generation;
     if (vma_map.empty()) {
         vma_span_begin = 0;
         vma_span_end = 0;
@@ -1551,6 +1590,11 @@ MemoryManager::PhysHandle MemoryManager::MergeAdjacent(PhysMap& handle_map, Phys
 }
 
 MemoryManager::VMAHandle MemoryManager::CarveVMA(VAddr virtual_addr, u64 size) {
+    // Every caller carves in order to change an area's type or protection, and
+    // the whole-area case below returns without splitting, so bumping here
+    // rather than only in Split/MergeAdjacent is what makes "the generation
+    // moved" mean "no area's extent or mapped state survived unchanged".
+    ++vma_generation;
     auto vma_handle = FindVMA(virtual_addr);
 
     const VirtualMemoryArea& vma = vma_handle->second;

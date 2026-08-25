@@ -341,6 +341,9 @@ private:
     VMAMap vma_map;
     VAddr vma_span_begin{};
     VAddr vma_span_end{};
+    /// Incremented on every structural change to vma_map. Readers holding the
+    /// shared lock may cache lookups against it; see CopySparseMemory.
+    u64 vma_generation{1};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};
