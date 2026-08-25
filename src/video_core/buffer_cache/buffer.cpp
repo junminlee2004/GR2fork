@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/rdtsc.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -50,8 +51,20 @@ std::string_view BufferTypeName(MemoryUsage type) {
 
 [[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryUsage usage) {
     switch (usage) {
-    case MemoryUsage::DeviceLocal:
     case MemoryUsage::Stream:
+        // On an APU there is no separate device memory to stage into: the
+        // "device local" host-visible heap is the same DRAM, exposed uncached
+        // and write-combining. Guest data is memcpy'd into this ring thousands
+        // of times per frame, and every copy is followed by a lock-prefixed
+        // instruction that has to drain those write-combining buffers, so
+        // placing the ring in ordinary cached memory can be the cheaper trade
+        // even though the GPU then reads it over the coherent fabric. Off by
+        // default; on discrete parts PREFER_DEVICE remains the right answer.
+        if (EmulatorSettings.IsStreamBufferPreferHost()) {
+            return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        }
+        return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    case MemoryUsage::DeviceLocal:
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     case MemoryUsage::Upload:
     case MemoryUsage::Download:
