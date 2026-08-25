@@ -509,10 +509,14 @@ void BufferCache::BindVertexBuffers(
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        const auto [buffer, offset] = ObtainBuffer(range.base_address, size, false);
+        // Resolved once and reused: ObtainBuffer would otherwise walk the same
+        // range, and the barrier decision below would walk it a second time.
+        const bool gpu_modified = IsRegionGpuModified(range.base_address, size);
+        const auto [buffer, offset] =
+            ObtainBuffer(range.base_address, size, false, false, {}, gpu_modified);
         range.vk_buffer = buffer->buffer;
         range.offset = offset;
-        if (IsRegionGpuModified(range.base_address, size)) {
+        if (gpu_modified) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
                                        vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
@@ -568,6 +572,10 @@ void BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    // Resolved once for the whole function. The memo check below, the acquire
+    // and the barrier decision all ask the same question about the same range;
+    // answering it is a chain of dependent loads, so it is asked once.
+    const bool index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         const u64 tick = scheduler.CurrentTick();
@@ -575,8 +583,7 @@ void BufferCache::BindIndexBuffer(
         if (index_bind_valid_ && index_bind_addr_ == index_address &&
             index_bind_size_ == index_buffer_size &&
             index_bind_type_ == static_cast<u32>(index_type) && index_bind_tick_ == tick &&
-            index_bind_mem_gen_ == mem_gen &&
-            !IsRegionGpuModified(index_address, index_buffer_size)) {
+            index_bind_mem_gen_ == mem_gen && !index_gpu_modified) {
             // Same resolved index range already bound on this command buffer,
             // no intervening CPU write, and no GPU write requiring a barrier.
             return;
@@ -590,8 +597,9 @@ void BufferCache::BindIndexBuffer(
     } else {
         index_bind_valid_ = false;
     }
-    const auto [vk_buffer, offset] = ObtainBuffer(index_address, index_buffer_size, false);
-    if (IsRegionGpuModified(index_address, index_buffer_size)) {
+    const auto [vk_buffer, offset] =
+        ObtainBuffer(index_address, index_buffer_size, false, false, {}, index_gpu_modified);
+    if (index_gpu_modified) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -715,11 +723,17 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
-                                                  bool is_texel_buffer, BufferId buffer_id) {
+                                                  bool is_texel_buffer, BufferId buffer_id,
+                                                  std::optional<bool> gpu_modified) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
-        const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-        return {&stream_buffer, offset};
+    if (!is_written && size <= CACHING_PAGESIZE) {
+        const bool is_gpu_modified =
+            gpu_modified.has_value() ? *gpu_modified : IsRegionGpuModified(device_addr, size);
+        if (!is_gpu_modified) {
+            const u64 offset =
+                stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+            return {&stream_buffer, offset};
+        }
     }
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
