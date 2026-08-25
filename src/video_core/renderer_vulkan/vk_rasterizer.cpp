@@ -590,6 +590,24 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    {
+        // Guest packet census. Deliberately outside the skipcache gate below:
+        // it describes what the title submits, not how this fork caches, so it
+        // stays available for surveying any game on stock settings. A
+        // non-zero occl or setpred means the title drives the occlusion path,
+        // which shadPS4 currently answers with a fixed "visible" result.
+        static u64 last_packet_frame = 0;
+        const u64 frame = DebugState.GetFrameNum();
+        if (frame - last_packet_frame >= 300) {
+            last_packet_frame = frame;
+            auto& pk = liverpool->packet_stats;
+            LOG_INFO(Render,
+                     "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} per300f",
+                     pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
+                     pk.set_predication);
+            pk = {};
+        }
+    }
     auto& skipcache = Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         // Ring pressure report: wraps are what block this thread, so surface
@@ -612,13 +630,6 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
-            auto& pk = liverpool->packet_stats;
-            LOG_INFO(Render_Skipcache,
-                     "[SkipCache] PACKETS draws={} predicated={} dispatch={} occl={} setpred={} "
-                     "per300f",
-                     pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
-                     pk.set_predication);
-            pk = {};
             const auto off = buffer_cache.DrainOffloadStats();
             if (off.jobs || off.fallbacks) {
                 LOG_INFO(Render_Skipcache,
