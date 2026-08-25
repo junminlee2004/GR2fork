@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <utility>
@@ -212,9 +213,18 @@ public:
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
+        const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
+        // Guest sources are written by game threads on other cores and read
+        // exactly once here, so their lines are cold. Requesting them before
+        // the ring bookkeeping and address resolution overlaps the memory
+        // latency with that work. Prefetch never faults, so protected or
+        // unmapped pages in sparse ranges are safe to request.
+        constexpr size_t prefetch_bytes = 1024;
+        for (size_t i = 0; i < std::min<size_t>(size, prefetch_bytes); i += 64) {
+            __builtin_prefetch(reinterpret_cast<const void*>(src_vaddr + i), 0, 3);
+        }
         const auto [data, offset] = Map(size, alignment);
         auto* memory = Core::Memory::Instance();
-        const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
         if (memory->IsValidMapping(src_vaddr)) {
             memory->CopySparseMemory(src_vaddr, data, size);
         } else {
