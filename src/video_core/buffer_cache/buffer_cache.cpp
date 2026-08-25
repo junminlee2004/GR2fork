@@ -250,16 +250,47 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     // download of the same range holds byte-identical data, making write-back
     // order among matching jobs irrelevant. A mismatched copy is written back
     // by nobody: its bytes may predate the newer write.
+    //
+    // Verified copies arrive in ascending address order, so page-adjacent runs
+    // are merged into one pending span and unmarked in a single call: the page
+    // watcher update then coalesces the whole run into one protection change
+    // instead of one per copy. Unmarking never advances the write sequence, so
+    // deferral cannot change any later verdict. A merge never crosses a page
+    // gap - gap pages may be GPU-dirty outside this download - which keeps the
+    // unmarked page set exactly the union of the per-copy page sets. The span
+    // is flushed before any tracker read that could see its pages: the veto
+    // branch below, and the CPU mark at the end (marking with GPU bits still
+    // set would ask for a write-only page, which Protect() rejects).
+    VAddr pending_start = 0;
+    VAddr pending_end = 0;
+    const auto flush_pending_unmark = [&] {
+        if (pending_end != pending_start) {
+            memory_tracker->UnmarkRegionAsGpuModified(pending_start, pending_end - pending_start);
+            pending_start = 0;
+            pending_end = 0;
+        }
+    };
     bool vetoed_any = false;
     for (const auto& copy : job.copies) {
         const VAddr copy_device_addr = job.buffer_base + copy.srcOffset;
         if (memory_tracker->GpuWriteSeqMatches(copy_device_addr, copy.size, job.snapshots)) {
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + copy.dstOffset,
                                     copy.size);
-            memory_tracker->UnmarkRegionAsGpuModified(copy_device_addr, copy.size);
+            // The ordering guard makes an out-of-order copy flush and restart
+            // the span instead of moving pending_end backward, so the merged
+            // range can never grow beyond the union of the copies.
+            const bool adjacent = pending_end != pending_start && copy_device_addr >= pending_end &&
+                                  Common::AlignDown(copy_device_addr, TRACKER_BYTES_PER_PAGE) <=
+                                      Common::AlignUp(pending_end, TRACKER_BYTES_PER_PAGE);
+            if (!adjacent) {
+                flush_pending_unmark();
+                pending_start = copy_device_addr;
+            }
+            pending_end = std::max(pending_end, copy_device_addr + copy.size);
             continue;
         }
         vetoed_any = true;
+        flush_pending_unmark();
         // The newer write's own bind restored the range set for its span; put
         // back only what is still marked and uncovered, so the tracker bits
         // and the range set stay in lockstep. New dirty coverage expires the
@@ -270,6 +301,7 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
             gpu_modified_ranges.Add(copy_device_addr, copy.size);
         }
     }
+    flush_pending_unmark();
     job.fully_cleared = !vetoed_any;
     if (vetoed_any) {
         offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
