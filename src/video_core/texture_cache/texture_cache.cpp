@@ -562,11 +562,19 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
             // Consumed hit: replicate the slow path's residual effects - the
             // LRU touch and the overlap view rebase captured at populate.
-            {
+            // Memo stamps make the repeat case lock-free: an equal pair proves
+            // the locked block already ran with this tick and gc tick, so the
+            // tick store is an identity write and TouchImage early-outs on the
+            // equal gc tick. Other slot_images writers can only grow the
+            // ticks, and a grown tick fails the compare and takes the lock.
+            const u64 current_tick = scheduler.CurrentTick();
+            if (e.access_tick != current_tick || e.lru_tick != gc_tick) {
                 std::scoped_lock lock{mutex};
                 Image& image = slot_images[e.image_id];
-                image.tick_accessed_last = scheduler.CurrentTick();
+                image.tick_accessed_last = current_tick;
                 TouchImage(image);
+                e.access_tick = current_tick;
+                e.lru_tick = gc_tick;
             }
             if (e.view_base_level > 0) {
                 desc.view_info.range.base.level = e.view_base_level;
@@ -1032,9 +1040,24 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     static_assert(sizeof(AmdGpu::Sampler) == 16);
     const auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
     const size_t slot = ((raw[0] >> 5) ^ (raw[0] >> 33) ^ raw[1]) & 255;
+    SamplerMemoEntry& e = sampler_memo_[slot];
+    const bool fast_active = sc.ActiveMode() == Mode::Adaptive;
+    // Gen equality proves the map entry, lru_id and handle are live: the
+    // samplers erase and the gen bump happen only in GarbageCollectSamplers,
+    // and both GetSampler and the GC run on the GPU thread only.
+    if (fast_active && e.valid && e.key == raw && e.sampler_gen == sampler_gen_) {
+        // An equal touch tick makes the LRU touch a no-op, so the slow path
+        // reduces to returning the memoized handle.
+        if (e.touch_tick == gc_tick) {
+            return e.handle;
+        }
+        std::scoped_lock lock{samplers_mutex};
+        sampler_lru_cache.Touch(e.lru_id, gc_tick);
+        e.touch_tick = gc_tick;
+        return e.handle;
+    }
     const bool probing = sc.Active() && sc.ShouldProbe(kCache);
     bool would_hit = false;
-    SamplerMemoEntry& e = sampler_memo_[slot];
     bool timed = false;
     u64 t0 = 0;
     if (probing) {
@@ -1092,15 +1115,20 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                 e.valid = false;
             }
         }
-        if (!would_hit) {
-            e = SamplerMemoEntry{
-                .key = raw,
-                .handle = handle,
-                .lru_id = it->second.lru_id,
-                .sampler_gen = sampler_gen_,
-                .valid = true,
-            };
-            sc2.NotifyPopulated(kCache);
+    }
+    if (!would_hit && (probing || fast_active)) {
+        // The touch tick is stamped right after the locked Insert/Touch at
+        // gc_tick, so an equal stamp implies the LRU item tick equals gc_tick.
+        e = SamplerMemoEntry{
+            .key = raw,
+            .handle = handle,
+            .lru_id = it->second.lru_id,
+            .sampler_gen = sampler_gen_,
+            .touch_tick = gc_tick,
+            .valid = true,
+        };
+        if (probing) {
+            sc.NotifyPopulated(kCache);
         }
     }
     return handle;

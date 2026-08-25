@@ -345,6 +345,7 @@ private:
         vk::Sampler handle{};
         u64 lru_id{};
         u64 sampler_gen{};
+        u64 touch_tick{};
         bool valid{};
     };
     std::array<SamplerMemoEntry, 256> sampler_memo_{};
@@ -354,6 +355,8 @@ private:
         std::array<u64, 4> tsharp_raw{};
         u64 image_uid{};
         u64 tex_gen{};
+        u64 access_tick{};
+        u64 lru_tick{};
         ImageId image_id{};
         u32 view_base_level{};
         u32 view_base_layer{};
