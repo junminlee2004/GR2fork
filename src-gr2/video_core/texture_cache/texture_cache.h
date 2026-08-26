@@ -443,6 +443,15 @@ private:
     std::unordered_map<VAddr, GuestWritebackEntry> grr_writeback_buffers;
     bool grr_writeback_enabled{};
     u64 grr_writeback_max_bytes{};
+    // Diagnostics: GR2_GRR_WB_SYNC finishes the GPU after each drain (upstream-equivalent
+    // timing), GR2_GRR_WB_LEGACY routes the set through the CPU download path, and
+    // GR2_GRR_WB_SURVEY logs every candidate image once so the enqueued set is visible.
+    bool grr_writeback_sync{};
+    bool grr_writeback_legacy{};
+    bool grr_writeback_survey{};
+    std::unordered_set<VAddr> grr_wb_skip_noted;
+    std::unordered_set<VAddr> grr_wb_surveyed;
+    u64 grr_wb_copy_count{};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

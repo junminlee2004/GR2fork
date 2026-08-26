@@ -49,21 +49,31 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // with zero CPU involvement. Env kill switch: GR2_GRR_WRITEBACK=0; size cap override:
     // GR2_GRR_WRITEBACK_MAX=<bytes>.
     {
-        grr_writeback_enabled =
-            Config::isGravityRushRemastered() && instance.IsExternalMemoryHostSupported();
+        const auto env_set = [](const char* name) {
+            const char* e = std::getenv(name);
+            return e && e[0] == '1';
+        };
+        grr_writeback_sync = env_set("GR2_GRR_WB_SYNC");
+        grr_writeback_legacy = env_set("GR2_GRR_WB_LEGACY");
+        grr_writeback_survey = env_set("GR2_GRR_WB_SURVEY");
+        // The host-pointer import is only a fast path; when it is unavailable (RADV: amdgpu
+        // userptr rejects the file-backed mirror pages) images fall back to the CPU download
+        // path, so the feature does not require the extension.
+        grr_writeback_enabled = Config::isGravityRushRemastered();
         if (const char* e = std::getenv("GR2_GRR_WRITEBACK"); e && e[0] == '0') {
             grr_writeback_enabled = false;
         }
-        grr_writeback_max_bytes = 16_MB;
+        grr_writeback_max_bytes = 128_MB;
         if (const char* e = std::getenv("GR2_GRR_WRITEBACK_MAX")) {
             grr_writeback_max_bytes = std::strtoull(e, nullptr, 0);
         }
         if (Config::isGravityRushRemastered()) {
             LOG_INFO(Render_Vulkan,
                      "[GR2FORK grr-writeback] guest writeback: {} (max {} bytes, "
-                     "external_memory_host: {})",
+                     "external_memory_host: {}, sync: {}, legacy: {}, survey: {})",
                      grr_writeback_enabled, grr_writeback_max_bytes,
-                     instance.IsExternalMemoryHostSupported());
+                     instance.IsExternalMemoryHostSupported(), grr_writeback_sync,
+                     grr_writeback_legacy, grr_writeback_survey);
         }
     }
 
@@ -166,7 +176,11 @@ void TextureCache::ProcessDownloadImages() {
     if (!grr_writeback_images.empty()) {
         bool recorded = false;
         for (const ImageId image_id : grr_writeback_images) {
-            recorded = WritebackImageDirect(image_id) || recorded;
+            if (grr_writeback_legacy) {
+                DownloadImageMemory(image_id);
+            } else {
+                recorded = WritebackImageDirect(image_id) || recorded;
+            }
         }
         grr_writeback_images.clear();
         if (recorded) {
@@ -181,6 +195,12 @@ void TextureCache::ProcessDownloadImages() {
                 .memoryBarrierCount = 1,
                 .pMemoryBarriers = &barrier,
             });
+        }
+        if (grr_writeback_sync) {
+            // Upstream-equivalent visibility: guest memory holds the pixels (and the CPU
+            // download path's deferred writes have run) before this submit's fence values
+            // become observable.
+            scheduler.Finish();
         }
     }
 }
@@ -270,6 +290,9 @@ void TextureCache::DownloadImageMemory(ImageId image_id) {
 
 TextureCache::GuestWritebackEntry* TextureCache::GetOrCreateGuestWriteback(VAddr guest_address,
                                                                            u64 size) {
+    if (!instance.IsExternalMemoryHostSupported()) {
+        return nullptr;
+    }
     auto* memory = Core::Memory::Instance();
     u8* const backing = memory->TryGetBacking(guest_address, size);
     if (backing == nullptr) {
@@ -404,33 +427,61 @@ bool TextureCache::WritebackImageDirect(ImageId image_id) {
         return false;
     }
     Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    // Every skipped image is logged once per address so a missing writeback is visible.
+    const auto skip = [&](const char* reason) {
+        if (grr_wb_skip_noted.insert(image.info.guest_address).second) {
+            LOG_INFO(Render_Vulkan,
+                     "[GR2FORK grr-writeback] skip {:#x} ({}x{} pitch {} bits {} tiled {}): {}",
+                     image.info.guest_address, image.info.size.width, image.info.size.height,
+                     image.info.pitch, image.info.num_bits, image.info.props.is_tiled, reason);
+        }
         return false;
+    };
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return skip("not GPU modified");
     }
     // Same source-shape restrictions as DownloadImageMemory: this copy descriptor only records
     // single-sample 2D color or pure-depth images correctly.
-    if (image.backing == nullptr || image.info.num_samples > 1 || image.info.size.depth > 1)
-        [[unlikely]] {
-        return false;
+    if (image.backing == nullptr) [[unlikely]] {
+        return skip("null backing");
+    }
+    if (image.info.num_samples > 1) [[unlikely]] {
+        return skip("multisampled");
+    }
+    if (image.info.size.depth > 1) [[unlikely]] {
+        return skip("3D image");
     }
     if (image.info.props.is_depth && (image.aspect_mask & vk::ImageAspectFlagBits::eStencil))
         [[unlikely]] {
-        return false;
+        return skip("combined depth/stencil");
     }
     const u32 texel_size = image.info.num_bits / 8;
     const u32 download_size =
         image.info.pitch * image.info.size.height * image.info.resources.layers * texel_size;
-    if (download_size == 0 || download_size > image.info.guest_size ||
-        download_size > grr_writeback_max_bytes) [[unlikely]] {
-        return false;
+    if (download_size == 0) [[unlikely]] {
+        return skip("zero download size");
+    }
+    if (download_size > image.info.guest_size) [[unlikely]] {
+        // A resolution-upscaled image is larger than the game's allocation; writing the full
+        // copy would overrun neighbouring guest memory.
+        return skip("exceeds guest allocation (resolution-scaled image)");
+    }
+    if (download_size > grr_writeback_max_bytes) [[unlikely]] {
+        return skip("exceeds GR2_GRR_WRITEBACK_MAX");
     }
     GuestWritebackEntry* entry =
         GetOrCreateGuestWriteback(image.info.guest_address, download_size);
     if (entry == nullptr) {
+        // No direct import for this range (extension missing, or the driver rejects the mirror
+        // pages - amdgpu userptr accepts only anonymous memory); use the CPU download path.
+        skip("host import unavailable; using CPU download path");
+        DownloadImageMemory(image_id);
         return false;
     }
     // vkCmdCopyImageToBuffer requires the offset to be texel-size (and 4-byte) aligned.
     if (entry->buffer_offset % std::max<u32>(texel_size, 4u) != 0) [[unlikely]] {
+        skip("unaligned buffer offset; using CPU download path");
+        DownloadImageMemory(image_id);
         return false;
     }
     const vk::BufferImageCopy copy = {
@@ -453,6 +504,14 @@ bool TextureCache::WritebackImageDirect(ImageId image_id) {
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              *entry->buffer, copy);
+    ++grr_wb_copy_count;
+    if (grr_wb_copy_count <= 8 || grr_wb_copy_count % 512 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[GR2FORK grr-writeback] copy #{} {:#x} {}x{} pitch {} bits {} tiled {}",
+                 grr_wb_copy_count, image.info.guest_address, image.info.size.width,
+                 image.info.size.height, image.info.pitch, image.info.num_bits,
+                 image.info.props.is_tiled);
+    }
     return true;
 }
 
@@ -1524,9 +1583,18 @@ ImageView& TextureCache::FindTexture(ImageId image_id, BindingType type, const I
         // GR2FORK: the width <= 8 clause also catches tiled measure targets that fit one
         // micro-tile, matching the upstream readbackLinearImages image set.
         if (grr_writeback_enabled) {
-            if ((!image.info.props.is_tiled || image.info.size.width <= 8) &&
-                image.info.guest_address != 0) {
+            const bool enqueue = (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+                                 image.info.guest_address != 0;
+            if (enqueue) {
                 grr_writeback_images.emplace(image_id);
+            }
+            if (grr_writeback_survey && grr_wb_surveyed.insert(image.info.guest_address).second) {
+                LOG_INFO(Render_Vulkan,
+                         "[GR2FORK grr-writeback] candidate storage {:#x} {}x{} pitch {} bits {} "
+                         "tiled {} enqueued {}",
+                         image.info.guest_address, image.info.size.width, image.info.size.height,
+                         image.info.pitch, image.info.num_bits, image.info.props.is_tiled,
+                         enqueue);
             }
         } else if (Config::readbackLinearImages() && !image.info.props.is_tiled &&
                    image.info.guest_address != 0) {
@@ -1660,9 +1728,17 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (grr_writeback_enabled) {
-        if ((!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
+        const bool enqueue = (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+                             image.info.guest_address != 0;
+        if (enqueue) {
             grr_writeback_images.emplace(image_id);
+        }
+        if (grr_writeback_survey && grr_wb_surveyed.insert(image.info.guest_address).second) {
+            LOG_INFO(Render_Vulkan,
+                     "[GR2FORK grr-writeback] candidate rt {:#x} {}x{} pitch {} bits {} tiled {} "
+                     "enqueued {}",
+                     image.info.guest_address, image.info.size.width, image.info.size.height,
+                     image.info.pitch, image.info.num_bits, image.info.props.is_tiled, enqueue);
         }
     } else if (Config::readbackLinearImages() && !image.info.props.is_tiled) {
         download_images.emplace(image_id);
