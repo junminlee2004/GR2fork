@@ -83,10 +83,6 @@ public:
         }
     }
 
-    /// Thread-safe query of the tracker's GPU-modified state, usable from
-    /// helper threads; answers through the lock-free region peeks.
-    [[nodiscard]] bool IsRegionGpuModified(VAddr addr, u64 size);
-
 private:
     // Phase-1 draw recurrence instrumentation (observe-only, GPU thread only).
     struct DrawKeyEntry {
