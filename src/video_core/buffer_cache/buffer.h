@@ -184,6 +184,9 @@ public:
     };
     std::array<SyncNoop, 2> sync_noop{};
     u32 sync_noop_next = 0;
+    // Phase-1 oracle: epoch sum recorded at the last nothing-to-upload walk.
+    u64 oracle_epoch_sum = 0;
+    bool oracle_sum_valid = false;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

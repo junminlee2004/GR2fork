@@ -397,7 +397,7 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         break;
     }
     case State::Learning: {
-        if (id == CacheId::BindingSkipProbe) {
+        if (id == CacheId::BindingSkipProbe || id == CacheId::StreamMirror) {
             break; // measurement-only: never promotes, never exhausts a budget
         }
         if (!warmed_up_ || w.low_signal) {

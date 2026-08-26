@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <map>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -843,10 +844,35 @@ void AddressSpace::Unmap(VAddr virtual_addr, u64 size) {
     impl->Unmap(virtual_addr, size);
 }
 
+static std::atomic<ProtectObserver> g_protect_observer{nullptr};
+static std::atomic<void*> g_protect_observer_user{nullptr};
+static thread_local bool g_tracker_origin_protect = false;
+
+void SetProtectObserver(ProtectObserver observer, void* user) {
+    g_protect_observer_user.store(user, std::memory_order_release);
+    g_protect_observer.store(observer, std::memory_order_release);
+}
+
+void NotifyProtectObserver(VAddr virtual_addr, u64 size, bool write_granted) {
+    if (const auto observer = g_protect_observer.load(std::memory_order_acquire)) {
+        observer(g_protect_observer_user.load(std::memory_order_acquire), virtual_addr, size,
+                 write_granted, g_tracker_origin_protect);
+    }
+}
+
+TrackerProtectScope::TrackerProtectScope() {
+    g_tracker_origin_protect = true;
+}
+
+TrackerProtectScope::~TrackerProtectScope() {
+    g_tracker_origin_protect = false;
+}
+
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     const bool read = True(perms & MemoryPermission::Read);
     const bool write = True(perms & MemoryPermission::Write);
     const bool execute = True(perms & MemoryPermission::Execute);
+    NotifyProtectObserver(virtual_addr, size, write);
     return impl->Protect(virtual_addr, size, read, write, execute);
 }
 

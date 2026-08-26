@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <optional>
 
@@ -256,6 +258,52 @@ public:
     // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
     u64 gpu_write_seq{0};
     LockType lock;
+
+    // Word epochs advance whenever guest bytes in a span may change outside
+    // the write watchers' sight: write protection loss, guest protection
+    // grants, and direct backing writes. A consumer that pairs an epoch sum
+    // with a content record gets a cheap it-cannot-have-changed certificate.
+    static constexpr u64 EPOCH_WORD_BITS = 18; // 256KB per word
+    static constexpr size_t NUM_EPOCH_WORDS = TRACKER_HIGHER_PAGE_SIZE >> EPOCH_WORD_BITS;
+    static constexpr u64 EPOCH_SUB_BITS = 16; // 64KB per subword
+    static constexpr size_t NUM_EPOCH_SUBS = TRACKER_HIGHER_PAGE_SIZE >> EPOCH_SUB_BITS;
+
+    void BumpWordEpochs(u64 offset, u64 size, u8 cause) noexcept {
+        if (size == 0) {
+            return;
+        }
+        const size_t w0 = std::min<u64>(offset >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
+        const size_t w1 =
+            std::min<u64>((offset + size - 1) >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
+        for (size_t w = w0; w <= w1; ++w) {
+            word_epochs[w].fetch_add(1, std::memory_order_release);
+            last_bump_cause[w].store(cause, std::memory_order_relaxed);
+        }
+        const size_t s0 = std::min<u64>(offset >> EPOCH_SUB_BITS, NUM_EPOCH_SUBS - 1);
+        const size_t s1 = std::min<u64>((offset + size - 1) >> EPOCH_SUB_BITS, NUM_EPOCH_SUBS - 1);
+        for (size_t sub = s0; sub <= s1; ++sub) {
+            sub_epochs[sub].fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    void PoisonEpochWords(u64 offset, u64 size) noexcept {
+        if (size == 0) {
+            return;
+        }
+        const size_t w0 = std::min<u64>(offset >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
+        const size_t w1 =
+            std::min<u64>((offset + size - 1) >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
+        u32 mask = 0;
+        for (size_t w = w0; w <= w1; ++w) {
+            mask |= 1u << w;
+        }
+        poison_words.fetch_or(mask, std::memory_order_release);
+    }
+
+    std::array<std::atomic<u64>, NUM_EPOCH_WORDS> word_epochs{};
+    std::array<std::atomic<u64>, NUM_EPOCH_SUBS> sub_epochs{};
+    std::array<std::atomic<u8>, NUM_EPOCH_WORDS> last_bump_cause{};
+    std::atomic<u32> poison_words{0};
 
 private:
     /**

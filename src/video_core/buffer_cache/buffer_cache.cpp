@@ -7,8 +7,10 @@
 #include <optional>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
+#include <xxhash.h>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
@@ -71,9 +73,206 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     critical_gc_memory = static_cast<u64>(
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
+    mirror_mode_ = EmulatorSettings.GetStreamUploadMirrorMode() != 0;
+    if (mirror_mode_) {
+        Core::SetProtectObserver(&BufferCache::MirrorProtectThunk, this);
+        Core::SetBackingWriteObserver(&BufferCache::MirrorBackingThunk, this);
+    }
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    if (mirror_mode_) {
+        Core::SetProtectObserver(nullptr, nullptr);
+        Core::SetBackingWriteObserver(nullptr, nullptr);
+    }
+}
+
+void BufferCache::MirrorProtectThunk(void* user, VAddr addr, u64 size, bool write_granted,
+                                     bool tracker_origin) {
+    // Runs on any thread, including inside the fault handler under the page
+    // manager's range locks: only atomics and the constinit lookup memo are
+    // touched, never locks or allocation.
+    if (!write_granted) {
+        return;
+    }
+    auto* cache = static_cast<BufferCache*>(user);
+    cache->memory_tracker->BumpEpochsForRange(addr, size, tracker_origin ? 0 : 1);
+    if (tracker_origin) {
+        cache->mirror_sink_.bump_tracker.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // Guest protection grants can hide later guest writes from every
+        // watcher, so the covered words are conservatively poisoned.
+        cache->mirror_sink_.bump_guestapi.fetch_add(1, std::memory_order_relaxed);
+        cache->memory_tracker->PoisonEpochsForRange(addr, size);
+        cache->mirror_sink_.poisoned.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void BufferCache::MirrorBackingThunk(void* user, VAddr addr, u64 size) {
+    auto* cache = static_cast<BufferCache*>(user);
+    cache->memory_tracker->BumpEpochsForRange(addr, size, 2);
+    cache->mirror_sink_.bump_backing.fetch_add(1, std::memory_order_relaxed);
+}
+
+void BufferCache::MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty) {
+    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+    if (!mirror_mode_ || !skipcache.ShouldProbe(VideoCore::Skipcache::CacheId::StreamMirror)) {
+        return;
+    }
+    auto& mo = mirror_oracle_;
+    ++mo.elig;
+    mo.elig_bytes += size;
+    if (!tick_hit) {
+        ++mo.tick_miss;
+    }
+    if (gpu_dirty) {
+        ++mo.gpu_dirty;
+        return;
+    }
+    const bool cpu_dirty = memory_tracker->PeekRegionCpuModifiedNoCreate(device_addr, size);
+    if (cpu_dirty) {
+        ++mo.cpu_dirty;
+        mo.cpu_dirty_bytes += size;
+    } else {
+        ++mo.clean;
+        mo.clean_bytes += size;
+        if (!tick_hit) {
+            ++mo.clean_tm;
+            mo.clean_tm_bytes += size;
+        }
+    }
+    const auto sums = memory_tracker->SumEpochsForRange(device_addr, size);
+    if (!sums.ok) {
+        ++mo.sum_unresolved;
+        return;
+    }
+    // The source is not GPU modified here, so its pages are readable; a racing
+    // GPU mark can still fault this read, which resolves through the GPU
+    // thread's own synchronous fault path like any guest access.
+    const u64 hash = XXH3_64bits(reinterpret_cast<const void*>(device_addr), size);
+
+    struct OracleEntry {
+        VAddr addr;
+        u32 size;
+        u8 clean;
+        u64 hash;
+        u64 sum256;
+        u64 sum64;
+    };
+    constexpr size_t kOracleSlots = 65536;
+    struct OracleTable {
+        std::array<OracleEntry, kOracleSlots> slots{};
+    };
+    // Heap-backed for the same TLS-budget reason as the stream copy cache.
+    static thread_local std::unique_ptr<OracleTable> oracle;
+    if (!oracle) {
+        oracle = std::make_unique<OracleTable>();
+    }
+    u64 key = device_addr ^ (u64{size} * 0x9e3779b97f4a7c15ULL);
+    key ^= key >> 29;
+    OracleEntry* entry = nullptr;
+    OracleEntry* victim = nullptr;
+    for (size_t way = 0; way < 2; ++way) {
+        OracleEntry& slot = oracle->slots[(key + way) & (kOracleSlots - 1)];
+        if (slot.addr == device_addr && slot.size == size) {
+            entry = &slot;
+            break;
+        }
+        if (victim == nullptr || slot.addr == 0) {
+            victim = &slot;
+        }
+    }
+    if (entry == nullptr) {
+        ++mo.cold;
+        if (victim->addr != 0) {
+            ++mo.evict;
+        }
+        if (!cpu_dirty) {
+            ++mo.ws_keys;
+            mo.ws_bytes += size;
+        }
+        *victim = {device_addr, size,        static_cast<u8>(cpu_dirty ? 0 : 1),
+                   hash,        sums.sum256, sums.sum64};
+        return;
+    }
+    const bool sum256_same = entry->sum256 == sums.sum256;
+    const bool sum64_same = entry->sum64 == sums.sum64;
+    const bool hash_same = entry->hash == hash;
+    if (entry->clean) {
+        if (sum256_same && hash_same) {
+            ++mo.hit_clean;
+            if (!tick_hit) {
+                ++mo.hit_clean_tm;
+            }
+        } else if (sum256_same && !hash_same) {
+            // The soundness lane: content changed under a stable, unpoisoned
+            // epoch sum. Any nonzero count falsifies the substrate.
+            if (!sums.poisoned) {
+                ++mo.div;
+                skipcache.RecordDivergence(VideoCore::Skipcache::CacheId::StreamMirror,
+                                           "epoch stable content changed");
+            } else {
+                ++mo.changed;
+            }
+        } else if (!sum256_same && hash_same) {
+            ++mo.alias256;
+            if (sum64_same) {
+                ++mo.alias64;
+            }
+        } else {
+            ++mo.changed;
+        }
+    } else {
+        if (sum256_same && hash_same) {
+            ++mo.dirty_stable;
+        } else if (sum256_same) {
+            ++mo.dirty_stable_chg;
+        } else {
+            ++mo.dirty_moved;
+        }
+    }
+    *entry = {device_addr, size, static_cast<u8>(cpu_dirty ? 0 : 1), hash, sums.sum256, sums.sum64};
+}
+
+void BufferCache::EmitMirrorTelemetry() {
+    if (!mirror_mode_) {
+        return;
+    }
+    auto& mo = mirror_oracle_;
+    const auto pct = [](u64 part, u64 whole) {
+        return whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+    };
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] MIRROR elig={} tickmiss={} clean%={:.1f} cleanTM%={:.1f} "
+             "cleanTM_MiB={:.1f} hitC%={:.1f} hitCTM={} cold={} evict={} unres={} per300f",
+             mo.elig, mo.tick_miss, pct(mo.clean, mo.elig), pct(mo.clean_tm, mo.tick_miss),
+             static_cast<double>(mo.clean_tm_bytes) / (1024.0 * 1024.0),
+             pct(mo.hit_clean, mo.clean), mo.hit_clean_tm, mo.cold, mo.evict, mo.sum_unresolved);
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] MIRRORVETO div={} dirty_stable={} dirty_stable_chg={} dirty_moved={} "
+             "alias256={} alias64={} changed={} gpudirty={} cpudirty={} cpudirty_MiB={:.1f} "
+             "per300f",
+             mo.div, mo.dirty_stable, mo.dirty_stable_chg, mo.dirty_moved, mo.alias256, mo.alias64,
+             mo.changed, mo.gpu_dirty, mo.cpu_dirty,
+             static_cast<double>(mo.cpu_dirty_bytes) / (1024.0 * 1024.0));
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] MIRROREPOCH tracker={} guestapi={} backing={} poisoned={} per300f",
+             mirror_sink_.bump_tracker.exchange(0, std::memory_order_relaxed),
+             mirror_sink_.bump_guestapi.exchange(0, std::memory_order_relaxed),
+             mirror_sink_.bump_backing.exchange(0, std::memory_order_relaxed),
+             mirror_sink_.poisoned.exchange(0, std::memory_order_relaxed));
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] MIRRORTIERA would_hit%={:.1f} walks={} elig_walks={} span_le64%={:.1f} "
+             "ws_keys={} ws_MiB={:.1f} per300f",
+             pct(mo.tierA_would_hit, mo.tierA_walks), mo.tierA_walks, mo.tierA_elig_walks,
+             pct(mo.tierA_span_le64, mo.tierA_walks), mo.ws_keys,
+             static_cast<double>(mo.ws_bytes) / (1024.0 * 1024.0));
+    LOG_INFO(Render_Skipcache, "[SkipCache] PEEKBASE calls={} dirty={} per300f",
+             memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty);
+    memory_tracker->peek_fastpath_calls = 0;
+    memory_tracker->peek_fastpath_dirty = 0;
+    mo = MirrorOracleCounters{};
+}
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
@@ -891,15 +1090,19 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 cache.lru[set_idx] = static_cast<u8>(hit == &set[0] ? 1u : 0u);
                 if (hit->gpu_gen == gpu_dirty_generation_) {
                     ++stream_copy_hits_;
+                    MirrorOracleProbe(device_addr, size, true, false);
                     return {&stream_buffer, hit->offset};
                 }
                 if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
                     hit->gpu_gen = gpu_dirty_generation_;
                     ++stream_copy_hits_;
+                    MirrorOracleProbe(device_addr, size, true, false);
                     return {&stream_buffer, hit->offset};
                 }
                 hit->addr = 0; // went GPU-dirty: no longer stream-eligible
+                MirrorOracleProbe(device_addr, size, true, true);
             } else if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
+                MirrorOracleProbe(device_addr, size, false, false);
                 const u64 offset =
                     stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
                 const u8 victim = cache.lru[set_idx] & 1u;
@@ -1232,6 +1435,23 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
+    }
+    if (mirror_mode_ && memo_eligible) {
+        ++mirror_oracle_.tierA_elig_walks;
+    }
+    if (mirror_mode_ && memo_eligible && !src_buffer) {
+        ++mirror_oracle_.tierA_walks;
+        const auto sums = memory_tracker->SumEpochsForRange(device_addr, size);
+        constexpr u64 word_size = u64{1} << RegionManager::EPOCH_WORD_BITS;
+        if (size <= 64 * word_size) {
+            ++mirror_oracle_.tierA_span_le64;
+        }
+        if (sums.ok && !sums.poisoned && buffer.oracle_sum_valid &&
+            buffer.oracle_epoch_sum == sums.sum256) {
+            ++mirror_oracle_.tierA_would_hit;
+        }
+        buffer.oracle_epoch_sum = sums.sum256;
+        buffer.oracle_sum_valid = sums.ok;
     }
     if (memo_eligible && !src_buffer) {
         // Nothing was uploaded: record the exact walked range so the next

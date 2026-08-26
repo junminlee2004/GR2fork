@@ -7,6 +7,7 @@
 #include "common/div_ceil.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
+#include "core/address_space.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -124,6 +125,10 @@ struct PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
         bool allow_write = True(perms & Core::MemoryPermission::Write);
+        // This path changes protection without going through AddressSpace, so
+        // it notifies the epoch observer itself.
+        Core::TrackerProtectScope tracker_scope;
+        Core::NotifyProtectObserver(address, size, allow_write);
         uffdio_writeprotect wp;
         wp.range.start = address;
         wp.range.len = size;
@@ -204,6 +209,7 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        Core::TrackerProtectScope tracker_scope;
         impl.Protect(address, size, perms);
     }
 

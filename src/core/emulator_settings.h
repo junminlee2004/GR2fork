@@ -451,6 +451,9 @@ struct GPUSettings {
     Setting<bool> readback_batching_enabled{false};
     Setting<u32> readback_offload_mode{GpuReadbackOffloadMode::OffloadDisabled};
     Setting<bool> stream_buffer_prefer_host{false};
+    // Phase-1 instrumentation modes; 0 keeps the hot paths byte-identical.
+    Setting<u32> stream_upload_mirror_mode{0};
+    Setting<u32> draw_replay_mode{0};
     // Probe the most recently matched shader permutation before the linear search
     // in the pipeline cache. May select a different compare-equal permutation when
     // several stored specializations satisfy the probe.
@@ -495,6 +498,9 @@ struct GPUSettings {
                                        &GPUSettings::readback_offload_mode),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
+            make_override<GPUSettings>("stream_upload_mirror_mode",
+                                       &GPUSettings::stream_upload_mirror_mode),
+            make_override<GPUSettings>("draw_replay_mode", &GPUSettings::draw_replay_mode),
             make_override<GPUSettings>("spec_mru_perm_probe", &GPUSettings::spec_mru_perm_probe),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
@@ -510,7 +516,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    stream_buffer_prefer_host, direct_memory_access_enabled,
                                    dump_shaders, patch_shaders, vblank_frequency, full_screen,
                                    full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
-                                   rcas_enabled, rcas_attenuation, spec_mru_perm_probe)
+                                   rcas_enabled, rcas_attenuation, spec_mru_perm_probe,
+                                   stream_upload_mirror_mode, draw_replay_mode)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -776,6 +783,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
     SETTING_FORWARD(m_gpu, ReadbackOffloadMode, readback_offload_mode)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
+    SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
+    SETTING_FORWARD(m_gpu, DrawReplayMode, draw_replay_mode)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)

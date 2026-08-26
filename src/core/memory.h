@@ -370,4 +370,9 @@ private:
 
 using Memory = Common::Singleton<MemoryManager>;
 
+/// Observes direct writes to guest memory through its physical backing, which
+/// bypass page protection and therefore every write watcher.
+using BackingWriteObserver = void (*)(void* user, VAddr virtual_addr, u64 size);
+void SetBackingWriteObserver(BackingWriteObserver observer, void* user);
+
 } // namespace Core

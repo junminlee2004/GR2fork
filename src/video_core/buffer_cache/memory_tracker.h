@@ -29,6 +29,10 @@ public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
+    // Upload-walk peek baseline; GPU-command-thread confined like the walk.
+    u64 peek_fastpath_calls{};
+    u64 peek_fastpath_dirty{};
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<true>(
@@ -104,6 +108,76 @@ public:
         return matches;
     }
 
+    /// Advances the word epochs of every existing region overlapping the
+    /// range. Missing regions have no consumers and are skipped.
+    void BumpEpochsForRange(VAddr cpu_addr, u64 size, u8 cause) noexcept {
+        IteratePages<false>(cpu_addr, size,
+                            [cause](RegionManager* manager, u64 offset, size_t range_size) {
+                                manager->BumpWordEpochs(offset, range_size, cause);
+                            });
+    }
+
+    /// Poisons the word epochs covering the range; a poisoned word never
+    /// certifies content stability.
+    void PoisonEpochsForRange(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages<false>(cpu_addr, size,
+                            [](RegionManager* manager, u64 offset, size_t range_size) {
+                                manager->PoisonEpochWords(offset, range_size);
+                            });
+    }
+
+    /// Like IsRegionCpuModified but never creates missing regions; uncovered
+    /// spans report modified, matching a fresh region's all-dirty default.
+    bool PeekRegionCpuModifiedNoCreate(VAddr query_cpu_addr, u64 query_size) noexcept {
+        u64 covered = 0;
+        const bool dirty = IteratePages<false>(
+            query_cpu_addr, query_size,
+            [&covered](RegionManager* manager, u64 offset, size_t size) {
+                covered += size;
+                return manager->template PeekRegionModified<Type::CPU>(offset, size);
+            });
+        return dirty || covered != query_size;
+    }
+
+    struct EpochSums {
+        u64 sum256;
+        u64 sum64;
+        bool poisoned;
+        bool ok;
+    };
+
+    /// Sums the word and subword epochs covering the range. ok is false when
+    /// part of the range has no region yet, since absent epochs prove nothing.
+    EpochSums SumEpochsForRange(VAddr cpu_addr, u64 size) noexcept {
+        EpochSums out{0, 0, false, true};
+        u64 covered = 0;
+        IteratePages<false>(
+            cpu_addr, size,
+            [&out, &covered](RegionManager* manager, u64 offset, size_t range_size) {
+                covered += range_size;
+                const size_t w0 = std::min<u64>(offset >> RegionManager::EPOCH_WORD_BITS,
+                                                RegionManager::NUM_EPOCH_WORDS - 1);
+                const size_t w1 =
+                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_WORD_BITS,
+                                  RegionManager::NUM_EPOCH_WORDS - 1);
+                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
+                for (size_t w = w0; w <= w1; ++w) {
+                    out.sum256 += manager->word_epochs[w].load(std::memory_order_acquire);
+                    out.poisoned |= (poison >> w) & 1u;
+                }
+                const size_t s0 = std::min<u64>(offset >> RegionManager::EPOCH_SUB_BITS,
+                                                RegionManager::NUM_EPOCH_SUBS - 1);
+                const size_t s1 =
+                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_SUB_BITS,
+                                  RegionManager::NUM_EPOCH_SUBS - 1);
+                for (size_t sub = s0; sub <= s1; ++sub) {
+                    out.sum64 += manager->sub_epochs[sub].load(std::memory_order_acquire);
+                }
+            });
+        out.ok = covered == size;
+        return out;
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         IteratePages<false>(
@@ -147,6 +221,8 @@ public:
             const u64 offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
             const bool nothing_to_upload =
                 !manager->template PeekRegionModified<Type::CPU>(offset, query_size);
+            ++peek_fastpath_calls;
+            peek_fastpath_dirty += nothing_to_upload ? 0 : 1;
             const bool skippable = nothing_to_upload &&
                                    (!is_written || manager->template PeekRegionFullySet<Type::GPU>(
                                                        offset, query_size));

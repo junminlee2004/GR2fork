@@ -84,6 +84,34 @@ public:
     }
 
 private:
+    // Phase-1 draw recurrence instrumentation (observe-only, GPU thread only).
+    struct DrawKeyEntry {
+        u64 key_lo;
+        u64 key_hi;
+        u32 last_frame;
+        u32 prev_frame;
+    };
+    struct DrawKeyTables {
+        std::array<DrawKeyEntry, 65536> full{};
+        std::array<DrawKeyEntry, 16384> k1_only{};
+        std::array<DrawKeyEntry, 16384> k1_k3{};
+    };
+    struct DrawKeyCounters {
+        u64 elig{};
+        u64 recur1{};
+        u64 recur2{};
+        u64 k1r2{};
+        u64 k13r2{};
+        u64 fresh{};
+        u64 indirect{};
+    };
+    void RecordDrawKey(const GraphicsPipeline* pipeline, bool is_indexed);
+    void EmitDrawKeyTelemetry();
+
+    std::unique_ptr<DrawKeyTables> drawkey_tables_;
+    DrawKeyCounters drawkey_{};
+    bool draw_replay_mode_{};
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();

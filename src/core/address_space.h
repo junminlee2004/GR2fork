@@ -99,4 +99,18 @@ private:
     u64 user_size{};
 };
 
+/// Observes protection changes for the stream mirror epoch machinery. The
+/// observer runs before the permission change takes effect; tracker_origin
+/// marks calls issued by the page manager's write-watch maintenance.
+using ProtectObserver = void (*)(void* user, VAddr virtual_addr, u64 size, bool write_granted,
+                                 bool tracker_origin);
+void SetProtectObserver(ProtectObserver observer, void* user);
+void NotifyProtectObserver(VAddr virtual_addr, u64 size, bool write_granted);
+
+/// Marks protection calls issued by the page tracker while in scope.
+struct TrackerProtectScope {
+    TrackerProtectScope();
+    ~TrackerProtectScope();
+};
+
 } // namespace Core

@@ -350,6 +350,66 @@ private:
     // thread, so plain counters suffice.
     u64 stream_copy_hits_{};
     u64 stream_copy_probes_{};
+
+public:
+    /// The vertex bind signature of the latest memoized vertex bind, zero when
+    /// the inline memo is inactive.
+    [[nodiscard]] u64 LastVertexBindSig() const noexcept {
+        return vertex_bind_valid_ ? vertex_bind_sig_ : 0;
+    }
+
+    /// Emits and resets the phase-1 stream mirror telemetry. Logs nothing when
+    /// the mirror mode is off.
+    void EmitMirrorTelemetry();
+
+private:
+    static void MirrorProtectThunk(void* user, VAddr addr, u64 size, bool write_granted,
+                                   bool tracker_origin);
+    static void MirrorBackingThunk(void* user, VAddr addr, u64 size);
+    void MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty);
+
+    // Phase-1 observe-only stream mirror instrumentation. The sink counters
+    // are written from guest threads and the fault path; the oracle counters
+    // are GPU command thread only.
+    struct MirrorSinkCounters {
+        std::atomic<u64> bump_tracker{};
+        std::atomic<u64> bump_guestapi{};
+        std::atomic<u64> bump_backing{};
+        std::atomic<u64> poisoned{};
+    };
+    struct MirrorOracleCounters {
+        u64 elig{};
+        u64 elig_bytes{};
+        u64 tick_miss{};
+        u64 clean{};
+        u64 clean_tm{};
+        u64 clean_bytes{};
+        u64 clean_tm_bytes{};
+        u64 hit_clean{};
+        u64 hit_clean_tm{};
+        u64 div{};
+        u64 alias256{};
+        u64 alias64{};
+        u64 changed{};
+        u64 dirty_stable{};
+        u64 dirty_stable_chg{};
+        u64 dirty_moved{};
+        u64 gpu_dirty{};
+        u64 cpu_dirty{};
+        u64 cpu_dirty_bytes{};
+        u64 cold{};
+        u64 evict{};
+        u64 ws_keys{};
+        u64 ws_bytes{};
+        u64 sum_unresolved{};
+        u64 tierA_walks{};
+        u64 tierA_would_hit{};
+        u64 tierA_elig_walks{};
+        u64 tierA_span_le64{};
+    };
+    MirrorSinkCounters mirror_sink_;
+    MirrorOracleCounters mirror_oracle_;
+    bool mirror_mode_{};
 };
 
 } // namespace VideoCore

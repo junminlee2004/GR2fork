@@ -97,6 +97,11 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline();
 
+    /// The key refreshed by the latest GetGraphicsPipeline call.
+    const GraphicsPipelineKey& CurrentGraphicsKey() const noexcept {
+        return graphics_key;
+    }
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, FetchShaderRef, u64>;

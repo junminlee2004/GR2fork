@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -202,9 +203,22 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+static std::atomic<BackingWriteObserver> g_backing_observer{nullptr};
+static std::atomic<void*> g_backing_observer_user{nullptr};
+
+void SetBackingWriteObserver(BackingWriteObserver observer, void* user) {
+    g_backing_observer_user.store(user, std::memory_order_release);
+    g_backing_observer.store(observer, std::memory_order_release);
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
+    // The observer runs before any byte moves, so an epoch consumer that reads
+    // its counters after the bytes always sees the advanced value.
+    if (const auto observer = g_backing_observer.load(std::memory_order_acquire)) {
+        observer(g_backing_observer_user.load(std::memory_order_acquire), virtual_addr, size);
+    }
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
