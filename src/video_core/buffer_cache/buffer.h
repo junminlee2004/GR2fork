@@ -164,6 +164,9 @@ public:
     /// Makes device writes visible to host reads on non-coherent memory.
     void InvalidateForRead(u64 offset, u64 num_bytes);
 
+    /// Makes host writes visible to device reads on non-coherent memory.
+    void FlushForDevice(u64 offset, u64 num_bytes);
+
 public:
     VAddr cpu_addr = 0;
     bool is_picked{};
