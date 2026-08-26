@@ -265,7 +265,7 @@ u8* MemoryManager::TryGetBacking(VAddr virtual_addr, u64 num_bytes) {
 }
 
 std::span<u8> MemoryManager::BackingSpan() noexcept {
-    return {impl.BackingBase(), impl.BackingSize()};
+    return {impl.BackingBase(), impl.BackingMirrorSize()};
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {

@@ -34,7 +34,7 @@ public:
     }
 
     // GR2FORK: size of the physical backing mirror starting at BackingBase().
-    [[nodiscard]] size_t BackingSize() const noexcept {
+    [[nodiscard]] size_t BackingMirrorSize() const noexcept {
         return backing_size;
     }
 
