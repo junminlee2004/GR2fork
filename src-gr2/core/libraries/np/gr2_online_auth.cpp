@@ -315,10 +315,26 @@ void LoginThread() {
 } // namespace
 
 bool IsOnlineEnabled() {
+    // This login backs the GR2 restoration server only. Other titles on this core (GRR) sign in
+    // through the shadNet NpHandler instead; a second login here would collide with that session
+    // server-side (LoginAlreadyLoggedIn), since this module holds its connection open all run.
+    static const bool is_gr2 = [] {
+        static constexpr const char* kGr2Serials[] = {
+            "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+            "PCJS50010", "PCAS00079", "CUSA04935",
+        };
+        const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
+        for (const char* s : kGr2Serials) {
+            if (serial == s) {
+                return true;
+            }
+        }
+        return false;
+    }();
     // Online (and thus the shadnet login) is intended only with an Online ID configured AND both the
     // "connected to network" and "signed in to PSN" toggles on - the same gates the game's own online
     // path respects (guest HTTP checks isConnectedToNetwork; NP WebApi checks both).
-    return !Config::GetShadnetNpid().empty() && Config::getIsConnectedToNetwork() &&
+    return is_gr2 && !Config::GetShadnetNpid().empty() && Config::getIsConnectedToNetwork() &&
            Config::getPSNSignedIn();
 }
 
