@@ -665,6 +665,9 @@ struct AddressSpace::Impl {
 
 AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
     backing_base = impl->backing_base;
+    // The Impl constructor has already folded the extra-dmem config option into BackingSize.
+    // Qualified: the unqualified name resolves to the BackingSize() accessor here.
+    backing_size = Core::BackingSize;
     system_managed_base = impl->system_managed_base;
     system_managed_size = impl->system_managed_size;
     system_reserved_base = impl->system_reserved_base;

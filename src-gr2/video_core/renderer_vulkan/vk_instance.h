@@ -196,6 +196,16 @@ public:
         return depth_range_unrestricted;
     }
 
+    /// Returns true when VK_EXT_external_memory_host is supported
+    bool IsExternalMemoryHostSupported() const {
+        return external_memory_host;
+    }
+
+    /// Returns the required alignment for imported host pointers
+    vk::DeviceSize GetMinImportedHostPointerAlignment() const {
+        return min_imported_host_pointer_alignment;
+    }
+
     /// Returns true when the extendedDynamicState3ColorWriteMask feature o
     /// VK_EXT_extended_dynamic_state3 is supported.
     bool IsDynamicColorWriteMaskSupported() const {
@@ -560,6 +570,8 @@ private:
     bool maintenance_8{};
     bool attachment_feedback_loop{};
     bool device_fault{};
+    bool external_memory_host{};
+    vk::DeviceSize min_imported_host_pointer_alignment{};
     bool supports_memory_budget{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

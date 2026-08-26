@@ -9,6 +9,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -355,6 +356,28 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id);
 
+    // GR2FORK: GPU-side guest writeback (Gravity Rush Remastered). Records a transfer of a
+    // GPU-modified image into its own guest memory through an imported backing-memory buffer,
+    // so the game's CPU reads real render output with no readback, sync, or CPU copy anywhere.
+    /// Records the guest-memory writeback copy for one image; returns true when recorded.
+    bool WritebackImageDirect(ImageId image_id);
+
+    struct GuestWritebackEntry {
+        vk::UniqueDeviceMemory memory;
+        vk::UniqueBuffer buffer;
+        vk::DeviceSize buffer_offset{}; // start of the guest range inside the imported buffer
+        u64 guest_size{};               // importable bytes from the image's guest address
+        u8* backing_ptr{};              // expected mirror pointer; a mismatch means remapped
+        bool failed{};                  // import failed once; skip without retrying
+    };
+
+    /// Returns the imported-buffer entry covering [guest_address, guest_address + size),
+    /// creating or rebuilding it as needed. Null when the range cannot be imported.
+    GuestWritebackEntry* GetOrCreateGuestWriteback(VAddr guest_address, u64 size);
+
+    /// Defers destruction of one writeback entry until the GPU is done with it.
+    void ReleaseGuestWriteback(VAddr guest_address);
+
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
 
@@ -415,6 +438,11 @@ private:
     tsl::robin_map<u64, Sampler> samplers;
     tsl::robin_map<vk::Format, ImageId> null_images;
     std::unordered_set<ImageId> download_images;
+    // GR2FORK: guest-writeback state; see WritebackImageDirect.
+    std::unordered_set<ImageId> grr_writeback_images;
+    std::unordered_map<VAddr, GuestWritebackEntry> grr_writeback_buffers;
+    bool grr_writeback_enabled{};
+    u64 grr_writeback_max_bytes{};
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

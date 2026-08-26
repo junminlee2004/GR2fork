@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/debug.h"
@@ -41,6 +42,30 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // Create basic null image at fixed image ID.
     const auto null_id = GetNullImage(vk::Format::eR8G8B8A8Unorm);
     ASSERT(null_id.index == NULL_IMAGE_ID.index);
+
+    // GR2FORK: Gravity Rush Remastered computes its scene exposure and related lighting state
+    // from render output it reads back through guest memory; without a writeback that state goes
+    // stale and the lighting collapses. The GPU-side guest writeback keeps those images current
+    // with zero CPU involvement. Env kill switch: GR2_GRR_WRITEBACK=0; size cap override:
+    // GR2_GRR_WRITEBACK_MAX=<bytes>.
+    {
+        grr_writeback_enabled =
+            Config::isGravityRushRemastered() && instance.IsExternalMemoryHostSupported();
+        if (const char* e = std::getenv("GR2_GRR_WRITEBACK"); e && e[0] == '0') {
+            grr_writeback_enabled = false;
+        }
+        grr_writeback_max_bytes = 16_MB;
+        if (const char* e = std::getenv("GR2_GRR_WRITEBACK_MAX")) {
+            grr_writeback_max_bytes = std::strtoull(e, nullptr, 0);
+        }
+        if (Config::isGravityRushRemastered()) {
+            LOG_INFO(Render_Vulkan,
+                     "[GR2FORK grr-writeback] guest writeback: {} (max {} bytes, "
+                     "external_memory_host: {})",
+                     grr_writeback_enabled, grr_writeback_max_bytes,
+                     instance.IsExternalMemoryHostSupported());
+        }
+    }
 
     // GR2FORK: kill switches + boot echoes for the IsMeta bloom prefilter and the gc-tick
     // TouchImage dedup mirror. Forced on, disabled only via the GR2_NO* env kills; placed before
@@ -138,6 +163,26 @@ void TextureCache::ProcessDownloadImages() {
         DownloadImageMemory(image_id);
     }
     download_images.clear();
+    if (!grr_writeback_images.empty()) {
+        bool recorded = false;
+        for (const ImageId image_id : grr_writeback_images) {
+            recorded = WritebackImageDirect(image_id) || recorded;
+        }
+        grr_writeback_images.clear();
+        if (recorded) {
+            // Make the transfer writes available to guest CPU reads through the backing mirror.
+            const vk::MemoryBarrier2 barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            };
+            scheduler.PrimaryCommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &barrier,
+            });
+        }
+    }
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id) {
@@ -221,6 +266,194 @@ void TextureCache::DownloadImageMemory(ImageId image_id) {
             Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
                                                       download_size);
         });
+}
+
+TextureCache::GuestWritebackEntry* TextureCache::GetOrCreateGuestWriteback(VAddr guest_address,
+                                                                           u64 size) {
+    auto* memory = Core::Memory::Instance();
+    u8* const backing = memory->TryGetBacking(guest_address, size);
+    if (backing == nullptr) {
+        return nullptr;
+    }
+    if (const auto it = grr_writeback_buffers.find(guest_address);
+        it != grr_writeback_buffers.end()) {
+        GuestWritebackEntry& entry = it->second;
+        if (entry.backing_ptr == backing && entry.guest_size >= size) {
+            return entry.failed ? nullptr : &entry;
+        }
+        // The guest range was remapped or the image grew; rebuild the import.
+        ReleaseGuestWriteback(guest_address);
+    }
+
+    GuestWritebackEntry& entry = grr_writeback_buffers[guest_address];
+    entry.failed = true;
+    entry.backing_ptr = backing;
+    entry.guest_size = size;
+
+    const auto device = instance.GetDevice();
+    const u64 align = std::max<u64>(instance.GetMinImportedHostPointerAlignment(), 0x1000);
+    const auto mirror = memory->BackingSpan();
+    u8* const import_base = mirror.data() + Common::AlignDown(
+                                                static_cast<u64>(backing - mirror.data()), align);
+    u8* const import_end =
+        mirror.data() + Common::AlignUp(static_cast<u64>(backing + size - mirror.data()), align);
+    if (import_end > mirror.data() + mirror.size()) {
+        return nullptr;
+    }
+    const u64 import_size = static_cast<u64>(import_end - import_base);
+
+    const auto host_props = device.getMemoryHostPointerPropertiesEXT(
+        vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT, import_base);
+    if (host_props.result != vk::Result::eSuccess || host_props.value.memoryTypeBits == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "[GR2FORK grr-writeback] host pointer query failed for {:#x}: {}",
+                    guest_address, vk::to_string(host_props.result));
+        return nullptr;
+    }
+
+    const vk::ExternalMemoryBufferCreateInfo external_info = {
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+    };
+    const vk::BufferCreateInfo buffer_ci = {
+        .pNext = &external_info,
+        .size = import_size,
+        .usage = vk::BufferUsageFlagBits::eTransferDst,
+        .sharingMode = vk::SharingMode::eExclusive,
+    };
+    auto buffer_rv = device.createBufferUnique(buffer_ci);
+    if (buffer_rv.result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "[GR2FORK grr-writeback] buffer create failed for {:#x}: {}",
+                    guest_address, vk::to_string(buffer_rv.result));
+        return nullptr;
+    }
+    const auto reqs = device.getBufferMemoryRequirements(*buffer_rv.value);
+    if (reqs.size > import_size) {
+        return nullptr;
+    }
+
+    const auto mem_props = instance.GetPhysicalDevice().getMemoryProperties();
+    const u32 type_bits = reqs.memoryTypeBits & host_props.value.memoryTypeBits;
+    u32 type_index = UINT32_MAX;
+    const auto desired =
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if ((type_bits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & desired) == desired) {
+            type_index = i;
+            break;
+        }
+    }
+    if (type_index == UINT32_MAX) {
+        // Coherent access happens through the original mirror pages, so any importable type works.
+        for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+            if (type_bits & (1u << i)) {
+                type_index = i;
+                break;
+            }
+        }
+    }
+    if (type_index == UINT32_MAX) {
+        return nullptr;
+    }
+
+    const vk::ImportMemoryHostPointerInfoEXT import_info = {
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+        .pHostPointer = import_base,
+    };
+    const vk::MemoryAllocateInfo alloc_ci = {
+        .pNext = &import_info,
+        .allocationSize = import_size,
+        .memoryTypeIndex = type_index,
+    };
+    auto memory_rv = device.allocateMemoryUnique(alloc_ci);
+    if (memory_rv.result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "[GR2FORK grr-writeback] host import failed for {:#x}: {}",
+                    guest_address, vk::to_string(memory_rv.result));
+        return nullptr;
+    }
+    if (device.bindBufferMemory(*buffer_rv.value, *memory_rv.value, 0) != vk::Result::eSuccess) {
+        return nullptr;
+    }
+
+    entry.memory = std::move(memory_rv.value);
+    entry.buffer = std::move(buffer_rv.value);
+    entry.buffer_offset = static_cast<vk::DeviceSize>(backing - import_base);
+    entry.failed = false;
+    LOG_INFO(Render_Vulkan,
+             "[GR2FORK grr-writeback] imported guest range {:#x} + {:#x} (buffer offset {:#x})",
+             guest_address, size, entry.buffer_offset);
+    return &entry;
+}
+
+void TextureCache::ReleaseGuestWriteback(VAddr guest_address) {
+    const auto it = grr_writeback_buffers.find(guest_address);
+    if (it == grr_writeback_buffers.end()) {
+        return;
+    }
+    if (it->second.buffer || it->second.memory) {
+        // Queued GPU work may still write through the import; destroy after the fence.
+        scheduler.DeferOperation(
+            [memory = std::move(it->second.memory), buffer = std::move(it->second.buffer)] {});
+    }
+    grr_writeback_buffers.erase(it);
+}
+
+bool TextureCache::WritebackImageDirect(ImageId image_id) {
+    if (!slot_images.is_allocated(image_id) ||
+        False(slot_images[image_id].flags & ImageFlagBits::Registered)) [[unlikely]] {
+        return false;
+    }
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return false;
+    }
+    // Same source-shape restrictions as DownloadImageMemory: this copy descriptor only records
+    // single-sample 2D color or pure-depth images correctly.
+    if (image.backing == nullptr || image.info.num_samples > 1 || image.info.size.depth > 1)
+        [[unlikely]] {
+        return false;
+    }
+    if (image.info.props.is_depth && (image.aspect_mask & vk::ImageAspectFlagBits::eStencil))
+        [[unlikely]] {
+        return false;
+    }
+    const u32 texel_size = image.info.num_bits / 8;
+    const u32 download_size =
+        image.info.pitch * image.info.size.height * image.info.resources.layers * texel_size;
+    if (download_size == 0 || download_size > image.info.guest_size ||
+        download_size > grr_writeback_max_bytes) [[unlikely]] {
+        return false;
+    }
+    GuestWritebackEntry* entry =
+        GetOrCreateGuestWriteback(image.info.guest_address, download_size);
+    if (entry == nullptr) {
+        return false;
+    }
+    // vkCmdCopyImageToBuffer requires the offset to be texel-size (and 4-byte) aligned.
+    if (entry->buffer_offset % std::max<u32>(texel_size, 4u) != 0) [[unlikely]] {
+        return false;
+    }
+    const vk::BufferImageCopy copy = {
+        .bufferOffset = entry->buffer_offset,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, 1},
+    };
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.PrimaryCommandBuffer();
+    image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+    cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                             *entry->buffer, copy);
+    return true;
 }
 
 bool TextureCache::ForceDownloadByAddress(VAddr address, u64 size) {
@@ -563,6 +796,20 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     for (const ImageId id : deleted_images) {
         // TODO: Download image data back to host.
         FreeImage(id);
+    }
+    // GR2FORK: writeback imports over the unmapped range go stale once the physical pages are
+    // reused; drop them so a later image at the same address rebuilds against live backing.
+    for (auto it = grr_writeback_buffers.begin(); it != grr_writeback_buffers.end();) {
+        const VAddr base = it->first;
+        if (base < cpu_addr + size && cpu_addr < base + it->second.guest_size) {
+            if (it->second.buffer || it->second.memory) {
+                scheduler.DeferOperation([memory = std::move(it->second.memory),
+                                          buffer = std::move(it->second.buffer)] {});
+            }
+            it = grr_writeback_buffers.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -1274,10 +1521,17 @@ ImageView& TextureCache::FindTexture(ImageId image_id, BindingType type, const I
     // compute paths and a few post-processing draws, so hint the Storage body as the rare branch.
     if (type == BindingType::Storage) [[unlikely]] {
         image.flags |= ImageFlagBits::GpuModified;
-        if (Config::readbackLinearImages() && !image.info.props.is_tiled &&
-            image.info.guest_address != 0) {
-            download_images.emplace(image_id);
+        // GR2FORK: the width <= 8 clause also catches tiled measure targets that fit one
+        // micro-tile, matching the upstream readbackLinearImages image set.
+        if (grr_writeback_enabled) {
+            if ((!image.info.props.is_tiled || image.info.size.width <= 8) &&
+                image.info.guest_address != 0) {
+                grr_writeback_images.emplace(image_id);
             }
+        } else if (Config::readbackLinearImages() && !image.info.props.is_tiled &&
+                   image.info.guest_address != 0) {
+            download_images.emplace(image_id);
+        }
 
         // GR2 Photo Mode: also track 1024x1024 storage writes (compute path).
         if (image.info.size.width == 1024 && image.info.size.height == 1024 &&
@@ -1405,7 +1659,12 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (Config::readbackLinearImages() && !image.info.props.is_tiled) {
+    if (grr_writeback_enabled) {
+        if ((!image.info.props.is_tiled || image.info.size.width <= 8) &&
+            image.info.guest_address != 0) {
+            grr_writeback_images.emplace(image_id);
+        }
+    } else if (Config::readbackLinearImages() && !image.info.props.is_tiled) {
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
@@ -1856,6 +2115,8 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
     }
     download_images.erase(image_id);
+    grr_writeback_images.erase(image_id);
+    ReleaseGuestWriteback(image.info.guest_address);
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
 

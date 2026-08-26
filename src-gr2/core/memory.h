@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -257,6 +258,14 @@ public:
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
     bool TryWriteBacking(void* address, const void* data, u32 num_bytes);
+
+    // GR2FORK: returns the backing-mirror pointer for [virtual_addr, virtual_addr + num_bytes),
+    // or null when the range is not fully inside one physically backed mapping. The mirror is
+    // never write-protected, so device writes through it bypass the page-tracking faults.
+    u8* TryGetBacking(VAddr virtual_addr, u64 num_bytes);
+
+    // GR2FORK: the whole physical backing mirror; backing pointers index into this span.
+    std::span<u8> BackingSpan() noexcept;
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

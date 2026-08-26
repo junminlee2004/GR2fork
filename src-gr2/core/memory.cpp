@@ -248,6 +248,26 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u32 num_byt
     return true;
 }
 
+u8* MemoryManager::TryGetBacking(VAddr virtual_addr, u64 num_bytes) {
+    if (!IsValidMapping(virtual_addr, num_bytes)) {
+        return nullptr;
+    }
+    const auto& vma = FindVMA(virtual_addr)->second;
+    if (!vma.IsMapped() || !HasPhysicalBacking(vma)) {
+        return nullptr;
+    }
+    // The mirror is contiguous per mapping only; a range spanning two VMAs may be split in
+    // physical space.
+    if (virtual_addr + num_bytes > vma.base + vma.size) {
+        return nullptr;
+    }
+    return impl.BackingBase() + vma.phys_base + (virtual_addr - vma.base);
+}
+
+std::span<u8> MemoryManager::BackingSpan() noexcept {
+    return {impl.BackingBase(), impl.BackingSize()};
+}
+
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
     std::scoped_lock lk{mutex};
     alignment = alignment > 0 ? alignment : 64_KB;

@@ -250,7 +250,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 40> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -367,6 +367,20 @@ bool Instance::CreateDevice() {
             // Extension advertised but feature not actually supported.
             device_fault = false;
         }
+    }
+
+    // GR2FORK: VK_EXT_external_memory_host lets guest backing memory bind directly as GPU
+    // buffer storage, so transfers can land guest-visible data without a CPU round trip.
+    external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (external_memory_host) {
+        const auto host_props_chain =
+            physical_device.getProperties2<vk::PhysicalDeviceProperties2,
+                                           vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+        min_imported_host_pointer_alignment =
+            host_props_chain.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
+                .minImportedHostPointerAlignment;
+        LOG_INFO(Render_Vulkan, "- minImportedHostPointerAlignment: {}",
+                 min_imported_host_pointer_alignment);
     }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();

@@ -33,6 +33,11 @@ public:
         return backing_base;
     }
 
+    // GR2FORK: size of the physical backing mirror starting at BackingBase().
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
+    }
+
     [[nodiscard]] VAddr SystemManagedVirtualBase() noexcept {
         return reinterpret_cast<VAddr>(system_managed_base);
     }
@@ -92,6 +97,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
     u8* backing_base{};
+    size_t backing_size{};
     u8* system_managed_base{};
     size_t system_managed_size{};
     u8* system_reserved_base{};
