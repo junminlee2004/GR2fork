@@ -94,7 +94,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     // clock. When this function is reached from the GPU command thread itself
     // (its own guest-memory read faulting), SendCommand runs the hops inline
     // and the wait lands where it always did - never worse than the sync form.
-    if (EmulatorSettings.IsReadbackOffloadEnabled()) {
+    //
+    // The bounded mode caps the faulting thread's fence wait. Some titles gate
+    // further GPU progress on memory the faulting thread writes only after its
+    // read returns; an unbounded wait then deadlocks guest against GPU. On
+    // timeout the job moves to the priority waiter thread, the write-back runs
+    // on the GPU command thread once the fence signals, and the refault loop
+    // above resolves the access through the in-flight-window spin.
+    const u32 offload_mode = EmulatorSettings.GetReadbackOffloadMode();
+    if (offload_mode != GpuReadbackOffloadMode::OffloadDisabled) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             FaultDownloadJob job;
             liverpool->SendCommand<true>(
@@ -113,7 +121,25 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 return;
             }
             const u64 t0 = Common::FencedRDTSC();
-            scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
+            if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
+                constexpr u64 BoundedWaitNs = 100'000'000;
+                if (!scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, BoundedWaitNs)) {
+                    offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0,
+                                               std::memory_order_relaxed);
+                    auto deferred = std::make_unique<FaultDownloadJob>(std::move(job));
+                    scheduler.DeferPriorityOperationAt(
+                        deferred->wait_tick,
+                        [this, device_addr, size, is_write, job = std::move(deferred)]() mutable {
+                            liverpool->SendCommand<false>(
+                                [this, device_addr, size, is_write, job = std::move(job)] {
+                                    FinishFaultDownload(*job, device_addr, size, is_write);
+                                });
+                        });
+                    return;
+                }
+            } else {
+                scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
+            }
             offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
             liverpool->SendCommand<true>(
                 [&] { FinishFaultDownload(job, device_addr, size, is_write); });

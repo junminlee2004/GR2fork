@@ -456,9 +456,16 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        DeferPriorityOperationAt(CurrentTick(), std::move(func));
+    }
+
+    /// Defers an operation until the gpu has reached the given tick. The tick
+    /// must belong to an already submitted batch: the waiter thread never
+    /// flushes, so an unsubmitted tick would never signal.
+    void DeferPriorityOperationAt(u64 gpu_tick, Common::UniqueFunction<void>&& func) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), gpu_tick);
         }
         priority_pending_ops_cv.notify_one();
     }
