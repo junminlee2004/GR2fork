@@ -441,6 +441,10 @@ struct GPUSettings {
     Setting<bool> readback_batching_enabled{false};
     Setting<bool> readback_offload_enabled{false};
     Setting<bool> stream_buffer_prefer_host{false};
+    // Probe the most recently matched shader permutation before the linear search
+    // in the pipeline cache. May select a different compare-equal permutation when
+    // several stored specializations satisfy the probe.
+    Setting<bool> spec_mru_perm_probe{false};
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
@@ -481,6 +485,7 @@ struct GPUSettings {
                                        &GPUSettings::readback_offload_enabled),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
+            make_override<GPUSettings>("spec_mru_perm_probe", &GPUSettings::spec_mru_perm_probe),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
@@ -495,7 +500,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    stream_buffer_prefer_host, direct_memory_access_enabled,
                                    dump_shaders, patch_shaders, vblank_frequency, full_screen,
                                    full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
-                                   rcas_enabled, rcas_attenuation)
+                                   rcas_enabled, rcas_attenuation, spec_mru_perm_probe)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -761,6 +766,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffloadEnabled, readback_offload_enabled)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
+    SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)
     SETTING_FORWARD_BOOL(m_gpu, CopyGpuBuffers, copy_gpu_buffers)

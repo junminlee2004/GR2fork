@@ -93,8 +93,23 @@ struct StageSpecialization {
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, const RuntimeInfo& runtime_info_,
-                        const Profile& profile_, Backend::Bindings start_)
-        : info{&info_}, runtime_info{runtime_info_}, start{start_} {
+                        const Profile& profile_, Backend::Bindings start_) {
+        Rebuild(info_, runtime_info_, profile_, start_);
+    }
+
+    // Refills every member as a fresh construction would while retaining vector capacity,
+    // so a persistent scratch object avoids per-call construction and destruction cost.
+    void Rebuild(const Info& info_, const RuntimeInfo& runtime_info_, const Profile& profile_,
+                 Backend::Bindings start_) {
+        info = &info_;
+        runtime_info = runtime_info_;
+        start = start_;
+        bitset.reset();
+        vs_attribs.clear();
+        buffers.clear();
+        images.clear();
+        fmasks.clear();
+        samplers.clear();
         fetch_shader_data = Gcn::ParseFetchShader(info_);
         if (info_.stage == Stage::Vertex && fetch_shader_data) {
             // Specialize shader on VS input number types to follow spec.
@@ -197,11 +212,18 @@ struct StageSpecialization {
             return false;
         }
 
-        if (vs_attribs != other.vs_attribs) {
+        // Cheap scalar rejects run before the vector walks; every compare is a
+        // side-effect-free const compare, so the reorder cannot change the result.
+        const bool no_bindings = bitset.none() && other.bitset.none();
+        if (!no_bindings && start != other.start) {
             return false;
         }
 
         if (runtime_info != other.runtime_info) {
+            return false;
+        }
+
+        if (vs_attribs != other.vs_attribs) {
             return false;
         }
 
@@ -217,12 +239,8 @@ struct StageSpecialization {
         // bindings still may change as they depend on previously processed FS. The check below
         // handles this case and prevents generation of redundant permutations. This is also safe
         // for other types of shaders with no bindings.
-        if (bitset.none() && other.bitset.none()) {
+        if (no_bindings) {
             return true;
-        }
-
-        if (start != other.start) {
-            return false;
         }
 
         u32 binding{};

@@ -205,11 +205,12 @@ struct FragmentRuntimeInfo {
     bool clip_distance_emulation{false};
 
     bool operator==(const FragmentRuntimeInfo& other) const noexcept {
-        return std::ranges::equal(color_buffers, other.color_buffers) &&
-               en_flags == other.en_flags && addr_flags == other.addr_flags &&
+        // Scalar compares run before the array walks so mismatches reject cheaply.
+        return en_flags == other.en_flags && addr_flags == other.addr_flags &&
                num_inputs == other.num_inputs && z_export_format == other.z_export_format &&
                mrtz_mask == other.mrtz_mask && dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
+               std::ranges::equal(color_buffers, other.color_buffers) &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

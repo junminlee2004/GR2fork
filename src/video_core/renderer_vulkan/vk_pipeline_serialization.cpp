@@ -155,7 +155,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
-    if (!LoadPipelineStage(meta_ar, 0)) {
+    // Compute stages carry no fetch shader; the loaded value is discarded.
+    std::optional<Shader::Gcn::FetchShaderData> fetch_data{};
+    if (!LoadPipelineStage(meta_ar, 0, fetch_data)) {
         return false;
     }
 
@@ -214,6 +216,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
+    // Accumulates across stages like the runtime lookup does; a key with no
+    // nonzero stage hashes yields disengaged fetch data.
+    std::optional<Shader::Gcn::FetchShaderData> fetch_data{};
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
         if (!hash) {
@@ -229,7 +234,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
-        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+        if (!LoadPipelineStage(meta_ar, stage_idx, fetch_data)) {
             return false;
         }
     }
@@ -239,21 +244,21 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+        runtime_infos, std::move(fetch_data), modules, sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-    fetch_shader.reset();
 
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                                      std::optional<Shader::Gcn::FetchShaderData>& fetch_out) {
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, fetch_out, spec, perm_idx)) {
         return false;
     }
 

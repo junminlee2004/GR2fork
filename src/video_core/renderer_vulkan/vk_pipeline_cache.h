@@ -47,6 +47,9 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    // Index of the permutation matched by the previous lookup; probed first when
+    // the MRU probe setting is enabled. Always bounds-checked before use.
+    u32 last_hit_perm{};
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
@@ -63,6 +66,21 @@ struct Program {
     }
 };
 
+// Names a fetch shader by (program, permutation) and resolves it against stored
+// module specs at use time, so module vector reallocation cannot dangle it.
+struct FetchShaderRef {
+    const Program* program{};
+    u32 perm_idx{};
+
+    const std::optional<Shader::Gcn::FetchShaderData>& Get() const {
+        return program->modules[perm_idx].spec.fetch_shader_data;
+    }
+
+    explicit operator bool() const {
+        return program != nullptr && Get().has_value();
+    }
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -74,14 +92,14 @@ public:
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                           std::optional<Shader::Gcn::FetchShaderData>& fetch_out);
 
     const GraphicsPipeline* GetGraphicsPipeline();
 
     const ComputePipeline* GetComputePipeline();
 
-    using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
+    using Result = std::tuple<const Shader::Info*, vk::ShaderModule, FetchShaderRef, u64>;
     Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
@@ -128,10 +146,19 @@ private:
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    FetchShaderRef fetch_shader_ref{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    // Persistent probe object for GetProgram; rebuilt in place every lookup.
+    Shader::StageSpecialization spec_scratch{};
+    // Result of the previous successful graphics lookup; a repeated key skips the
+    // hash and map probe. Validated against pipe_gen, which ReplaceShader bumps.
+    GraphicsPipelineKey last_graphics_key{};
+    const GraphicsPipeline* last_graphics_pipeline{};
+    u64 last_graphics_pipe_gen{};
+    // Cached value of the spec_mru_perm_probe setting, read once at construction.
+    bool spec_mru_perm_probe{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

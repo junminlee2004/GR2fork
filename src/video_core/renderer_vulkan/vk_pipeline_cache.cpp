@@ -313,6 +313,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    spec_mru_perm_probe = EmulatorSettings.IsSpecMruPermProbe();
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -327,6 +328,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    // A repeated key returns the previous pipeline without hashing or probing the
+    // map. pipe_gen invalidates the cached pair when ReplaceShader erases entries.
+    const u64 pipe_gen =
+        Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
+    if (last_graphics_pipeline && pipe_gen == last_graphics_pipe_gen &&
+        graphics_key == last_graphics_key) {
+        return last_graphics_pipeline;
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -335,7 +344,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            runtime_infos,
+            fetch_shader_ref
+                ? std::optional<const Shader::Gcn::FetchShaderData>{*fetch_shader_ref.Get()}
+                : std::optional<const Shader::Gcn::FetchShaderData>{},
+            modules, sdata, false);
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -348,9 +361,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
                 }
             }
         }
-        fetch_shader.reset();
+        fetch_shader_ref = {};
     }
-    return it->second.get();
+    // memcpy keeps the padding bytes deterministic for the memcmp-based compare.
+    std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+    last_graphics_pipeline = it->second.get();
+    last_graphics_pipe_gen = pipe_gen;
+    return last_graphics_pipeline;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -481,7 +498,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
-    fetch_shader = std::nullopt;
+    fetch_shader_ref = {};
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
@@ -501,12 +518,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
+        FetchShaderRef fetch_ref{};
+        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_ref,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
-        if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
+        if (fetch_ref) {
+            fetch_shader_ref = fetch_ref;
         }
         return true;
     };
@@ -584,11 +601,11 @@ bool PipelineCache::RefreshGraphicsStages() {
     }
 
     const auto* vs_info = infos[static_cast<u32>(Shader::LogicalStage::Vertex)];
-    if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
+    if (vs_info && fetch_shader_ref && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
-        for (const auto& attrib : fetch_shader->attributes) {
+        for (const auto& attrib : fetch_shader_ref.Get()->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
@@ -605,7 +622,9 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
+    // Compute stages carry no fetch shader; the reference is discarded.
+    FetchShaderRef fetch_ref{};
+    std::tie(infos[0], modules[0], fetch_ref, compute_key.value) =
         GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
     return true;
 }
@@ -658,7 +677,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
+        return std::make_tuple(&program->info, module, FetchShaderRef{program.get(), 0u},
                                perm_hash);
     }
 
@@ -667,14 +686,38 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    auto& spec = spec_scratch;
+    spec.Rebuild(info, runtime_info, profile, binding);
+#ifdef _DEBUG
+    {
+        // A fresh construction must match the rebuilt scratch member for member.
+        const Shader::StageSpecialization ref_spec(info, runtime_info, profile, binding);
+        DEBUG_ASSERT(ref_spec.info == spec.info && ref_spec.runtime_info == spec.runtime_info &&
+                     ref_spec.bitset == spec.bitset &&
+                     ref_spec.fetch_shader_data == spec.fetch_shader_data &&
+                     ref_spec.vs_attribs == spec.vs_attribs && ref_spec.buffers == spec.buffers &&
+                     ref_spec.images == spec.images && ref_spec.fmasks == spec.fmasks &&
+                     ref_spec.samplers == spec.samplers && ref_spec.start == spec.start);
+    }
+#endif
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    auto it = program->modules.end();
+    if (spec_mru_perm_probe) {
+        // Probes the previously matched permutation with the same predicate and
+        // orientation the linear search below uses.
+        const u32 mru = program->last_hit_perm;
+        if (mru < program->modules.size() && program->modules[mru].spec == spec) {
+            it = program->modules.begin() + mru;
+        }
+    }
+    if (it == program->modules.end()) {
+        it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(stage, l_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
@@ -687,8 +730,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
+    program->last_hit_perm = static_cast<u32>(perm_idx);
     return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+                           FetchShaderRef{program.get(), static_cast<u32>(perm_idx)}, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
