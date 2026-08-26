@@ -339,6 +339,12 @@ private:
 
         httplib::Client cli(host);
 
+        // Guest titles pin Sony CAs that do not exist here, and non-overridden hosts (GRR's
+        // ss4.scej-network.jp status check) present certificates that fail public verification;
+        // a verification failure would read as connection-dead where real hardware and upstream
+        // deliver the HTTP response. Trust decisions belong to the servers, not this client.
+        cli.enable_server_certificate_verification(false);
+
         // httplib defaults to a 300s connection timeout, long enough for one unreachable host to
         // hold a synchronous guest thread past any watchdog. The restoration server is local.
         cli.set_connection_timeout(5, 0);
@@ -437,7 +443,9 @@ private:
         // polls the status to decide the response is readable, then asks for its length.
         std::lock_guard<std::mutex> lk(state_mutex);
 
-        if (response->status / 100 == 2) {
+        // Any status with a body: GRR's ss.info probe reads the error page of a 403 reply, so
+        // non-2xx bodies must be readable exactly like on real hardware.
+        if (!response->body.empty()) {
 
             delete[] result_body;
             result_body_size = static_cast<u32>(response->body.size());
