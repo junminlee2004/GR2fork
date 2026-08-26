@@ -9,7 +9,6 @@
 
 #include "common/assert.h"
 #include "common/config.h"
-#include "common/elf_info.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -148,29 +147,6 @@ GraphicsPipeline::GraphicsPipeline(
         .pNext = instance.IsDepthClipControlSupported() ? &clip_control : nullptr,
     };
 
-    // GR2FORK: GRR wind/speed-line over-intensity fix. The wind fragment shader (fs 0xc1338b35)
-    // renders near-solid white in emulation, so its colour contribution is scaled to 5% via a
-    // constant blend factor (src.rgb*0.05 + dst.rgb*(1-srcA)). Gated to GRR serials only.
-    static constexpr u64 kWindPsHash = 0xc1338b35;
-    static constexpr float kWindFadeAmt = 0.05f;
-    static constexpr std::array<std::string_view, 12> kGrrSerials = {
-        "CUSA01112", "CUSA01113", "CUSA01113P", "CUSA01130",
-        "CUSA02318", "CUSA00546", "CUSA02443",  "CUSA04246",
-        "PCJS50004", "PCJS50008", "PCJS66015",  "PCJS66029",
-    };
-    static const bool is_gr_remastered = [&] {
-        const auto serial = Common::ElfInfo::Instance().GameSerial();
-        return std::find(kGrrSerials.begin(), kGrrSerials.end(), serial) != kGrrSerials.end();
-    }();
-    u64 fs_pgm_hash = 0;
-    for (const Shader::Info* s : stages) {
-        if (s != nullptr && s->l_stage == Shader::LogicalStage::Fragment) {
-            fs_pgm_hash = s->pgm_hash;
-            break;
-        }
-    }
-    const bool fade_wind = is_gr_remastered && fs_pgm_hash == kWindPsHash;
-
     boost::container::static_vector<vk::DynamicState, 32> dynamic_states = {
         vk::DynamicState::eViewportWithCount,  vk::DynamicState::eScissorWithCount,
         vk::DynamicState::eBlendConstants,     vk::DynamicState::eDepthTestEnable,
@@ -194,18 +170,6 @@ GraphicsPipeline::GraphicsPipeline(
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
     } else if (!sdata.vertex_bindings.empty()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
-    }
-
-    // GR2FORK: the wind fade uses a static ConstantColor, so drop the dynamic blend constant for
-    // this one pipeline. vkCmdSetBlendConstants elsewhere stays valid and is simply ignored by
-    // pipelines that don't declare the dynamic state, so no other pipeline is affected.
-    if (fade_wind) {
-        for (auto it = dynamic_states.begin(); it != dynamic_states.end(); ++it) {
-            if (*it == vk::DynamicState::eBlendConstants) {
-                dynamic_states.erase(it);
-                break;
-            }
-        }
     }
 
     const vk::PipelineDynamicStateCreateInfo dynamic_info = {
@@ -386,12 +350,6 @@ GraphicsPipeline::GraphicsPipeline(
                                                      ? vk::BlendFactor::eOne
                                                      : vk::BlendFactor::eZero; // 1-A
         }
-
-        // GR2FORK: scale the GRR wind shader's premultiplied colour by the static ConstantColor
-        // (kWindFadeAmt). dst factor is left as the game set it, so the background is preserved.
-        if (fade_wind) {
-            attachments[i].srcColorBlendFactor = vk::BlendFactor::eConstantColor;
-        }
     }
 
     const vk::PipelineColorBlendStateCreateInfo color_blending = {
@@ -400,8 +358,7 @@ GraphicsPipeline::GraphicsPipeline(
         .logicOp = LiverpoolToVK::LogicOp(key.logic_op),
         .attachmentCount = key.num_color_attachments,
         .pAttachments = attachments.data(),
-        .blendConstants = fade_wind ? std::array{kWindFadeAmt, kWindFadeAmt, kWindFadeAmt, 1.0f}
-                                    : std::array{1.0f, 1.0f, 1.0f, 1.0f},
+        .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},
     };
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
