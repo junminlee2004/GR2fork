@@ -395,7 +395,9 @@ public:
     }
 
     /// Waits for the given tick, attributing any blocking to a call site.
-    void WaitTagged(u64 tick, WaitSite site);
+    /// Returns the recorded wait duration in RDTSC ticks (converted by callers
+    /// via EstimateRDTSCFrequency), zero when the tick was already free.
+    u64 WaitTagged(u64 tick, WaitSite site);
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);

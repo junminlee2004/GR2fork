@@ -795,7 +795,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 std::array<u8, kSets> lru{};
             };
             // Heap-backed: only the pointer lives in TLS (a large in-TLS array
-            // blows the guest pthread TLS budget at create time).
+            // blows the guest pthread TLS budget at create time). Probes run on the
+            // GPU command thread only; the plain stream_copy_* counters share that contract.
             static thread_local std::unique_ptr<StreamCopyCache> storage;
             if (!storage) {
                 storage = std::make_unique<StreamCopyCache>();
@@ -811,7 +812,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             const u64 tick = scheduler.CurrentTick();
             const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
 
-            stream_copy_probes_.fetch_add(1, std::memory_order_relaxed);
+            ++stream_copy_probes_;
             StreamCopyCacheEntry* hit = nullptr;
             if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
                 set[0].mem_gen == mem_gen) {
@@ -823,12 +824,12 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             if (hit) {
                 cache.lru[set_idx] = static_cast<u8>(hit == &set[0] ? 1u : 0u);
                 if (hit->gpu_gen == gpu_dirty_generation_) {
-                    stream_copy_hits_.fetch_add(1, std::memory_order_relaxed);
+                    ++stream_copy_hits_;
                     return {&stream_buffer, hit->offset};
                 }
                 if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
                     hit->gpu_gen = gpu_dirty_generation_;
-                    stream_copy_hits_.fetch_add(1, std::memory_order_relaxed);
+                    ++stream_copy_hits_;
                     return {&stream_buffer, hit->offset};
                 }
                 hit->addr = 0; // went GPU-dirty: no longer stream-eligible

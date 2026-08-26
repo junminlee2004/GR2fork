@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/alignment.h"
+#include <bit>
+
 #include "common/assert.h"
-#include "common/rdtsc.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -193,9 +193,16 @@ StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& 
                           size_bytes);
 }
 
+// Alignments on the map path are Vulkan device limits, which the spec
+// defines as power-of-two values; the mask form avoids a divide per map.
+static u64 AlignUpPow2(u64 value, u64 alignment) {
+    DEBUG_ASSERT(std::has_single_bit(alignment));
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
 std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) {
     if (!is_coherent && usage == MemoryUsage::Stream) {
-        size = Common::AlignUp(size, instance->NonCoherentAtomSize());
+        size = AlignUpPow2(size, instance->NonCoherentAtomSize());
     }
 
     if (size > this->size_bytes) {
@@ -205,7 +212,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     mapped_size = size;
 
     if (alignment > 0) {
-        offset = Common::AlignUp(offset, alignment);
+        offset = AlignUpPow2(offset, alignment);
     }
 
     ++ring_stats_.maps;
@@ -224,17 +231,8 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     const u64 mapped_upper_bound = offset + size;
-    {
-        // Measure only the blocking case: this is the stall that costs the GPU
-        // command thread whole milliseconds when the ring laps the GPU.
-        const bool may_block = invalidation_mark && mapped_upper_bound > wait_bound;
-        const u64 t0 = may_block ? Common::FencedRDTSC() : 0;
-        if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
-            return {nullptr, 0};
-        }
-        if (may_block) {
-            ring_stats_.blocked_ns += Common::FencedRDTSC() - t0;
-        }
+    if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
+        return {nullptr, 0};
     }
 
     return {mapped_data.data() + offset, offset};
@@ -251,9 +249,12 @@ void StreamBuffer::Commit() {
     }
 
     offset += mapped_size;
-    if (current_watch_cursor != 0 &&
-        current_watches[current_watch_cursor].tick == scheduler->CurrentTick()) {
-        current_watches[current_watch_cursor].upper_bound = offset;
+    const u64 tick = scheduler->CurrentTick();
+    // Watches only order ring reuse against submissions, so commits within one
+    // tick collapse into the last appended watch: waiting out that tick frees
+    // every region committed under it.
+    if (current_watch_cursor != 0 && current_watches[current_watch_cursor - 1].tick == tick) {
+        current_watches[current_watch_cursor - 1].upper_bound = offset;
         return;
     }
 
@@ -264,7 +265,7 @@ void StreamBuffer::Commit() {
 
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
-    watch.tick = scheduler->CurrentTick();
+    watch.tick = tick;
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
@@ -286,7 +287,10 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!allow_wait && !scheduler->IsFree(watch.tick)) {
             return false;
         }
-        scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
+        // WaitTagged times only waits whose tick is not already known free, so
+        // blocked_ns counts real stalls and none of the drain walk itself.
+        ring_stats_.blocked_ns +=
+            scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

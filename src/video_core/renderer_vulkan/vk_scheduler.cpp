@@ -113,14 +113,16 @@ void Scheduler::Finish() {
     RecordWait(WaitSite::Finish, Common::FencedRDTSC() - t0);
 }
 
-void Scheduler::WaitTagged(u64 tick, WaitSite site) {
+u64 Scheduler::WaitTagged(u64 tick, WaitSite site) {
     if (master_semaphore.IsFree(tick)) {
         Wait(tick); // still needs the flush path; it will not block
-        return;
+        return 0;
     }
     const u64 t0 = Common::FencedRDTSC();
     Wait(tick);
-    RecordWait(site, Common::FencedRDTSC() - t0);
+    const u64 blocked = Common::FencedRDTSC() - t0;
+    RecordWait(site, blocked);
+    return blocked;
 }
 
 void Scheduler::Wait(u64 tick) {

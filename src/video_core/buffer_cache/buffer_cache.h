@@ -136,8 +136,10 @@ public:
 
     /// Snapshot and reset the stream copy cache counters (for periodic logs).
     StreamCopyStats DrainStreamCopyStats() {
-        return {stream_copy_hits_.exchange(0, std::memory_order_relaxed),
-                stream_copy_probes_.exchange(0, std::memory_order_relaxed)};
+        const StreamCopyStats stats{stream_copy_hits_, stream_copy_probes_};
+        stream_copy_hits_ = 0;
+        stream_copy_probes_ = 0;
+        return stats;
     }
 
     /// Binds host vertex buffers for the current draw.
@@ -324,9 +326,11 @@ private:
     std::atomic<u64> offload_vetoes_{};
     std::atomic<u64> offload_fallbacks_{};
     std::atomic<u64> offload_wait_ns_{};
-    // Stream copy cache counters; hits count probes that return a cached offset.
-    std::atomic<u64> stream_copy_hits_{};
-    std::atomic<u64> stream_copy_probes_{};
+    // Stream copy cache counters; hits count probes that return a cached
+    // offset. The probes and the telemetry drain both run on the GPU command
+    // thread, so plain counters suffice.
+    u64 stream_copy_hits_{};
+    u64 stream_copy_probes_{};
 };
 
 } // namespace VideoCore
