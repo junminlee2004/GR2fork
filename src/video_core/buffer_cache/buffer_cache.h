@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
+#include "common/assert.h"
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -267,6 +268,17 @@ private:
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes);
+
+    /// Records the barriers and copy commands for a completed upload batch.
+    /// Out of line so the no-upload walk in SynchronizeBuffer stays compact.
+    SHAD_NO_INLINE void EmitBufferUpload(Buffer& buffer, vk::Buffer src_buffer,
+                                         std::span<const vk::BufferCopy> copies);
+
+    /// Large one time transfer path for UploadCopies when the staging ring
+    /// cannot hold the batch; copies through a temporary host buffer.
+    SHAD_NO_INLINE vk::Buffer UploadCopiesFallback(Buffer& buffer,
+                                                   std::span<const vk::BufferCopy> copies,
+                                                   size_t total_size_bytes);
 
     bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
 

@@ -9,6 +9,7 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include "common/assert.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
@@ -249,6 +250,10 @@ private:
 
     /// Increases the amount of watches available.
     void ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size);
+
+    /// Starts a new ring lap when a map does not fit in the remaining space
+    /// and arms the watch drain for the previous lap.
+    SHAD_NO_INLINE void MapWrap();
 
     /// Waits pending watches until requested upper bound.
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);

@@ -205,7 +205,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         size = AlignUpPow2(size, instance->NonCoherentAtomSize());
     }
 
-    if (size > this->size_bytes) {
+    if (size > this->size_bytes) [[unlikely]] {
         return {nullptr, 0};
     }
 
@@ -217,17 +217,8 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 
     ++ring_stats_.maps;
     ring_stats_.bytes += size;
-    if (offset + size > this->size_bytes) {
-        ++ring_stats_.wraps;
-        // The buffer would overflow, save the amount of used watches and reset the state.
-        invalidation_mark = current_watch_cursor;
-        current_watch_cursor = 0;
-        offset = 0;
-
-        // Swap watches and reset waiting cursors.
-        std::swap(previous_watches, current_watches);
-        wait_cursor = 0;
-        wait_bound = 0;
+    if (offset + size > this->size_bytes) [[unlikely]] {
+        MapWrap();
     }
 
     const u64 mapped_upper_bound = offset + size;
@@ -236,6 +227,19 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     return {mapped_data.data() + offset, offset};
+}
+
+void StreamBuffer::MapWrap() {
+    ++ring_stats_.wraps;
+    // The buffer would overflow, save the amount of used watches and reset the state.
+    invalidation_mark = current_watch_cursor;
+    current_watch_cursor = 0;
+    offset = 0;
+
+    // Swap watches and reset waiting cursors.
+    std::swap(previous_watches, current_watches);
+    wait_cursor = 0;
+    wait_bound = 0;
 }
 
 void StreamBuffer::Commit() {

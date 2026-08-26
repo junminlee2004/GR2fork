@@ -11,6 +11,7 @@
 #include <queue>
 #include <tsl/robin_map.h>
 
+#include "common/assert.h"
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
@@ -339,6 +340,12 @@ private:
 
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
+
+    /// Overlap resolution, validation, and creation for FindImage when no
+    /// accepted perfect match exists. Requires the cache mutex to be held.
+    SHAD_NO_INLINE ImageId FindImageSlow(ImageDesc& desc, bool exact_fmt, ImageId image_id,
+                                         const ImageIds& image_ids, int& out_view_mip,
+                                         int& out_view_slice);
 
     struct SamplerMemoEntry {
         std::array<u64, 2> key{};

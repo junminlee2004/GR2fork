@@ -1201,41 +1201,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         },
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
-    if (src_buffer) {
-        scheduler.EndRendering();
-        const auto cmdbuf = scheduler.CommandBuffer();
-        const vk::BufferMemoryBarrier2 pre_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
-                             vk::AccessFlagBits2::eTransferRead |
-                             vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .buffer = buffer.Handle(),
-            .offset = 0,
-            .size = buffer.SizeBytes(),
-        };
-        const vk::BufferMemoryBarrier2 post_barrier = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-            .buffer = buffer.Handle(),
-            .offset = 0,
-            .size = buffer.SizeBytes(),
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &pre_barrier,
-        });
-        cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = 1,
-            .pBufferMemoryBarriers = &post_barrier,
-        });
-        TouchBuffer(buffer);
+    if (src_buffer) [[unlikely]] {
+        EmitBufferUpload(buffer, src_buffer, copies);
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeBufferFromImage(buffer, device_addr, size);
@@ -1266,48 +1233,89 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     return false;
 }
 
+void BufferCache::EmitBufferUpload(Buffer& buffer, vk::Buffer src_buffer,
+                                   std::span<const vk::BufferCopy> copies) {
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::BufferMemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .buffer = buffer.Handle(),
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    const vk::BufferMemoryBarrier2 post_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .buffer = buffer.Handle(),
+        .offset = 0,
+        .size = buffer.SizeBytes(),
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &pre_barrier,
+    });
+    cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &post_barrier,
+    });
+    TouchBuffer(buffer);
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      size_t total_size_bytes) {
-    if (copies.empty()) {
+    if (copies.empty()) [[likely]] {
         return VK_NULL_HANDLE;
     }
     const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
-    if (staging) {
-        for (size_t i = 0; i < copies.size(); ++i) {
-            auto& copy = copies[i];
-            // Requesting the next island's source overlaps its misses with this
-            // island's copy. Walk-time prefetches of early islands may already
-            // be evicted on large multi-island syncs, so this repeat is kept.
-            if (i + 1 < copies.size()) {
-                PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
-            }
-            u8* const src_pointer = staging + copy.srcOffset;
-            const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
-            // Apply the staging offset
-            copy.srcOffset += offset;
-        }
-        staging_buffer.Commit();
-        return staging_buffer.Handle();
-    } else {
-        // For large one time transfers use a temporary host buffer.
-        auto temp_buffer =
-            std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
-                                     vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
-        const vk::Buffer src_buffer = temp_buffer->Handle();
-        u8* const staging = temp_buffer->mapped_data.data();
-        for (size_t i = 0; i < copies.size(); ++i) {
-            const auto& copy = copies[i];
-            if (i + 1 < copies.size()) {
-                PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
-            }
-            u8* const src_pointer = staging + copy.srcOffset;
-            const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-            memory->CopySparseMemory(device_addr, src_pointer, copy.size);
-        }
-        scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
-        return src_buffer;
+    if (staging == nullptr) [[unlikely]] {
+        return UploadCopiesFallback(buffer, copies, total_size_bytes);
     }
+    for (size_t i = 0; i < copies.size(); ++i) {
+        auto& copy = copies[i];
+        // Requesting the next island's source overlaps its misses with this
+        // island's copy. Walk-time prefetches of early islands may already
+        // be evicted on large multi-island syncs, so this repeat is kept.
+        if (i + 1 < copies.size()) {
+            PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
+        }
+        u8* const src_pointer = staging + copy.srcOffset;
+        const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
+        memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+        // Apply the staging offset
+        copy.srcOffset += offset;
+    }
+    staging_buffer.Commit();
+    return staging_buffer.Handle();
+}
+
+vk::Buffer BufferCache::UploadCopiesFallback(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                                             size_t total_size_bytes) {
+    // For large one time transfers use a temporary host buffer.
+    auto temp_buffer =
+        std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Upload, 0,
+                                 vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
+    const vk::Buffer src_buffer = temp_buffer->Handle();
+    u8* const staging = temp_buffer->mapped_data.data();
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const auto& copy = copies[i];
+        if (i + 1 < copies.size()) {
+            PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
+        }
+        u8* const src_pointer = staging + copy.srcOffset;
+        const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
+        memory->CopySparseMemory(device_addr, src_pointer, copy.size);
+    }
+    scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });
+    return src_buffer;
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
