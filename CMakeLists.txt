@@ -260,7 +260,13 @@ target_compile_definitions(core_gr2 PRIVATE XXH_INLINE_ALL)
 # built core carries ~36.6k fs:0x28 checks and instruction-precise profiles
 # show them in most hot video_core prologues/epilogues (~0.3-0.6% of the
 # assembler thread). Deliberate hardening tradeoff for an emulator core.
-target_compile_options(core_gr2 PRIVATE -fno-stack-protector)
+# clang-cl only takes MSVC-style options; the /clang: prefix passes the flag through (plain
+# -fno-stack-protector is ignored there with a per-file warning).
+if(MSVC)
+    target_compile_options(core_gr2 PRIVATE /clang:-fno-stack-protector)
+else()
+    target_compile_options(core_gr2 PRIVATE -fno-stack-protector)
+endif()
 
 # GR2FORK PERF: AutoFDO hooks, core_gr2 only (core_main stays an unmodified
 # upstream mirror). Two-phase workflow:
