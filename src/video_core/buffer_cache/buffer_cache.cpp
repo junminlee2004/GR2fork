@@ -74,21 +74,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
     mirror_mode_ = EmulatorSettings.GetStreamUploadMirrorMode() != 0;
-    mirror_arena_mode_ = EmulatorSettings.GetStreamUploadMirrorMode() >= 2;
     if (mirror_mode_) {
         Core::SetProtectObserver(&BufferCache::MirrorProtectThunk, this);
         Core::SetBackingWriteObserver(&BufferCache::MirrorBackingThunk, this);
-    }
-    if (mirror_arena_mode_) {
-        // Host-cached placement regardless of the stream ring's setting:
-        // adoption writes scatter across freelist slots and hits read nothing
-        // on the CPU, so cached memory costs only fabric-coherent GPU reads,
-        // which the UMA target does not penalize.
-        mirror_arena_ = std::make_unique<Buffer>(instance, scheduler, MemoryUsage::Download, 0,
-                                                 AllFlags, MIRROR_ARENA_SIZE);
-        mirror_map_ = std::make_unique<std::array<MirrorEntry, MIRROR_ENTRIES>>();
-        VideoCore::Skipcache::Framework::Instance().RegisterInvalidate(
-            &BufferCache::MirrorDropThunk, this);
     }
 }
 
@@ -246,216 +234,6 @@ void BufferCache::MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, 
     *entry = {device_addr, size, static_cast<u8>(cpu_dirty ? 0 : 1), hash, sums.sum256, sums.sum64};
 }
 
-std::pair<Buffer*, u32> BufferCache::MirrorServe(MirrorEntry& entry) {
-    entry.last_use_tick = scheduler.CurrentTick();
-    ++mirror_b_.hits;
-    mirror_b_.served_bytes += entry.size;
-    return {mirror_arena_.get(), entry.arena_offset};
-}
-
-void BufferCache::MirrorRetireSlot(MirrorEntry& entry) {
-    if (entry.addr == 0) {
-        return;
-    }
-    mirror_retired_[entry.size_class].emplace_back(entry.arena_offset, entry.last_use_tick);
-    entry.addr = 0;
-}
-
-bool BufferCache::MirrorAllocSlot(u32 size, u32& out_offset, u16& out_class) {
-    const u32 rounded = std::max(std::bit_ceil(size), MIRROR_MIN_CLASS);
-    const u16 size_class = static_cast<u16>(std::bit_width(rounded) - 9);
-    out_class = size_class;
-    auto& retired = mirror_retired_[size_class];
-    // Retired slots recycle once their last referencing submission's fence has
-    // signaled; entries retire in rough tick order, so the head decides.
-    if (!retired.empty() && scheduler.IsFree(retired.front().second)) {
-        out_offset = retired.front().first;
-        retired.erase(retired.begin());
-        return true;
-    }
-    if (mirror_bump_ + rounded <= MIRROR_ARENA_SIZE) {
-        out_offset = mirror_bump_;
-        mirror_bump_ += rounded;
-        return true;
-    }
-    ++mirror_b_.alloc_fail;
-    MirrorEvictSome();
-    if (!retired.empty() && scheduler.IsFree(retired.front().second)) {
-        out_offset = retired.front().first;
-        retired.erase(retired.begin());
-        return true;
-    }
-    return false;
-}
-
-void BufferCache::MirrorEvictSome() {
-    // Bounded sweep: retire fence-passed entries so their slots recycle.
-    auto& map = *mirror_map_;
-    for (u32 step = 0; step < 128; ++step) {
-        MirrorEntry& entry = map[mirror_evict_cursor_];
-        mirror_evict_cursor_ = (mirror_evict_cursor_ + 1) & (MIRROR_ENTRIES - 1);
-        if (entry.addr != 0 && scheduler.IsFree(entry.last_use_tick)) {
-            MirrorRetireSlot(entry);
-            ++mirror_b_.evicted;
-        }
-    }
-}
-
-std::optional<std::pair<Buffer*, u32>> BufferCache::MirrorProbe(VAddr device_addr, u32 size,
-                                                                u64 mem_key, bool mem_key_ok,
-                                                                std::optional<bool> gpu_modified) {
-    using namespace VideoCore::Skipcache;
-    auto& skipcache = Framework::Instance();
-    constexpr auto kCache = CacheId::StreamMirror;
-    if (!mem_key_ok) {
-        return std::nullopt;
-    }
-    u64 key = static_cast<u64>(device_addr);
-    key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
-    key ^= key >> 33;
-    auto& map = *mirror_map_;
-    MirrorEntry* entry = nullptr;
-    for (size_t way = 0; way < 2; ++way) {
-        MirrorEntry& slot = map[(key + way) & (MIRROR_ENTRIES - 1)];
-        if (slot.addr == device_addr && slot.size == size) {
-            entry = &slot;
-            break;
-        }
-    }
-    const bool probing = skipcache.Active() && skipcache.ShouldProbe(kCache);
-    if (probing) {
-        ++skipcache.Counters(kCache).eligible;
-    }
-    if (entry == nullptr) {
-        if (probing) {
-            ++skipcache.Counters(kCache).miss_cold;
-        }
-        return std::nullopt;
-    }
-    if (entry->epoch_sum != mem_key) {
-        if (probing) {
-            ++skipcache.Counters(kCache).miss_gen[0];
-        }
-        MirrorRetireSlot(*entry);
-        return std::nullopt;
-    }
-    if (entry->gpu_gen != gpu_dirty_generation_) {
-        const bool clean = gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size);
-        if (!clean) {
-            if (probing) {
-                ++skipcache.Counters(kCache).veto[0];
-            }
-            MirrorRetireSlot(*entry);
-            return std::nullopt;
-        }
-        entry->gpu_gen = gpu_dirty_generation_;
-        ++mirror_b_.gpu_restamp;
-    }
-    if (probing) {
-        ++skipcache.Counters(kCache).hits;
-    }
-    if (skipcache.MayConsume(kCache) && !skipcache.ShouldVerify(kCache)) {
-        return MirrorServe(*entry);
-    }
-    if (!skipcache.Active() || skipcache.GetState(kCache) == State::Learning) {
-        return std::nullopt;
-    }
-    // Shadow and verify ticks: predict-then-execute. The authoritative ring
-    // copy is served and the arena bytes only compared against it; the
-    // records drive the controller's promotion and the corruption tripwire.
-    const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-    const u8* ring_bytes = stream_buffer.mapped_data.data() + offset;
-    const u8* arena_bytes = mirror_arena_->mapped_data.data() + entry->arena_offset;
-    if (std::memcmp(ring_bytes, arena_bytes, size) == 0) {
-        ++mirror_b_.verify_clean;
-        skipcache.RecordVerifyClean(kCache);
-    } else {
-        ++mirror_b_.verify_div;
-        skipcache.RecordDivergence(kCache, "mirror arena bytes diverge from ring copy");
-        MirrorRetireSlot(*entry);
-    }
-    return std::make_pair(&stream_buffer, static_cast<u32>(offset));
-}
-
-std::optional<std::pair<Buffer*, u32>> BufferCache::MirrorTryAdopt(VAddr device_addr, u32 size,
-                                                                   u64 mem_key, bool mem_key_ok,
-                                                                   bool serve) {
-    using namespace VideoCore::Skipcache;
-    auto& skipcache = Framework::Instance();
-    if (!mem_key_ok) {
-        return std::nullopt;
-    }
-    // Clean-implies-armed: the peek runs after the epoch snapshot, so every
-    // covered page is write-watched and any later guest write moves the sum.
-    if (memory_tracker->PeekRegionCpuModifiedNoCreate(device_addr, size)) {
-        return std::nullopt;
-    }
-    u32 offset = 0;
-    u16 size_class = 0;
-    if (!MirrorAllocSlot(size, offset, size_class)) {
-        return std::nullopt;
-    }
-    auto* memory = Core::Memory::Instance();
-    memory->CopySparseMemory(device_addr, mirror_arena_->mapped_data.data() + offset, size);
-    mirror_arena_->FlushForDevice(offset, size);
-    const auto after = memory_tracker->Sum256ForRange(device_addr, size);
-    if (!after.ok || after.sum != mem_key) {
-        // The bytes may be torn; the slot was never published so it recycles
-        // immediately through its class list.
-        mirror_retired_[size_class].emplace_back(offset, u64{0});
-        ++mirror_b_.adopt_torn;
-        return std::nullopt;
-    }
-    u64 key = static_cast<u64>(device_addr);
-    key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
-    key ^= key >> 33;
-    auto& map = *mirror_map_;
-    MirrorEntry* victim = &map[key & (MIRROR_ENTRIES - 1)];
-    for (size_t way = 0; way < 2; ++way) {
-        MirrorEntry& slot = map[(key + way) & (MIRROR_ENTRIES - 1)];
-        if (slot.addr == 0) {
-            victim = &slot;
-            break;
-        }
-        if (slot.last_use_tick < victim->last_use_tick) {
-            victim = &slot;
-        }
-    }
-    MirrorRetireSlot(*victim);
-    *victim = MirrorEntry{
-        .addr = device_addr,
-        .epoch_sum = mem_key,
-        .gpu_gen = gpu_dirty_generation_,
-        .last_use_tick = scheduler.CurrentTick(),
-        .arena_offset = offset,
-        .size = static_cast<u16>(size),
-        .size_class = size_class,
-    };
-    ++mirror_b_.adopts;
-    mirror_b_.adopt_bytes += size;
-    if (skipcache.Active()) {
-        skipcache.NotifyPopulated(CacheId::StreamMirror);
-    }
-    if (!serve) {
-        return std::nullopt;
-    }
-    return MirrorServe(*victim);
-}
-
-void BufferCache::MirrorDropThunk(void* user) {
-    static_cast<BufferCache*>(user)->MirrorDropAll();
-}
-
-void BufferCache::MirrorDropAll() {
-    if (!mirror_arena_mode_ || !mirror_map_) {
-        return;
-    }
-    for (MirrorEntry& entry : *mirror_map_) {
-        MirrorRetireSlot(entry);
-    }
-    ++mirror_b_.drops;
-}
-
 void BufferCache::EmitMirrorTelemetry() {
     if (!mirror_mode_) {
         return;
@@ -489,16 +267,6 @@ void BufferCache::EmitMirrorTelemetry() {
              pct(mo.tierA_hits, mo.tierA_hits + mo.tierA_walks), mo.tierA_hits, mo.tierA_walks,
              mo.tierA_elig_walks, pct(mo.tierA_span_le64, mo.tierA_walks), mo.ws_keys,
              static_cast<double>(mo.ws_bytes) / (1024.0 * 1024.0));
-    if (mirror_arena_mode_) {
-        LOG_INFO(Render_Skipcache,
-                 "[SkipCache] MIRRORB hits={} MiB={:.1f} adopts={} adoptMiB={:.1f} torn={} "
-                 "vclean={} vdiv={} allocfail={} evict={} restamp={} drops={} per300f",
-                 mirror_b_.hits, static_cast<double>(mirror_b_.served_bytes) / (1024.0 * 1024.0),
-                 mirror_b_.adopts, static_cast<double>(mirror_b_.adopt_bytes) / (1024.0 * 1024.0),
-                 mirror_b_.adopt_torn, mirror_b_.verify_clean, mirror_b_.verify_div,
-                 mirror_b_.alloc_fail, mirror_b_.evicted, mirror_b_.gpu_restamp, mirror_b_.drops);
-        mirror_b_ = MirrorArenaCounters{};
-    }
     LOG_INFO(Render_Skipcache, "[SkipCache] PEEKBASE calls={} dirty={} per300f",
              memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty);
     memory_tracker->peek_fastpath_calls = 0;
@@ -1338,12 +1106,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             }
 
             ++stream_copy_probes_;
-            if (mirror_arena_mode_) {
-                if (auto served =
-                        MirrorProbe(device_addr, size, mem_key, mem_key_ok, gpu_modified)) {
-                    return *served;
-                }
-            }
             StreamCopyCacheEntry* hit = nullptr;
             if (!mem_key_ok) {
                 // An uncertifiable range neither hits nor records.
@@ -1371,22 +1133,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 MirrorOracleProbe(device_addr, size, true, true);
             } else if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
                 MirrorOracleProbe(device_addr, size, false, false);
-                if (mirror_arena_mode_) {
-                    auto& mirror_sk = VideoCore::Skipcache::Framework::Instance();
-                    const bool consume =
-                        mirror_sk.MayConsume(VideoCore::Skipcache::CacheId::StreamMirror);
-                    // Before promotion the arena populates on a fraction of
-                    // misses while the ring still serves, bounding the
-                    // double-copy burn-in the controller's pricing needs.
-                    const bool populate =
-                        consume || (mirror_sk.Active() && (mirror_populate_tick_++ & 7) == 0);
-                    if (populate) {
-                        if (auto served =
-                                MirrorTryAdopt(device_addr, size, mem_key, mem_key_ok, consume)) {
-                            return *served;
-                        }
-                    }
-                }
                 const u64 offset =
                     stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
                 if (mem_key_ok) {

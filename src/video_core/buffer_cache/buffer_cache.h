@@ -404,63 +404,6 @@ private:
     MirrorSinkCounters mirror_sink_;
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
-
-    // Tier B mirror arena: a persistent host-cached device buffer serving
-    // recurring clean stream sources across frames. Entries certify with the
-    // same word-epoch sums the tier A memos use; published slot bytes are
-    // immutable and return to their free list only after the last referencing
-    // submission's fence.
-    struct alignas(64) MirrorEntry {
-        VAddr addr;    // 0 = invalid
-        u64 epoch_sum; // certificate recorded at adoption
-        u64 gpu_gen;
-        u64 last_use_tick;
-        u32 arena_offset;
-        u16 size;
-        u16 size_class;
-    };
-    static constexpr size_t MIRROR_ENTRIES = 32768;
-    static constexpr u32 MIRROR_ARENA_SIZE = 64 * 1024 * 1024;
-    static constexpr u32 MIRROR_MIN_CLASS = 256;
-    static constexpr u32 MIRROR_NUM_CLASSES = 7; // 256B..16KB
-
-    std::pair<Buffer*, u32> MirrorServe(MirrorEntry& entry);
-    void MirrorRetireSlot(MirrorEntry& entry);
-    bool MirrorAllocSlot(u32 size, u32& out_offset, u16& out_class);
-    void MirrorEvictSome();
-    std::optional<std::pair<Buffer*, u32>> MirrorProbe(VAddr device_addr, u32 size, u64 mem_key,
-                                                       bool mem_key_ok,
-                                                       std::optional<bool> gpu_modified);
-    std::optional<std::pair<Buffer*, u32>> MirrorTryAdopt(VAddr device_addr, u32 size, u64 mem_key,
-                                                          bool mem_key_ok, bool serve);
-    static void MirrorDropThunk(void* user);
-
-public:
-    /// Drops every mirror arena entry; live slots recycle after their fences.
-    void MirrorDropAll();
-
-private:
-    struct MirrorArenaCounters {
-        u64 hits{};
-        u64 served_bytes{};
-        u64 verify_clean{};
-        u64 verify_div{};
-        u64 adopts{};
-        u64 adopt_bytes{};
-        u64 adopt_torn{};
-        u64 alloc_fail{};
-        u64 evicted{};
-        u64 drops{};
-        u64 gpu_restamp{};
-    };
-    std::unique_ptr<std::array<MirrorEntry, MIRROR_ENTRIES>> mirror_map_;
-    std::unique_ptr<Buffer> mirror_arena_;
-    std::array<std::vector<std::pair<u32, u64>>, MIRROR_NUM_CLASSES> mirror_retired_;
-    MirrorArenaCounters mirror_b_;
-    u32 mirror_bump_{};
-    u32 mirror_evict_cursor_{};
-    u32 mirror_populate_tick_{};
-    bool mirror_arena_mode_{};
 };
 
 } // namespace VideoCore

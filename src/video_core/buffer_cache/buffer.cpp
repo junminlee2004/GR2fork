@@ -144,12 +144,6 @@ void Buffer::InvalidateForRead(u64 offset, u64 num_bytes) {
     }
 }
 
-void Buffer::FlushForDevice(u64 offset, u64 num_bytes) {
-    if (!is_coherent) {
-        vmaFlushAllocation(instance->GetAllocator(), buffer.allocation, offset, num_bytes);
-    }
-}
-
 void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
     scheduler->EndRendering();
     ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
