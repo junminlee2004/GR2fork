@@ -139,6 +139,44 @@ public:
         return dirty || covered != query_size;
     }
 
+    struct EpochSum256 {
+        u64 sum;
+        bool ok;
+    };
+
+    /// Word-epoch sum alone, for consumers that key memos on it. ok is false
+    /// when part of the range has no region, when any covered word is
+    /// poisoned, or when the span exceeds 64 words; callers then fall back to
+    /// their coarse generation key.
+    EpochSum256 Sum256ForRange(VAddr cpu_addr, u64 size) noexcept {
+        constexpr u64 max_span = u64{64} << RegionManager::EPOCH_WORD_BITS;
+        EpochSum256 out{0, true};
+        if (size == 0 || size > max_span) {
+            out.ok = false;
+            return out;
+        }
+        u64 covered = 0;
+        IteratePages<false>(
+            cpu_addr, size,
+            [&out, &covered](RegionManager* manager, u64 offset, size_t range_size) {
+                covered += range_size;
+                const size_t w0 = std::min<u64>(offset >> RegionManager::EPOCH_WORD_BITS,
+                                                RegionManager::NUM_EPOCH_WORDS - 1);
+                const size_t w1 =
+                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_WORD_BITS,
+                                  RegionManager::NUM_EPOCH_WORDS - 1);
+                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
+                for (size_t w = w0; w <= w1; ++w) {
+                    out.sum += manager->word_epochs[w].load(std::memory_order_acquire);
+                    if ((poison >> w) & 1u) {
+                        out.ok = false;
+                    }
+                }
+            });
+        out.ok = out.ok && covered == size;
+        return out;
+    }
+
     struct EpochSums {
         u64 sum256;
         u64 sum64;

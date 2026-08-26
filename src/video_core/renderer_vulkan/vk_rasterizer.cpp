@@ -403,13 +403,16 @@ void Rasterizer::RecordDrawKey(const GraphicsPipeline* pipeline, bool is_indexed
     // component.
     const auto& gkey = pipeline_cache.CurrentGraphicsKey();
     u64 k1 = XXH3_64bits(&gkey, sizeof(gkey));
-    const u64 extra[4] = {is_indexed ? regs.index_base_address.Address<u64>() : 0,
-                          regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
+    // The index base rotates with the guest ring, so only its presence is
+    // keyed, matching the canonical sharp treatment below.
+    const u64 extra[3] = {regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
                           is_indexed ? 1u : 0u};
     k1 ^= XXH3_64bits(extra, sizeof(extra));
-    // K3: the raw sharp regions of each active stage's flattened user data.
-    // Samplers are excluded in this revision; buffer and image sharps carry
-    // the addresses and sizes that decide bind identity.
+    // K3: the sharp regions of each active stage's flattened user data with
+    // their base-address fields masked out. Guest stream addresses rotate
+    // every frame, so the canonical form prices recurrence as it would look
+    // above a stable-slot mirror; sizes, strides, and formats stay keyed.
+    // Samplers are excluded in this revision.
     u64 k3 = 0x9e3779b97f4a7c15ULL;
     for (const auto* info : pipeline->GetStages()) {
         if (info == nullptr) {
@@ -418,18 +421,29 @@ void Rasterizer::RecordDrawKey(const GraphicsPipeline* pipeline, bool is_indexed
         const auto& ud = info->flattened_ud_buf;
         for (const auto& buffer : info->buffers) {
             if (buffer.sharp_idx + 4 <= ud.size()) {
-                k3 = XXH3_64bits_withSeed(&ud[buffer.sharp_idx], 4 * sizeof(u32), k3);
+                u32 words[4];
+                std::memcpy(words, &ud[buffer.sharp_idx], sizeof(words));
+                // V# base address: word0 plus the low 16 bits of word1.
+                words[0] = 0;
+                words[1] &= 0xFFFF0000u;
+                k3 = XXH3_64bits_withSeed(words, sizeof(words), k3);
             }
         }
         for (const auto& image : info->images) {
             if (image.sharp_idx + 8 <= ud.size()) {
-                k3 = XXH3_64bits_withSeed(&ud[image.sharp_idx], 8 * sizeof(u32), k3);
+                u32 words[8];
+                std::memcpy(words, &ud[image.sharp_idx], sizeof(words));
+                // T# base address: word0 plus the low 8 bits of word1.
+                words[0] = 0;
+                words[1] &= 0xFFFFFF00u;
+                k3 = XXH3_64bits_withSeed(words, sizeof(words), k3);
             }
         }
     }
-    // K4: the vertex bind signature already computed by the inline bind memo.
-    const u64 k4 = buffer_cache.LastVertexBindSig();
-    const u64 parts[3] = {k1, k3, k4};
+    // The bind signature mixes rotating guest base addresses, so it stays out
+    // of the canonical key; the masked buffer sharps carry the surviving
+    // identity (size, stride, format).
+    const u64 parts[2] = {k1, k3};
     const XXH128_hash_t full = XXH3_128bits(parts, sizeof(parts));
     const u32 frame = static_cast<u32>(DebugState.GetFrameNum());
 

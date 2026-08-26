@@ -298,15 +298,15 @@ private:
 
     // Vertex/index bind memos (adaptive skip caches, inline form). Validity
     // requires same submission tick (stream ring offsets are only stable
-    // within one command buffer) and unchanged mem_gen (no CPU write reached
-    // the emulator since the recorded bind). The clean-gen fields record the
-    // gpu_dirty_generation_ at which the memoized range was last proven not
-    // GPU modified; zero means unproven.
+    // within one command buffer) and an unchanged memory key: the host-memory
+    // generation, or the bound range's word-epoch sum under the mirror mode. The clean-gen fields
+    // record the gpu_dirty_generation_ at which the memoized range was last proven not GPU
+    // modified; zero means unproven.
     u64 vertex_bind_sig_{};
     u64 vertex_input_sig_{};
     u64 vertex_bind_tick_{};
     u64 vertex_input_tick_{};
-    u64 vertex_bind_mem_gen_{};
+    u64 vertex_bind_mem_key_{};
     u64 vertex_bind_clean_gpu_gen_{};
     bool vertex_bind_valid_{};
     bool vertex_input_valid_{};
@@ -314,7 +314,7 @@ private:
     u32 index_bind_size_{};
     u32 index_bind_type_{};
     u64 index_bind_tick_{};
-    u64 index_bind_mem_gen_{};
+    u64 index_bind_mem_key_{};
     u64 index_bind_clean_gpu_gen_{};
     bool index_bind_valid_{};
     StreamBuffer staging_buffer;
@@ -352,12 +352,6 @@ private:
     u64 stream_copy_probes_{};
 
 public:
-    /// The vertex bind signature of the latest memoized vertex bind, zero when
-    /// the inline memo is inactive.
-    [[nodiscard]] u64 LastVertexBindSig() const noexcept {
-        return vertex_bind_valid_ ? vertex_bind_sig_ : 0;
-    }
-
     /// Emits and resets the phase-1 stream mirror telemetry. Logs nothing when
     /// the mirror mode is off.
     void EmitMirrorTelemetry();
@@ -403,7 +397,7 @@ private:
         u64 ws_bytes{};
         u64 sum_unresolved{};
         u64 tierA_walks{};
-        u64 tierA_would_hit{};
+        u64 tierA_hits{};
         u64 tierA_elig_walks{};
         u64 tierA_span_le64{};
     };

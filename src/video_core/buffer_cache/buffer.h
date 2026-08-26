@@ -173,20 +173,20 @@ public:
     size_t size_bytes = 0;
     u64 lru_id = 0;
     // Memos of recent read-only upload queries that found nothing to upload.
-    // While the host-memory generation is unchanged the guest bytes still
-    // equal the device-buffer bytes for a recorded range, so eliding the
-    // upload is byte-identical; a query contained in a recorded range hits,
-    // since a clean range has no dirty subrange. Zero generation = empty.
+    // While the key is unchanged the guest bytes still equal the device-buffer
+    // bytes for a recorded range, so eliding the upload is byte-identical; a
+    // query contained in a recorded range hits, since a clean range has no
+    // dirty subrange. The key is the host-memory generation, or the range's
+    // word-epoch sum under the stream mirror mode, where a clean range keeps
+    // every page write-protected and any write bumps the sum through the
+    // protection grant. Zero size = empty.
     struct SyncNoop {
         VAddr addr = 0;
         u32 size = 0;
-        u64 mem_gen = 0;
+        u64 mem_key = 0;
     };
     std::array<SyncNoop, 2> sync_noop{};
     u32 sync_noop_next = 0;
-    // Phase-1 oracle: epoch sum recorded at the last nothing-to-upload walk.
-    u64 oracle_epoch_sum = 0;
-    bool oracle_sum_valid = false;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

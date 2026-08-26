@@ -262,10 +262,10 @@ void BufferCache::EmitMirrorTelemetry() {
              mirror_sink_.bump_backing.exchange(0, std::memory_order_relaxed),
              mirror_sink_.poisoned.exchange(0, std::memory_order_relaxed));
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] MIRRORTIERA would_hit%={:.1f} walks={} elig_walks={} span_le64%={:.1f} "
-             "ws_keys={} ws_MiB={:.1f} per300f",
-             pct(mo.tierA_would_hit, mo.tierA_walks), mo.tierA_walks, mo.tierA_elig_walks,
-             pct(mo.tierA_span_le64, mo.tierA_walks), mo.ws_keys,
+             "[SkipCache] MIRRORTIERA hit%={:.1f} hits={} walks={} elig_walks={} "
+             "span_le64%={:.1f} ws_keys={} ws_MiB={:.1f} per300f",
+             pct(mo.tierA_hits, mo.tierA_hits + mo.tierA_walks), mo.tierA_hits, mo.tierA_walks,
+             mo.tierA_elig_walks, pct(mo.tierA_span_le64, mo.tierA_walks), mo.ws_keys,
              static_cast<double>(mo.ws_bytes) / (1024.0 * 1024.0));
     LOG_INFO(Render_Skipcache, "[SkipCache] PEEKBASE calls={} dirty={} per300f",
              memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty);
@@ -683,26 +683,39 @@ void BufferCache::BindVertexBuffers(
             mix(bind_sig, static_cast<u64>(gb.GetStride()));
         }
         const u64 tick = scheduler.CurrentTick();
-        const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
-        if (vertex_bind_valid_ && bind_sig == vertex_bind_sig_ && tick == vertex_bind_tick_ &&
-            mem_gen == vertex_bind_mem_gen_) {
+        VAddr span_lo = ~VAddr{0};
+        VAddr span_hi = 0;
+        for (const auto& gb : guest_buffers) {
+            if (gb.base_address != 0 && gb.GetSize() > 0) {
+                span_lo = std::min<VAddr>(span_lo, gb.base_address);
+                span_hi = std::max<VAddr>(span_hi, gb.base_address + gb.GetSize());
+            }
+        }
+        // The memo keys on the bound span's word-epoch sum under the mirror
+        // mode, so faults outside the span no longer invalidate it; the
+        // certificate is the same one the sync memo relies on.
+        u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+        bool mem_key_ok = true;
+        if (mirror_mode_) {
+            if (span_hi > span_lo) {
+                const auto sum = memory_tracker->Sum256ForRange(span_lo, span_hi - span_lo);
+                mem_key = sum.sum;
+                mem_key_ok = sum.ok;
+            } else {
+                mem_key_ok = false;
+            }
+        }
+        if (mem_key_ok && vertex_bind_valid_ && bind_sig == vertex_bind_sig_ &&
+            tick == vertex_bind_tick_ && mem_key == vertex_bind_mem_key_) {
             // Identical resolved layout and buffer contents descriptors on the
             // same command buffer with no intervening CPU write. GPU writes do
-            // not move mem_gen, so a skip additionally requires that no bound
+            // not move the key, so a skip additionally requires that no bound
             // range is GPU modified (else the re-bind's barrier is required).
             // The generation only moves on new GPU-dirty coverage, so an
             // unchanged value reproves the recorded clean answer without the
             // region walk.
             if (vertex_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
                 return;
-            }
-            VAddr span_lo = ~VAddr{0};
-            VAddr span_hi = 0;
-            for (const auto& gb : guest_buffers) {
-                if (gb.base_address != 0 && gb.GetSize() > 0) {
-                    span_lo = std::min<VAddr>(span_lo, gb.base_address);
-                    span_hi = std::max<VAddr>(span_hi, gb.base_address + gb.GetSize());
-                }
             }
             if (span_hi <= span_lo || !IsRegionGpuModified(span_lo, span_hi - span_lo)) {
                 vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
@@ -711,8 +724,8 @@ void BufferCache::BindVertexBuffers(
         }
         vertex_bind_sig_ = bind_sig;
         vertex_bind_tick_ = tick;
-        vertex_bind_mem_gen_ = mem_gen;
-        vertex_bind_valid_ = true;
+        vertex_bind_mem_key_ = mem_key;
+        vertex_bind_valid_ = mem_key_ok;
         // A fresh stamp invalidates the standing clean proof.
         vertex_bind_clean_gpu_gen_ = 0;
     } else {
@@ -859,11 +872,17 @@ void BufferCache::BindIndexBuffer(
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         const u64 tick = scheduler.CurrentTick();
-        const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
-        if (index_bind_valid_ && index_bind_addr_ == index_address &&
+        u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+        bool mem_key_ok = true;
+        if (mirror_mode_) {
+            const auto sum = memory_tracker->Sum256ForRange(index_address, index_buffer_size);
+            mem_key = sum.sum;
+            mem_key_ok = sum.ok;
+        }
+        if (mem_key_ok && index_bind_valid_ && index_bind_addr_ == index_address &&
             index_bind_size_ == index_buffer_size &&
             index_bind_type_ == static_cast<u32>(index_type) && index_bind_tick_ == tick &&
-            index_bind_mem_gen_ == mem_gen) {
+            index_bind_mem_key_ == mem_key) {
             // Same resolved index range already bound on this command buffer
             // with no intervening CPU write; an unchanged GPU-dirty generation
             // reproves the recorded clean answer without the region walk.
@@ -880,8 +899,8 @@ void BufferCache::BindIndexBuffer(
         index_bind_size_ = index_buffer_size;
         index_bind_type_ = static_cast<u32>(index_type);
         index_bind_tick_ = tick;
-        index_bind_mem_gen_ = mem_gen;
-        index_bind_valid_ = true;
+        index_bind_mem_key_ = mem_key;
+        index_bind_valid_ = mem_key_ok;
         // A fresh stamp invalidates the standing clean proof.
         index_bind_clean_gpu_gen_ = 0;
     } else {
@@ -1048,7 +1067,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             struct StreamCopyCacheEntry {
                 VAddr addr; // 0 = invalid
                 u64 tick;
-                u64 mem_gen;
+                // Host-memory generation, or the range's word-epoch sum under
+                // the mirror mode: range-local keying survives the constant
+                // generation churn of unrelated faults.
+                u64 mem_key;
                 u64 gpu_gen;
                 u32 offset;
                 u32 size;
@@ -1075,15 +1097,23 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             const size_t set_idx = key & (kSets - 1);
             auto& set = cache.sets[set_idx];
             const u64 tick = scheduler.CurrentTick();
-            const u64 mem_gen = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+            u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+            bool mem_key_ok = true;
+            if (mirror_mode_) {
+                const auto sum = memory_tracker->Sum256ForRange(device_addr, size);
+                mem_key = sum.sum;
+                mem_key_ok = sum.ok;
+            }
 
             ++stream_copy_probes_;
             StreamCopyCacheEntry* hit = nullptr;
-            if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
-                set[0].mem_gen == mem_gen) {
+            if (!mem_key_ok) {
+                // An uncertifiable range neither hits nor records.
+            } else if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
+                       set[0].mem_key == mem_key) {
                 hit = &set[0];
             } else if (set[1].addr == device_addr && set[1].size == size && set[1].tick == tick &&
-                       set[1].mem_gen == mem_gen) {
+                       set[1].mem_key == mem_key) {
                 hit = &set[1];
             }
             if (hit) {
@@ -1105,16 +1135,18 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 MirrorOracleProbe(device_addr, size, false, false);
                 const u64 offset =
                     stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-                const u8 victim = cache.lru[set_idx] & 1u;
-                set[victim] = StreamCopyCacheEntry{
-                    .addr = device_addr,
-                    .tick = tick,
-                    .mem_gen = mem_gen,
-                    .gpu_gen = gpu_dirty_generation_,
-                    .offset = static_cast<u32>(offset),
-                    .size = size,
-                };
-                cache.lru[set_idx] = static_cast<u8>(victim ^ 1u);
+                if (mem_key_ok) {
+                    const u8 victim = cache.lru[set_idx] & 1u;
+                    set[victim] = StreamCopyCacheEntry{
+                        .addr = device_addr,
+                        .tick = tick,
+                        .mem_key = mem_key,
+                        .gpu_gen = gpu_dirty_generation_,
+                        .offset = static_cast<u32>(offset),
+                        .size = size,
+                    };
+                    cache.lru[set_idx] = static_cast<u8>(victim ^ 1u);
+                }
                 return {&stream_buffer, static_cast<u32>(offset)};
             }
             // GPU-modified: fall through to the slot path below.
@@ -1406,12 +1438,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // binds are excluded: their walk also marks the range GPU modified.
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     const bool memo_eligible = skipcache.Active() && !is_written && !is_texel_buffer;
+    // Under the mirror mode the memo keys on the recorded range's word-epoch
+    // sum instead of the global generation, so unrelated faults elsewhere no
+    // longer invalidate it. The sum is validated over the recorded range, not
+    // the queried subrange, since the stored sum covers exactly that span.
+    const bool epoch_keyed = memo_eligible && mirror_mode_;
     const u64 memo_gen =
         memo_eligible ? skipcache.Gens().mem_gen.load(std::memory_order_acquire) : 0;
     if (memo_eligible) {
         for (const auto& noop : buffer.sync_noop) {
-            if (noop.mem_gen == memo_gen && device_addr >= noop.addr &&
-                device_addr + size <= noop.addr + noop.size) {
+            if (noop.size == 0 || device_addr < noop.addr ||
+                device_addr + size > noop.addr + noop.size) {
+                continue;
+            }
+            if (epoch_keyed) {
+                const auto sum = memory_tracker->Sum256ForRange(noop.addr, noop.size);
+                if (sum.ok && noop.mem_key == sum.sum) {
+                    ++mirror_oracle_.tierA_hits;
+                    return false;
+                }
+            } else if (noop.mem_key == memo_gen) {
                 return false;
             }
         }
@@ -1441,40 +1487,42 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     }
     if (mirror_mode_ && memo_eligible && !src_buffer) {
         ++mirror_oracle_.tierA_walks;
-        const auto sums = memory_tracker->SumEpochsForRange(device_addr, size);
         constexpr u64 word_size = u64{1} << RegionManager::EPOCH_WORD_BITS;
         if (size <= 64 * word_size) {
             ++mirror_oracle_.tierA_span_le64;
         }
-        if (sums.ok && !sums.poisoned && buffer.oracle_sum_valid &&
-            buffer.oracle_epoch_sum == sums.sum256) {
-            ++mirror_oracle_.tierA_would_hit;
-        }
-        buffer.oracle_epoch_sum = sums.sum256;
-        buffer.oracle_sum_valid = sums.ok;
     }
     if (memo_eligible && !src_buffer) {
         // Nothing was uploaded: record the exact walked range so the next
         // query contained in it skips the page walk entirely. Prefer to
-        // replace a same-generation entry the new range covers, then a
-        // stale-generation entry, then the round-robin victim.
-        size_t victim = buffer.sync_noop.size();
-        for (size_t i = 0; i < buffer.sync_noop.size(); ++i) {
-            const auto& noop = buffer.sync_noop[i];
-            if (noop.mem_gen != memo_gen) {
-                victim = i;
-                continue;
-            }
-            if (noop.addr >= device_addr && noop.addr + noop.size <= device_addr + size) {
-                victim = i;
-                break;
-            }
+        // replace a same-key entry the new range covers, then a stale entry,
+        // then the round-robin victim.
+        u64 record_key = memo_gen;
+        bool record_valid = true;
+        if (epoch_keyed) {
+            const auto sum = memory_tracker->Sum256ForRange(device_addr, size);
+            record_key = sum.sum;
+            record_valid = sum.ok;
         }
-        if (victim == buffer.sync_noop.size()) {
-            victim = buffer.sync_noop_next;
+        if (record_valid) {
+            size_t victim = buffer.sync_noop.size();
+            for (size_t i = 0; i < buffer.sync_noop.size(); ++i) {
+                const auto& noop = buffer.sync_noop[i];
+                if (noop.mem_key != record_key || noop.size == 0) {
+                    victim = i;
+                    continue;
+                }
+                if (noop.addr >= device_addr && noop.addr + noop.size <= device_addr + size) {
+                    victim = i;
+                    break;
+                }
+            }
+            if (victim == buffer.sync_noop.size()) {
+                victim = buffer.sync_noop_next;
+            }
+            buffer.sync_noop[victim] = {.addr = device_addr, .size = size, .mem_key = record_key};
+            buffer.sync_noop_next = static_cast<u32>((victim + 1) % buffer.sync_noop.size());
         }
-        buffer.sync_noop[victim] = {.addr = device_addr, .size = size, .mem_gen = memo_gen};
-        buffer.sync_noop_next = static_cast<u32>((victim + 1) % buffer.sync_noop.size());
     }
     return false;
 }
