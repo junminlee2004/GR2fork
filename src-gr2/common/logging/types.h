@@ -122,6 +122,8 @@ enum class Class : u8 {
     Render_Vulkan,           ///< Vulkan backend
     Render_Recompiler,       ///< Shader recompiler
     ImGui,                   ///< ImGui
+    ShadNet,                 ///< shadNet client
+    NpHandler,               ///< shadNet NP handler
     Loader,                  ///< ROM loader
     Input,                   ///< Input emulation
     Tty,                     ///< Debug output from emu

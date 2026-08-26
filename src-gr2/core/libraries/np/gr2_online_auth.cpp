@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -24,6 +25,8 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/libraries/np/gr2_online_auth.h"
+#include "core/libraries/np/np_handler.h"
+#include "core/user_settings.h"
 
 // Server-verified login for the GR2 online restoration. Enough of the shadnet framed-protobuf TCP
 // protocol to authenticate the configured Online ID + password and capture the bearer token; the
@@ -385,6 +388,16 @@ std::string BearerToken() {
 std::string EffectiveOnlineId() {
     if (std::string npid = VerifiedNpid(); !npid.empty()) {
         return npid;
+    }
+    // GRR titles authenticate through the shadNet NpHandler instead of this module; the signed-in
+    // Online ID must still replace the local Username everywhere the identity is displayed.
+    {
+        const auto online_id = Libraries::Np::NpHandler::GetInstance().GetOnlineId(
+            UserManagement.GetDefaultUser().user_id);
+        const size_t len = strnlen(online_id.data, sizeof(online_id.data));
+        if (len > 0) {
+            return std::string(online_id.data, len);
+        }
     }
     return Config::getUserName();
 }

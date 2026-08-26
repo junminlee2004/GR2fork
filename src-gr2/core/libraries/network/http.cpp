@@ -39,7 +39,30 @@ static inline std::string SafeCStr(const char* p) {
     return p ? std::string(p) : std::string("(null)");
 }
 
+// GR2FORK: the restoration-server redirect belongs to GR2 alone. Other titles running on this
+// core (GRR: CUSA01130) do their online through shadNet, and their guest HTTP must reach the
+// original hosts untouched.
+static bool IsGr2Title() {
+    static const bool is_gr2 = [] {
+        static constexpr const char* kGr2Serials[] = {
+            "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+            "PCJS50010", "PCAS00079", "CUSA04935",
+        };
+        const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
+        for (const char* s : kGr2Serials) {
+            if (serial == s) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return is_gr2;
+}
+
 std::string ReplaceHost(std::string url, const std::string& new_host, bool force_http = true) {
+    if (!IsGr2Title() || new_host.empty()) {
+        return url;
+    }
 
     std::string separator = "://";
     u64 protocol_pos = url.find(separator);
@@ -247,7 +270,9 @@ static s32 HttpMethodFromString(const char* method) {
 // host. ReplaceHost forces every request to the restoration server anyway, so binding the path
 // to the override host reproduces the real route; only the path identifies the endpoint.
 static std::string BuildOverrideUrlFromPath(const char* path) {
-    std::string url = "http://" + host_override;
+    // Non-GR2 titles get no redirect; with no stored connection there is no host to rebuild, so
+    // the request fails cleanly instead of reaching the restoration server.
+    std::string url = "http://" + (IsGr2Title() ? host_override : std::string{});
     if (path != nullptr && path[0] != '\0') {
         if (path[0] != '/') {
             url.push_back('/');

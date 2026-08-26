@@ -143,6 +143,8 @@ static std::map<s32, std::string> ExtractTrophies(std::string_view npbind_guest,
         LOG_WARNING(Common_Filesystem, "No NPCommIDs in npbind.dat");
         return trophy_index_map;
     }
+    // The NP handler resolves service labels to these ids for shadNet score requests.
+    Common::ElfInfo::Instance().SetNpCommIds(np_comm_ids);
 
     if (!mnt->IsDirectory(trophy_dir_guest)) {
         LOG_WARNING(Common_Filesystem, "Game does not contain a trophy directory");

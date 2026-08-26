@@ -244,7 +244,7 @@ add_core(
              # Upstream excludes this too (CORE_MAIN_EXCLUDES): its File::Open definitions
              # predate the IFile backend refactor and no longer match fs.h.
              core/file_sys/file.cpp
-    LIBS     SDL3_mixer::SDL3_mixer miniz Cpp_Httplib ZArchive::zarchive)
+    LIBS     SDL3_mixer::SDL3_mixer miniz Cpp_Httplib ZArchive::zarchive libprotobuf)
 
 # GR2FORK PERF: inline xxhash in the gr2 core. The GpuAssembler hot path makes
 # many small XXH3 calls per draw (ud_hash 64 B x2 stages, spec-fp per-sharp

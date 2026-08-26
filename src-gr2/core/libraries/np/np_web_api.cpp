@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -437,6 +438,26 @@ s32 PS4_SYSV_ABI sceNpWebApiSendRequest2(s64 requestId, const void* data, u64 da
                   "forwarding; returning 0 bytes (stub)",
                   Config::getPSNSignedIn(), Config::getIsConnectedToNetwork());
         return ORBIS_OK;
+    }
+
+    // GR2FORK: the forward target is the GR2 restoration server; other titles on this core
+    // (GRR) must not have their WebApi requests routed there. 0 bytes = not-found.
+    {
+        static constexpr const char* kGr2Serials[] = {
+            "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",
+            "PCJS50010", "PCAS00079", "CUSA04935",
+        };
+        const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
+        bool is_gr2 = false;
+        for (const char* s : kGr2Serials) {
+            if (serial == s) {
+                is_gr2 = true;
+                break;
+            }
+        }
+        if (!is_gr2) {
+            return ORBIS_OK;
+        }
     }
 
     // Look up the request captured by CreateRequest and forward it to the local server.

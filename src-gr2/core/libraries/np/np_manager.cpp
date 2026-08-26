@@ -9,6 +9,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/np/gr2_online_auth.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_handler.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/tls.h"
 
@@ -602,6 +603,13 @@ s32 PS4_SYSV_ABI sceNpGetAccountId(OrbisNpOnlineId* online_id, u64* account_id) 
         *account_id = 0;
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
+    // GR2FORK: with a shadNet session (GRR leaderboards) the server-assigned account id is the
+    // real identity; the placeholder only backs the offline/GR2 paths.
+    if (const s32 uid = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
+        uid >= 0) {
+        *account_id = Libraries::Np::NpHandler::GetInstance().GetAccountId(uid);
+        return ORBIS_OK;
+    }
     *account_id = 0xFEEDFACE;
     return ORBIS_OK;
 }
@@ -615,6 +623,11 @@ s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUser
     if (!g_signed_in) {
         *account_id = 0;
         return ORBIS_NP_ERROR_SIGNED_OUT;
+    }
+    if (const u64 shadnet_id = Libraries::Np::NpHandler::GetInstance().GetAccountId(user_id);
+        shadnet_id != 0) {
+        *account_id = shadnet_id;
+        return ORBIS_OK;
     }
     *account_id = 0xFEEDFACE;
     return ORBIS_OK;
@@ -892,6 +905,10 @@ s32 PS4_SYSV_ABI sceToolkitUserProfileGetAvatarUrl(u64 future, const u8* request
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     g_signed_in = Config::getPSNSignedIn();
+
+    // GR2FORK: mirrors upstream, which starts the shadNet session when the game loads
+    // libSceNpManager. The handler is inert for non-GRR titles and without credentials.
+    Libraries::Np::NpHandler::GetInstance().Initialize();
 
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
     LIB_FUNCTION("eiqMCt9UshI", "libSceNpManager", 1, "libSceNpManager", sceNpCreateAsyncRequest);

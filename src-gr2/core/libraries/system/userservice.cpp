@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <queue>
 
 #include "common/config.h"
@@ -8,6 +9,7 @@
 
 #include "core/libraries/libs.h"
 #include "core/libraries/np/gr2_online_auth.h"
+#include "core/libraries/np/np_handler.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/system/userservice_error.h"
 #include "core/user_settings.h"
@@ -1109,6 +1111,14 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
     // on-screen name matches the account the restoration server signed in.
     if (std::string oid = GR2Fork::Auth::VerifiedNpid(); !oid.empty()) {
         name = oid;
+    }
+    // Same substitution for a shadNet NpHandler session (GRR leaderboards); inert otherwise.
+    if (Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+        const auto np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
+        const std::size_t handle_len = strnlen(np_id.handle.data, sizeof(np_id.handle.data));
+        if (handle_len > 0) {
+            name.assign(np_id.handle.data, handle_len);
+        }
     }
     if (size < name.length()) {
         LOG_ERROR(Lib_UserService, "buffer is too short");

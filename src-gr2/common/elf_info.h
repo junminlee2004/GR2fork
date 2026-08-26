@@ -76,6 +76,8 @@ class ElfInfo {
     std::vector<u8> splash_data{};
     std::filesystem::path game_folder{};
     std::map<s32, std::string> trophy_index_map{};
+    // NP Communication IDs from sce_sys/npbind.dat, indexed by npbind entry order.
+    std::vector<std::string> np_comm_ids{};
 
 public:
     static constexpr u32 FW_15 = 0x1500000;
@@ -141,6 +143,14 @@ public:
 
     [[nodiscard]] const std::map<s32, std::string>& GetTrophyIndexMap() const {
         return trophy_index_map;
+    }
+
+    [[nodiscard]] const std::vector<std::string>& GetNpCommIds() const {
+        return np_comm_ids;
+    }
+
+    void SetNpCommIds(std::vector<std::string> ids) {
+        np_comm_ids = std::move(ids);
     }
 };
 
