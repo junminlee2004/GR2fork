@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <optional>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include "common/alignment.h"
@@ -464,6 +465,12 @@ void BufferCache::BindVertexBuffers(
             // same command buffer with no intervening CPU write. GPU writes do
             // not move mem_gen, so a skip additionally requires that no bound
             // range is GPU modified (else the re-bind's barrier is required).
+            // The generation only moves on new GPU-dirty coverage, so an
+            // unchanged value reproves the recorded clean answer without the
+            // region walk.
+            if (vertex_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
+                return;
+            }
             VAddr span_lo = ~VAddr{0};
             VAddr span_hi = 0;
             for (const auto& gb : guest_buffers) {
@@ -473,6 +480,7 @@ void BufferCache::BindVertexBuffers(
                 }
             }
             if (span_hi <= span_lo || !IsRegionGpuModified(span_lo, span_hi - span_lo)) {
+                vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
                 return;
             }
         }
@@ -480,6 +488,8 @@ void BufferCache::BindVertexBuffers(
         vertex_bind_tick_ = tick;
         vertex_bind_mem_gen_ = mem_gen;
         vertex_bind_valid_ = true;
+        // A fresh stamp invalidates the standing clean proof.
+        vertex_bind_clean_gpu_gen_ = 0;
     } else {
         vertex_bind_valid_ = false;
         vertex_input_valid_ = false;
@@ -541,11 +551,15 @@ void BufferCache::BindVertexBuffers(
     }
 
     // Map buffers for merged ranges
+    bool span_proven_clean = memo_active && vertex_bind_valid_ && ranges_merged.size() == 1;
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         // Resolved once and reused: ObtainBuffer would otherwise walk the same
         // range, and the barrier decision below would walk it a second time.
         const bool gpu_modified = IsRegionGpuModified(range.base_address, size);
+        if (size != range.GetSize() || gpu_modified) {
+            span_proven_clean = false;
+        }
         const auto [buffer, offset] =
             ObtainBuffer(range.base_address, size, false, false, {}, gpu_modified);
         range.vk_buffer = buffer->buffer;
@@ -557,6 +571,13 @@ void BufferCache::BindVertexBuffers(
                 barriers.emplace_back(*barrier);
             }
         }
+    }
+    // A single merged range spans the whole memo span, so one clean unclamped
+    // walk proves it at the current generation. The seed relies on the loop
+    // reading guest memory only inside the walked range: a read outside it
+    // could fault into a veto re-Add that bumps the generation mid-loop.
+    if (span_proven_clean) {
+        vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
     }
 
     // Bind vertex buffers
@@ -606,10 +627,10 @@ void BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    // Resolved once for the whole function. The memo check below, the acquire
-    // and the barrier decision all ask the same question about the same range;
-    // answering it is a chain of dependent loads, so it is asked once.
-    const bool index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
+    // Resolved lazily: the memo check, the acquire and the barrier decision
+    // all ask the same question about the same range, and a memo hit whose
+    // range is proven clean at the current GPU-dirty generation needs no walk.
+    std::optional<bool> index_gpu_modified{};
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         const u64 tick = scheduler.CurrentTick();
@@ -617,10 +638,18 @@ void BufferCache::BindIndexBuffer(
         if (index_bind_valid_ && index_bind_addr_ == index_address &&
             index_bind_size_ == index_buffer_size &&
             index_bind_type_ == static_cast<u32>(index_type) && index_bind_tick_ == tick &&
-            index_bind_mem_gen_ == mem_gen && !index_gpu_modified) {
-            // Same resolved index range already bound on this command buffer,
-            // no intervening CPU write, and no GPU write requiring a barrier.
-            return;
+            index_bind_mem_gen_ == mem_gen) {
+            // Same resolved index range already bound on this command buffer
+            // with no intervening CPU write; an unchanged GPU-dirty generation
+            // reproves the recorded clean answer without the region walk.
+            if (index_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
+                return;
+            }
+            index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
+            if (!*index_gpu_modified) {
+                index_bind_clean_gpu_gen_ = gpu_dirty_generation_;
+                return;
+            }
         }
         index_bind_addr_ = index_address;
         index_bind_size_ = index_buffer_size;
@@ -628,12 +657,23 @@ void BufferCache::BindIndexBuffer(
         index_bind_tick_ = tick;
         index_bind_mem_gen_ = mem_gen;
         index_bind_valid_ = true;
+        // A fresh stamp invalidates the standing clean proof.
+        index_bind_clean_gpu_gen_ = 0;
     } else {
         index_bind_valid_ = false;
     }
+    // has_value distinguishes an unresolved answer from a resolved false.
+    if (!index_gpu_modified.has_value()) {
+        index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
+        if (index_bind_valid_ && !*index_gpu_modified) {
+            // The walked range is exactly the stamped memo range, so a fresh
+            // clean answer seeds the walk skip for the next hit.
+            index_bind_clean_gpu_gen_ = gpu_dirty_generation_;
+        }
+    }
     const auto [vk_buffer, offset] =
-        ObtainBuffer(index_address, index_buffer_size, false, false, {}, index_gpu_modified);
-    if (index_gpu_modified) {
+        ObtainBuffer(index_address, index_buffer_size, false, false, {}, *index_gpu_modified);
+    if (*index_gpu_modified) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
@@ -1129,18 +1169,23 @@ static void PrefetchGuestSource(VAddr device_addr, u64 size) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
     // Read-only binds dominate and almost never have anything to upload, but
-    // proving it walks every page of the range under the tracker lock. The
-    // walk's answer only changes when a page becomes CPU dirty, which only
-    // happens on paths that bump the host-memory generation, so an unchanged
-    // generation reproduces the previous empty result exactly. Written binds
-    // are excluded: their walk also marks the range GPU modified.
+    // proving it walks every page of the range under the tracker lock. While
+    // the host-memory generation is unchanged the guest bytes still equal the
+    // device-buffer bytes for a range that had nothing to upload, so eliding
+    // the walk and upload is byte-identical. A query contained in a recorded
+    // clean range hits, since a clean range has no dirty subrange. Written
+    // binds are excluded: their walk also marks the range GPU modified.
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     const bool memo_eligible = skipcache.Active() && !is_written && !is_texel_buffer;
     const u64 memo_gen =
         memo_eligible ? skipcache.Gens().mem_gen.load(std::memory_order_acquire) : 0;
-    if (memo_eligible && buffer.sync_noop_mem_gen == memo_gen &&
-        buffer.sync_noop_addr == device_addr && buffer.sync_noop_size == size) {
-        return false;
+    if (memo_eligible) {
+        for (const auto& noop : buffer.sync_noop) {
+            if (noop.mem_gen == memo_gen && device_addr >= noop.addr &&
+                device_addr + size <= noop.addr + noop.size) {
+                return false;
+            }
+        }
     }
 
     boost::container::small_vector<vk::BufferCopy, 4> copies;
@@ -1196,11 +1241,27 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         return SynchronizeBufferFromImage(buffer, device_addr, size);
     }
     if (memo_eligible && !src_buffer) {
-        // Nothing was uploaded: record so the next identical query skips the
-        // page walk entirely.
-        buffer.sync_noop_addr = device_addr;
-        buffer.sync_noop_size = size;
-        buffer.sync_noop_mem_gen = memo_gen;
+        // Nothing was uploaded: record the exact walked range so the next
+        // query contained in it skips the page walk entirely. Prefer to
+        // replace a same-generation entry the new range covers, then a
+        // stale-generation entry, then the round-robin victim.
+        size_t victim = buffer.sync_noop.size();
+        for (size_t i = 0; i < buffer.sync_noop.size(); ++i) {
+            const auto& noop = buffer.sync_noop[i];
+            if (noop.mem_gen != memo_gen) {
+                victim = i;
+                continue;
+            }
+            if (noop.addr >= device_addr && noop.addr + noop.size <= device_addr + size) {
+                victim = i;
+                break;
+            }
+        }
+        if (victim == buffer.sync_noop.size()) {
+            victim = buffer.sync_noop_next;
+        }
+        buffer.sync_noop[victim] = {.addr = device_addr, .size = size, .mem_gen = memo_gen};
+        buffer.sync_noop_next = static_cast<u32>((victim + 1) % buffer.sync_noop.size());
     }
     return false;
 }
@@ -1389,6 +1450,9 @@ void BufferCache::RunGarbageCollector() {
         Buffer& buffer = slot_buffers[buffer_id];
         // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
         DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes());
+        // Nothing invokes clean_up today. Wiring it up requires a skip cache
+        // mem_gen bump alongside this CPU-dirty marking, which the sync-noop
+        // and bind memos rely on.
         memory_tracker->MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
         DeleteBuffer(buffer_id);
     };

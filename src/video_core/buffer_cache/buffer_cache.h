@@ -287,12 +287,15 @@ private:
     // Vertex/index bind memos (adaptive skip caches, inline form). Validity
     // requires same submission tick (stream ring offsets are only stable
     // within one command buffer) and unchanged mem_gen (no CPU write reached
-    // the emulator since the recorded bind).
+    // the emulator since the recorded bind). The clean-gen fields record the
+    // gpu_dirty_generation_ at which the memoized range was last proven not
+    // GPU modified; zero means unproven.
     u64 vertex_bind_sig_{};
     u64 vertex_input_sig_{};
     u64 vertex_bind_tick_{};
     u64 vertex_input_tick_{};
     u64 vertex_bind_mem_gen_{};
+    u64 vertex_bind_clean_gpu_gen_{};
     bool vertex_bind_valid_{};
     bool vertex_input_valid_{};
     VAddr index_bind_addr_{};
@@ -300,6 +303,7 @@ private:
     u32 index_bind_type_{};
     u64 index_bind_tick_{};
     u64 index_bind_mem_gen_{};
+    u64 index_bind_clean_gpu_gen_{};
     bool index_bind_valid_{};
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
@@ -316,6 +320,9 @@ private:
     RangeSet gpu_modified_ranges;
     // Bumped only on clean->dirty coverage transitions; an entry stamped with
     // the current value is proven GPU-clean without walking the range set.
+    // Overlapping in-flight fault downloads can leave the range set covering
+    // clear-bit pages (veto re-Add in FinishFaultDownload); every consumer of
+    // this generation shares that window and is off when skip caches are off.
     u64 gpu_dirty_generation_{1};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;

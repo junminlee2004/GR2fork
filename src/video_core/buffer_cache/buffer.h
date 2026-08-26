@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <optional>
 #include <utility>
@@ -170,12 +171,18 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
-    // Memo of the last read-only upload query that found nothing to upload.
-    // Valid while the host-memory generation is unchanged, since only paths
-    // that bump it can mark pages CPU dirty. Zero generation = no memo.
-    VAddr sync_noop_addr = 0;
-    u32 sync_noop_size = 0;
-    u64 sync_noop_mem_gen = 0;
+    // Memos of recent read-only upload queries that found nothing to upload.
+    // While the host-memory generation is unchanged the guest bytes still
+    // equal the device-buffer bytes for a recorded range, so eliding the
+    // upload is byte-identical; a query contained in a recorded range hits,
+    // since a clean range has no dirty subrange. Zero generation = empty.
+    struct SyncNoop {
+        VAddr addr = 0;
+        u32 size = 0;
+        u64 mem_gen = 0;
+    };
+    std::array<SyncNoop, 2> sync_noop{};
+    u32 sync_noop_next = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;
