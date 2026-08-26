@@ -386,6 +386,10 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+bool Rasterizer::IsRegionGpuModified(VAddr addr, u64 size) {
+    return buffer_cache.IsRegionGpuModified(addr, size);
+}
+
 void Rasterizer::RecordDrawKey(const GraphicsPipeline* pipeline, bool is_indexed) {
     if (!draw_replay_mode_ || !Skipcache::Framework::Instance().Active()) {
         return;

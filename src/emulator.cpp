@@ -492,6 +492,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU streamUploadMirrorMode: {}",
              EmulatorSettings.GetStreamUploadMirrorMode());
     LOG_INFO(Config, "GPU drawReplayMode: {}", EmulatorSettings.GetDrawReplayMode());
+    LOG_INFO(Config, "GPU pm4ScoutEnabled: {}", EmulatorSettings.IsPm4ScoutEnabled());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());

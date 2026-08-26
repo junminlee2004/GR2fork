@@ -65,6 +65,124 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
+void Liverpool::ScoutPost(std::span<const u32> dcb) {
+    // Invalidate the previous span and wait out the walker before publishing:
+    // the scout must never hold a span the translator has moved past.
+    scout_gen.fetch_add(1, std::memory_order_release);
+    while (scout_busy.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    {
+        std::scoped_lock lk{scout_mutex};
+        scout_base = dcb.data();
+        scout_size = static_cast<u32>(dcb.size());
+        scout_gen.fetch_add(1, std::memory_order_release);
+    }
+    scout_cv.notify_one();
+}
+
+void Liverpool::ScoutLoop(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:Pm4Scout");
+    u64 seen = scout_gen.load(std::memory_order_acquire);
+    while (!stoken.stop_requested()) {
+        const u32* base{};
+        u32 size{};
+        u64 gen{};
+        {
+            std::unique_lock lk{scout_mutex};
+            scout_cv.wait(lk, stoken,
+                          [&] { return scout_gen.load(std::memory_order_acquire) != seen; });
+            if (stoken.stop_requested()) {
+                break;
+            }
+            gen = scout_gen.load(std::memory_order_acquire);
+            base = scout_base;
+            size = scout_size;
+        }
+        seen = gen;
+        if (base == nullptr || size == 0) {
+            continue;
+        }
+        scout_busy.store(true, std::memory_order_release);
+        if (scout_gen.load(std::memory_order_acquire) == gen) {
+            ScoutWalk(base, size, gen);
+        }
+        scout_busy.store(false, std::memory_order_release);
+    }
+}
+
+void Liverpool::ScoutWalk(const u32* base, u32 num_dwords, u64 gen) {
+    const u32* cur = base;
+    const u32* end = base + num_dwords;
+    u32 index_size = 4;
+    u32 heuristic_budget = 1024;
+    VAddr checked_page = 0;
+    u32 packets = 0;
+    while (cur + 1 < end) {
+        // Abandon promptly once the translator publishes a newer span.
+        if ((++packets & 63) == 0 && scout_gen.load(std::memory_order_relaxed) != gen) {
+            return;
+        }
+        // Header reads are demand loads; GPU-dirty pages are read protected
+        // under precise readbacks and a fault here would trigger a readback
+        // from the wrong thread, so those spans are left alone.
+        const VAddr page = reinterpret_cast<VAddr>(cur) & ~VAddr{0xFFF};
+        if (page != checked_page) {
+            checked_page = page;
+            if (rasterizer != nullptr && rasterizer->IsRegionGpuModified(page, 0x1000)) {
+                return;
+            }
+        }
+        __builtin_prefetch(cur + 128, 0, 3);
+        const auto* header = reinterpret_cast<const PM4Header*>(cur);
+        if (header->type == 2) {
+            cur += 1;
+            continue;
+        }
+        if (header->type != 3) {
+            return;
+        }
+        const u32 count = header->type3.NumWords();
+        const u32* payload = cur + 1;
+        if (cur + count + 1 > end) {
+            return;
+        }
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::IndexType:
+            index_size = (payload[0] & 0b11) == 1 ? 4 : 2;
+            break;
+        case PM4ItOpcode::DrawIndex2: {
+            const auto* draw = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
+            const VAddr index_base =
+                VAddr{draw->index_base_lo} | (VAddr{draw->index_base_hi} << 32);
+            const u64 bytes = std::min<u64>(u64{draw->index_count} * index_size, 8192);
+            for (u64 line = 0; line < bytes; line += 64) {
+                __builtin_prefetch(reinterpret_cast<const void*>(index_base + line), 0, 3);
+            }
+            break;
+        }
+        case PM4ItOpcode::SetShReg: {
+            // User data words frequently carry V# descriptors whose first two
+            // dwords form a guest address; warming the head of each plausible
+            // target covers most upcoming stream copy sources. A wrong guess
+            // costs one dropped prefetch and nothing else.
+            for (u32 i = 1; i + 1 < count && heuristic_budget != 0; ++i) {
+                const VAddr addr = VAddr{payload[i]} | (VAddr{payload[i + 1] & 0xFFFF} << 32);
+                if (addr >= 0x10000 && addr < (VAddr{1} << 40)) {
+                    __builtin_prefetch(reinterpret_cast<const void*>(addr), 0, 3);
+                    __builtin_prefetch(reinterpret_cast<const void*>(addr + 64), 0, 3);
+                    --heuristic_budget;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        cur += count + 1;
+    }
+}
+
 // The per-stage user_data words are excluded from the graphics state stamp by
 // contract: engines rewrite them every draw, and marking them would advance
 // the stamp per draw and starve every stamp-keyed cache for zero correctness
@@ -82,6 +200,10 @@ static bool IsGfxUserDataWrite(const Regs& regs, u32 word_addr, u32 num_words) {
 }
 
 Liverpool::Liverpool() {
+    scout_enabled = EmulatorSettings.IsPm4ScoutEnabled();
+    if (scout_enabled) {
+        scout_thread = std::jthread([this](std::stop_token stoken) { ScoutLoop(stoken); });
+    }
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // Stamp dormancy is decided before the process thread can observe work;
     // when the adaptive skip caches are disabled the register funnel is a
@@ -239,6 +361,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
+    if (scout_enabled && !dcb.empty()) {
+        ScoutPost(dcb);
+    }
     cblock.Reset();
 
     // TODO: potentially, ASCs also can depend on CE and in this case the

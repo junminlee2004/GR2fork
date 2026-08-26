@@ -244,6 +244,25 @@ private:
     } cblock{};
 
     Vulkan::Rasterizer* rasterizer{};
+
+    // PM4 prefetch scout: a helper thread that walks the graphics command
+    // span ahead of translation and warms the shared cache with the guest
+    // data upcoming draws read. It mutates no emulator state and never
+    // demand-faults guest memory: data targets are touched with prefetch
+    // instructions only, and header reads stop at GPU-dirty pages.
+    void ScoutLoop(std::stop_token stoken);
+    void ScoutWalk(const u32* base, u32 num_dwords, u64 gen);
+    void ScoutPost(std::span<const u32> dcb);
+
+    std::mutex scout_mutex;
+    std::condition_variable_any scout_cv;
+    const u32* scout_base{};
+    u32 scout_size{};
+    std::atomic<u64> scout_gen{};
+    std::atomic<bool> scout_busy{};
+    bool scout_enabled{};
+    // Declared last so it stops and joins before the members it uses die.
+    std::jthread scout_thread{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
