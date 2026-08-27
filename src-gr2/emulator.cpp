@@ -424,7 +424,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     LOG_INFO(Loader, "Starting gr2fork (shadps4 v{} base)", Common::g_version);
     LOG_INFO(Loader, "Fork: Gravity Rush 2 focus");
-    LOG_INFO(Loader, "Build: v6.1");
+    LOG_INFO(Loader, "Build: v7.0");
 
     const bool has_game_config = std::filesystem::exists(
         Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".json"));
@@ -680,19 +680,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // fork's own release. Format: "Junmin Lee GR2FORK <fork> (v<base>) | <game>".
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v6.1 (v{}) | {}", Common::g_version,
+            window_title = fmt::format("Junmin Lee GR2FORK v7.0 (v{}) | {}", Common::g_version,
                                        game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v6.1 {}/(v{}) | {}", remote_host,
+            window_title = fmt::format("Junmin Lee GR2FORK v7.0 {}/(v{}) | {}", remote_host,
                                        Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("Junmin Lee GR2FORK v6.1 (v{}) {} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v7.0 (v{}) {} {} | {}",
                                        Common::g_version, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("Junmin Lee GR2FORK v6.1 (v{}) {}/{} {} | {}",
+            window_title = fmt::format("Junmin Lee GR2FORK v7.0 (v{}) {}/{} {} | {}",
                                        Common::g_version, remote_host, Common::g_scm_branch,
                                        Common::g_scm_desc, game_title);
         }
