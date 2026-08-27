@@ -51,6 +51,10 @@ enum OrbisHttpRequestMethod : s32 {
     ORBIS_INTERNAL_HTTP_REQUEST_METHOD_INVALID = 8,
 };
 
+// GR2FORK: true when the running title is a GR2 serial. Gates the restoration-server host
+// rewrite and the fork identity headers; other titles' guest HTTP is passed through untouched.
+bool IsGr2Title();
+
 class RequestTemplate {
 public:
     int id;
@@ -356,8 +360,10 @@ private:
         // GR2 identity: authenticate to shadnet once, then forward the verified Online ID plus the
         // bearer token the restoration server validates. Falls back to the local UserManagement
         // username when shadnet is unconfigured, so an un-set-up player still reaches the server
-        // (which may reject in enforce mode). Sanitized to a safe header value.
-        {
+        // (which may reject in enforce mode). Sanitized to a safe header value. Gated to GR2
+        // serials: other titles' requests reach real external hosts and must not carry the
+        // player's bearer token or any fork header.
+        if (IsGr2Title()) {
             GR2Fork::Auth::EnsureAuthed();
             std::string player = GR2Fork::Auth::VerifiedNpid();
             if (player.empty()) {

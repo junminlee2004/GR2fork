@@ -39,10 +39,10 @@ static inline std::string SafeCStr(const char* p) {
     return p ? std::string(p) : std::string("(null)");
 }
 
-// GR2FORK: the restoration-server redirect belongs to GR2 alone. Other titles running on this
-// core (GRR: CUSA01130) do their online through shadNet, and their guest HTTP must reach the
-// original hosts untouched.
-static bool IsGr2Title() {
+// GR2FORK: the restoration-server redirect and identity headers belong to GR2 alone. Other titles
+// running on this core (GRR: CUSA01130) do their online through shadNet, and their guest HTTP must
+// reach the original hosts untouched.
+bool IsGr2Title() {
     static const bool is_gr2 = [] {
         static constexpr const char* kGr2Serials[] = {
             "CUSA03694", "CUSA04943", "CUSA04934", "CUSA00547",

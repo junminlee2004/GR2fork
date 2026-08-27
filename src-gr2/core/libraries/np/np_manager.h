@@ -16,6 +16,7 @@ namespace Libraries::Np::NpManager {
 
 constexpr s32 ORBIS_NP_MANAGER_REQUEST_LIMIT = 0x20;
 constexpr s32 ORBIS_NP_MANAGER_REQUEST_ID_OFFSET = 0x20000000;
+constexpr s32 ORBIS_NP_STATE_CALLBACK_MAX = 8;
 
 enum class OrbisNpState : u32 {
     Unknown = 0,
@@ -23,6 +24,10 @@ enum class OrbisNpState : u32 {
     SignedIn = 2,
 };
 
+// The legacy callback receives the signed-in user's OrbisNpId in addition to the state.
+using OrbisNpStateCallback = PS4_SYSV_ABI void (*)(s32 userId, OrbisNpState state, OrbisNpId* npId,
+                                                   void* userdata);
+using OrbisNpStateCallbackA = PS4_SYSV_ABI void (*)(s32 userId, OrbisNpState state, void* userdata);
 using OrbisNpStateCallbackForNpToolkit = PS4_SYSV_ABI void (*)(s32 userId, OrbisNpState state,
                                                                void* userdata);
 
@@ -41,6 +46,20 @@ struct OrbisNpCountryCode {
     char country_code[2];
     char end;
     char pad;
+};
+
+struct OrbisNpAgeRestriction {
+    OrbisNpCountryCode country_code;
+    s8 age;
+    u8 padding[3];
+};
+
+struct OrbisNpContentRestriction {
+    u64 size;
+    s8 default_age_restriction;
+    u8 padding[3];
+    s32 age_restriction_count;
+    const OrbisNpAgeRestriction* age_restriction;
 };
 
 struct OrbisNpDate {

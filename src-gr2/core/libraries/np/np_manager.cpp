@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <mutex>
 
 #include "common/config.h"
@@ -710,6 +711,33 @@ s32 PS4_SYSV_ABI sceNpHasSignedUp(Libraries::UserService::OrbisUserServiceUserId
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpSetContentRestriction(const OrbisNpContentRestriction* restriction) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+    if (restriction == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (restriction->size != sizeof(OrbisNpContentRestriction)) {
+        return ORBIS_NP_ERROR_INVALID_SIZE;
+    }
+    if (restriction->default_age_restriction < 0 || restriction->age_restriction_count > 0x100) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (restriction->age_restriction_count > 0 && restriction->age_restriction == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpSetNpTitleId(const OrbisNpTitleId* title_id,
+                                   const OrbisNpTitleSecret* title_secret) {
+    if (title_id == nullptr || title_secret == nullptr) {
+        LOG_ERROR(Lib_NpManager, "called with invalid arguments");
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called, title_id = {}", title_id->id);
+    return ORBIS_OK;
+}
+
 struct NpStateCallbackForNpToolkit {
     OrbisNpStateCallbackForNpToolkit func;
     void* userdata;
@@ -721,6 +749,32 @@ NpStateCallbackForNpToolkit NpStateCbForNp;
 // sceNpRegisterStateCallbackForToolkit and waits for sign-in notification, never polling - an
 // undelivered state stalls it forever. Delivered once per change from sceNpCheckCallback[ForLib].
 static bool g_np_toolkit_state_dirty = false;
+
+// GR2FORK: GRR (CUSA01130) registers its sign-in callback through the legacy
+// sceNpRegisterStateCallback and blocks its whole score subsystem on the SignedIn event; the
+// legacy form additionally hands the callback the signed-in user's OrbisNpId. Same
+// dirty-flag-at-registration delivery model as the toolkit callback above.
+struct LegacyNpStateCallback {
+    OrbisNpStateCallback func;
+    void* userdata;
+};
+
+LegacyNpStateCallback LegacyNpStateCb;
+static bool g_np_legacy_state_dirty = false;
+
+struct NpStateCallbackAEntry {
+    OrbisNpStateCallbackA func;
+    void* userdata;
+    bool in_use;
+    bool dirty; // per-slot so a late registration cannot re-deliver to already-notified slots
+};
+
+static std::array<NpStateCallbackAEntry, ORBIS_NP_STATE_CALLBACK_MAX> g_np_state_callbacks{};
+
+// Guards every callback slot and dirty flag in this block: registrations arrive on guest worker
+// threads while the sceNpCheckCallback pump runs on the game's main thread. Never held across
+// Core::ExecuteGuest - a guest callback may re-enter the registration entry points.
+static std::mutex g_np_state_cb_mutex;
 
 // GR2: the toolkit also registers an NP reachability callback
 // (sceNpRegisterNpReachabilityStateCallback) and waits to be told it is network-reachable;
@@ -746,22 +800,78 @@ static void DeliverNpToolkitState() {
         }
     };
 
-    // Deliver sign-in state, once per change. PS4 delivers NP callbacks from this pump.
-    if (NpStateCbForNp.func != nullptr && g_np_toolkit_state_dirty) {
-        // Clear before invoking so a re-entrant / multi-threaded pump cannot double-deliver.
-        g_np_toolkit_state_dirty = false;
+    // Snapshot the pending deliveries under the lock, clearing each dirty flag, then invoke the
+    // guest callbacks with the lock released (they may re-enter the registration entry points).
+    LegacyNpStateCallback legacy{};
+    std::array<NpStateCallbackAEntry, ORBIS_NP_STATE_CALLBACK_MAX> a_pending{};
+    NpStateCallbackForNpToolkit toolkit{};
+    NpReachabilityStateCallback reach{};
+    {
+        std::scoped_lock lk{g_np_state_cb_mutex};
+        if (LegacyNpStateCb.func != nullptr && g_np_legacy_state_dirty) {
+            g_np_legacy_state_dirty = false;
+            legacy = LegacyNpStateCb;
+        }
+        for (size_t i = 0; i < g_np_state_callbacks.size(); ++i) {
+            auto& entry = g_np_state_callbacks[i];
+            if (entry.in_use && entry.func != nullptr && entry.dirty) {
+                entry.dirty = false;
+                a_pending[i] = entry;
+            }
+        }
+        if (NpStateCbForNp.func != nullptr && g_np_toolkit_state_dirty) {
+            g_np_toolkit_state_dirty = false;
+            toolkit = NpStateCbForNp;
+        }
+        if (NpReachabilityCb.func != nullptr && g_np_reachability_dirty) {
+            g_np_reachability_dirty = false;
+            reach = NpReachabilityCb;
+        }
+    }
+
+    const OrbisNpState state = g_signed_in ? OrbisNpState::SignedIn : OrbisNpState::SignedOut;
+
+    // Deliver sign-in state to the legacy callback, once per change. A SignedIn delivery carries
+    // the user's OrbisNpId; the shadNet session npid wins, with the configured Online ID as the
+    // fallback when no session exists yet.
+    if (legacy.func != nullptr) {
         ensure_user();
-        const OrbisNpState state = g_signed_in ? OrbisNpState::SignedIn : OrbisNpState::SignedOut;
+        OrbisNpId np_id{};
+        if (state == OrbisNpState::SignedIn) {
+            np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
+            if (np_id.handle.data[0] == '\0') {
+                SetNpId(np_id, GR2Fork::Auth::EffectiveOnlineId());
+            }
+        }
+        LOG_INFO(Lib_NpManager, "GR2: delivering NP state {} to legacy callback, user_id = {}",
+                 state == OrbisNpState::SignedIn ? "SignedIn" : "SignedOut", user_id);
+        Core::ExecuteGuest(legacy.func, user_id, state,
+                           state == OrbisNpState::SignedIn ? &np_id : nullptr, legacy.userdata);
+    }
+
+    // Deliver sign-in state to the per-user (A-variant) callbacks, once per change per slot.
+    for (const auto& entry : a_pending) {
+        if (!entry.in_use || entry.func == nullptr) {
+            continue;
+        }
+        ensure_user();
+        LOG_INFO(Lib_NpManager, "GR2: delivering NP state {} to state callback A, user_id = {}",
+                 state == OrbisNpState::SignedIn ? "SignedIn" : "SignedOut", user_id);
+        Core::ExecuteGuest(entry.func, user_id, state, entry.userdata);
+    }
+
+    // Deliver sign-in state, once per change. PS4 delivers NP callbacks from this pump.
+    if (toolkit.func != nullptr) {
+        ensure_user();
         LOG_INFO(Lib_NpManager, "GR2: delivering NP state {} to toolkit callback, user_id = {}",
                  state == OrbisNpState::SignedIn ? "SignedIn" : "SignedOut", user_id);
         // Invoke the guest callback through the host->guest helper so the guest TLS/stack are set
         // up correctly (this is why core/tls.h is included).
-        Core::ExecuteGuest(NpStateCbForNp.func, user_id, state, NpStateCbForNp.userdata);
+        Core::ExecuteGuest(toolkit.func, user_id, state, toolkit.userdata);
     }
 
     // Deliver reachability state, once per change.
-    if (NpReachabilityCb.func != nullptr && g_np_reachability_dirty) {
-        g_np_reachability_dirty = false;
+    if (reach.func != nullptr) {
         ensure_user();
         const OrbisNpReachabilityState rstate = g_signed_in ? OrbisNpReachabilityState::Reachable
                                                             : OrbisNpReachabilityState::Unavailable;
@@ -769,7 +879,7 @@ static void DeliverNpToolkitState() {
                  "GR2: delivering NP reachability {} to toolkit callback, user_id = {}",
                  rstate == OrbisNpReachabilityState::Reachable ? "Reachable" : "Unavailable",
                  user_id);
-        Core::ExecuteGuest(NpReachabilityCb.func, user_id, rstate, NpReachabilityCb.userdata);
+        Core::ExecuteGuest(reach.func, user_id, rstate, reach.userdata);
     }
 }
 
@@ -783,9 +893,92 @@ s32 PS4_SYSV_ABI sceNpCheckCallbackForLib() {
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void* userdata) {
+    if (callback == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    std::scoped_lock lk{g_np_state_cb_mutex};
+    if (LegacyNpStateCb.func != nullptr) {
+        return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
+    }
+    LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
+    LegacyNpStateCb.func = callback;
+    LegacyNpStateCb.userdata = userdata;
+    // Deliver the current sign-in state on the next callback pump.
+    g_np_legacy_state_dirty = true;
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpUnregisterStateCallback() {
+    std::scoped_lock lk{g_np_state_cb_mutex};
+    if (LegacyNpStateCb.func == nullptr) {
+        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+    }
+    LegacyNpStateCb.func = nullptr;
+    LegacyNpStateCb.userdata = nullptr;
+    return ORBIS_OK;
+}
+
+static s32 RegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
+    if (callback == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lk{g_np_state_cb_mutex};
+    for (const auto& entry : g_np_state_callbacks) {
+        if (!entry.in_use) {
+            continue;
+        }
+        if (entry.func == callback) {
+            return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
+        }
+    }
+
+    for (size_t i = 0; i < g_np_state_callbacks.size(); ++i) {
+        auto& entry = g_np_state_callbacks[i];
+        if (entry.in_use) {
+            continue;
+        }
+        entry.func = callback;
+        entry.userdata = userdata;
+        entry.in_use = true;
+        // Deliver the current sign-in state on the next callback pump.
+        entry.dirty = true;
+        return static_cast<s32>(i + 1);
+    }
+
+    return ORBIS_NP_ERROR_CALLBACK_MAX;
+}
+
+static s32 UnregisterStateCallbackAById(s32 callback_id) {
+    if (callback_id <= 0 || callback_id > static_cast<s32>(g_np_state_callbacks.size())) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lk{g_np_state_cb_mutex};
+    auto& entry = g_np_state_callbacks[callback_id - 1];
+    if (!entry.in_use) {
+        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+    }
+
+    entry = {};
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
+    LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
+    return RegisterStateCallbackA(callback, userdata);
+}
+
+s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackA(s32 callback_id) {
+    LOG_INFO(Lib_NpManager, "called, callback_id = {}", callback_id);
+    return UnregisterStateCallbackAById(callback_id);
+}
+
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpToolkit callback,
                                                       void* userdata) {
     static s32 id = 0;
+    std::scoped_lock lk{g_np_state_cb_mutex};
     NpStateCbForNp.func = callback;
     NpStateCbForNp.userdata = userdata;
     // Deliver the current sign-in state on the next callback pump.
@@ -796,6 +989,7 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpT
 
 s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback(
     OrbisNpReachabilityStateCallback callback, void* userdata) {
+    std::scoped_lock lk{g_np_state_cb_mutex};
     NpReachabilityCb.func = callback;
     NpReachabilityCb.userdata = userdata;
     // Deliver the current reachability state on the next callback pump.
@@ -945,9 +1139,20 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("p-o74CnoNzY", "libSceNpManager", 1, "libSceNpManager", sceNpGetNpId);
     LIB_FUNCTION("XDncXQIJUSk", "libSceNpManager", 1, "libSceNpManager", sceNpGetOnlineId);
     LIB_FUNCTION("eQH7nWPcAgc", "libSceNpManager", 1, "libSceNpManager", sceNpGetState);
+    LIB_FUNCTION("A2CQ3kgSopQ", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpSetContentRestriction);
+    LIB_FUNCTION("Ec63y59l9tw", "libSceNpManager", 1, "libSceNpManager", sceNpSetNpTitleId);
     LIB_FUNCTION("Oad3rvY-NJQ", "libSceNpManager", 1, "libSceNpManager", sceNpHasSignedUp);
     LIB_FUNCTION("3Zl8BePTh9Y", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallback);
     LIB_FUNCTION("JELHf4xPufo", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallbackForLib);
+    LIB_FUNCTION("VfRSmPmj8Q8", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterStateCallback);
+    LIB_FUNCTION("mjjTXh+NHWY", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpUnregisterStateCallback);
+    LIB_FUNCTION("qQJfO8HAiaY", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterStateCallbackA);
+    LIB_FUNCTION("M3wFXbYQtAA", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpUnregisterStateCallbackA);
     LIB_FUNCTION("JELHf4xPufo", "libSceNpManagerForToolkit", 1, "libSceNpManager",
                  sceNpCheckCallbackForLib);
     LIB_FUNCTION("0c7HbXRKUt4", "libSceNpManagerForToolkit", 1, "libSceNpManager",
