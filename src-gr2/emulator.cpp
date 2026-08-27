@@ -16,7 +16,6 @@
 #include <cstdlib>
 #include <string_view>
 #include "common/config.h"
-#include "core/cpu_patches.h"
 #include "common/crash_handler.h"
 #include "common/debug.h"
 #include "common/hang_watchdog.h"
@@ -390,13 +389,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     Config::load(Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".json"),
                  true);
-
-    // GR2FORK: latch Windows static guest red-zone protection from the freshly loaded config,
-    // before any guest module is mapped (module.cpp reads the active mode while patching).
-    Core::WindowsGuestRedZoneProtection::SetActiveMode(
-        Config::getWindowsGuestRedZoneProtection()
-            ? WindowsGuestRedZoneProtectionMode::StaticPatching
-            : WindowsGuestRedZoneProtectionMode::Disabled);
 
     // Initialize logging as soon as possible
     if (!id.empty() && Config::getSeparateLogFilesEnabled()) {

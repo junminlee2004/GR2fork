@@ -10,7 +10,6 @@
 #include "common/logging/log.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
-#include "core/cpu_patches.h"
 #include "core/signals.h"
 
 #ifdef _WIN32
@@ -387,13 +386,6 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     }
     case EXCEPTION_ILLEGAL_INSTRUCTION:
         handled = signals->DispatchIllegalInstruction(pExp);
-        break;
-    case EXCEPTION_PRIV_INSTRUCTION:
-        // Windows static guest red-zone protection: relocated short SSE4a sites can surface as
-        // privileged-instruction faults, so route them through the same patcher when it is on.
-        if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
-            handled = signals->DispatchIllegalInstruction(pExp);
-        }
         break;
     default:
         break;

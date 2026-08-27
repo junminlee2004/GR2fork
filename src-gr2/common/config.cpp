@@ -188,12 +188,6 @@ public:
 static ConfigEntry<int> volumeSlider(100);
 static ConfigEntry<bool> isNeo(false);
 static ConfigEntry<bool> isDevKit(false);
-// GR2FORK: Windows static guest red-zone protection (upstream shadPS4 #4802). Windows exception
-// dispatch writes into the 128-byte SysV red zone below the guest's RSP, corrupting leaf-function
-// stacks on every tracked page fault. Static patching relocates the affected guest memory accesses
-// so the dispatch cannot land in a live red zone. Windows-only at runtime; the setting is stored
-// on every platform so configs stay portable.
-static ConfigEntry<bool> windowsGuestRedZoneProtection(false);
 static ConfigEntry<int> extraDmemInMbytes(0);
 static ConfigEntry<bool> isPSNSignedIn(false);
 static ConfigEntry<bool> isTrophyPopupDisabled(false);
@@ -476,10 +470,6 @@ bool isNeoModeConsole() {
 
 bool isDevKitConsole() {
     return isDevKit.get();
-}
-
-bool getWindowsGuestRedZoneProtection() {
-    return windowsGuestRedZoneProtection.get();
 }
 
 int getExtraDmemInMbytes() {
@@ -1103,10 +1093,6 @@ void setDevKitConsole(bool enable, bool is_game_specific) {
     isDevKit.set(enable, is_game_specific);
 }
 
-void setWindowsGuestRedZoneProtection(bool enable, bool is_game_specific) {
-    windowsGuestRedZoneProtection.set(enable, is_game_specific);
-}
-
 void setLogType(const string& type, bool is_game_specific) {
     logType.set(type, is_game_specific);
 }
@@ -1459,8 +1445,6 @@ static void loadFromToml(const std::filesystem::path& path, bool is_game_specifi
         volumeSlider.setFromToml(general, "volumeSlider", is_game_specific);
         isNeo.setFromToml(general, "isPS4Pro", is_game_specific);
         isDevKit.setFromToml(general, "isDevKit", is_game_specific);
-        windowsGuestRedZoneProtection.setFromToml(general, "windowsGuestRedZoneProtection",
-                                                  is_game_specific);
         if (is_game_specific) { // do not get this value from the base config
             extraDmemInMbytes.setFromToml(general, "extraDmemInMbytes", is_game_specific);
         }
@@ -1648,8 +1632,6 @@ static void loadFromJson(const std::filesystem::path& path, bool is_game_specifi
         volumeSlider.setFromJson(general, "volume_slider", is_game_specific);
         isNeo.setFromJson(general, "neo_mode", is_game_specific);
         isDevKit.setFromJson(general, "dev_kit_mode", is_game_specific);
-        windowsGuestRedZoneProtection.setFromJson(general, "windows_guest_red_zone_protection",
-                                                  is_game_specific);
         if (is_game_specific) {
             extraDmemInMbytes.setFromJson(general, "extra_dmem_in_mbytes", is_game_specific);
         }
@@ -1912,9 +1894,6 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     isSideTrophy.setJsonValue(data, "General", "trophy_notification_side", is_game_specific);
     isNeo.setJsonValue(data, "General", "neo_mode", is_game_specific);
     isDevKit.setJsonValue(data, "General", "dev_kit_mode", is_game_specific);
-    windowsGuestRedZoneProtection.setJsonValue(data, "General",
-                                               "windows_guest_red_zone_protection",
-                                               is_game_specific);
     if (is_game_specific) {
         extraDmemInMbytes.setJsonValue(data, "General", "extra_dmem_in_mbytes", is_game_specific);
     }
@@ -2117,7 +2096,6 @@ void setDefaultValues(bool is_game_specific) {
         readbackLinearImagesEnabled.set(false, is_game_specific);
         isNeo.set(false, is_game_specific);
         isDevKit.set(false, is_game_specific);
-        windowsGuestRedZoneProtection.set(false, is_game_specific);
         isPSNSignedIn.set(false, is_game_specific);
         isConnectedToNetwork.set(false, is_game_specific);
         directMemoryAccessEnabled.set(false, is_game_specific);
