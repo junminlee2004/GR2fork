@@ -9,6 +9,8 @@ https://www.youtube.com/watch?v=O8z6QPOaGDg&list=PLOgHncbXc__M&pp=sAgC
 (Atlanta server)
 45.76.253.42
 
+**The steps to enabling GRR online is identical to GR2fork online except you do not have to enter ANYTHING in the http host override box**
+
 **Join the GR2fork discord server** (new) here for extended support. Anyone who wants to lurk for general game discussion surrounding gravity rush 1 and 2 are also welcome -> https://discord.gg/hnHRpzxGzG
 
 **Support My Project Here** for Restored Online and New Features in the Future: https://gofund.me/3340f1576
