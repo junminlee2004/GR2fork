@@ -1162,11 +1162,14 @@ void TextureCache::RegisterImage(ImageId image_id) {
         image.info.guest_address, image.info.guest_size,
         [this, image_id, addr = image.info.guest_address, size = image.info.guest_size](u64 page) {
             auto& bucket = page_table[page];
+            if (size > kSmallRefBytes) {
+                bucket.large_refs.push_back({image_id, addr, size});
+                return;
+            }
             const auto pos =
-                std::lower_bound(bucket.refs.begin(), bucket.refs.end(), addr,
+                std::lower_bound(bucket.small_refs.begin(), bucket.small_refs.end(), addr,
                                  [](const PageImageRef& r, VAddr key) { return r.addr < key; });
-            bucket.refs.insert(pos, {image_id, addr, size});
-            bucket.max_size = std::max<u64>(bucket.max_size, size);
+            bucket.small_refs.insert(pos, {image_id, addr, size});
         });
     images_by_addr[image.info.guest_address].push_back(image_id);
     Skipcache::Framework::Instance().BumpTexGen();
@@ -1179,29 +1182,24 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
-    ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
-        const auto page_it = page_table.find(page);
-        if (page_it == nullptr) {
-            UNREACHABLE_MSG("Unregistering unregistered page=0x{:x}", page << PageShift);
-            return;
-        }
-        auto& bucket = *page_it;
-        const auto vector_it = std::ranges::find(bucket.refs, image_id, &PageImageRef::id);
-        if (vector_it == bucket.refs.end()) {
-            ASSERT_MSG(false, "Unregistering unregistered image in page=0x{:x}", page << PageShift);
-            return;
-        }
-        const bool was_max = vector_it->size == bucket.max_size;
-        bucket.refs.erase(vector_it);
-        if (was_max) {
-            // The erased entry may have been the sole carrier of the bound;
-            // recompute so the query window does not stay needlessly wide.
-            bucket.max_size = 0;
-            for (const PageImageRef& r : bucket.refs) {
-                bucket.max_size = std::max(bucket.max_size, r.size);
-            }
-        }
-    });
+    ForEachPage(image.info.guest_address, image.info.guest_size,
+                [this, image_id, is_large = image.info.guest_size > kSmallRefBytes](u64 page) {
+                    const auto page_it = page_table.find(page);
+                    if (page_it == nullptr) {
+                        UNREACHABLE_MSG("Unregistering unregistered page=0x{:x}",
+                                        page << PageShift);
+                        return;
+                    }
+                    auto& bucket = *page_it;
+                    auto& refs = is_large ? bucket.large_refs : bucket.small_refs;
+                    const auto vector_it = std::ranges::find(refs, image_id, &PageImageRef::id);
+                    if (vector_it == refs.end()) {
+                        ASSERT_MSG(false, "Unregistering unregistered image in page=0x{:x}",
+                                   page << PageShift);
+                        return;
+                    }
+                    refs.erase(vector_it);
+                });
     if (const auto it = images_by_addr.find(image.info.guest_address); it != images_by_addr.end()) {
         auto& ids = it.value();
         if (const auto id_it = std::ranges::find(ids, image_id); id_it != ids.end()) {

@@ -52,14 +52,17 @@ class TextureCache {
     };
     using PageRefs = boost::container::small_vector<PageImageRef, 8>;
 
-    // Bucket kept sorted by addr with the largest resident size alongside, so
-    // a query scans only the window [query_start - max_size, query_end) that
-    // can possibly overlap instead of the whole population - dense regions
-    // put dozens of images in one 1MB bucket and full scans were the
-    // dominant FindImage cost. max_size is recomputed on erase (rare).
+    // Buckets split by image size. Small refs stay sorted by addr so a query
+    // scans only [query_start - kSmallRefBytes, query_end) - the dense
+    // population that made full scans the dominant FindImage cost. Large refs
+    // (render targets, depth buffers, streaming textures) are few per bucket
+    // and scanned linearly; folding them into one sorted list poisoned the
+    // window bound, since a single multi-megabyte resident forced every
+    // query in the bucket back to a full scan.
+    static constexpr u64 kSmallRefBytes = 64 * 1024;
     struct PageBucket {
-        PageRefs refs;
-        u64 max_size{};
+        PageRefs small_refs;
+        PageRefs large_refs;
     };
 
     struct Traits {
@@ -286,11 +289,45 @@ public:
                     return;
                 }
             }
-            // Sorted-window scan: entries below the window cannot reach the
-            // query (their addr + size <= addr + max_size <= cpu_addr) and
-            // entries at or past the end cannot start inside it.
-            const auto& refs = it->refs;
-            const VAddr low_key = cpu_addr > it->max_size ? cpu_addr - it->max_size + 1 : 0;
+            // Visits one candidate: bucket-local overlap test (mirrors
+            // Image::Overlaps exactly), duplicate rejection against the tiny
+            // local list (a spanning range reappears in every page's bucket),
+            // then the Picked flag, which still guards nested walks - the
+            // cold Image load happens only for genuine first-time overlaps.
+            bool stop = false;
+            const auto visit = [&](const PageImageRef& ref) {
+                if (ref.addr >= cpu_addr + size || cpu_addr >= ref.addr + ref.size) {
+                    return;
+                }
+                const ImageId image_id = ref.id;
+                if (std::ranges::find(images, image_id) != images.end()) {
+                    return;
+                }
+                Image& image = slot_images[image_id];
+                if (image.flags & ImageFlagBits::Picked) {
+                    return;
+                }
+                image.flags |= ImageFlagBits::Picked;
+                images.push_back(image_id);
+                if constexpr (BOOL_BREAK) {
+                    stop = func(image_id, image);
+                } else {
+                    func(image_id, image);
+                }
+            };
+            for (const PageImageRef& ref : it->large_refs) {
+                visit(ref);
+                if constexpr (BOOL_BREAK) {
+                    if (stop) {
+                        return true;
+                    }
+                }
+            }
+            // Small refs cannot reach the query from further back than their
+            // size class allows, so the sorted scan starts at the window edge
+            // and ends before the first entry past the query.
+            const auto& refs = it->small_refs;
+            const VAddr low_key = cpu_addr > kSmallRefBytes ? cpu_addr - kSmallRefBytes + 1 : 0;
             const auto ref_begin =
                 std::lower_bound(refs.begin(), refs.end(), low_key,
                                  [](const PageImageRef& r, VAddr key) { return r.addr < key; });
@@ -298,35 +335,11 @@ public:
                 std::lower_bound(ref_begin, refs.end(), cpu_addr + size,
                                  [](const PageImageRef& r, VAddr key) { return r.addr < key; });
             for (auto ref_it = ref_begin; ref_it != ref_end; ++ref_it) {
-                const PageImageRef& ref = *ref_it;
-                // Mirrors Image::Overlaps exactly, from the bucket copy; the
-                // Image itself is only touched for genuine overlaps, so the
-                // Picked dedup semantics (including across nested walks) are
-                // unchanged.
-                if (ref.addr >= cpu_addr + size || cpu_addr >= ref.addr + ref.size) {
-                    continue;
-                }
-                const ImageId image_id = ref.id;
-                // A range spanning many pages reappears in every page's
-                // bucket and passes the overlap test each time; rejecting
-                // duplicates against the tiny local list costs a few register
-                // compares where the Picked-flag check costs a cold load into
-                // the image. The flag still guards nested walks below.
-                if (std::ranges::find(images, image_id) != images.end()) {
-                    continue;
-                }
-                Image& image = slot_images[image_id];
-                if (image.flags & ImageFlagBits::Picked) {
-                    continue;
-                }
-                image.flags |= ImageFlagBits::Picked;
-                images.push_back(image_id);
+                visit(*ref_it);
                 if constexpr (BOOL_BREAK) {
-                    if (func(image_id, image)) {
+                    if (stop) {
                         return true;
                     }
-                } else {
-                    func(image_id, image);
                 }
             }
             if constexpr (BOOL_BREAK) {
