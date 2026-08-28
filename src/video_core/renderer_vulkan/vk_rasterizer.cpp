@@ -950,6 +950,13 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
+    // One shared-lock hold covers every guest copy this stage stages
+    // (flatbuf, clip planes, stream uploads); see GuestCopyScope.
+    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
+    if (batch_copy_lock) {
+        copy_scope.emplace(Core::Memory::Instance());
+    }
     buffer_bindings.clear();
 
     for (const auto& desc : stage.buffers) {

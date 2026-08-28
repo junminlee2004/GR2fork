@@ -149,7 +149,13 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
-    std::shared_lock lk{mutex};
+    // The batch scope already holds the shared lock for this thread; taking
+    // it again is legal (recursive-shared) but pays the contended
+    // reader-count RMW this scope exists to elide.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope) {
+        lk.lock();
+    }
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 

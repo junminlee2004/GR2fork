@@ -239,6 +239,37 @@ public:
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
+    /// Holds the memory map's shared lock open for a batch of guest copies.
+    /// CopySparseMemory calls made by the owning thread inside the scope skip
+    /// their own acquisition, so a bind pass staging dozens of guest ranges
+    /// pays one pair of reader-count atomics instead of one per copy - the
+    /// contended RMW on that counter is the dominant cost of the copies
+    /// themselves. The lock is recursive-shared, so nesting stays safe, and
+    /// only the outermost scope takes ownership.
+    class GuestCopyScope {
+    public:
+        explicit GuestCopyScope(MemoryManager* mm) : mm_{mm}, owner_{!tls_in_guest_copy_scope} {
+            if (owner_) {
+                mm_->mutex.lock_shared();
+                tls_in_guest_copy_scope = true;
+            }
+        }
+        ~GuestCopyScope() {
+            if (owner_) {
+                tls_in_guest_copy_scope = false;
+                mm_->mutex.unlock_shared();
+            }
+        }
+        GuestCopyScope(const GuestCopyScope&) = delete;
+        GuestCopyScope& operator=(const GuestCopyScope&) = delete;
+
+    private:
+        MemoryManager* mm_;
+        bool owner_;
+    };
+
+    static inline thread_local bool tls_in_guest_copy_scope = false;
+
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
