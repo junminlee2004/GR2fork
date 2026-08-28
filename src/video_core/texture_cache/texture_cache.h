@@ -52,8 +52,18 @@ class TextureCache {
     };
     using PageRefs = boost::container::small_vector<PageImageRef, 8>;
 
+    // Bucket kept sorted by addr with the largest resident size alongside, so
+    // a query scans only the window [query_start - max_size, query_end) that
+    // can possibly overlap instead of the whole population - dense regions
+    // put dozens of images in one 1MB bucket and full scans were the
+    // dominant FindImage cost. max_size is recomputed on erase (rare).
+    struct PageBucket {
+        PageRefs refs;
+        u64 max_size{};
+    };
+
     struct Traits {
-        using Entry = PageRefs;
+        using Entry = PageBucket;
         static constexpr size_t AddressSpaceBits = 40;
         static constexpr size_t FirstLevelBits = 10;
         static constexpr size_t PageBits = 20;
@@ -276,7 +286,19 @@ public:
                     return;
                 }
             }
-            for (const PageImageRef& ref : *it) {
+            // Sorted-window scan: entries below the window cannot reach the
+            // query (their addr + size <= addr + max_size <= cpu_addr) and
+            // entries at or past the end cannot start inside it.
+            const auto& refs = it->refs;
+            const VAddr low_key = cpu_addr > it->max_size ? cpu_addr - it->max_size + 1 : 0;
+            const auto ref_begin =
+                std::lower_bound(refs.begin(), refs.end(), low_key,
+                                 [](const PageImageRef& r, VAddr key) { return r.addr < key; });
+            const auto ref_end =
+                std::lower_bound(ref_begin, refs.end(), cpu_addr + size,
+                                 [](const PageImageRef& r, VAddr key) { return r.addr < key; });
+            for (auto ref_it = ref_begin; ref_it != ref_end; ++ref_it) {
+                const PageImageRef& ref = *ref_it;
                 // Mirrors Image::Overlaps exactly, from the bucket copy; the
                 // Image itself is only touched for genuine overlaps, so the
                 // Picked dedup semantics (including across nested walks) are

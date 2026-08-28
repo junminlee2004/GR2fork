@@ -1158,9 +1158,16 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
-    ForEachPage(image.info.guest_address, image.info.guest_size,
-                [this, image_id, addr = image.info.guest_address, size = image.info.guest_size](
-                    u64 page) { page_table[page].push_back({image_id, addr, size}); });
+    ForEachPage(
+        image.info.guest_address, image.info.guest_size,
+        [this, image_id, addr = image.info.guest_address, size = image.info.guest_size](u64 page) {
+            auto& bucket = page_table[page];
+            const auto pos =
+                std::lower_bound(bucket.refs.begin(), bucket.refs.end(), addr,
+                                 [](const PageImageRef& r, VAddr key) { return r.addr < key; });
+            bucket.refs.insert(pos, {image_id, addr, size});
+            bucket.max_size = std::max<u64>(bucket.max_size, size);
+        });
     images_by_addr[image.info.guest_address].push_back(image_id);
     Skipcache::Framework::Instance().BumpTexGen();
 }
@@ -1178,13 +1185,22 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             UNREACHABLE_MSG("Unregistering unregistered page=0x{:x}", page << PageShift);
             return;
         }
-        auto& image_ids = *page_it;
-        const auto vector_it = std::ranges::find(image_ids, image_id, &PageImageRef::id);
-        if (vector_it == image_ids.end()) {
+        auto& bucket = *page_it;
+        const auto vector_it = std::ranges::find(bucket.refs, image_id, &PageImageRef::id);
+        if (vector_it == bucket.refs.end()) {
             ASSERT_MSG(false, "Unregistering unregistered image in page=0x{:x}", page << PageShift);
             return;
         }
-        image_ids.erase(vector_it);
+        const bool was_max = vector_it->size == bucket.max_size;
+        bucket.refs.erase(vector_it);
+        if (was_max) {
+            // The erased entry may have been the sole carrier of the bound;
+            // recompute so the query window does not stay needlessly wide.
+            bucket.max_size = 0;
+            for (const PageImageRef& r : bucket.refs) {
+                bucket.max_size = std::max(bucket.max_size, r.size);
+            }
+        }
     });
     if (const auto it = images_by_addr.find(image.info.guest_address); it != images_by_addr.end()) {
         auto& ids = it.value();
