@@ -453,6 +453,14 @@ struct GPUSettings {
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
+    // Collapses the clean steady state of per-binding texture updates to one
+    // atomic load instead of a texture-cache mutex acquisition; every
+    // dirtying path stamps the per-image word back to dirty.
+    Setting<bool> image_fast_state{false};
+    // Holds the memory map's shared lock across a whole buffer-bind batch so
+    // each guest copy inside stops paying its own pair of contended atomic
+    // lock operations.
+    Setting<bool> guest_copy_lock_batch{false};
     // Memoizes clean per-bind upload peeks keyed on the range's word-epoch
     // sum; a hit skips the dirty-bit scan under the same certificate the
     // sync-noop memos use (clean range => write-protected => any write bumps
@@ -505,6 +513,9 @@ struct GPUSettings {
             make_override<GPUSettings>("stream_upload_mirror_mode",
                                        &GPUSettings::stream_upload_mirror_mode),
             make_override<GPUSettings>("tracker_peek_memo", &GPUSettings::tracker_peek_memo),
+            make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
+            make_override<GPUSettings>("guest_copy_lock_batch",
+                                       &GPUSettings::guest_copy_lock_batch),
             make_override<GPUSettings>("spec_mru_perm_probe", &GPUSettings::spec_mru_perm_probe),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
@@ -512,16 +523,14 @@ struct GPUSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   adaptive_skipcaches_mode, stream_buffer_size_mb,
-                                   readback_batching_enabled, readback_offload_mode,
-                                   stream_buffer_prefer_host, direct_memory_access_enabled,
-                                   dump_shaders, patch_shaders, vblank_frequency, full_screen,
-                                   full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
-                                   rcas_enabled, rcas_attenuation, spec_mru_perm_probe,
-                                   stream_upload_mirror_mode, tracker_peek_memo)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
+    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
+    adaptive_skipcaches_mode, stream_buffer_size_mb, readback_batching_enabled,
+    readback_offload_mode, stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders,
+    patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
+    fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
+    tracker_peek_memo, image_fast_state, guest_copy_lock_batch)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -789,6 +798,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD_BOOL(m_gpu, TrackerPeekMemo, tracker_peek_memo)
+    SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
+    SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
     SETTING_FORWARD_BOOL(m_gpu, DumpShaders, dump_shaders)

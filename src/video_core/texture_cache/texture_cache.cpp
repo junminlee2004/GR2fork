@@ -32,7 +32,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      image_fast_state{EmulatorSettings.IsImageFastState()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -850,9 +851,10 @@ void TextureCache::UpdateImage(ImageId image_id) {
     // find the image clean, tracked and recently touched; the lock alone is a
     // measurable share of L1 misses on handheld cache hierarchies. Every path
     // that dirties or (partially) untracks an image marks the fast state, so
-    // a clean read here proves the full pass would be a no-op.
-    auto& sc = VideoCore::Skipcache::Framework::Instance();
-    if (!sc.Active()) {
+    // a clean read here proves the full pass would be a no-op. Gated on the
+    // image_fast_state toggle latched at construction; when it is off this is
+    // exactly the plain locked pass.
+    if (!image_fast_state) {
         std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
@@ -862,7 +864,7 @@ void TextureCache::UpdateImage(ImageId image_id) {
     }
     const u64 now_tick = scheduler.CurrentTick();
     constexpr u64 kTouchIntervalTicks = 8192;
-    {
+    if (slot_images.is_allocated(image_id)) {
         const u64 fast = slot_images[image_id].ReadFastState();
         const bool dirty = (fast & Image::kFastStateDirty) != 0;
         const bool tracked = (fast & Image::kFastStateTracked) != 0;
