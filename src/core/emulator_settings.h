@@ -35,7 +35,10 @@ enum UsbBackendType : int {
 enum AdaptiveSkipCachesMode : int {
     SkipCachesDisabled = 0,
     SkipCachesAdaptive = 1,
-    SkipCachesValidateOnly = 2,
+    // All consumer caches pinned on at boot; the controller, verify tripwire,
+    // telemetry and timer sampling never run.
+    SkipCachesForced = 2,
+    SkipCachesValidateOnly = 3,
 };
 
 enum GpuReadbacksMode : int {

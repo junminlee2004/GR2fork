@@ -48,6 +48,26 @@ void Framework::Init(Mode mode) {
     if (mode_ == Mode::Disabled) {
         return;
     }
+    if (mode_ == Mode::Forced) {
+        // Everything decided here, once: consumers pinned Enabled, the
+        // probe-only ids (BindingSkipProbe, StreamMirror) and the dead
+        // Pipeline id pinned Off so their call sites short-circuit to
+        // nothing. No calibration - nothing ever samples a timer.
+        timing_enabled_ = false;
+        if (!dedup_invalidate_registered_) {
+            dedup_invalidate_registered_ = true;
+            RegisterInvalidate(
+                [](void* self) { static_cast<Framework*>(self)->DedupInvalidateAll(); }, this);
+        }
+        for (auto& cs : caches_) {
+            cs.state = State::Enabled;
+        }
+        caches_[static_cast<size_t>(CacheId::BindingSkipProbe)].state = State::Off;
+        caches_[static_cast<size_t>(CacheId::Pipeline)].state = State::Off;
+        caches_[static_cast<size_t>(CacheId::StreamMirror)].state = State::Off;
+        LOG_INFO(Render_Skipcache, "[SkipCache] init mode=Forced");
+        return;
+    }
     // Startup calibration on the boot path, never lazily on a draw.
     tsc_hz_ = Common::EstimateRDTSCFrequency();
     if (tsc_hz_ >= 100'000'000) {
@@ -93,6 +113,9 @@ u64 Framework::Now() const {
 }
 
 bool Framework::ShouldVerify(CacheId id) {
+    if (mode_ == Mode::Forced) {
+        return false; // no tripwire; the mode itself is the safety valve
+    }
     auto& cs = caches_[static_cast<size_t>(id)];
     if (cs.state == State::Shadow) {
         return true; // predict-then-execute on 100% of would-hits
@@ -222,6 +245,11 @@ void Framework::OnSubmit(u32 frame_num, bool guest_paused) {
         if (req != mode_) {
             Init(req);
         }
+        return;
+    }
+    if (mode_ == Mode::Forced) {
+        // Fixed at boot: no windows, no pricing, no transitions, no
+        // telemetry, and no runtime mode changes.
         return;
     }
     if (guest_paused) {

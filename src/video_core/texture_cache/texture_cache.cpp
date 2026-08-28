@@ -1058,7 +1058,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     const auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
     const size_t slot = ((raw[0] >> 5) ^ (raw[0] >> 33) ^ raw[1]) & 255;
     SamplerMemoEntry& e = sampler_memo_[slot];
-    const bool fast_active = sc.ActiveMode() == Mode::Adaptive;
+    const bool fast_active = sc.ActiveMode() == Mode::Adaptive || sc.ActiveMode() == Mode::Forced;
     // Gen equality proves the map entry, lru_id and handle are live: the
     // samplers erase and the gen bump happen only in GarbageCollectSamplers,
     // and both GetSampler and the GC run on the GPU thread only.

@@ -47,7 +47,12 @@ namespace VideoCore::Skipcache {
 // thread reader, asserted not narrated.
 // =============================================================================
 
-enum class Mode : u8 { Disabled = 0, Adaptive = 1, ValidateOnly = 2 };
+// Forced pins every cache with a real consumer to Enabled once at boot: no
+// learning windows, no verify tripwire, no pricing, no telemetry, no timer
+// sampling - OnSubmit returns immediately, so the framework runs zero
+// per-frame code. The probe-only and dead ids stay Off. There is no
+// divergence safety net in this mode; the setting itself is the valve.
+enum class Mode : u8 { Disabled = 0, Adaptive = 1, Forced = 2, ValidateOnly = 3 };
 enum class CacheId : u8 {
     UpdateImageDedup = 0,
     BeginRendering = 1,
