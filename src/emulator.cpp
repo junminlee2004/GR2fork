@@ -491,6 +491,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU adaptiveSkipCaches: {}", EmulatorSettings.GetAdaptiveSkipCachesMode());
     LOG_INFO(Config, "GPU streamUploadMirrorMode: {}",
              EmulatorSettings.GetStreamUploadMirrorMode());
+    LOG_INFO(Config, "GPU trackerProtectHysteresis: {}",
+             EmulatorSettings.IsTrackerProtectHysteresis());
+    LOG_INFO(Config, "GPU trackerPeekMemo: {}", EmulatorSettings.IsTrackerPeekMemo());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());

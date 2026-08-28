@@ -32,6 +32,31 @@ public:
     // Upload-walk peek baseline; GPU-command-thread confined like the walk.
     u64 peek_fastpath_calls{};
     u64 peek_fastpath_dirty{};
+    u64 peek_memo_hits{};
+
+    // Clean-answer memo for the upload-walk peek, keyed on the range's
+    // word-epoch sum. Sound by the mirror certificate: a clean range keeps
+    // every page write-protected, any write faults and bumps the epochs, so
+    // an unchanged sum proves the bits are still clean. Dirty answers are
+    // never cached - a stale dirty entry would pin the fast path off exactly
+    // when the range settles. GPU-command-thread confined like the walk.
+    struct PeekMemoEntry {
+        VAddr addr;
+        u64 size;
+        u64 sum;
+    };
+    static constexpr size_t PEEK_MEMO_SIZE = 1024;
+    std::array<PeekMemoEntry, PEEK_MEMO_SIZE> peek_memo_{};
+
+    static bool PeekMemoEnabled() noexcept {
+        static const bool enabled = EmulatorSettings.IsTrackerPeekMemo();
+        return enabled;
+    }
+
+    static size_t PeekMemoSlot(VAddr addr, u64 size) noexcept {
+        const u64 h = (addr ^ (size * 0x9e3779b97f4a7c15ULL)) * 0xff51afd7ed558ccdULL;
+        return static_cast<size_t>(h >> 40) & (PEEK_MEMO_SIZE - 1);
+    }
 
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
@@ -257,8 +282,42 @@ public:
                 manager = LookupRegion(first_page);
             }
             const u64 offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
-            const bool nothing_to_upload =
-                !manager->template PeekRegionModified<Type::CPU>(offset, query_size);
+            // Memo front: sum the covered word epochs and compare against the
+            // last clean answer recorded for this exact (addr, size). The sum
+            // is read BEFORE the peek, so a write racing the record leaves a
+            // stale sum behind and the next compare conservatively misses.
+            bool sum_ok = false;
+            u64 cur_sum = 0;
+            PeekMemoEntry* memo_entry = nullptr;
+            if (PeekMemoEnabled()) {
+                const size_t w0 = offset >> RegionManager::EPOCH_WORD_BITS;
+                const size_t w1 =
+                    std::min<size_t>((offset + query_size - 1) >> RegionManager::EPOCH_WORD_BITS,
+                                     RegionManager::NUM_EPOCH_WORDS - 1);
+                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
+                sum_ok = true;
+                for (size_t w = w0; w <= w1; ++w) {
+                    cur_sum += manager->word_epochs[w].load(std::memory_order_acquire);
+                    if ((poison >> w) & 1u) {
+                        sum_ok = false;
+                    }
+                }
+                if (sum_ok) {
+                    memo_entry = &peek_memo_[PeekMemoSlot(query_cpu_range, query_size)];
+                }
+            }
+            bool nothing_to_upload;
+            if (memo_entry != nullptr && memo_entry->addr == query_cpu_range &&
+                memo_entry->size == query_size && memo_entry->sum == cur_sum) {
+                nothing_to_upload = true;
+                ++peek_memo_hits;
+            } else {
+                nothing_to_upload =
+                    !manager->template PeekRegionModified<Type::CPU>(offset, query_size);
+                if (nothing_to_upload && memo_entry != nullptr) {
+                    *memo_entry = {query_cpu_range, query_size, cur_sum};
+                }
+            }
             ++peek_fastpath_calls;
             peek_fastpath_dirty += nothing_to_upload ? 0 : 1;
             const bool skippable = nothing_to_upload &&
