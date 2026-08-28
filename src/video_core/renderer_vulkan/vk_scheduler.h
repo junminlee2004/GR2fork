@@ -493,6 +493,10 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::atomic<u64> pending_ops_count{};
+    // Non-empty-queue poll throttle (pending_pop_throttle setting, latched at
+    // construction). GPU-command-thread confined like the polls it counts.
+    u32 pop_poll_throttle_{};
+    u32 pop_poll_counter_{};
     std::recursive_mutex pending_ops_mutex;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;

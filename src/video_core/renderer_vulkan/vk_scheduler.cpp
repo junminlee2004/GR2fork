@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/rdtsc.h"
 #include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -19,6 +20,7 @@ Scheduler::Scheduler(const Instance& instance)
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    pop_poll_throttle_ = EmulatorSettings.GetPendingPopThrottle();
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -141,6 +143,15 @@ void Scheduler::PopPendingOperations() {
     if (pending_ops_count.load(std::memory_order_acquire) == 0) {
         return;
     }
+    // While an op waits out its GPU tick the queue stays non-empty and every
+    // draw would otherwise take the lock and issue a SYNCOBJ_QUERY ioctl;
+    // the ops are latency-tolerant (deferred frees - urgent writebacks ride
+    // the priority queue), so attempt the pop once per N non-empty polls
+    // instead. An op retires at most N draws late. 0 polls every call.
+    if (pop_poll_throttle_ != 0 && ++pop_poll_counter_ < pop_poll_throttle_) {
+        return;
+    }
+    pop_poll_counter_ = 0;
     std::unique_lock lk(pending_ops_mutex);
     master_semaphore.Refresh();
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {

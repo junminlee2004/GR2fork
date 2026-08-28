@@ -456,6 +456,10 @@ struct GPUSettings {
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
+    // While a deferred operation waits out its GPU tick, attempt the pending
+    // pop (a lock plus a fence-query ioctl) once per this many draw-rate
+    // polls instead of every draw. 0 polls every call.
+    Setting<u32> pending_pop_throttle{0};
     // Resolves shader permutations through an address-masked specialization
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.
@@ -514,6 +518,7 @@ struct GPUSettings {
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
                                        &GPUSettings::stream_upload_mirror_mode),
+            make_override<GPUSettings>("pending_pop_throttle", &GPUSettings::pending_pop_throttle),
             make_override<GPUSettings>("spec_fp_cache", &GPUSettings::spec_fp_cache),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
@@ -532,7 +537,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     readback_offload_mode, stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders,
     patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache)
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -799,6 +804,7 @@ public:
     SETTING_FORWARD(m_gpu, ReadbackOffloadMode, readback_offload_mode)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
+    SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpCache, spec_fp_cache)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
