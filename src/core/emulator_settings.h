@@ -453,12 +453,6 @@ struct GPUSettings {
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
-    // Stops re-write-protecting tracker words that fault every frame: their
-    // pages stay writable and their upload ranges stay marked dirty, trading
-    // uploads that already happen each frame for the fault + two mprotect
-    // calls per page cycle. Scores decay, so a range that stops being written
-    // re-arms its protection.
-    Setting<bool> tracker_protect_hysteresis{false};
     // Memoizes clean per-bind upload peeks keyed on the range's word-epoch
     // sum; a hit skips the dirty-bit scan under the same certificate the
     // sync-noop memos use (clean range => write-protected => any write bumps
@@ -510,8 +504,6 @@ struct GPUSettings {
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
                                        &GPUSettings::stream_upload_mirror_mode),
-            make_override<GPUSettings>("tracker_protect_hysteresis",
-                                       &GPUSettings::tracker_protect_hysteresis),
             make_override<GPUSettings>("tracker_peek_memo", &GPUSettings::tracker_peek_memo),
             make_override<GPUSettings>("spec_mru_perm_probe", &GPUSettings::spec_mru_perm_probe),
             make_override<GPUSettings>("direct_memory_access_enabled",
@@ -520,14 +512,16 @@ struct GPUSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
-    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
-    adaptive_skipcaches_mode, stream_buffer_size_mb, readback_batching_enabled,
-    readback_offload_mode, stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders,
-    patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
-    fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
-    tracker_protect_hysteresis, tracker_peek_memo)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
+                                   internal_screen_height, null_gpu, copy_gpu_buffers,
+                                   readbacks_mode, readback_linear_images_enabled,
+                                   adaptive_skipcaches_mode, stream_buffer_size_mb,
+                                   readback_batching_enabled, readback_offload_mode,
+                                   stream_buffer_prefer_host, direct_memory_access_enabled,
+                                   dump_shaders, patch_shaders, vblank_frequency, full_screen,
+                                   full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
+                                   rcas_enabled, rcas_attenuation, spec_mru_perm_probe,
+                                   stream_upload_mirror_mode, tracker_peek_memo)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -794,7 +788,6 @@ public:
     SETTING_FORWARD(m_gpu, ReadbackOffloadMode, readback_offload_mode)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
-    SETTING_FORWARD_BOOL(m_gpu, TrackerProtectHysteresis, tracker_protect_hysteresis)
     SETTING_FORWARD_BOOL(m_gpu, TrackerPeekMemo, tracker_peek_memo)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)

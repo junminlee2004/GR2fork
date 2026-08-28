@@ -335,18 +335,13 @@ public:
                 return;
             }
             manager->lock.lock();
+            manager->template ForEachModifiedRange<Type::CPU, true>(manager->GetCpuAddr() + offset,
+                                                                    query_size, func);
             if (!is_written) {
-                // Read-only binds may leave flappy words dirty and
-                // unprotected; written binds must clear so the GPU marking
-                // below never read-tracks a write-untracked page.
-                manager->template ForEachModifiedRange<Type::CPU, true, true>(
-                    manager->GetCpuAddr() + offset, query_size, func);
                 manager->lock.unlock();
                 on_upload();
                 return;
             }
-            manager->template ForEachModifiedRange<Type::CPU, true>(manager->GetCpuAddr() + offset,
-                                                                    query_size, func);
             // A written bind holds the lock from the upload walk until the
             // GPU marking below, so the marking observes the bits it covers.
             on_upload();
@@ -389,14 +384,9 @@ public:
                     return;
                 }
                 manager->lock.lock();
-                if (is_written) {
-                    manager->template ForEachModifiedRange<Type::CPU, true>(
-                        manager->GetCpuAddr() + offset, size, func);
-                } else {
-                    // Hysteresis is licensed only without the GPU marking of
-                    // the second pass; see the single-region fast path.
-                    manager->template ForEachModifiedRange<Type::CPU, true, true>(
-                        manager->GetCpuAddr() + offset, size, func);
+                manager->template ForEachModifiedRange<Type::CPU, true>(
+                    manager->GetCpuAddr() + offset, size, func);
+                if (!is_written) {
                     manager->lock.unlock();
                 }
             });

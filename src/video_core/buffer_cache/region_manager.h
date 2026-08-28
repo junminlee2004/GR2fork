@@ -115,13 +115,6 @@ public:
                 return;
             }
         }
-        if constexpr (type == Type::CPU && enable) {
-            // Pages going clean -> dirty lose their write protection; that is
-            // one half of the fault + reprotect cycle the hysteresis prices.
-            if (ProtectHysteresis()) {
-                BumpFlapScores(start_page, end_page);
-            }
-        }
         WriteScope write_scope{*this};
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
@@ -143,7 +136,7 @@ public:
      * @param size            Size in bytes of the CPU range to loop over
      * @param func            Function to call for each turned off region
      */
-    template <Type type, bool clear, bool allow_hysteresis = false>
+    template <Type type, bool clear>
     void ForEachModifiedRange(VAddr query_cpu_range, s64 size, auto&& func) {
         RENDERER_TRACE;
         const size_t offset = query_cpu_range - cpu_addr;
@@ -152,30 +145,6 @@ public:
             Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
         if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
             return;
-        }
-
-        // A range whose words flap - fault, unprotect, upload, reprotect,
-        // every frame - gains nothing from the clear: the next guest write
-        // faults it dirty again immediately. Reporting the dirty ranges
-        // without clearing keeps the upload (the caller reads current guest
-        // bytes either way) and drops the reprotect mprotect plus the next
-        // fault. The decrement re-arms protection once the range cools, so a
-        // stale score cannot pin a range unprotected. Only read-only binds
-        // may opt in (allow_hysteresis): a written bind GPU-marks the range
-        // right after this walk, and under precise readbacks that read-tracks
-        // pages the skipped clear would leave write-untracked - an invalid
-        // write-only protection state.
-        if constexpr (clear && type == Type::CPU && allow_hysteresis) {
-            if (ProtectHysteresis() && FlapWordsAllHot(start_page, end_page)) {
-                DecayFlapScores(start_page, end_page);
-                RegionBits& hot_bits = GetRegionBits<type>();
-                RegionBits hot_mask(hot_bits, start_page, end_page);
-                for (const auto& [start, end] : hot_mask) {
-                    func(cpu_addr + start * TRACKER_BYTES_PER_PAGE,
-                         (end - start) * TRACKER_BYTES_PER_PAGE);
-                }
-                return;
-            }
         }
 
         // Only the clearing form mutates the bits; entering the scope
@@ -335,61 +304,6 @@ public:
     std::array<std::atomic<u64>, NUM_EPOCH_SUBS> sub_epochs{};
     std::array<std::atomic<u8>, NUM_EPOCH_WORDS> last_bump_cause{};
     std::atomic<u32> poison_words{0};
-
-    // Protection hysteresis. Every clean -> dirty transition of a word's
-    // pages costs a fault plus two mprotect calls when the word is
-    // re-protected after the upload clears it. Words whose score stays above
-    // the threshold are left dirty and unprotected by the clearing walk; the
-    // per-skip decay re-arms protection once writes stop. Scores are touched
-    // from the fault side (guest threads) and the upload side (GPU thread),
-    // so they are relaxed atomics; a lost update only shifts the flap
-    // estimate by one cycle.
-    static constexpr u8 FLAP_HOT_THRESHOLD = 8;
-    static constexpr u8 FLAP_SCORE_CAP = 64;
-    static constexpr u64 PAGES_PER_EPOCH_WORD_SHIFT = EPOCH_WORD_BITS - TRACKER_PAGE_BITS;
-
-    static bool ProtectHysteresis() noexcept {
-        static const bool enabled = EmulatorSettings.IsTrackerProtectHysteresis();
-        return enabled;
-    }
-
-    void BumpFlapScores(size_t start_page, size_t end_page) noexcept {
-        const size_t w0 = start_page >> PAGES_PER_EPOCH_WORD_SHIFT;
-        const size_t w1 =
-            std::min((end_page - 1) >> PAGES_PER_EPOCH_WORD_SHIFT, NUM_EPOCH_WORDS - 1);
-        for (size_t w = w0; w <= w1; ++w) {
-            const u8 score = flap_scores[w].load(std::memory_order_relaxed);
-            if (score < FLAP_SCORE_CAP) {
-                flap_scores[w].store(score + 2, std::memory_order_relaxed);
-            }
-        }
-    }
-
-    bool FlapWordsAllHot(size_t start_page, size_t end_page) const noexcept {
-        const size_t w0 = start_page >> PAGES_PER_EPOCH_WORD_SHIFT;
-        const size_t w1 =
-            std::min((end_page - 1) >> PAGES_PER_EPOCH_WORD_SHIFT, NUM_EPOCH_WORDS - 1);
-        for (size_t w = w0; w <= w1; ++w) {
-            if (flap_scores[w].load(std::memory_order_relaxed) <= FLAP_HOT_THRESHOLD) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void DecayFlapScores(size_t start_page, size_t end_page) noexcept {
-        const size_t w0 = start_page >> PAGES_PER_EPOCH_WORD_SHIFT;
-        const size_t w1 =
-            std::min((end_page - 1) >> PAGES_PER_EPOCH_WORD_SHIFT, NUM_EPOCH_WORDS - 1);
-        for (size_t w = w0; w <= w1; ++w) {
-            const u8 score = flap_scores[w].load(std::memory_order_relaxed);
-            if (score > FLAP_HOT_THRESHOLD) {
-                flap_scores[w].store(score - 1, std::memory_order_relaxed);
-            }
-        }
-    }
-
-    std::array<std::atomic<u8>, NUM_EPOCH_WORDS> flap_scores{};
 
 private:
     /**
