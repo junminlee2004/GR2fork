@@ -40,8 +40,20 @@ class TextureCache {
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
+    // Page-table bucket entry. The guest range is copied in at registration
+    // (it is immutable while registered), so overlap filtering reads the
+    // bucket's contiguous memory instead of chasing each candidate's cold
+    // 752-byte Image struct - the dominant cost of FindImage was that
+    // dependent load missing cache once per candidate.
+    struct PageImageRef {
+        ImageId id;
+        VAddr addr;
+        u64 size;
+    };
+    using PageRefs = boost::container::small_vector<PageImageRef, 8>;
+
     struct Traits {
-        using Entry = ImageIds;
+        using Entry = PageRefs;
         static constexpr size_t AddressSpaceBits = 40;
         static constexpr size_t FirstLevelBits = 10;
         static constexpr size_t PageBits = 20;
@@ -264,12 +276,17 @@ public:
                     return;
                 }
             }
-            for (const ImageId image_id : *it) {
-                Image& image = slot_images[image_id];
-                if (image.flags & ImageFlagBits::Picked) {
+            for (const PageImageRef& ref : *it) {
+                // Mirrors Image::Overlaps exactly, from the bucket copy; the
+                // Image itself is only touched for genuine overlaps, so the
+                // Picked dedup semantics (including across nested walks) are
+                // unchanged.
+                if (ref.addr >= cpu_addr + size || cpu_addr >= ref.addr + ref.size) {
                     continue;
                 }
-                if (!image.Overlaps(cpu_addr, size)) {
+                const ImageId image_id = ref.id;
+                Image& image = slot_images[image_id];
+                if (image.flags & ImageFlagBits::Picked) {
                     continue;
                 }
                 image.flags |= ImageFlagBits::Picked;

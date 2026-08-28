@@ -1159,7 +1159,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
-                [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+                [this, image_id, addr = image.info.guest_address, size = image.info.guest_size](
+                    u64 page) { page_table[page].push_back({image_id, addr, size}); });
     images_by_addr[image.info.guest_address].push_back(image_id);
     Skipcache::Framework::Instance().BumpTexGen();
 }
@@ -1178,7 +1179,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             return;
         }
         auto& image_ids = *page_it;
-        const auto vector_it = std::ranges::find(image_ids, image_id);
+        const auto vector_it = std::ranges::find(image_ids, image_id, &PageImageRef::id);
         if (vector_it == image_ids.end()) {
             ASSERT_MSG(false, "Unregistering unregistered image in page=0x{:x}", page << PageShift);
             return;
