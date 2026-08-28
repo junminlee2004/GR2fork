@@ -143,7 +143,7 @@ public:
      * @param size            Size in bytes of the CPU range to loop over
      * @param func            Function to call for each turned off region
      */
-    template <Type type, bool clear>
+    template <Type type, bool clear, bool allow_hysteresis = false>
     void ForEachModifiedRange(VAddr query_cpu_range, s64 size, auto&& func) {
         RENDERER_TRACE;
         const size_t offset = query_cpu_range - cpu_addr;
@@ -160,9 +160,12 @@ public:
         // without clearing keeps the upload (the caller reads current guest
         // bytes either way) and drops the reprotect mprotect plus the next
         // fault. The decrement re-arms protection once the range cools, so a
-        // stale score cannot pin a range unprotected. CPU-clearing walks
-        // only; the caller uploads exactly the ranges reported.
-        if constexpr (clear && type == Type::CPU) {
+        // stale score cannot pin a range unprotected. Only read-only binds
+        // may opt in (allow_hysteresis): a written bind GPU-marks the range
+        // right after this walk, and under precise readbacks that read-tracks
+        // pages the skipped clear would leave write-untracked - an invalid
+        // write-only protection state.
+        if constexpr (clear && type == Type::CPU && allow_hysteresis) {
             if (ProtectHysteresis() && FlapWordsAllHot(start_page, end_page)) {
                 DecayFlapScores(start_page, end_page);
                 RegionBits& hot_bits = GetRegionBits<type>();
