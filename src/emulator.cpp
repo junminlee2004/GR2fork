@@ -491,6 +491,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU adaptiveSkipCaches: {}", EmulatorSettings.GetAdaptiveSkipCachesMode());
     LOG_INFO(Config, "GPU streamUploadMirrorMode: {}",
              EmulatorSettings.GetStreamUploadMirrorMode());
+    LOG_INFO(Config, "GPU faultWidenBytes: {}", EmulatorSettings.GetFaultWidenBytes());
     LOG_INFO(Config, "GPU pendingPopThrottle: {}", EmulatorSettings.GetPendingPopThrottle());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

@@ -240,6 +240,46 @@ public:
             });
     }
 
+    /// InvalidateRegion with fault widening: the whole widened chunk goes
+    /// CPU-dirty when it holds no GPU-modified page - extra dirty pages only
+    /// re-upload bytes the guest already owns, and pages never uploaded are
+    /// dirty by default so their protection is never touched. Any GPU bit in
+    /// the chunk falls back to page-exact semantics for the original range
+    /// (identical flush behavior, no spurious readbacks, and never a
+    /// CPU-dirty mark over read-tracked pages).
+    void InvalidateRegionWidened(VAddr orig_addr, u64 orig_size, VAddr wide_addr, u64 wide_size,
+                                 auto&& on_flush) noexcept {
+        IteratePages<false>(
+            wide_addr, wide_size, [&](RegionManager* manager, u64 offset, size_t size) {
+                const VAddr chunk_addr = manager->GetCpuAddr() + offset;
+                bool flush = false;
+                {
+                    std::scoped_lock lk{manager->lock};
+                    const bool readbacks =
+                        EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled;
+                    if (!readbacks ||
+                        !manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                        manager->template ChangeRegionState<Type::CPU, true>(chunk_addr, size);
+                        return;
+                    }
+                    const VAddr lo = std::max(chunk_addr, orig_addr);
+                    const VAddr hi = std::min(chunk_addr + size, orig_addr + orig_size);
+                    if (lo >= hi) {
+                        return; // pure widening over GPU data: leave untouched
+                    }
+                    if (manager->template IsRegionModified<Type::GPU>(lo - manager->GetCpuAddr(),
+                                                                      hi - lo)) {
+                        flush = true;
+                    } else {
+                        manager->template ChangeRegionState<Type::CPU, true>(lo, hi - lo);
+                    }
+                }
+                if (flush) {
+                    on_flush();
+                }
+            });
+    }
+
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {

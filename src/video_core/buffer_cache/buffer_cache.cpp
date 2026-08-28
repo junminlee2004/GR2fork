@@ -278,6 +278,17 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
+    // Rounded down to a power of two once; the flush callback keeps the
+    // original range so readbacks never widen.
+    static const u64 widen = std::bit_floor(u64{EmulatorSettings.GetFaultWidenBytes()});
+    if (widen >= TRACKER_BYTES_PER_PAGE) {
+        const VAddr wide_addr = device_addr & ~(widen - 1);
+        const u64 wide_size = ((device_addr + size + widen - 1) & ~(widen - 1)) - wide_addr;
+        memory_tracker->InvalidateRegionWidened(
+            device_addr, size, wide_addr, wide_size,
+            [this, device_addr, size] { ReadMemory(device_addr, size, true); });
+        return;
+    }
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
