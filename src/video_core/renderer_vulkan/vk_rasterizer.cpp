@@ -57,6 +57,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
+    flatbuf_streak_ = EmulatorSettings.IsFlatbufStreak();
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -983,9 +984,133 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
-                const u64 offset =
-                    vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                if (!flatbuf_streak_) {
+                    const u64 offset =
+                        vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                } else {
+                    // GR2 PORT (flatbuf-streak): thread-local memo over the flattened
+                    // user-data staging copy. Identity {stage_key, cmdbuf, size}, then an
+                    // XXH3 content verify recycles the previous stream offset on match.
+                    struct FlatbufCacheEntry {
+                        u64 stage_key = 0;
+                        vk::CommandBuffer cmdbuf{};
+                        // Scheduler tick at populate time. The command pool recycles
+                        // cmdbuf handles and the stream ring reclaims offsets once their
+                        // tick retires, so an offset is only reusable inside the tick
+                        // that staged it; the handle alone cannot prove that.
+                        u64 tick = 0;
+                        u64 hash = 0;
+                        u64 offset = 0;
+                        u32 size = 0;
+                        // GR2 PERF: saturating count of consecutive verify-hash misses; at
+                        // >= kFlatHashOffStreak the verify hash is skipped and the payload
+                        // re-staged unconditionally. Fits in the struct's tail padding.
+                        u8 miss_streak = 0;
+                        u8 probe_ctr = 0;
+                        bool valid = false;
+                    };
+                    static thread_local std::array<FlatbufCacheEntry, 32> flatbuf_cache{};
+
+                    // GR2 PERF: adaptive verify-hash. User data rewrites between most draws,
+                    // so 8 straight hash misses disable hashing per entry; a probe hash each
+                    // 128th hit re-enables when stable.
+                    constexpr u8 kFlatHashOffStreak = 8;
+
+                    const auto cmdbuf = scheduler.CommandBuffer();
+                    const u64 now_tick = scheduler.CurrentTick();
+                    const u64 stage_key =
+                        static_cast<u64>(stage.pgm_hash) ^ (static_cast<u64>(desc.sharp_idx) << 1);
+
+                    FlatbufCacheEntry& e = flatbuf_cache[stage_key & (flatbuf_cache.size() - 1)];
+
+                    // GR2 PERF: defer the XXH3 hash until the cheap identity checks pass -
+                    // skipping XXH3_64bits when a validator fails saves ~80-300 cycles per
+                    // Flatbuf binding.
+                    const bool identity_match = e.valid && e.stage_key == stage_key &&
+                                                e.cmdbuf == cmdbuf && e.tick == now_tick &&
+                                                e.size == ubo_size;
+
+                    u64 offset;
+                    // GR2 PERF: once the 32-entry thread-local cache is warm, identity_match
+                    // dominates - stage_key hashes distribute ~uniformly, so slot collisions
+                    // are rare.
+                    if (identity_match) [[likely]] {
+                        if (e.miss_streak >= kFlatHashOffStreak) {
+                            // Hashing is disabled for this entry (payload churned 8 binds in
+                            // a row): stage unconditionally, probing every 128th hit against
+                            // the hash stored at the previous probe to detect the payload
+                            // settling.
+                            if ((++e.probe_ctr & 127) == 0) [[unlikely]] {
+                                const u64 payload_hash =
+                                    (ubo_size == 0)
+                                        ? 0
+                                        : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                                if (e.hash == payload_hash) {
+                                    // Stable across the whole probe window -
+                                    // re-enable verify hashing. Do NOT reuse e.offset:
+                                    // the disabled lane staged without updating e.hash,
+                                    // so the bytes at e.offset are the previous bind's
+                                    // unverified payload, not necessarily this one.
+                                    e.miss_streak = 0;
+                                    offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                            alignment);
+                                    e.offset = offset;
+                                } else {
+                                    offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                            alignment);
+                                    e.hash = payload_hash;
+                                    e.offset = offset;
+                                }
+                            } else {
+                                offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                        alignment);
+                                e.offset = offset;
+                            }
+                        } else {
+                            // Same shader, same cmdbuf, same payload size - content
+                            // *might* be unchanged. Hash to verify.
+                            const u64 payload_hash =
+                                (ubo_size == 0)
+                                    ? 0
+                                    : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                            // GR2 PERF: UD content typically changes per parameter set
+                            // (camera/view constants), not per draw, so hashes match across
+                            // consecutive same-pipeline draws sharing the flat-buf payload.
+                            if (e.hash == payload_hash) [[likely]] {
+                                // Full hit - reuse the prior staging-buffer offset.
+                                offset = e.offset;
+                                e.miss_streak = 0;
+                            } else {
+                                // Content changed - re-stage and update hash only.
+                                offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size,
+                                                        alignment);
+                                e.hash = payload_hash;
+                                e.offset = offset;
+                                if (e.miss_streak < kFlatHashOffStreak) {
+                                    ++e.miss_streak;
+                                    e.probe_ctr = 0;
+                                }
+                            }
+                        }
+                    } else {
+                        // Slot miss - full populate. Hash on the way in.
+                        offset = vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                        e.stage_key = stage_key;
+                        e.cmdbuf = cmdbuf;
+                        e.tick = now_tick;
+                        e.hash = (ubo_size == 0)
+                                     ? 0
+                                     : XXH3_64bits(stage.flattened_ud_buf.data(), ubo_size);
+                        e.offset = offset;
+                        e.size = ubo_size;
+                        e.miss_streak = 0; // a new identity starts with hashing on
+                        e.probe_ctr = 0;
+                        e.valid = true;
+                    }
+
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.

@@ -84,7 +84,8 @@ public:
     }
 
 private:
-    // Phase-1 draw recurrence instrumentation (observe-only, GPU thread only).
+    bool flatbuf_streak_{}; // flatbufStreak snapshot: latched once at construction
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
