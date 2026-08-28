@@ -4,6 +4,9 @@
 #pragma once
 
 #include <bitset>
+#include <type_traits>
+
+#include <xxhash.h>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -90,6 +93,12 @@ struct StageSpecialization {
     boost::container::small_vector<FMaskSpecialization, 8> fmasks;
     boost::container::small_vector<SamplerSpecialization, 16> samplers;
     Backend::Bindings start{};
+    // 128-bit signature pair over the fields operator== consults; sig-equality with a sig2
+    // confirm replaces deep permutation compares on the resolve path. Computed only while the
+    // spec_fp_cache setting is on: sig == 0 doubles as the "never computed" sentinel, and such
+    // specs never enter Program::perm_index_by_sig.
+    u64 sig{};
+    u64 sig2{};
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, const RuntimeInfo& runtime_info_,
@@ -104,6 +113,8 @@ struct StageSpecialization {
         info = &info_;
         runtime_info = runtime_info_;
         start = start_;
+        sig = 0;
+        sig2 = 0;
         bitset.reset();
         vs_attribs.clear();
         buffers.clear();
@@ -205,6 +216,72 @@ struct StageSpecialization {
 
     [[nodiscard]] bool Valid() const {
         return info != nullptr;
+    }
+
+    // Fills sig/sig2 from every field operator== consults (plus the program identity), so two
+    // specs with equal signatures are interchangeable up to a ~2^-128 collision. Called
+    // explicitly by the pipeline cache when the spec_fp_cache setting is on; never from
+    // construction, so the disabled path pays nothing.
+    void ComputeSig() noexcept {
+        u64 h1 = 1469598103934665603ULL;
+        u64 h2 = 0x84222325cbf29ce4ULL;
+        auto step = [&](u64 v) noexcept {
+            h1 ^= v;
+            h1 *= 1099511628211ULL;
+            h2 ^= v + 0x9e3779b97f4a7c15ULL + (h2 << 6) + (h2 >> 2);
+        };
+        auto mix_pod_bulk = [&](const void* p, size_t n) noexcept {
+            if (n == 0) {
+                return;
+            }
+            step(XXH3_64bits(p, n));
+        };
+        auto mix_pod_vec_fast = [&](const auto& vec) noexcept {
+            using T = typename std::decay_t<decltype(vec)>::value_type;
+            static_assert(std::is_trivially_copyable_v<T>);
+            step(static_cast<u64>(vec.size()));
+            if (!vec.empty()) {
+                mix_pod_bulk(vec.data(), vec.size() * sizeof(T));
+            }
+        };
+        step(static_cast<u64>(info ? info->pgm_hash : 0));
+        step(static_cast<u64>(info ? static_cast<u32>(info->stage) : 0));
+        step(static_cast<u64>(info ? static_cast<u32>(info->l_stage) : 0));
+        mix_pod_bulk(&runtime_info, sizeof(runtime_info));
+        mix_pod_bulk(&start, sizeof(start));
+        // The donor mirrors bitset into two u64 words at bind time; deriving them here hashes
+        // identical content while keeping the bitset the single source of truth (deserialized
+        // specs restore only the bitset).
+        static_assert(MaxStageResources == 128);
+        step(((bitset << 64) >> 64).to_ullong());
+        step((bitset >> 64).to_ullong());
+        step(fetch_shader_data.has_value() ? 1ULL : 0ULL);
+        if (fetch_shader_data) {
+            const u64 fs_packed =
+                static_cast<u64>(fetch_shader_data->attributes.size()) |
+                (static_cast<u64>(static_cast<u8>(fetch_shader_data->vertex_offset_sgpr)) << 16) |
+                (static_cast<u64>(static_cast<u8>(fetch_shader_data->instance_offset_sgpr)) << 24);
+            step(fs_packed);
+            for (const auto& a : fetch_shader_data->attributes) {
+                u64 w = 0;
+                w |= static_cast<u64>(a.semantic) << 0;
+                w |= static_cast<u64>(a.dest_vgpr) << 8;
+                w |= static_cast<u64>(a.num_elements) << 16;
+                w |= static_cast<u64>(a.sgpr_base) << 24;
+                w |= static_cast<u64>(a.dword_offset) << 32;
+                w |= static_cast<u64>(a.instance_data) << 40;
+                w |= static_cast<u64>(a.inst_offset) << 48;
+                step(w);
+                step(static_cast<u64>(a.data_format) | (static_cast<u64>(a.num_format) << 8));
+            }
+        }
+        mix_pod_vec_fast(vs_attribs);
+        mix_pod_vec_fast(buffers);
+        mix_pod_vec_fast(images);
+        mix_pod_vec_fast(fmasks);
+        mix_pod_vec_fast(samplers);
+        sig = h1;
+        sig2 = h2;
     }
 
     bool operator==(const StageSpecialization& other) const {

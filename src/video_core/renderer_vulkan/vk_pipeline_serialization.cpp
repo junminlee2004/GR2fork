@@ -261,6 +261,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     if (!LoadShaderMeta(ar, program->info, fetch_out, spec, perm_idx)) {
         return false;
     }
+    if (spec_fp_cache) {
+        // Signatures are not serialized; without recomputing here the (sig, sig2) resolve
+        // would treat every preloaded permutation as unknown and compile a duplicate.
+        spec.ComputeSig();
+    }
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,

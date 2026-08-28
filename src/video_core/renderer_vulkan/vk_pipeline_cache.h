@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <memory>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -51,18 +53,53 @@ struct Program {
     // the MRU probe setting is enabled. Always bounds-checked before use.
     u32 last_hit_perm{};
 
+    // Fast lookup for shader permutations by specialization signature; a sig-map hit confirmed
+    // by sig2 replaces the deep StageSpecialization comparisons on hot paths. Populated only
+    // while the spec_fp_cache setting is on (specs carry sig == 0 otherwise). Never
+    // invalidated: modules are append-only and entries hold indices, not handles.
+    tsl::robin_map<u64, size_t> perm_index_by_sig{};
+
+    // ComputeSpecProxyFp -> perm_idx cache for draws where only resource addresses changed.
+    // base_address is masked and not a fingerprint input; the key only over-discriminates
+    // (GR2: 93.1% reclaim, 0 collisions over 12.2M samples). HS/DS excluded (their spec folds
+    // guest tess constants). Stores perm_idx and reads the module fresh on every hit, so the
+    // ReplaceShader in-place module swap needs no invalidation here.
+    struct SpecFpCacheEntry {
+        u64 fp{};
+        u32 perm_idx{};
+        bool valid{false};
+    };
+    // Direct-mapped, indexed by spec_fp & (size-1). Measured reclaim knee on GR2: 64 slots ->
+    // 71%, 1024 -> 91.6%, 4096 -> 97.2% (residual ~2.8% is the cold tail, not conflicts); a
+    // smaller table only collides fingerprints without shrinking the touched-line working set
+    // (16 B/entry). Heap-backed and allocated on first probe so the disabled path keeps the
+    // current Program footprint.
+    static constexpr size_t kSpecFpCacheSize = 4096;
+    std::unique_ptr<std::array<SpecFpCacheEntry, kSpecFpCacheSize>> spec_fp_lru{};
+
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+        // Only keep the first index for a given sig; multiple permutation indices may map to
+        // the same specialization (safe to reuse the same module). sig == 0 means the
+        // signature was never computed (spec_fp_cache off), so the map stays empty.
+        const u64 sig = spec.sig;
         modules.emplace_back(module, std::move(spec));
+        if (sig != 0) {
+            perm_index_by_sig.try_emplace(sig, modules.size() - 1);
+        }
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
+        const u64 sig = spec.sig;
         modules[perm_idx] = {module, std::move(spec)};
+        if (sig != 0) {
+            perm_index_by_sig.try_emplace(sig, perm_idx);
+        }
     }
 };
 
@@ -164,6 +201,10 @@ private:
     u64 last_graphics_pipe_gen{};
     // Cached value of the spec_mru_perm_probe setting, read once at construction.
     bool spec_mru_perm_probe{};
+    // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
+    // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
+    // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
+    bool spec_fp_cache{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

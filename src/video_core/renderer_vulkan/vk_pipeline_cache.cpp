@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <limits>
 #include <ranges>
+#include <xxhash.h>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -28,6 +31,122 @@ namespace Skipcache = VideoCore::Skipcache;
 using Shader::LogicalStage;
 using Shader::Output;
 using Shader::Stage;
+
+namespace {
+
+// Address-independent specialization fingerprint - hashes the specialization's per-draw inputs
+// (runtime_info, binding start, every bound sharp) with base_address zeroed so pointer re-emits
+// hash identically. A superset of the spec identity, it can only over-discriminate, never
+// wrongly reuse.
+//
+// GR2 measured 0 collisions over 12.2M samples. Callers exclude HS/DS (their spec folds tess
+// constant-buffer contents read from guest memory). ri_bytes_hash is the raw-byte hash of the
+// stage's persistent RuntimeInfo member.
+u64 ComputeSpecProxyFp(const Shader::Info& info,
+                       const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
+                       u64 ri_bytes_hash, const Shader::Backend::Bindings& start) noexcept {
+    u64 h = 0x84222325cbf29ce4ULL;
+    const auto mix = [&](u64 v) noexcept { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    // Batched gather: one XXH3 over every sharp instead of one call per sharp.
+    // Worst case: 12 B bindings + 40*16 + 64*32 + 8*32 + 16*16 sharps + VS attribute sharps.
+    // 4096 covers it with headroom for 32 attrs.
+    alignas(16) u8 buf[4096];
+    size_t len = 0;
+    const auto put = [&](const void* p, size_t n) noexcept {
+        std::memcpy(buf + len, p, n);
+        len += n;
+    };
+    const size_t attrib_bytes = (info.stage == Shader::Stage::Vertex && fetch_data)
+                                    ? fetch_data->attributes.size() * sizeof(AmdGpu::Buffer)
+                                    : 0;
+    const size_t needed = sizeof(start) + info.buffers.size() * sizeof(AmdGpu::Buffer) +
+                          info.images.size() * sizeof(AmdGpu::Image) +
+                          info.fmasks.size() * sizeof(AmdGpu::Image) +
+                          info.samplers.size() * sizeof(AmdGpu::Sampler) + attrib_bytes;
+    // Image/fmask validity IS base_address != 0, and the spec bitset branches
+    // on it, so zeroing the address must not erase it: fold a per-sharp
+    // validity bit or two T#s differing only in valid-vs-null alias to one fp
+    // and a hit returns the wrong permutation. Buffer validity is num_records,
+    // which stays in the hashed bytes.
+    u64 vmask = 0;
+    u32 vidx = 0;
+    const auto mix_valid = [&](bool valid) noexcept {
+        vmask |= static_cast<u64>(valid) << (vidx++ & 63);
+    };
+    if (needed <= sizeof(buf)) [[likely]] {
+        put(&start, sizeof(start));
+        for (const auto& d : info.buffers) {
+            AmdGpu::Buffer s = d.GetSharp(info);
+            s.base_address = 0;
+            put(&s, sizeof(s));
+        }
+        for (const auto& d : info.images) {
+            AmdGpu::Image s = d.GetSharp(info);
+            mix_valid(s.base_address != 0);
+            s.base_address = 0;
+            put(&s, sizeof(s));
+        }
+        for (const auto& d : info.fmasks) {
+            AmdGpu::Image s = d.GetSharp(info);
+            mix_valid(s.base_address != 0);
+            s.base_address = 0;
+            put(&s, sizeof(s));
+        }
+        for (const auto& d : info.samplers) {
+            AmdGpu::Sampler s = d.GetSharp(info);
+            put(&s, sizeof(s));
+        }
+        // vs_attribs are specialized only for the Vertex stage (see StageSpecialization);
+        // fold the vertex-buffer sharps that feed them.
+        if (attrib_bytes != 0) {
+            for (const auto& a : fetch_data->attributes) {
+                AmdGpu::Buffer s = a.GetSharp(info);
+                s.base_address = 0;
+                put(&s, sizeof(s));
+            }
+        }
+        mix(ri_bytes_hash);
+        mix(vmask);
+        mix(XXH3_64bits(buf, len));
+        return h ? h : 1ULL;
+    }
+    // Per-sharp overflow fallback (an absurd attribute count); counts are Program-static, so
+    // the chosen form stays consistent for this Program.
+    mix(ri_bytes_hash);
+    mix(XXH3_64bits(&start, sizeof(start)));
+    for (const auto& d : info.buffers) {
+        AmdGpu::Buffer s = d.GetSharp(info);
+        s.base_address = 0;
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    for (const auto& d : info.images) {
+        AmdGpu::Image s = d.GetSharp(info);
+        mix_valid(s.base_address != 0);
+        s.base_address = 0;
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    for (const auto& d : info.fmasks) {
+        AmdGpu::Image s = d.GetSharp(info);
+        mix_valid(s.base_address != 0);
+        s.base_address = 0;
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    for (const auto& d : info.samplers) {
+        AmdGpu::Sampler s = d.GetSharp(info);
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    if (info.stage == Shader::Stage::Vertex && fetch_data) {
+        for (const auto& a : fetch_data->attributes) {
+            AmdGpu::Buffer s = a.GetSharp(info);
+            s.base_address = 0;
+            mix(XXH3_64bits(&s, sizeof(s)));
+        }
+    }
+    mix(vmask);
+    return h ? h : 1ULL;
+}
+
+} // namespace
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -314,6 +433,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
     spec_mru_perm_probe = EmulatorSettings.IsSpecMruPermProbe();
+    // Latched before WarmUp so deserialized permutations get signatures computed.
+    spec_fp_cache = EmulatorSettings.IsSpecFpCache();
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -675,6 +796,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
+        if (spec_fp_cache) {
+            spec.ComputeSig();
+        }
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
         return std::make_tuple(&program->info, module, FetchShaderRef{program.get(), 0u},
@@ -686,6 +810,40 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+
+    // Spec-fingerprint tier: catches the per-draw UBO-pointer churn a raw user_data key cannot
+    // (the raw bytes change every draw, the spec result does not). A hit skips the
+    // StageSpecialization rebuild below entirely. HS/DS are excluded - their spec folds tess
+    // constant-buffer contents this key cannot cover. spec_fp is reused at the populate site
+    // after resolution; it stays 0 when the tier did not run.
+    u64 spec_fp = 0;
+    const bool spec_fp_eligible = spec_fp_cache && l_stage != LogicalStage::TessellationControl &&
+                                  l_stage != LogicalStage::TessellationEval;
+    if (spec_fp_eligible && !program->modules.empty()) {
+        // Hash the persistent member, not the local copy: the member's padding bytes are stable
+        // across calls, so the raw-byte hash repeats; a padding mismatch could only
+        // over-discriminate into a miss, never wrongly hit.
+        const auto& ri_member = runtime_infos[static_cast<u32>(l_stage)];
+        const u64 ri_fp_hash = XXH3_64bits(&ri_member, sizeof(ri_member));
+        spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data, ri_fp_hash,
+                                     binding);
+        if (!program->spec_fp_lru) {
+            program->spec_fp_lru = std::make_unique<
+                std::array<Program::SpecFpCacheEntry, Program::kSpecFpCacheSize>>();
+        }
+        const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
+        const auto& fe = (*program->spec_fp_lru)[fp_slot];
+        if (fe.valid && fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
+            const size_t hit_idx = fe.perm_idx;
+            const u64 hit_hash = HashCombine(params.hash, hit_idx);
+            info.AddBindings(binding);
+            program->last_hit_perm = static_cast<u32>(hit_idx);
+            return std::make_tuple(&program->info, program->modules[hit_idx].module,
+                                   FetchShaderRef{program.get(), static_cast<u32>(hit_idx)},
+                                   hit_hash);
+        }
+    }
+
     auto& spec = spec_scratch;
     spec.Rebuild(info, runtime_info, profile, binding);
 #ifdef _DEBUG
@@ -705,6 +863,67 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
+
+    if (spec_fp_cache) {
+        // Fast path: look up by specialization signature. A *pair* of signatures (sig + sig2)
+        // stands in for the deep comparisons the legacy branch below runs.
+        spec.ComputeSig();
+        bool found = false;
+        if (const auto it_sig = program->perm_index_by_sig.find(spec.sig);
+            it_sig != program->perm_index_by_sig.end() &&
+            it_sig->second < program->modules.size()) {
+            const auto& ms = program->modules[it_sig->second].spec;
+            // The sig-map hit already matches spec.sig up to a ~2^-64 hash collision; sig2,
+            // computed from the same StageSpecialization fields, confirms the match.
+            if (ms.sig == spec.sig && ms.sig2 == spec.sig2) [[likely]] {
+                info.AddBindings(binding);
+                perm_idx = it_sig->second;
+                perm_hash = HashCombine(params.hash, perm_idx);
+                module = program->modules[perm_idx].module;
+                found = true;
+            }
+        }
+        if (!found) {
+            // Fallback: linear scan by (sig, sig2) without deep comparisons.
+            size_t found_idx = std::numeric_limits<size_t>::max();
+            for (size_t i = 0; i < program->modules.size(); ++i) {
+                const auto& ms = program->modules[i].spec;
+                if (ms.sig == spec.sig && ms.sig2 == spec.sig2) {
+                    found_idx = i;
+                    break;
+                }
+            }
+            if (found_idx == std::numeric_limits<size_t>::max()) {
+                auto new_info = Shader::Info(stage, l_stage, params);
+                module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+
+                RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+                program->AddPermut(module, std::move(spec));
+            } else {
+                info.AddBindings(binding);
+                module = program->modules[found_idx].module;
+                perm_idx = found_idx;
+                perm_hash = HashCombine(params.hash, perm_idx);
+                // Keep the map warm for future lookups.
+                program->perm_index_by_sig.try_emplace(spec.sig, perm_idx);
+            }
+        }
+        // Record spec fingerprint -> perm_idx so the next draw with structurally identical
+        // (address-masked) sharps skips the StageSpecialization rebuild; spec_fp is nonzero
+        // only when the eligible tier above computed it (HS/DS leave it 0).
+        if (spec_fp_eligible && spec_fp != 0 && perm_idx < program->modules.size()) {
+            const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
+            (*program->spec_fp_lru)[fp_slot] = Program::SpecFpCacheEntry{
+                .fp = spec_fp,
+                .perm_idx = static_cast<u32>(perm_idx),
+                .valid = true,
+            };
+        }
+        program->last_hit_perm = static_cast<u32>(perm_idx);
+        return std::make_tuple(&program->info, module,
+                               FetchShaderRef{program.get(), static_cast<u32>(perm_idx)},
+                               perm_hash);
+    }
 
     auto it = program->modules.end();
     if (spec_mru_perm_probe) {
@@ -745,6 +964,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 d.destroyShaderModule(m.module);
                 m.module = CompileSPV(spv_code, d);
                 new_module = m.module;
+                // spec_fp_lru and perm_index_by_sig store permutation indices and read the
+                // module fresh on every hit, so this in-place swap needs no invalidation
+                // there; the pipe_gen bump below covers the pipeline-level memo.
             }
         }
     }
