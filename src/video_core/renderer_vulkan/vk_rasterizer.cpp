@@ -57,7 +57,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
-    draw_replay_mode_ = EmulatorSettings.GetDrawReplayMode() != 0;
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -386,113 +385,6 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-void Rasterizer::RecordDrawKey(const GraphicsPipeline* pipeline, bool is_indexed) {
-    if (!draw_replay_mode_ || !Skipcache::Framework::Instance().Active()) {
-        return;
-    }
-    if (!drawkey_tables_) {
-        drawkey_tables_ = std::make_unique<DrawKeyTables>();
-    }
-    const auto& regs = liverpool->regs;
-    ++drawkey_.elig;
-    // K1: fixed-function and stage identity via the refreshed pipeline key,
-    // plus the index and instance-step registers the bind path consumes. Raw
-    // user_data words never enter the key; per-frame push data churn would
-    // otherwise dominate the miss rate. Dynamic-state-only registers are not
-    // keyed in this revision, so recurrence here is an upper bound on that
-    // component.
-    const auto& gkey = pipeline_cache.CurrentGraphicsKey();
-    u64 k1 = XXH3_64bits(&gkey, sizeof(gkey));
-    // The index base rotates with the guest ring, so only its presence is
-    // keyed, matching the canonical sharp treatment below.
-    const u64 extra[3] = {regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1,
-                          is_indexed ? 1u : 0u};
-    k1 ^= XXH3_64bits(extra, sizeof(extra));
-    // K3: the sharp regions of each active stage's flattened user data with
-    // their base-address fields masked out. Guest stream addresses rotate
-    // every frame, so the canonical form prices recurrence as it would look
-    // above a stable-slot mirror; sizes, strides, and formats stay keyed.
-    // Samplers are excluded in this revision.
-    u64 k3 = 0x9e3779b97f4a7c15ULL;
-    for (const auto* info : pipeline->GetStages()) {
-        if (info == nullptr) {
-            continue;
-        }
-        const auto& ud = info->flattened_ud_buf;
-        for (const auto& buffer : info->buffers) {
-            if (buffer.sharp_idx + 4 <= ud.size()) {
-                u32 words[4];
-                std::memcpy(words, &ud[buffer.sharp_idx], sizeof(words));
-                // V# base address: word0 plus the low 16 bits of word1.
-                words[0] = 0;
-                words[1] &= 0xFFFF0000u;
-                k3 = XXH3_64bits_withSeed(words, sizeof(words), k3);
-            }
-        }
-        for (const auto& image : info->images) {
-            if (image.sharp_idx + 8 <= ud.size()) {
-                u32 words[8];
-                std::memcpy(words, &ud[image.sharp_idx], sizeof(words));
-                // T# base address: word0 plus the low 8 bits of word1.
-                words[0] = 0;
-                words[1] &= 0xFFFFFF00u;
-                k3 = XXH3_64bits_withSeed(words, sizeof(words), k3);
-            }
-        }
-    }
-    // The bind signature mixes rotating guest base addresses, so it stays out
-    // of the canonical key; the masked buffer sharps carry the surviving
-    // identity (size, stride, format).
-    const u64 parts[2] = {k1, k3};
-    const XXH128_hash_t full = XXH3_128bits(parts, sizeof(parts));
-    const u32 frame = static_cast<u32>(DebugState.GetFrameNum());
-
-    const auto probe = [frame](auto& table, u64 lo, u64 hi) -> u32 {
-        DrawKeyEntry& entry = table[lo & (table.size() - 1)];
-        u32 age = ~0u;
-        if (entry.key_lo == lo && entry.key_hi == hi) {
-            age = frame - entry.last_frame;
-        } else {
-            entry.key_lo = lo;
-            entry.key_hi = hi;
-        }
-        entry.prev_frame = entry.last_frame;
-        entry.last_frame = frame;
-        return age;
-    };
-    const u32 age_full = probe(drawkey_tables_->full, full.low64, full.high64);
-    if (age_full == 1) {
-        ++drawkey_.recur1;
-        ++drawkey_.recur2;
-    } else if (age_full == 2) {
-        ++drawkey_.recur2;
-    } else if (age_full == ~0u) {
-        ++drawkey_.fresh;
-    }
-    if (probe(drawkey_tables_->k1_only, k1, 0) == 1) {
-        ++drawkey_.k1r2;
-    }
-    if (probe(drawkey_tables_->k1_k3, k1 ^ k3, 0) == 1) {
-        ++drawkey_.k13r2;
-    }
-}
-
-void Rasterizer::EmitDrawKeyTelemetry() {
-    if (!draw_replay_mode_) {
-        return;
-    }
-    LOG_INFO(Render_Skipcache,
-             "[SkipCache] DRAWKEY elig={} r1={} r2={} k1r1={} k13r1={} new={} indirect={} per300f",
-             drawkey_.elig, drawkey_.recur1, drawkey_.recur2, drawkey_.k1r2, drawkey_.k13r2,
-             drawkey_.fresh, drawkey_.indirect);
-    auto& gens = Skipcache::Framework::Instance().Gens();
-    LOG_INFO(
-        Render_Skipcache, "[SkipCache] GENSNAP mem={} tex={} pipe={} imgdirty={} meta={} per300f",
-        gens.mem_gen.load(std::memory_order_relaxed), gens.tex_gen.load(std::memory_order_relaxed),
-        gens.pipe_gen.load(std::memory_order_relaxed), gens.img_dirty_gen, gens.meta_gen);
-    drawkey_ = DrawKeyCounters{};
-}
-
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -538,7 +430,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
-    RecordDrawKey(pipeline, is_indexed);
     DebugState.IncDrawCall();
 
     ResetBindings();
@@ -548,9 +439,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
 
-    if (draw_replay_mode_) {
-        ++drawkey_.indirect;
-    }
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
@@ -756,7 +644,6 @@ void Rasterizer::OnSubmit() {
                          sc.hits, sc.probes);
             }
             buffer_cache.EmitMirrorTelemetry();
-            EmitDrawKeyTelemetry();
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());
