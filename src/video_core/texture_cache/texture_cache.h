@@ -285,6 +285,14 @@ public:
                     continue;
                 }
                 const ImageId image_id = ref.id;
+                // A range spanning many pages reappears in every page's
+                // bucket and passes the overlap test each time; rejecting
+                // duplicates against the tiny local list costs a few register
+                // compares where the Picked-flag check costs a cold load into
+                // the image. The flag still guards nested walks below.
+                if (std::ranges::find(images, image_id) != images.end()) {
+                    continue;
+                }
                 Image& image = slot_images[image_id];
                 if (image.flags & ImageFlagBits::Picked) {
                     continue;
