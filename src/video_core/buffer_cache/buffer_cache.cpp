@@ -267,12 +267,10 @@ void BufferCache::EmitMirrorTelemetry() {
              pct(mo.tierA_hits, mo.tierA_hits + mo.tierA_walks), mo.tierA_hits, mo.tierA_walks,
              mo.tierA_elig_walks, pct(mo.tierA_span_le64, mo.tierA_walks), mo.ws_keys,
              static_cast<double>(mo.ws_bytes) / (1024.0 * 1024.0));
-    LOG_INFO(Render_Skipcache, "[SkipCache] PEEKBASE calls={} dirty={} memo_hits={} per300f",
-             memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty,
-             memory_tracker->peek_memo_hits);
+    LOG_INFO(Render_Skipcache, "[SkipCache] PEEKBASE calls={} dirty={} per300f",
+             memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty);
     memory_tracker->peek_fastpath_calls = 0;
     memory_tracker->peek_fastpath_dirty = 0;
-    memory_tracker->peek_memo_hits = 0;
     mo = MirrorOracleCounters{};
 }
 
