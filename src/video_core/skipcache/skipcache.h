@@ -299,9 +299,12 @@ public:
     // Runs on the GPU thread at submit-done. Closes the window when >=250 ms
     // elapsed or >=32 flips, whichever first.
     void OnSubmit(u32 frame_num, bool guest_paused);
-    // Masked fallback for titles that rarely reach submit-done.
+    // Masked fallback for titles that rarely reach submit-done. Adaptive-only:
+    // in Forced mode states are pinned at boot, and letting this drive the
+    // window controller prices every cache at zero (timing is off) and demotes
+    // it, silently turning Forced into all-caches-Off within minutes.
     void OnDraw() {
-        if (!Active()) {
+        if (mode_ != Mode::Adaptive) {
             return;
         }
         ++window_draws_;
