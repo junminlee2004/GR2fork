@@ -26,43 +26,12 @@ public:
     static constexpr size_t MANAGER_POOL_SIZE = 32;
 
 public:
-    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {
-        // All-set start: the reader consults this before regions exist, and a
-        // missing region is all-dirty by construction.
-        for (auto& word : region_dirty_bits_) {
-            word.store(~u64{0}, std::memory_order_relaxed);
-        }
-    }
+    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
-
-    // One bit per 4MB region above the per-region summary words: clear means
-    // the region PROVABLY has no CPU-dirty bytes, so read-only binds skip the
-    // lookup and peek wholesale. Set under the region lock BEFORE the dirty
-    // bits are published (a reader that sees clear therefore reads a state no
-    // in-flight marker has passed); cleared only under the region lock when
-    // an upload walk leaves the summary empty. Spurious set bits just fall
-    // through to the exact peek.
-    void MarkRegionBit(std::size_t page_index) noexcept {
-        region_dirty_bits_[page_index >> 6].fetch_or(u64{1} << (page_index & 63),
-                                                     std::memory_order_release);
-    }
-    void ClearRegionBitIfClean(RegionManager* manager, std::size_t page_index) noexcept {
-        // Caller holds the region lock; the summary is authoritative there.
-        if (manager->cpu_summary_ == 0) {
-            region_dirty_bits_[page_index >> 6].fetch_and(~(u64{1} << (page_index & 63)),
-                                                          std::memory_order_release);
-        }
-    }
-    bool RegionBitClear(std::size_t page_index) const noexcept {
-        return (region_dirty_bits_[page_index >> 6].load(std::memory_order_acquire) &
-                (u64{1} << (page_index & 63))) == 0;
-    }
 
     // Upload-walk peek baseline; GPU-command-thread confined like the walk.
     u64 peek_fastpath_calls{};
     u64 peek_fastpath_dirty{};
-
-    std::array<std::atomic<u64>, NUM_HIGH_PAGES / 64> region_dirty_bits_;
 
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
@@ -83,9 +52,8 @@ public:
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<false>(dirty_cpu_addr, query_size,
-                            [this](RegionManager* manager, u64 offset, size_t size) {
+                            [](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
-                                MarkRegionBit(manager->GetCpuAddr() >> TRACKER_HIGHER_PAGE_BITS);
                                 manager->template ChangeRegionState<Type::CPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                             });
@@ -250,26 +218,26 @@ public:
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
-        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64 offset, size_t size) {
-            const bool should_flush = [&] {
-                // Perform both the GPU modification check and CPU state change with the lock
-                // in case we are racing with GPU thread trying to mark the page as GPU
-                // modified. If we need to flush the flush function is going to perform CPU
-                // state change.
-                std::scoped_lock lk{manager->lock};
-                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
-                    manager->template IsRegionModified<Type::GPU>(offset, size)) {
-                    return true;
+        IteratePages<false>(
+            cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {
+                const bool should_flush = [&] {
+                    // Perform both the GPU modification check and CPU state change with the lock
+                    // in case we are racing with GPU thread trying to mark the page as GPU
+                    // modified. If we need to flush the flush function is going to perform CPU
+                    // state change.
+                    std::scoped_lock lk{manager->lock};
+                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                        manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                        return true;
+                    }
+                    manager->template ChangeRegionState<Type::CPU, true>(
+                        manager->GetCpuAddr() + offset, size);
+                    return false;
+                }();
+                if (should_flush) {
+                    on_flush();
                 }
-                MarkRegionBit(manager->GetCpuAddr() >> TRACKER_HIGHER_PAGE_BITS);
-                manager->template ChangeRegionState<Type::CPU, true>(manager->GetCpuAddr() + offset,
-                                                                     size);
-                return false;
-            }();
-            if (should_flush) {
-                on_flush();
-            }
-        });
+            });
     }
 
     /// InvalidateRegion with fault widening: the whole widened chunk goes
@@ -291,7 +259,6 @@ public:
                         EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled;
                     if (!readbacks ||
                         !manager->template IsRegionModified<Type::GPU>(offset, size)) {
-                        MarkRegionBit(manager->GetCpuAddr() >> TRACKER_HIGHER_PAGE_BITS);
                         manager->template ChangeRegionState<Type::CPU, true>(chunk_addr, size);
                         return;
                     }
@@ -304,7 +271,6 @@ public:
                                                                       hi - lo)) {
                         flush = true;
                     } else {
-                        MarkRegionBit(manager->GetCpuAddr() >> TRACKER_HIGHER_PAGE_BITS);
                         manager->template ChangeRegionState<Type::CPU, true>(lo, hi - lo);
                     }
                 }
@@ -325,13 +291,6 @@ public:
         if (query_size != 0 && first_page == ((query_cpu_range + query_size - 1) >>
                                               TRACKER_HIGHER_PAGE_BITS)) [[likely]] {
             RENDERER_TRACE;
-            // Region-tier skip, read-only binds only: written binds must
-            // still advance gpu_write_seq and GPU-mark even when CPU-clean,
-            // so they always take the full path.
-            if (!is_written && RegionBitClear(first_page)) {
-                on_upload();
-                return;
-            }
             RegionManager* manager = LookupRegion(first_page);
             if (manager == nullptr) [[unlikely]] {
                 CreateRegion(first_page);
@@ -359,7 +318,6 @@ public:
             manager->lock.lock();
             manager->template ForEachModifiedRange<Type::CPU, true>(manager->GetCpuAddr() + offset,
                                                                     query_size, func);
-            ClearRegionBitIfClean(manager, first_page);
             if (!is_written) {
                 manager->lock.unlock();
                 on_upload();
@@ -548,7 +506,6 @@ private:
     }
 
     void CreateRegion(std::size_t page_index) {
-        MarkRegionBit(page_index); // fresh regions are all-dirty
         const VAddr base_cpu_addr = page_index << TRACKER_HIGHER_PAGE_BITS;
         if (free_managers.empty()) {
             manager_pool.emplace_back();
