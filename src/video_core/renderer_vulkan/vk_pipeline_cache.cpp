@@ -786,14 +786,21 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+    // Reference, not copy: the member persists until the next
+    // BuildRuntimeInfo call, and copying the struct per resolve was measured
+    // per-draw-stage cost. Compile branches make their own mutable copy
+    // because CompileModule rewrites tess/fragment fields through its
+    // reference - and the new-program spec must be built from that SAME
+    // mutated copy to keep stored-spec bytes identical to before.
+    const auto& runtime_info = BuildRuntimeInfo(stage, l_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        auto ri_compile = runtime_info;
+        const auto module = CompileModule(program->info, ri_compile, params.code, 0, binding);
+        auto spec = Shader::StageSpecialization(program->info, ri_compile, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         if (spec_fp_cache) {
@@ -827,6 +834,18 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         const u64 ri_fp_hash = XXH3_64bits(&ri_member, sizeof(ri_member));
         spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data, ri_fp_hash,
                                      binding);
+        // MRU front: consecutive draws overwhelmingly repeat the fingerprint,
+        // and this compare reads a line the probe already has hot.
+        if (program->mru_fp == spec_fp && program->mru_perm_idx < program->modules.size())
+            [[likely]] {
+            const size_t hit_idx = program->mru_perm_idx;
+            const u64 hit_hash = HashCombine(params.hash, hit_idx);
+            info.AddBindings(binding);
+            program->last_hit_perm = static_cast<u32>(hit_idx);
+            return std::make_tuple(&program->info, program->modules[hit_idx].module,
+                                   FetchShaderRef{program.get(), static_cast<u32>(hit_idx)},
+                                   hit_hash);
+        }
         if (!program->spec_fp_lru) {
             program->spec_fp_lru = std::make_unique<
                 std::array<Program::SpecFpCacheEntry, Program::kSpecFpCacheSize>>();
@@ -837,6 +856,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             const size_t hit_idx = fe.perm_idx;
             const u64 hit_hash = HashCombine(params.hash, hit_idx);
             info.AddBindings(binding);
+            program->mru_fp = spec_fp;
+            program->mru_perm_idx = fe.perm_idx;
             program->last_hit_perm = static_cast<u32>(hit_idx);
             return std::make_tuple(&program->info, program->modules[hit_idx].module,
                                    FetchShaderRef{program.get(), static_cast<u32>(hit_idx)},
@@ -895,7 +916,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             }
             if (found_idx == std::numeric_limits<size_t>::max()) {
                 auto new_info = Shader::Info(stage, l_stage, params);
-                module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+                auto ri_compile = runtime_info;
+                module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
 
                 RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
                 program->AddPermut(module, std::move(spec));
@@ -918,6 +940,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 .perm_idx = static_cast<u32>(perm_idx),
                 .valid = true,
             };
+            program->mru_fp = spec_fp;
+            program->mru_perm_idx = static_cast<u32>(perm_idx);
         }
         program->last_hit_perm = static_cast<u32>(perm_idx);
         return std::make_tuple(&program->info, module,
@@ -939,7 +963,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(stage, l_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        auto ri_compile = runtime_info;
+        module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

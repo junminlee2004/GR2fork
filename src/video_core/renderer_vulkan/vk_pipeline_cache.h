@@ -74,6 +74,12 @@ struct Program {
     // smaller table only collides fingerprints without shrinking the touched-line working set
     // (16 B/entry). Heap-backed and allocated on first probe so the disabled path keeps the
     // current Program footprint.
+    // One-entry MRU in front of the fingerprint table: consecutive draws
+    // overwhelmingly repeat the fingerprint, and a hit here touches no extra
+    // cache line. Same validity contract as the table (fp match + index
+    // bound; modules are append-only, ReplaceShader swaps in place).
+    u64 mru_fp{};
+    u32 mru_perm_idx{};
     static constexpr size_t kSpecFpCacheSize = 4096;
     std::unique_ptr<std::array<SpecFpCacheEntry, kSpecFpCacheSize>> spec_fp_lru{};
 
