@@ -1,6 +1,6 @@
 # carried local patch for the upstream mirror
 # file: externals/CMakeLists.txt
-# original base: 0aea6ef36f6202104bdb7777cf5682333991d185
+# original base: 388cff5177f82e75a667d529212d34f3c255b7fc
 diff --git a/externals/CMakeLists.txt b/externals/CMakeLists.txt
 index e7944af6..c9cde9cd 100644
 --- a/externals/CMakeLists.txt
