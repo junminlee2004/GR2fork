@@ -122,6 +122,7 @@ public:
             bits.UnsetRange(start_page, end_page);
         }
         if constexpr (type == Type::CPU) {
+            RefreshCpuSummary(start_page, end_page);
             UpdateProtection<!enable, false>();
         } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
             UpdateProtection<enable, true>();
@@ -159,6 +160,7 @@ public:
         if constexpr (clear) {
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
+                RefreshCpuSummary(start_page, end_page);
                 UpdateProtection<true, false>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
                 UpdateProtection<false, true>();
@@ -186,6 +188,14 @@ public:
             return false;
         }
 
+        // Summary front: one mask test answers the clean common case without
+        // scanning the bit words. A set summary bit only proves the word is
+        // worth scanning, so stale-set bits fall through to the exact answer.
+        if constexpr (type == Type::CPU) {
+            if ((cpu_summary_ & SummaryMask(start_page, end_page)) == 0) {
+                return false;
+            }
+        }
         // Ask the range directly: materialising a masked copy of the whole
         // region's bits to answer a yes/no question was the single largest
         // cost on the bind path.
@@ -300,6 +310,35 @@ public:
         poison_words.fetch_or(mask, std::memory_order_release);
     }
 
+    // 16-bit summary over the CPU dirty bits: bit k covers pages
+    // [k*64, k*64+64) - exactly one storage word of the bitset. Maintained
+    // under the same write scope as the bits, so the lock-free peek's seqlock
+    // protocol covers it too; the region starts fully dirty, so the summary
+    // starts fully set. Readers treat it as a prefilter only: clean is
+    // authoritative (a clear bit proves its word is zero), dirty falls
+    // through to the exact scan.
+    static constexpr size_t PAGES_PER_SUMMARY_BIT = 64;
+    static_assert(NUM_PAGES_PER_REGION / PAGES_PER_SUMMARY_BIT <= 16);
+
+    static u16 SummaryMask(size_t start_page, size_t end_page) noexcept {
+        const size_t w0 = start_page / PAGES_PER_SUMMARY_BIT;
+        const size_t w1 = (end_page - 1) / PAGES_PER_SUMMARY_BIT;
+        return static_cast<u16>(((2u << w1) - (1u << w0)) & 0xFFFFu);
+    }
+
+    void RefreshCpuSummary(size_t start_page, size_t end_page) noexcept {
+        const size_t w0 = start_page / PAGES_PER_SUMMARY_BIT;
+        const size_t w1 = (end_page - 1) / PAGES_PER_SUMMARY_BIT;
+        for (size_t w = w0; w <= w1; ++w) {
+            const size_t p0 = w * PAGES_PER_SUMMARY_BIT;
+            if (cpu.AnyInRange(p0, p0 + PAGES_PER_SUMMARY_BIT)) {
+                cpu_summary_ |= static_cast<u16>(1u << w);
+            } else {
+                cpu_summary_ &= static_cast<u16>(~(1u << w));
+            }
+        }
+    }
+
     std::array<std::atomic<u64>, NUM_EPOCH_WORDS> word_epochs{};
     std::array<std::atomic<u64>, NUM_EPOCH_SUBS> sub_epochs{};
     std::array<std::atomic<u8>, NUM_EPOCH_WORDS> last_bump_cause{};
@@ -332,6 +371,7 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr = 0;
+    u16 cpu_summary_{0xFFFF}; // cpu.Fill() in the ctor => fully set
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;
