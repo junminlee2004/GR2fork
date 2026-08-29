@@ -294,6 +294,10 @@ public:
     };
 
     std::atomic<u32> seq{0};
+    // Kept adjacent to seq: the lock-free peek fast path reads exactly this
+    // pair, and the old layout put them eleven cache lines apart. Public for
+    // layout reasons only - written solely under WriteScope.
+    u16 cpu_summary_{0xFFFF}; // cpu.Fill() in the ctor => fully set
     // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
     u64 gpu_write_seq{0};
     LockType lock;
@@ -400,7 +404,6 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr = 0;
-    u16 cpu_summary_{0xFFFF}; // cpu.Fill() in the ctor => fully set
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;
