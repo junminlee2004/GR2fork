@@ -57,6 +57,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
+    // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
+    // to measure, and calling it from the per-300-frame telemetry block put a
+    // deterministic two-frame stall on the GPU command thread every ~17s.
+    tsc_hz_ = Common::EstimateRDTSCFrequency();
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -619,7 +623,7 @@ void Rasterizer::OnSubmit() {
         if (frame - last_report_frame >= 300) {
             last_report_frame = frame;
             auto& st = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Stats();
-            const u64 hz = Common::EstimateRDTSCFrequency();
+            const u64 hz = tsc_hz_;
             LOG_INFO(Render_Skipcache,
                      "[SkipCache] RING maps={} MiB={} wraps={} blocked_ms={} per300f", st.maps,
                      st.bytes >> 20, st.wraps, hz ? st.blocked_ns * 1000 / hz : 0);

@@ -159,6 +159,7 @@ private:
     }
     BeginRenderingCache br_cache_{};
     bool br_readback_gate_{}; // readbackLinearImages snapshot: cache off when set
+    u64 tsc_hz_{};            // measured once at construction; the estimator sleeps ~101ms
 
     // BindingSkip LEARNING probe state (observation snapshot, not a cache).
     struct BindingSkipProbeState {
