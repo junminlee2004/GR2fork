@@ -29,12 +29,15 @@ struct BufferSpecialization {
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    // The Coherent decoration is derived from the V# MTYPE at compile time,
+    // so two binds whose descriptors disagree on it need distinct modules.
+    u32 is_coherent : 1;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
         return stride == other.stride && is_formatted == other.is_formatted &&
-               swizzle_enable == other.swizzle_enable &&
+               swizzle_enable == other.swizzle_enable && is_coherent == other.is_coherent &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
                  dst_select == other.dst_select && num_conversion == other.num_conversion)) &&
@@ -119,6 +122,9 @@ struct StageSpecialization {
                          spec.stride = sharp.GetStride();
                          spec.is_formatted = desc.is_formatted;
                          spec.swizzle_enable = sharp.swizzle_enable;
+                         // Only written buffers are ever decorated, so only
+                         // they may create new permutations on it.
+                         spec.is_coherent = desc.is_written && sharp.mtype == 3;
                          if (spec.is_formatted) {
                              spec.data_format = static_cast<u32>(sharp.GetDataFmt());
                              spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
