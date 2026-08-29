@@ -452,11 +452,27 @@ private:
         MetaType type;
         s32 clear_mask = -1;
     };
-    tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    // Guest addresses are at least 256-byte aligned, and tsl::robin_map
+    // masks the hash with a power-of-two bucket count: the default identity
+    // hash then reaches only every 2^k-th home bucket and robin-hood
+    // displacement builds long clustered probe chains - the chains were
+    // ~75% of FindImage. The splitmix64 finalizer pushes entropy into the
+    // LOW bits the mask keeps.
+    struct MixedVAddrHash {
+        size_t operator()(VAddr addr) const noexcept {
+            u64 a = addr;
+            a ^= a >> 33;
+            a *= 0xff51afd7ed558ccdULL;
+            a ^= a >> 29;
+            return static_cast<size_t>(a);
+        }
+    };
+    tsl::robin_map<VAddr, MetaDataInfo, MixedVAddrHash> surface_metas;
     // Images keyed by their exact guest base address. FindImageFromRange only
     // ever matches on equality, so the page walk it used to do was a range
     // scan answering an exact-match question.
-    tsl::robin_map<VAddr, boost::container::small_vector<ImageId, 2>> images_by_addr;
+    tsl::robin_map<VAddr, boost::container::small_vector<ImageId, 2>, MixedVAddrHash>
+        images_by_addr;
     // Dense dedup bits for ForEachImageInRegion, indexed by ImageId; sized to
     // the slot vector's index capacity at walk start.
     std::vector<u8> image_picked_;
