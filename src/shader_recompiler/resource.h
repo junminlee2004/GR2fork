@@ -52,8 +52,10 @@ struct BufferResource {
         } else {
             buffer = info.template ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
         }
-        if (!buffer.Valid()) {
-            LOG_DEBUG(Render, "Encountered invalid buffer sharp");
+        // No logging here: the fmt machinery a log line drags in makes this
+        // function too big to inline, and it runs once per descriptor per
+        // draw across every bind site.
+        if (!buffer.Valid()) [[unlikely]] {
             return AmdGpu::Buffer::Null();
         }
         return buffer;
@@ -82,15 +84,13 @@ struct ImageResource {
             std::memcpy(&image, &raw, sizeof(raw));
             image.pitch = image.width;
         }
-        if (!image.Valid()) {
-            LOG_DEBUG(Render_Vulkan, "Encountered invalid image sharp");
+        // Unlogged for the same inlining reason as the buffer form above.
+        if (!image.Valid()) [[unlikely]] {
             image = AmdGpu::Image::Null(is_depth);
         } else if (is_depth) {
             const auto data_fmt = image.GetDataFmt();
             if (data_fmt != AmdGpu::DataFormat::Format16 &&
-                data_fmt != AmdGpu::DataFormat::Format32) {
-                LOG_DEBUG(Render_Vulkan,
-                          "Encountered non-depth image used with depth instruction!");
+                data_fmt != AmdGpu::DataFormat::Format32) [[unlikely]] {
                 image = AmdGpu::Image::Null(true);
             }
         }
