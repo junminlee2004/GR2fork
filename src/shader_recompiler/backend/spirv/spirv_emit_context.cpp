@@ -817,10 +817,12 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 void EmitContext::DefineBuffers() {
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
-        // MTYPE class 3 marks guest buffers shared between invocations; shared
-        // memory lowered to a storage buffer needs the same guarantee.
+        // Diagnostic predicate: Coherent only for written buffers of guest V#
+        // MTYPE class 4, to isolate which class carries the coherence the
+        // hair solver needs. Shared memory lowered to a storage buffer keeps
+        // the guarantee unconditionally.
         const bool is_coherent =
-            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3;
+            desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 4;
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
