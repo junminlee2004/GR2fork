@@ -405,6 +405,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    // One shared-lock hold covers every guest copy of the whole draw setup;
+    // the per-function scopes inside become TLS-flag no-ops. Placed after the
+    // filter and pipeline resolution so filtered draws pay nothing and a
+    // pipeline compile never holds the memory map open.
+    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
+    if (batch_copy_lock) {
+        copy_scope.emplace(Core::Memory::Instance());
+    }
+
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
@@ -452,6 +462,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
         return;
+    }
+
+    // One shared-lock hold covers every guest copy of the whole draw setup;
+    // the per-function scopes inside become TLS-flag no-ops. Placed after the
+    // filter and pipeline resolution so filtered draws pay nothing and a
+    // pipeline compile never holds the memory map open.
+    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
+    if (batch_copy_lock) {
+        copy_scope.emplace(Core::Memory::Instance());
     }
 
     PrepareRenderState(pipeline);
@@ -534,6 +554,16 @@ void Rasterizer::DispatchDirect() {
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
+    }
+
+    // One shared-lock hold covers every guest copy of the whole draw setup;
+    // the per-function scopes inside become TLS-flag no-ops. Placed after the
+    // filter and pipeline resolution so filtered draws pay nothing and a
+    // pipeline compile never holds the memory map open.
+    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
+    if (batch_copy_lock) {
+        copy_scope.emplace(Core::Memory::Instance());
     }
 
     if (!BindResources(pipeline)) {
