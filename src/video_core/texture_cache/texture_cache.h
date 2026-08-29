@@ -367,7 +367,16 @@ private:
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    /// Touch is idempotent within one gc tick; the inline mirror compare
+    /// spares the call (one per binding per draw) entirely on repeats.
+    void TouchImage(const Image& image) {
+        if (image.lru_touch_tick == gc_tick &&
+            VideoCore::Skipcache::Framework::Instance().Active()) {
+            return;
+        }
+        TouchImageSlow(image);
+    }
+    void TouchImageSlow(const Image& image);
 
     /// Overlap resolution, validation, and creation for FindImage when no
     /// accepted perfect match exists. Requires the cache mutex to be held.

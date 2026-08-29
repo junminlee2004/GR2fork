@@ -114,7 +114,8 @@ void BufferCache::MirrorBackingThunk(void* user, VAddr addr, u64 size) {
     cache->mirror_sink_.bump_backing.fetch_add(1, std::memory_order_relaxed);
 }
 
-void BufferCache::MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty) {
+void BufferCache::MirrorOracleProbeSlow(VAddr device_addr, u32 size, bool tick_hit,
+                                        bool gpu_dirty) {
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     if (!mirror_mode_ || !skipcache.ShouldProbe(VideoCore::Skipcache::CacheId::StreamMirror)) {
         return;

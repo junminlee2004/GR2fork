@@ -1464,12 +1464,7 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectSamplers();
 }
 
-void TextureCache::TouchImage(const Image& image) {
-    // Touch is idempotent within one gc tick; the mirror makes repeat calls
-    // (one per binding per draw) a field compare instead of an LRU update.
-    if (image.lru_touch_tick == gc_tick && VideoCore::Skipcache::Framework::Instance().Active()) {
-        return;
-    }
+void TextureCache::TouchImageSlow(const Image& image) {
     image.lru_touch_tick = gc_tick;
     lru_cache.Touch(image.lru_id, gc_tick);
 }

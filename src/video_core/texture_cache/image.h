@@ -123,7 +123,9 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
-    using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
+    // Inline capacity 2: nearly every call emits 0-1 barriers, and the old
+    // 32-slot inline buffer made every GetBarriers reserve a 3.5KB frame.
+    using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 2>;
     /// Records that the given query needed no barriers, valid until the
     /// backing's state epoch changes.
     void RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,

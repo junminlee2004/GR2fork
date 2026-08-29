@@ -18,6 +18,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/skipcache/skipcache.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -360,7 +361,16 @@ private:
     static void MirrorProtectThunk(void* user, VAddr addr, u64 size, bool write_granted,
                                    bool tracker_origin);
     static void MirrorBackingThunk(void* user, VAddr addr, u64 size);
-    void MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty);
+    /// Inline gate: with the mirror instrumentation quarantined or the mode
+    /// off, draw-rate callers pay two loads instead of a call per probe.
+    void MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty) {
+        if (!mirror_mode_ ||
+            !Skipcache::Framework::Instance().ShouldProbe(Skipcache::CacheId::StreamMirror)) {
+            return;
+        }
+        MirrorOracleProbeSlow(device_addr, size, tick_hit, gpu_dirty);
+    }
+    void MirrorOracleProbeSlow(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty);
 
     // Phase-1 observe-only stream mirror instrumentation. The sink counters
     // are written from guest threads and the fault path; the oracle counters

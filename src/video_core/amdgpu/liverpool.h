@@ -206,7 +206,14 @@ private:
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
-    void ProcessCommands();
+    /// Draw-rate callers poll this with an empty queue in steady state; the
+    /// inline gate spares them the call.
+    void ProcessCommands() {
+        if (num_commands.load(std::memory_order_relaxed)) {
+            DrainCommands();
+        }
+    }
+    void DrainCommands();
     void Process(std::stop_token stoken);
 
     struct GpuQueue {

@@ -51,17 +51,21 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
-static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
-    if (offset > span.size()) {
-        LOG_ERROR(
-            Lib_GnmDriver,
-            ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
-            "submission dwords={}",
-            offset, span.size());
-        // Return empty subspan so check for next packet bails out
-        return {};
-    }
+static SHAD_NO_INLINE std::span<const u32> NextPacketOverflow(size_t offset, size_t remaining) {
+    LOG_ERROR(Lib_GnmDriver,
+              ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
+              "submission dwords={}",
+              offset, remaining);
+    // Return empty subspan so check for next packet bails out
+    return {};
+}
 
+// The log machinery in the overflow branch kept this out of line at packet
+// rate; split so the common path inlines.
+static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
+    if (offset > span.size()) [[unlikely]] {
+        return NextPacketOverflow(offset, span.size());
+    }
     return span.subspan(offset);
 }
 
@@ -96,7 +100,7 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
-void Liverpool::ProcessCommands() {
+void Liverpool::DrainCommands() {
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -151,9 +155,14 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
 
-                --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                // The only submit_cv waiters on this edge block until the
+                // queue drains (num_submits == 0); waking them per popped
+                // submit burned a futex broadcast each. The lock is still
+                // held for the notify so the wakeup cannot be lost.
+                if (--num_submits == 0) {
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
             }
         }
 

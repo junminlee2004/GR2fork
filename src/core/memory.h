@@ -235,7 +235,15 @@ public:
         return size_to_validate <= 0;
     }
 
-    u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+    /// Small ranges (the per-binding common case) skip the map lookup and
+    /// its shared-lock pair entirely; the clamp only matters past 1 GiB.
+    u64 ClampRangeSize(VAddr virtual_addr, u64 size) {
+        if (size < 1_GB) [[likely]] {
+            return size;
+        }
+        return ClampRangeSizeSlow(virtual_addr, size);
+    }
+    u64 ClampRangeSizeSlow(VAddr virtual_addr, u64 size);
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
