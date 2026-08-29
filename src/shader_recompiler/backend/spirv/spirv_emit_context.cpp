@@ -821,6 +821,15 @@ void EmitContext::DefineBuffers() {
         // memory lowered to a storage buffer needs the same guarantee.
         const bool is_coherent =
             desc.buffer_type == BufferType::SharedMemory || buf_sharp.mtype == 3;
+        // Diagnostic: one line per written buffer per module compile, to
+        // observe what the descriptors hold at each compile of a shader.
+        if (desc.is_written) {
+            LOG_INFO(Render_Recompiler,
+                     "MTYPEDIAG shader={:#x} buffer[{}] base={:#x} size={:#x} stride={} mtype={} "
+                     "coherent={}",
+                     info.pgm_hash, u32(&desc - info.buffers.data()), buf_sharp.base_address,
+                     buf_sharp.GetSize(), buf_sharp.GetStride(), u32(buf_sharp.mtype), is_coherent);
+        }
 
         // Set indexes for special buffers.
         if (desc.buffer_type == BufferType::Flatbuf) {
