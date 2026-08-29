@@ -132,11 +132,50 @@ struct Image {
                            vk::PipelineStageFlags2 dst_stage,
                            std::optional<SubresourceRange> subres_range);
 
+    /// Header fast path for GetBarriers' repeat no-op answer: the memo the
+    /// outlined body maintains proves an identical query under an unchanged
+    /// state epoch emits nothing. Probing it BEFORE the body's divergent
+    /// collapse is sound because every path that makes the collapse
+    /// applicable bumps state_epoch, which misses this memo.
+    bool BarriersNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                      vk::PipelineStageFlags2 dst_stage,
+                      const std::optional<SubresourceRange>& subres_range) const {
+        const u64 range_key =
+            subres_range ? (u64{subres_range->base.level} | (u64{subres_range->base.layer} << 16) |
+                            (u64{subres_range->extent.levels} << 32) |
+                            (u64{subres_range->extent.layers} << 48))
+                         : ~u64{0};
+        return backing->noop_epoch == backing->state_epoch && backing->noop_layout == dst_layout &&
+               backing->noop_access == dst_mask && backing->noop_stage == dst_stage &&
+               backing->noop_range == range_key;
+    }
+
     Barriers GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                          vk::PipelineStageFlags2 dst_stage,
-                         std::optional<SubresourceRange> subres_range);
+                         std::optional<SubresourceRange> subres_range) {
+        if (BarriersNoop(dst_layout, dst_mask, dst_stage, subres_range)) {
+            return {};
+        }
+        return GetBarriersSlow(dst_layout, dst_mask, dst_stage, subres_range);
+    }
+    Barriers GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                             vk::PipelineStageFlags2 dst_stage,
+                             std::optional<SubresourceRange> subres_range);
     void Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                 std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
+                 std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {}) {
+        const vk::PipelineStageFlags2 dst_pl_stage =
+            (dst_mask == vk::AccessFlagBits2::eTransferRead ||
+             dst_mask == vk::AccessFlagBits2::eTransferWrite)
+                ? vk::PipelineStageFlagBits2::eTransfer
+                : vk::PipelineStageFlagBits2::eAllGraphics |
+                      vk::PipelineStageFlagBits2::eComputeShader;
+        if (BarriersNoop(dst_layout, dst_mask, dst_pl_stage, range)) {
+            return;
+        }
+        TransitSlow(dst_layout, dst_mask, range, cmdbuf);
+    }
+    void TransitSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                     std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
     void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset);
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                   u64 offset, u64 download_size);

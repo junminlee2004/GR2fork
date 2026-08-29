@@ -233,9 +233,9 @@ void Image::RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_m
             : ~u64{0};
 }
 
-Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                                   vk::PipelineStageFlags2 dst_stage,
-                                   std::optional<SubresourceRange> subres_range) {
+Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                                       vk::PipelineStageFlags2 dst_stage,
+                                       std::optional<SubresourceRange> subres_range) {
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
@@ -418,8 +418,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 
     return barriers;
 }
 
-void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                    std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
+void Image::TransitSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                        std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
     // Adjust pipeline stage
     const vk::PipelineStageFlags2 dst_pl_stage =
         (dst_mask == vk::AccessFlagBits2::eTransferRead ||
@@ -427,7 +427,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
             ? vk::PipelineStageFlagBits2::eTransfer
             : vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 
-    const auto barriers = GetBarriers(dst_layout, dst_mask, dst_pl_stage, range);
+    const auto barriers = GetBarriersSlow(dst_layout, dst_mask, dst_pl_stage, range);
     if (barriers.empty()) {
         return;
     }
