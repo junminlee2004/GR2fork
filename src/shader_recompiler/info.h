@@ -182,18 +182,9 @@ struct Info : InfoPersistent {
         }
     }
 
-    void AddBindings(Backend::Bindings& bnd, bool separate_texture_set) const {
+    void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        if (separate_texture_set) {
-            // Mirrors split-mode emission exactly: buffers advance the set-0
-            // counter, images and samplers advance the set-1 counter. A
-            // mismatch here bakes colliding binding numbers into every
-            // multi-stage pipeline resolved through a cache hit.
-            bnd.unified += buffers.size();
-            bnd.texture += images.size() + samplers.size();
-        } else {
-            bnd.unified += buffers.size() + images.size() + samplers.size();
-        }
+        bnd.unified += buffers.size() + images.size() + samplers.size();
         bnd.user_data += ud_mask.NumRegs();
     }
 

@@ -836,7 +836,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         if (fe.valid && fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
             const size_t hit_idx = fe.perm_idx;
             const u64 hit_hash = HashCombine(params.hash, hit_idx);
-            info.AddBindings(binding, profile.separate_texture_set);
+            info.AddBindings(binding);
             program->last_hit_perm = static_cast<u32>(hit_idx);
             return std::make_tuple(&program->info, program->modules[hit_idx].module,
                                    FetchShaderRef{program.get(), static_cast<u32>(hit_idx)},
@@ -876,7 +876,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             // The sig-map hit already matches spec.sig up to a ~2^-64 hash collision; sig2,
             // computed from the same StageSpecialization fields, confirms the match.
             if (ms.sig == spec.sig && ms.sig2 == spec.sig2) [[likely]] {
-                info.AddBindings(binding, profile.separate_texture_set);
+                info.AddBindings(binding);
                 perm_idx = it_sig->second;
                 perm_hash = HashCombine(params.hash, perm_idx);
                 module = program->modules[perm_idx].module;
@@ -900,7 +900,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
                 program->AddPermut(module, std::move(spec));
             } else {
-                info.AddBindings(binding, profile.separate_texture_set);
+                info.AddBindings(binding);
                 module = program->modules[found_idx].module;
                 perm_idx = found_idx;
                 perm_hash = HashCombine(params.hash, perm_idx);
@@ -944,7 +944,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
     } else {
-        info.AddBindings(binding, profile.separate_texture_set);
+        info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
