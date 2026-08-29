@@ -84,8 +84,6 @@ public:
     }
 
 private:
-    bool flatbuf_streak_{}; // flatbufStreak snapshot: latched once at construction
-
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
