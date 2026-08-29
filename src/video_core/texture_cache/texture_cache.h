@@ -47,10 +47,11 @@ class TextureCache {
     // dependent load missing cache once per candidate.
     struct PageImageRef {
         ImageId id;
+        u32 size; // RegisterImage asserts guest_size fits
         VAddr addr;
-        u64 size;
     };
-    using PageRefs = boost::container::small_vector<PageImageRef, 8>;
+    static_assert(sizeof(PageImageRef) == 16);
+    using PageRefs = boost::container::small_vector<PageImageRef, 4>;
 
     struct Traits {
         using Entry = PageRefs;
@@ -267,6 +268,9 @@ public:
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
         ImageIds images;
+        if (image_picked_.size() < slot_images.IndexCapacity()) {
+            image_picked_.resize(slot_images.IndexCapacity());
+        }
         ForEachPage(cpu_addr, size, [this, &images, cpu_addr, size, func](u64 page) {
             const auto it = page_table.find(page);
             if (it == nullptr) {
@@ -285,20 +289,19 @@ public:
                     continue;
                 }
                 const ImageId image_id = ref.id;
-                // A range spanning many pages reappears in every page's
-                // bucket and passes the overlap test each time; rejecting
-                // duplicates against the tiny local list costs a few register
-                // compares where the Picked-flag check costs a cold load into
-                // the image. The flag still guards nested walks below.
-                if (std::ranges::find(images, image_id) != images.end()) {
+                // Dedup against the dense per-image byte array: one warm
+                // cache line covers hundreds of ids, where the old Picked
+                // flag cost a cold load into the 752-byte Image slot per
+                // duplicate and the local list cost a linear scan. Semantics
+                // match the flag exactly, including across nested walks -
+                // bits set by an outer walk stay set until its trailing
+                // clear.
+                if (image_picked_[image_id.index]) {
                     continue;
                 }
-                Image& image = slot_images[image_id];
-                if (image.flags & ImageFlagBits::Picked) {
-                    continue;
-                }
-                image.flags |= ImageFlagBits::Picked;
+                image_picked_[image_id.index] = 1;
                 images.push_back(image_id);
+                Image& image = slot_images[image_id];
                 if constexpr (BOOL_BREAK) {
                     if (func(image_id, image)) {
                         return true;
@@ -312,7 +315,7 @@ public:
             }
         });
         for (const ImageId image_id : images) {
-            slot_images[image_id].flags &= ~ImageFlagBits::Picked;
+            image_picked_[image_id.index] = 0;
         }
     }
 
@@ -445,6 +448,9 @@ private:
     // ever matches on equality, so the page walk it used to do was a range
     // scan answering an exact-match question.
     tsl::robin_map<VAddr, boost::container::small_vector<ImageId, 2>> images_by_addr;
+    // Dense dedup bits for ForEachImageInRegion, indexed by ImageId; sized to
+    // the slot vector's index capacity at walk start.
+    std::vector<u8> image_picked_;
     alignas(64) std::array<u64, 8> meta_bloom_{};
 };
 

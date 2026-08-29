@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 
 #include <xxhash.h>
 
@@ -1194,9 +1195,13 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    ASSERT_MSG(image.info.guest_size <= std::numeric_limits<u32>::max(),
+               "guest_size does not fit the packed page ref");
     ForEachPage(image.info.guest_address, image.info.guest_size,
-                [this, image_id, addr = image.info.guest_address, size = image.info.guest_size](
-                    u64 page) { page_table[page].push_back({image_id, addr, size}); });
+                [this, image_id, addr = image.info.guest_address,
+                 size = static_cast<u32>(image.info.guest_size)](u64 page) {
+                    page_table[page].push_back({image_id, size, addr});
+                });
     images_by_addr[image.info.guest_address].push_back(image_id);
     Skipcache::Framework::Instance().BumpTexGen();
 }

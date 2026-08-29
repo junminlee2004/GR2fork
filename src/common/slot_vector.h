@@ -138,6 +138,11 @@ public:
         return values_capacity - free_list.size();
     }
 
+    /// One past the largest index ever allocated; ids always index below it.
+    std::size_t IndexCapacity() const noexcept {
+        return values_capacity;
+    }
+
     iterator begin() noexcept {
         return iterator(*this, 0);
     }

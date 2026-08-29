@@ -4,6 +4,7 @@
 // Copyright © 2015-2023 Valve Corporation
 // Copyright © 2015-2023 LunarG, Inc.
 
+#include <array>
 #include <unordered_map>
 #include "common/enum.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -208,12 +209,34 @@ static const std::unordered_map<vk::Format, CompatibilityClass> FORMAT_TABLE = {
     {vk::Format::eUndefined, CompatibilityClass::NONE},
 };
 
+// Flat array over the core format range: the map paid two hash probes per
+// candidate in the FindImage match loop. Built once from FORMAT_TABLE so the
+// data stays in one place; formats outside the array keep the original map
+// lookup.
+static CompatibilityClass FormatClass(vk::Format format) {
+    static const auto flat = [] {
+        std::array<CompatibilityClass, 256> table{};
+        for (const auto& [fmt, cls] : FORMAT_TABLE) {
+            const auto index = static_cast<u32>(fmt);
+            if (index < table.size()) {
+                table[index] = cls;
+            }
+        }
+        return table;
+    }();
+    const auto index = static_cast<u32>(format);
+    if (index < flat.size()) [[likely]] {
+        return flat[index];
+    }
+    return FORMAT_TABLE.at(format);
+}
+
 bool IsVulkanFormatCompatible(vk::Format base, vk::Format view) {
     if (base == view) {
         return true;
     }
-    const auto base_comp = FORMAT_TABLE.at(base);
-    const auto view_comp = FORMAT_TABLE.at(view);
+    const auto base_comp = FormatClass(base);
+    const auto view_comp = FormatClass(view);
     return (base_comp & view_comp) == view_comp;
 }
 
