@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <span>
 #include "common/assert.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -49,9 +50,38 @@ vk::SamplerMipmapMode MipFilter(AmdGpu::MipFilter filter);
 
 vk::BorderColor BorderColor(AmdGpu::BorderColor color);
 
-vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle);
+[[noreturn]] void ComponentSwizzleInvalid(u32 raw);
 
-vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping);
+/// Table lookup with the crash path outlined: this was the single heaviest
+/// call edge in the binary (four calls per image view), and the UNREACHABLE
+/// machinery in the switch kept it out of line. CompSwizzle values 2 and 3
+/// are reserved and must keep crashing, not silently map.
+inline vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
+    static constexpr std::array<vk::ComponentSwizzle, 8> table = {
+        vk::ComponentSwizzle::eZero, // Zero = 0
+        vk::ComponentSwizzle::eOne,  // One = 1
+        vk::ComponentSwizzle::eZero, // reserved (crashes below)
+        vk::ComponentSwizzle::eZero, // reserved (crashes below)
+        vk::ComponentSwizzle::eR,    // Red = 4
+        vk::ComponentSwizzle::eG,    // Green = 5
+        vk::ComponentSwizzle::eB,    // Blue = 6
+        vk::ComponentSwizzle::eA,    // Alpha = 7
+    };
+    const u32 raw = static_cast<u32>(comp_swizzle);
+    if (raw >= table.size() || raw == 2 || raw == 3) [[unlikely]] {
+        ComponentSwizzleInvalid(raw);
+    }
+    return table[raw];
+}
+
+inline vk::ComponentMapping ComponentMapping(AmdGpu::CompMapping comp_mapping) {
+    return vk::ComponentMapping{
+        .r = ComponentSwizzle(comp_mapping.r),
+        .g = ComponentSwizzle(comp_mapping.g),
+        .b = ComponentSwizzle(comp_mapping.b),
+        .a = ComponentSwizzle(comp_mapping.a),
+    };
+}
 
 struct SurfaceFormatInfo {
     AmdGpu::DataFormat data_format;
