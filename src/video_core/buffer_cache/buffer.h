@@ -14,6 +14,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
 class Instance;
@@ -219,8 +220,22 @@ public:
         return ring_stats_;
     }
 
-    /// Ensures that reserved bytes of memory are available to the GPU.
-    void Commit();
+    /// Ensures that reserved bytes of memory are available to the GPU. The
+    /// header fast path collapses a coherent same-tick commit into the last
+    /// watch without the call or the flush branch - identical to the slow
+    /// path's own first branch.
+    void Commit() {
+        if (is_coherent && current_watch_cursor != 0) {
+            auto& last = current_watches[current_watch_cursor - 1];
+            if (last.tick == scheduler->CurrentTick()) {
+                offset += mapped_size;
+                last.upper_bound = offset;
+                return;
+            }
+        }
+        CommitSlow();
+    }
+    void CommitSlow();
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {

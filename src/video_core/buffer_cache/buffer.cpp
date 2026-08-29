@@ -222,7 +222,9 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     const u64 mapped_upper_bound = offset + size;
-    if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
+    // Call elided in the no-wrap steady state: the callee's first line
+    // returns true when no invalidation is outstanding.
+    if (invalidation_mark && !WaitPendingOperations(mapped_upper_bound, allow_wait)) {
         return {nullptr, 0};
     }
 
@@ -242,7 +244,7 @@ void StreamBuffer::MapWrap() {
     wait_bound = 0;
 }
 
-void StreamBuffer::Commit() {
+void StreamBuffer::CommitSlow() {
     if (!is_coherent) {
         if (usage == MemoryUsage::Download) {
             vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset,
