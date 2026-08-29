@@ -11,11 +11,12 @@
 namespace Vulkan {
 
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
-                                 DescriptorHeap& desc_heap, const Shader::Profile& profile,
-                                 vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
-                                 const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/)
-    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
+                                 DescriptorHeap& desc_heap, DescriptorSetCache& desc_set_cache,
+                                 const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
+                                 ComputePipelineKey compute_key_, const Shader::Info& info_,
+                                 vk::ShaderModule module, SerializationSupport& sdata,
+                                 bool preloading /*=false*/)
+    : Pipeline{instance, scheduler, desc_heap, desc_set_cache, profile, pipeline_cache, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::LogicalStage::Compute)];
     info = &info_;
@@ -72,7 +73,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .size = sizeof(Shader::PushData),
     };
 
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    ClassifyDescSet(bindings);
+    uses_push_descriptors = !DescDropPush() && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

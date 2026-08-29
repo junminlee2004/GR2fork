@@ -1503,6 +1503,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.erase(image_id);
     });
+    Skipcache::Framework::Instance().BumpViewGen();
     Skipcache::Framework::Instance().BumpTexGen();
 }
 

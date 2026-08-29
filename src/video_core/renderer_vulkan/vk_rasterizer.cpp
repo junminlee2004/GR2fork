@@ -57,6 +57,22 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
+    desc_cache_mode_ = EmulatorSettings.GetDescriptorSetCache();
+    desc_flat_memo_ = desc_cache_mode_ >= DescSetCacheEnabledFlatMemo;
+    // The ClipPlanes half of the stream-copy memo is enabled one mode earlier than the Flatbuf
+    // half. LowerUserClipPlanes inserts a ClipPlanes buffer into EVERY vertex program, so while
+    // clipper_control.user_clip_plane_enable is non-zero essentially every cacheable graphics
+    // pipeline copied fresh planes into the stream ring per draw and could never match a
+    // content-keyed entry. From mode 2 on such a pipeline has already lost ePushDescriptorKHR at
+    // creation time, so declining it does not fall back to a push - it burns one descriptor set
+    // per draw for a guaranteed miss, and once the cache's bounded pool budget is spent the draw
+    // lands in DescriptorHeap::Commit, which is the exact path this design exists to avoid.
+    // Memoizing the 96-byte payload makes those draws repeat within a tick and hit instead.
+    // Observe deliberately keeps the old gate: mode 1 must not change stream-ring behavior.
+    desc_clip_memo_ = desc_cache_mode_ >= DescSetCacheEnabled;
+    if (desc_flat_memo_ || desc_clip_memo_) {
+        stream_memo_ = std::make_unique<StreamMemoStore>();
+    }
     // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
@@ -64,6 +80,54 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
 }
 
 Rasterizer::~Rasterizer() = default;
+
+Rasterizer::DescEpochs Rasterizer::SampleDescEpochs() {
+    return DescEpochs{
+        .view = Skipcache::Framework::Instance().Gens().view_gen.load(std::memory_order_acquire),
+        .sampler = texture_cache.SamplerGen(),
+        .buffer = buffer_cache.BufferGen(),
+    };
+}
+
+bool Rasterizer::StreamMemoProbe(const StreamCopyMemo& m, u64 pgm_hash, const void* src, u32 size,
+                                 const VideoCore::StreamBuffer& ring, vk::Buffer& out_buf,
+                                 u64& out_off) {
+    // The tick and wrap_gen pair is what makes reusing a previously handed out ring region legal:
+    // the region is still covered by this tick's watch and the ring has not lapped over it. The
+    // byte compare is the value check; the two epochs are the lifetime check.
+    ++stream_memo_probes_;
+    if (size > m.bytes.size()) {
+        return false;
+    }
+    if (!m.valid || m.size != size || m.pgm_hash != pgm_hash || m.tick != scheduler.CurrentTick() ||
+        m.wrap_gen != ring.WrapGen() || m.buf != ring.Handle()) {
+        return false;
+    }
+    if (std::memcmp(m.bytes.data(), src, size) != 0) {
+        return false;
+    }
+    out_buf = m.buf;
+    out_off = m.offset;
+    ++stream_memo_hits_;
+    return true;
+}
+
+void Rasterizer::StreamMemoRecord(StreamCopyMemo& m, u64 pgm_hash, const void* src, u32 size,
+                                  const VideoCore::StreamBuffer& ring, vk::Buffer buf, u64 offset) {
+    if (size > m.bytes.size()) {
+        // Fails closed: an oversized payload is never memoized rather than truncated.
+        m.valid = false;
+        return;
+    }
+    m.pgm_hash = pgm_hash;
+    m.tick = scheduler.CurrentTick();
+    m.wrap_gen = ring.WrapGen();
+    m.size = size;
+    m.buf = buf;
+    m.offset = offset;
+    std::memcpy(m.bytes.data(), src, size);
+    m.valid = true;
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();
@@ -426,7 +490,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, buffer_barriers, push_data, desc_probe_);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -505,7 +569,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, buffer_barriers, push_data, desc_probe_);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -571,7 +635,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, buffer_barriers, push_data, desc_probe_);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -604,7 +668,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, buffer_barriers, push_data, desc_probe_);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -688,6 +752,36 @@ void Rasterizer::OnSubmit() {
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
+    if (desc_cache_mode_ != 0) {
+        // Deliberately outside the skipcache.Active() guard above: the DESCSET valve is
+        // independent of the adaptive framework, so its telemetry must work with that disabled.
+        auto& dsc = pipeline_cache.GetDescriptorSetCache();
+        const auto ep = SampleDescEpochs();
+        dsc.OnSubmit(ep.view, ep.sampler, ep.buffer);
+        static u64 last_descset_frame = 0;
+        const u64 frame = DebugState.GetFrameNum();
+        if (frame - last_descset_frame >= 300) {
+            last_descset_frame = frame;
+            const auto& st = dsc.GetStats();
+            const auto& ps = dsc.GetPipeStats();
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] DESCSET mode={} elig={} hits={} miss={} scratch={} "
+                     "decl_budget={} decl_noset={} decl_noslot={} decl_payload={} gen_abort={} "
+                     "clip_stream={} memo_hit={} memo_probe={} live={} classes={} sets={} pools={} "
+                     "degraded={} per300f",
+                     desc_cache_mode_, st.eligible, st.hits, st.miss, st.scratch, st.decl_budget,
+                     st.decl_noset, st.decl_noslot, st.decl_payload, st.gen_abort, st.clip_stream,
+                     stream_memo_hits_, stream_memo_probes_, dsc.LiveEntries(), dsc.NumClasses(),
+                     dsc.NumSets(), dsc.NumPools(), dsc.Degraded());
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] DESCSET-PIPE total={} cacheable={} v_flat={} v_lds={} "
+                     "v_dynmip={} v_size={}",
+                     ps.total, ps.cacheable, ps.v_flat, ps.v_lds, ps.v_dynmip, ps.v_size);
+            stream_memo_hits_ = 0;
+            stream_memo_probes_ = 0;
+            dsc.ResetStats();
+        }
+    }
 }
 
 // ---- BindingSkip LEARNING probe (observe-only) ---------------------------
@@ -785,6 +879,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         IsComputeImageClear(pipeline)) {
         return false;
     }
+    // An HLE-aborted draw must never leave a stale active probe behind for the next one.
+    desc_probe_.active = false;
 
     BindingSkipProbe(pipeline);
 
@@ -793,6 +889,25 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_barriers.clear();
     buffer_infos.clear();
     image_infos.clear();
+
+    // An enabled clipper_control makes BindBuffers copy fresh planes into the stream ring. From
+    // mode 2 on that copy is memoized, so the descriptor repeats within a tick and the draw stays
+    // eligible - the entry is confined to the tick instead of the draw being declined. Declining
+    // it is NOT free here: a cacheable pipeline has no push descriptors left in mode >= 2, so a
+    // decline costs a whole descriptor set per draw for a guaranteed miss.
+    // Ordered so the disabled path still short-circuits on the first member load.
+    const bool desc_cacheable = desc_cache_mode_ != 0 && pipeline->DescCacheable();
+    const bool clip_stream = desc_cacheable && pipeline->DescHasClipPlanes() &&
+                             liverpool->regs.clipper_control.user_clip_plane_enable != 0;
+    if (clip_stream) {
+        pipeline_cache.GetDescriptorSetCache().NoteClipStream();
+    }
+    // Observe keeps the old gate: it does not memoize, so such a draw genuinely cannot repeat.
+    desc_fp_active_ = desc_cacheable && (desc_clip_memo_ || !clip_stream);
+    if (desc_fp_active_) {
+        desc_fp_ = pipeline->DescClassSeed();
+        desc_epochs_pre_ = SampleDescEpochs();
+    }
 
     bool uses_dma = false;
 
@@ -819,6 +934,29 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         fault_process_pending = true;
     }
+
+    if (desc_fp_active_) {
+        const auto post = SampleDescEpochs();
+        // Sampled BEFORE the gather and re-checked after: a mid-gather image/sampler/buffer death
+        // must produce a miss, never a valid-looking stale entry (the exact TOCTOU a9e97bde hit).
+        if (post.view == desc_epochs_pre_.view && post.sampler == desc_epochs_pre_.sampler &&
+            post.buffer == desc_epochs_pre_.buffer) {
+            // Tick-bound is a per-DRAW property, not a per-pipeline one: a ClipPlanes pipeline
+            // only rides the stream ring while the clipper register is on. Stamping it on the
+            // pipeline would confine every such entry to one submit even when the descriptor is
+            // the stable null one.
+            desc_probe_ = DescSetProbe{desc_fp_,
+                                       desc_epochs_pre_.view,
+                                       desc_epochs_pre_.sampler,
+                                       desc_epochs_pre_.buffer,
+                                       true,
+                                       pipeline->DescTickBound() || clip_stream};
+        } else {
+            desc_probe_.active = false;
+            pipeline_cache.GetDescriptorSetCache().NoteGenAbort();
+        }
+    }
+    DEBUG_ASSERT(set_write_index == set_writes.size());
 
     return true;
 }
@@ -1013,18 +1151,34 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         if (!buffer_id) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
-                buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
+                PushBufferInfo(gds_buf->Handle(), 0, gds_buf->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
-                const u64 offset =
-                    vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                const auto* ubo_src = stage.flattened_ud_buf.data();
+                vk::Buffer memo_buf{};
+                u64 offset = 0;
+                StreamCopyMemo* memo =
+                    desc_flat_memo_ ? &stream_memo_->flat[stage.pgm_hash & 7] : nullptr;
+                if (memo && ubo_size <= memo->bytes.size() &&
+                    StreamMemoProbe(*memo, stage.pgm_hash, ubo_src, ubo_size, vk_buffer, memo_buf,
+                                    offset)) {
+                    // Same bytes, same tick, same ring lap: the region handed out earlier is still
+                    // ours and still committed, so the copy is pure repeated work.
+                    PushBufferInfo(memo_buf, offset, ubo_size);
+                } else {
+                    offset = vk_buffer.Copy(ubo_src, ubo_size, alignment);
+                    if (memo && ubo_size <= memo->bytes.size()) {
+                        StreamMemoRecord(*memo, stage.pgm_hash, ubo_src, ubo_size, vk_buffer,
+                                         vk_buffer.Handle(), offset);
+                    }
+                    PushBufferInfo(vk_buffer.Handle(), offset, ubo_size);
+                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
                 if (liverpool->regs.clipper_control.user_clip_plane_enable == 0) {
-                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                    PushBufferInfo(vk::Buffer{}, 0, VK_WHOLE_SIZE);
                 } else {
                     auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
@@ -1036,24 +1190,36 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
                     }
                     const u32 ubo_size = static_cast<u32>(sizeof(planes));
-                    const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
-                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                    vk::Buffer memo_buf{};
+                    u64 offset = 0;
+                    // Keyless slot: the 96-byte payload is the whole key, so pgm_hash is 0.
+                    if (desc_clip_memo_ && StreamMemoProbe(stream_memo_->clip, 0, planes.data(),
+                                                           ubo_size, vk_buffer, memo_buf, offset)) {
+                        PushBufferInfo(memo_buf, offset, ubo_size);
+                    } else {
+                        offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
+                        if (desc_clip_memo_) {
+                            StreamMemoRecord(stream_memo_->clip, 0, planes.data(), ubo_size,
+                                             vk_buffer, vk_buffer.Handle(), offset);
+                        }
+                        PushBufferInfo(vk_buffer.Handle(), offset, ubo_size);
+                    }
                 }
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
-                buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
+                PushBufferInfo(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
-                buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
+                PushBufferInfo(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const auto& cs_program = liverpool->GetCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
-                buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                PushBufferInfo(lds_buffer.Handle(), offset, lds_size);
             } else {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                PushBufferInfo(vk::Buffer{}, 0, VK_WHOLE_SIZE);
             }
         } else {
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
@@ -1067,7 +1233,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                             i, stage.pgm_hash);
             }
             push_data.AddOffset(binding.buffer, adjust);
-            buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
+            PushBufferInfo(vk_buffer->Handle(), offset_aligned, size + adjust);
             if (auto barrier =
                     vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
                                                           : vk::AccessFlagBits2::eShaderRead,
@@ -1086,6 +1252,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
+        FoldWriteShape(set_write.dstBinding, set_write.descriptorType, 1);
         ++binding.buffer;
     }
 }
@@ -1165,7 +1332,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (auto& [image_id, desc] : image_bindings) {
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
-            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            PushImageInfo(vk::Sampler{}, vk::ImageView{}, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -1210,8 +1377,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     image.backing->state.layout);
+            PushImageInfo(vk::Sampler{}, *image_view.image_view, image.backing->state.layout);
         }
     }
 
@@ -1228,6 +1394,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorType =
             is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
         set_write.pImageInfo = &image_infos[image_info_idx];
+        FoldWriteShape(set_write.dstBinding, set_write.descriptorType, array_size);
 
         image_info_idx += array_size;
         image_binding_idx += array_size;
@@ -1243,7 +1410,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
         const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
-        image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+        PushImageInfo(vk_sampler, vk::ImageView{}, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
@@ -1251,6 +1418,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorCount = 1;
         set_write.descriptorType = vk::DescriptorType::eSampler;
         set_write.pImageInfo = &image_infos.back();
+        FoldWriteShape(set_write.dstBinding, set_write.descriptorType, 1);
     }
 }
 

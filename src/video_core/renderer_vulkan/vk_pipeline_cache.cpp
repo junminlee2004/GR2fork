@@ -378,7 +378,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes},
+      desc_set_cache{instance, scheduler} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -464,8 +465,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos,
+            instance, scheduler, desc_heap, desc_set_cache, profile, graphics_key, *pipeline_cache,
+            infos, runtime_infos,
             fetch_shader_ref
                 ? std::optional<const Shader::Gcn::FetchShaderData>{*fetch_shader_ref.Get()}
                 : std::optional<const Shader::Gcn::FetchShaderData>{},
@@ -501,9 +502,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false);
+        it.value() = std::make_unique<ComputePipeline>(
+            instance, scheduler, desc_heap, desc_set_cache, profile, *pipeline_cache, compute_key,
+            *infos[0], modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

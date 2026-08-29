@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -113,6 +114,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(0);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 
@@ -214,6 +216,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(0);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 

@@ -115,6 +115,7 @@ struct ValidityGens {
     std::atomic<u64> mem_gen{1};  // host-guest-memory writes incl. emulator-internal downloads
     std::atomic<u64> tex_gen{1};  // texture-cache identity/lifecycle
     std::atomic<u64> pipe_gen{1}; // pipeline object destroyed/replaced
+    std::atomic<u64> view_gen{1}; // image view destruction (TextureCache::DeleteImage only)
     u64 img_dirty_gen{1};         // GPU-thread confined: GPU-side image dirtying
     u64 layout_gen{1};            // GPU-thread confined: any image layout/backing state write
     u64 meta_gen{1};              // GPU-thread confined: real CMASK/HTILE arm/disarm changes
@@ -388,6 +389,9 @@ public:
     }
     void BumpTexGen() {
         gens_.tex_gen.fetch_add(1, std::memory_order_release);
+    }
+    void BumpViewGen() {
+        gens_.view_gen.fetch_add(1, std::memory_order_release);
     }
     void BumpPipeGen() {
         gens_.pipe_gen.fetch_add(1, std::memory_order_release);

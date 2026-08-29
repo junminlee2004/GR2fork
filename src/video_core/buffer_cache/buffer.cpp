@@ -232,6 +232,8 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 }
 
 void StreamBuffer::MapWrap() {
+    // Monotonic and never reset, unlike ring_stats_.wraps: stream-copy memos key on it.
+    ++wrap_gen_;
     ++ring_stats_.wraps;
     // The buffer would overflow, save the amount of used watches and reset the state.
     invalidation_mark = current_watch_cursor;
