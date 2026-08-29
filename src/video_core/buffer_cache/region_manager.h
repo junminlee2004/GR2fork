@@ -17,6 +17,7 @@
 #else
 #include "common/spin_lock.h"
 #endif
+#include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -214,6 +215,34 @@ public:
      */
     template <Type type>
     [[nodiscard]] bool PeekRegionModified(u64 offset, u64 size) noexcept {
+        if constexpr (type == Type::CPU) {
+            // Clean-case fast path: half the function's measured cost was
+            // call glue executed before the summary test. The degenerate
+            // range guards must run before SummaryMask (out-of-range pages
+            // are shift-count UB), and the seq/fence ordering here is
+            // exactly the outlined protocol's - a stale summary read is
+            // caught by the seq re-check and falls through.
+            const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+            const size_t end_page =
+                Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+            if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+                return false;
+            }
+            const u32 before = seq.load(std::memory_order_acquire);
+            if (!(before & 1u)) {
+                const u16 summary = cpu_summary_;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (seq.load(std::memory_order_relaxed) == before &&
+                    (summary & SummaryMask(start_page, end_page)) == 0) {
+                    return false;
+                }
+            }
+        }
+        return PeekRegionModifiedSlow<type>(offset, size);
+    }
+
+    template <Type type>
+    [[nodiscard]] SHAD_NO_INLINE bool PeekRegionModifiedSlow(u64 offset, u64 size) noexcept {
         for (u32 attempt = 0; attempt < 4; ++attempt) {
             const u32 before = seq.load(std::memory_order_acquire);
             if (before & 1u) {
