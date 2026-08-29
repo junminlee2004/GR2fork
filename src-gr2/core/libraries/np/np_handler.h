@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -71,6 +72,12 @@ public:
     // Reverse lookup: OrbisNpOnlineId to local user_id. Returns -1 if no connected user has
     // that Online ID.
     s32 GetUserIdByOnlineId(const OrbisNpOnlineId& online_id) const;
+
+    // Trophies.
+    void ReportTrophyUnlock(s32 user_id, s32 service_label, s32 trophy_id, u64 timestamp);
+    void SyncTrophies(s32 user_id, s32 service_label,
+                      const std::vector<std::pair<s32, u64>>& local_trophies,
+                      std::function<void(const std::vector<std::pair<s32, u64>>&)> on_merged);
 
     // Submit a RecordScore request to the shadNet server.
     s32 RecordScore(s32 user_id, s32 service_label, u32 boardId, s32 pcId, s64 score,
@@ -222,6 +229,12 @@ private:
     };
     mutable std::mutex m_mutex_pending_score;
     std::map<u64, PendingScoreRequest> m_pending_score;
+
+    // Callbacks awaiting a SyncTrophies reply, keyed by packet id.
+    std::mutex m_mutex_pending_trophy;
+    std::map<u64, std::function<void(const std::vector<std::pair<s32, u64>>&)>> m_pending_trophy;
+    void OnTrophyReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
+                       const std::vector<u8>& body);
 
     // Worker thread
     std::atomic<bool> m_initialized{false};
