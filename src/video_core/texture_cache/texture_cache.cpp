@@ -634,6 +634,42 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ASSERT(info.guest_address != 0);
 
     std::scoped_lock lock{mutex};
+
+    // Exact-address fast path: most lookups are perfect matches, and
+    // images_by_addr already indexes registered images by base address, so
+    // the page-table walk and candidate filtering can be skipped entirely.
+    // The filters below mirror the perfect-match loop exactly (last match
+    // wins, in registration order); any demotion or exact-format miss falls
+    // through to the full walk unchanged.
+    if (info.guest_size > 0) {
+        if (const auto it = images_by_addr.find(info.guest_address); it != images_by_addr.end()) {
+            ImageId match{};
+            for (const ImageId cache_id : it.value()) {
+                const auto& cache_info = slot_images[cache_id].info;
+                if (cache_info.guest_size != info.guest_size) {
+                    continue;
+                }
+                if (cache_info.size != info.size) {
+                    continue;
+                }
+                if (!IsVulkanFormatCompatible(cache_info.pixel_format, info.pixel_format) ||
+                    (cache_info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+                    continue;
+                }
+                if (exact_fmt && info.pixel_format != cache_info.pixel_format) {
+                    continue;
+                }
+                match = cache_id;
+            }
+            if (match && slot_images[match].info.resources >= info.resources) {
+                Image& image = slot_images[match];
+                image.tick_accessed_last = scheduler.CurrentTick();
+                TouchImage(image);
+                return match;
+            }
+        }
+    }
+
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
