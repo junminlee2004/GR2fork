@@ -525,7 +525,7 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
                 flush_pending_unmark();
                 pending_start = copy_device_addr;
             }
-            pending_end = std::max(pending_end, copy_device_addr + copy.size);
+            pending_end = std::max<VAddr>(pending_end, copy_device_addr + copy.size);
             continue;
         }
         vetoed_any = true;
