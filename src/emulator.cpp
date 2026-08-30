@@ -496,7 +496,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
     LOG_INFO(Config, "GPU guestCopyLockBatch: {}", EmulatorSettings.IsGuestCopyLockBatch());
-    LOG_INFO(Config, "GPU descriptorSetCache: {}", EmulatorSettings.GetDescriptorSetCache());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());

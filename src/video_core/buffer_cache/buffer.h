@@ -220,14 +220,6 @@ public:
         return ring_stats_;
     }
 
-    /// Monotonic ring-lap counter, bumped by MapWrap. A memo that remembers a previously handed
-    /// out (buffer, offset) is only safe while the ring has not lapped over it, and
-    /// `ring_stats_.wraps` cannot serve that role: the telemetry block resets the whole RingStats
-    /// struct per window, so it is not monotonic.
-    u64 WrapGen() const noexcept {
-        return wrap_gen_;
-    }
-
     /// Ensures that reserved bytes of memory are available to the GPU. The
     /// header fast path collapses a coherent same-tick commit into the last
     /// watch without the call or the flush branch - identical to the slow
@@ -293,7 +285,6 @@ private:
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
     RingStats ring_stats_{};
-    u64 wrap_gen_{1};
     u64 wait_bound{};
 };
 

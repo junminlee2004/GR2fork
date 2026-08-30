@@ -99,12 +99,6 @@ public:
         return tile_manager;
     }
 
-    /// Epoch of VkSampler destruction; GarbageCollectSamplers bumps it on
-    /// every erase. GPU-thread confined, so a plain u64 read is correct.
-    u64 SamplerGen() const noexcept {
-        return sampler_gen_;
-    }
-
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 

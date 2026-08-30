@@ -11,7 +11,6 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
-#include "video_core/renderer_vulkan/vk_descriptor_set_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
@@ -162,10 +161,6 @@ public:
         return profile;
     }
 
-    [[nodiscard]] DescriptorSetCache& GetDescriptorSetCache() noexcept {
-        return desc_set_cache;
-    }
-
 private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
@@ -189,8 +184,6 @@ private:
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
-    // Declared immediately after desc_heap: declaration order is construction order.
-    DescriptorSetCache desc_set_cache;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};

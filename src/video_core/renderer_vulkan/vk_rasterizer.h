@@ -3,9 +3,6 @@
 
 #pragma once
 
-#include <bit>
-#include <memory>
-
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -201,101 +198,6 @@ private:
     void RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pipeline, u64 reg_stamp,
                               u64 tex_gen, u64 pipe_gen);
     PrepareRtMemo rt_memo_{};
-
-    // =========================================================================
-    // Global descriptor set cache (DESCSET) draw-path state. The per-draw key
-    // is folded incrementally at the descriptor stores themselves - the values
-    // are already in registers there - rather than re-hashing the assembled
-    // arrays, which would add a second full content pass to the hottest thread.
-    // =========================================================================
-    struct DescEpochs {
-        u64 view{}, sampler{}, buffer{};
-    };
-    /// Sampled at the TOP of BindResources and re-checked after the gather: a handle destroyed
-    /// mid-gather and recycled onto another object must produce a miss, never a valid-looking
-    /// stale entry.
-    DescEpochs SampleDescEpochs();
-
-    static constexpr u64 kDescFoldMul = 0x9E3779B97F4A7C15ull;
-    void FoldDesc(u64 v) {
-        desc_fp_ = std::rotl((desc_fp_ ^ v) * kDescFoldMul, 29);
-    }
-    /// Mandatory fold routing: every descriptor store in BindBuffers/BindTextures goes through
-    /// these, so a missed fold site is impossible by construction.
-    void PushBufferInfo(vk::Buffer b, u64 off, u64 range) {
-        buffer_infos.emplace_back(b, off, range);
-        if (desc_fp_active_) {
-            FoldDesc(std::bit_cast<u64>(b));
-            FoldDesc(off);
-            FoldDesc(range);
-        }
-    }
-    void PushImageInfo(vk::Sampler s, vk::ImageView v, vk::ImageLayout l) {
-        image_infos.emplace_back(s, v, l);
-        if (desc_fp_active_) {
-            FoldDesc(std::bit_cast<u64>(s));
-            FoldDesc(std::bit_cast<u64>(v));
-            FoldDesc(static_cast<u64>(l));
-        }
-    }
-    /// The per-write shape is NOT structurally fixed by the layout class: the invalid/rejected-T#
-    /// paths emit a default-constructed desc.type, so the type must be part of the key.
-    void FoldWriteShape(u32 dst_binding, vk::DescriptorType t, u32 count) {
-        if (desc_fp_active_) {
-            FoldDesc((u64(dst_binding) << 32) | (u64(count) << 8) | u64(u32(t) & 0xFFu));
-        }
-    }
-
-    u32 desc_cache_mode_{}; // latched in the ctor, never read from the setting per draw
-    bool desc_fp_active_{};
-    u64 desc_fp_{};
-    DescEpochs desc_epochs_pre_{};
-    DescSetProbe desc_probe_{};
-
-    // =========================================================================
-    // Stream-copy memo (Flatbuf half from mode 3, ClipPlanes half from mode 2). StreamBuffer::Copy
-    // always Maps a fresh,
-    // monotonically advancing ring region with no dedup, so the Flatbuf and ClipPlanes
-    // descriptors change every draw and their pipelines could never hit a content-keyed cache.
-    // The memo reuses the previous (buffer, offset) when the payload bytes are identical AND the
-    // region is provably still ours.
-    //
-    // BOTH GUARDS ARE LOAD BEARING. `tick` pins the memo to the command buffer that recorded the
-    // original copy - a wrap that could reuse the memoized region forces a flush and therefore a
-    // tick change - and `wrap_gen` is the direct belt-and-braces check on the same hazard. Drop
-    // either and a later copy can overwrite the memoized bytes, leaving the draw reading another
-    // shader's constants.
-    // =========================================================================
-    struct StreamCopyMemo {
-        u64 pgm_hash{};
-        u64 tick{};
-        u64 wrap_gen{};
-        u32 size{};
-        vk::Buffer buf{};
-        u64 offset{};
-        bool valid{};
-        std::array<u8, 2048> bytes{};
-    };
-    /// Returns true and fills out_buf/out_off when `m` still describes a live copy of the first
-    /// `size` bytes at `src`. `pgm_hash` is compared as part of the key; pass 0 for keyless slots.
-    bool StreamMemoProbe(const StreamCopyMemo& m, u64 pgm_hash, const void* src, u32 size,
-                         const VideoCore::StreamBuffer& ring, vk::Buffer& out_buf, u64& out_off);
-    void StreamMemoRecord(StreamCopyMemo& m, u64 pgm_hash, const void* src, u32 size,
-                          const VideoCore::StreamBuffer& ring, vk::Buffer buf, u64 offset);
-
-    // ~19KB, so it lives behind a pointer allocated only when a memo mode is
-    // active: modes 0-2 must not stretch the Rasterizer's hot-member layout.
-    struct StreamMemoStore {
-        std::array<StreamCopyMemo, 8> flat{}; // index = pgm_hash & 7
-        StreamCopyMemo clip{};                // single slot, 96-byte payload
-    };
-    std::unique_ptr<StreamMemoStore> stream_memo_;
-    bool desc_flat_memo_{}; // latched: desc_cache_mode_ >= 3
-    /// Latched: desc_cache_mode_ >= 2. The ClipPlanes half of the memo runs one mode earlier than
-    /// the Flatbuf half on purpose - see the note in the constructor.
-    bool desc_clip_memo_{};
-    u64 stream_memo_probes_{}; // reported on the DESCSET line, reset with it
-    u64 stream_memo_hits_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);

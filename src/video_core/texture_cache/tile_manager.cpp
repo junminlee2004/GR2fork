@@ -5,7 +5,6 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
-#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
@@ -235,7 +234,6 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
             .pBufferInfo = &params_buffer_info,
         },
     }};
-    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
@@ -321,7 +319,6 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
             .pBufferInfo = &params_buffer_info,
         },
     }};
-    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;

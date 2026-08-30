@@ -47,17 +47,6 @@ enum GpuReadbacksMode : int {
     Precise,
 };
 
-// Global content-keyed descriptor set cache. Observe measures the
-// eligible/would-hit rate without changing any behavior; Enabled lets
-// cacheable pipelines drop push descriptors and be served from the
-// cache; EnabledFlatMemo adds the Flatbuf/ClipPlanes stream-copy memo.
-enum DescriptorSetCacheMode : int {
-    DescSetCacheDisabled = 0,
-    DescSetCacheObserve = 1,
-    DescSetCacheEnabled = 2,
-    DescSetCacheEnabledFlatMemo = 3,
-};
-
 // Guest read faults on GPU-written memory. OffloadFull moves the fence wait
 // onto the faulting guest thread. OffloadBounded caps that wait and hands the
 // write-back to the priority waiter on timeout, so a title whose GPU work
@@ -494,12 +483,6 @@ struct GPUSettings {
     // in the pipeline cache. May select a different compare-equal permutation when
     // several stored specializations satisfy the probe.
     Setting<bool> spec_mru_perm_probe{false};
-    // Global content-keyed descriptor set cache: repeated draws whose assembled
-    // descriptor payload is byte-identical reuse a ready VkDescriptorSet instead
-    // of re-pushing every descriptor. Observe (1) only measures eligibility and
-    // would-hit rate; Enabled (2) consumes hits; EnabledFlatMemo (3) adds the
-    // Flatbuf/ClipPlanes stream-copy memo.
-    Setting<u32> descriptor_set_cache{DescSetCacheDisabled};
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
@@ -549,7 +532,6 @@ struct GPUSettings {
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
             make_override<GPUSettings>("spec_mru_perm_probe", &GPUSettings::spec_mru_perm_probe),
-            make_override<GPUSettings>("descriptor_set_cache", &GPUSettings::descriptor_set_cache),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
@@ -563,8 +545,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     readback_offload_mode, stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders,
     patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
-    descriptor_set_cache)
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -834,7 +815,6 @@ public:
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpCache, spec_fp_cache)
-    SETTING_FORWARD(m_gpu, DescriptorSetCache, descriptor_set_cache)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

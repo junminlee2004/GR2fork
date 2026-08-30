@@ -1385,7 +1385,6 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
     Register(new_buffer_id);
-    ++buffer_gen_;
     return new_buffer_id;
 }
 
@@ -1792,7 +1791,6 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
     buffer.is_deleted = true;
-    ++buffer_gen_;
 }
 
 } // namespace VideoCore

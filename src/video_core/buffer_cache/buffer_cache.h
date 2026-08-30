@@ -97,12 +97,6 @@ public:
         return slot_buffers[id];
     }
 
-    /// Epoch of buffer creation/destruction; a change means a VkBuffer handle
-    /// may have been recycled onto a different object.
-    u64 BufferGen() const noexcept {
-        return buffer_gen_;
-    }
-
     /// Retrieves a utility buffer optimized for specified memory usage.
     StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept {
         if (usage == MemoryUsage::Stream) {
@@ -343,10 +337,6 @@ private:
     // clear-bit pages (veto re-Add in FinishFaultDownload); every consumer of
     // this generation shares that window and is off when skip caches are off.
     u64 gpu_dirty_generation_{1};
-    // Buffer creation/destruction epoch. GPU-thread confined: CreateBuffer
-    // and DeleteBuffer are the only lifecycle sites and both run on the
-    // GPU command thread.
-    u64 buffer_gen_{1};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
     // Staging pool for offloaded fault readbacks. GPU command thread only.

@@ -29,13 +29,12 @@ static constexpr std::array LogicalStageToStageBit = {
 
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-    DescriptorSetCache& desc_set_cache, const Shader::Profile& profile,
-    const GraphicsPipelineKey& key_, vk::PipelineCache pipeline_cache,
-    std::span<const Shader::Info*, MaxShaderStages> infos,
+    const Shader::Profile& profile, const GraphicsPipelineKey& key_,
+    vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
-    : Pipeline{instance, scheduler, desc_heap, desc_set_cache, profile, pipeline_cache}, key{key_},
+    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
@@ -518,8 +517,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    ClassifyDescSet(bindings);
-    uses_push_descriptors = !DescDropPush() && binding < instance.MaxPushDescriptors();
+    uses_push_descriptors = binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};
