@@ -61,9 +61,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
     tsc_hz_ = Common::EstimateRDTSCFrequency();
+    const u32 lane_workers = std::min<u32>(EmulatorSettings.GetStreamCopyWorkers(), 3);
+    if (lane_workers != 0) {
+        VideoCore::StreamCopyLane::Instance().Init(lane_workers);
+        Core::MemoryManager::RegisterUnmapDrain(
+            [](void*) { VideoCore::StreamCopyLane::Instance().DrainRemote(); }, nullptr);
+    }
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    VideoCore::StreamCopyLane::Instance().Shutdown();
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();
@@ -676,6 +684,14 @@ void Rasterizer::OnSubmit() {
             if (sc.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] STREAMCOPY hits={} probes={} per300f",
                          sc.hits, sc.probes);
+            }
+            if (auto& lane = VideoCore::StreamCopyLane::Instance(); lane.Enabled()) {
+                const auto ls = lane.DrainStats();
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] LANE jobs={} MiB={} unres={} full={} barriers={} "
+                         "wait_ms={} per300f",
+                         ls.jobs, ls.bytes >> 20, ls.inline_unresolved, ls.inline_full, ls.barriers,
+                         ls.barrier_wait_ns / 1000000);
             }
             buffer_cache.EmitMirrorTelemetry();
         }

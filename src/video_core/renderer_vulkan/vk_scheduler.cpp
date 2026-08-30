@@ -7,6 +7,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
@@ -184,6 +185,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
+    // Every stream-lane byte this command buffer reads must be in place
+    // before the queue submit.
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
     const u64 signal_value = master_semaphore.NextTick();
     // Cmdbuf rollover: mid-draw submits (stream wraparound flushes) must
     // synchronously invalidate all skip caches - a draw-entry token snapshot

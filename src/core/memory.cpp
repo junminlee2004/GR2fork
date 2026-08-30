@@ -212,6 +212,90 @@ void SetBackingWriteObserver(BackingWriteObserver observer, void* user) {
     g_backing_observer.store(observer, std::memory_order_release);
 }
 
+static std::atomic<void (*)(void*)> g_unmap_drain{nullptr};
+static std::atomic<void*> g_unmap_drain_user{nullptr};
+
+void MemoryManager::RegisterUnmapDrain(void (*drain)(void*), void* user) {
+    g_unmap_drain_user.store(user, std::memory_order_release);
+    g_unmap_drain.store(drain, std::memory_order_release);
+}
+
+u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out,
+                                       u32 max_spans) {
+    // The batch scope already holds the shared lock for this thread (see
+    // CopySparseMemory); the vma map and phys_areas are stable underneath it.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope) {
+        lk.lock();
+    }
+    // Chunk memo, generation-keyed like CopySparseMemory's area memo: the
+    // stream lane resolves thousands of small ranges per frame and nearly all
+    // of them land in the same few backing chunks.
+    struct ChunkMemo {
+        u64 generation;
+        VAddr base;
+        VAddr end;
+        const u8* backing;
+    };
+    static constexpr size_t NumMemoEntries = 4;
+    static thread_local std::array<ChunkMemo, NumMemoEntries> memo{};
+    static thread_local size_t memo_next = 0;
+    for (const auto& entry : memo) {
+        if (entry.generation == vma_generation && virtual_addr >= entry.base &&
+            virtual_addr + size <= entry.end) {
+            out[0] = BackingSpan{entry.backing + (virtual_addr - entry.base), size};
+            return 1;
+        }
+    }
+
+    u32 num_spans = 0;
+    VAddr addr = virtual_addr;
+    u64 remaining = size;
+    auto vma_it = FindVMA(addr);
+    while (remaining != 0) {
+        const auto& vma = vma_it->second;
+        if (!vma.Overlaps(addr, 1) || !HasPhysicalBacking(vma)) {
+            return 0;
+        }
+        u64 start_in_vma = addr - vma_it->first;
+        auto phys = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+        for (; remaining != 0 && phys != vma.phys_areas.end(); ++phys) {
+            if (start_in_vma < phys->first) {
+                return 0; // hole between physical areas
+            }
+            const u64 start_in_dma = start_in_vma - phys->first;
+            if (start_in_dma >= phys->second.size) {
+                continue;
+            }
+            const u8* backing = impl.BackingBase() + phys->second.base + start_in_dma;
+            const u64 chunk = std::min<u64>(remaining, phys->second.size - start_in_dma);
+            if (num_spans == max_spans) {
+                return 0;
+            }
+            out[num_spans++] = BackingSpan{backing, chunk};
+            if (num_spans == 1 && chunk == size) {
+                memo[memo_next] = ChunkMemo{
+                    .generation = vma_generation,
+                    .base = addr - start_in_dma,
+                    .end = addr - start_in_dma + phys->second.size,
+                    .backing = backing - start_in_dma,
+                };
+                memo_next = (memo_next + 1) % NumMemoEntries;
+            }
+            remaining -= chunk;
+            addr += chunk;
+            start_in_vma += chunk;
+        }
+        if (remaining != 0) {
+            ++vma_it;
+            if (vma_it->first != addr) {
+                return 0;
+            }
+        }
+    }
+    return num_spans;
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
@@ -1051,6 +1135,11 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 }
 
 s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
+    // Backing pointers held by queued stream-lane jobs must not outlive the
+    // mapping they resolve into.
+    if (const auto drain = g_unmap_drain.load(std::memory_order_acquire)) {
+        drain(g_unmap_drain_user.load(std::memory_order_acquire));
+    }
     u64 unmapped_bytes = 0;
     do {
         auto it = FindVMA(virtual_addr + unmapped_bytes);

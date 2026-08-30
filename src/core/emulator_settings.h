@@ -467,6 +467,11 @@ struct GPUSettings {
     // pop (a lock plus a fence-query ioctl) once per this many draw-rate
     // polls instead of every draw. 0 polls every call.
     Setting<u32> pending_pop_throttle{0};
+    // Number of worker threads that drain guest -> stream-ring copies queued
+    // by the GPU command thread. Ring offsets are still allocated in order on
+    // that thread; only the byte movement moves off it, fenced before every
+    // submit. 0 copies inline (today's behavior).
+    Setting<u32> stream_copy_workers{0};
     // Resolves shader permutations through an address-masked specialization
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.
@@ -527,6 +532,7 @@ struct GPUSettings {
                                        &GPUSettings::stream_upload_mirror_mode),
             make_override<GPUSettings>("fault_widen_bytes", &GPUSettings::fault_widen_bytes),
             make_override<GPUSettings>("pending_pop_throttle", &GPUSettings::pending_pop_throttle),
+            make_override<GPUSettings>("stream_copy_workers", &GPUSettings::stream_copy_workers),
             make_override<GPUSettings>("spec_fp_cache", &GPUSettings::spec_fp_cache),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
@@ -545,7 +551,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     readback_offload_mode, stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders,
     patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes)
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
+    stream_copy_workers)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -814,6 +821,7 @@ public:
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
+    SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpCache, spec_fp_cache)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)

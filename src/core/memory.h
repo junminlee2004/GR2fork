@@ -280,6 +280,20 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// A contiguous run of the never-protected physical backing view.
+    struct BackingSpan {
+        const u8* ptr;
+        u64 size;
+    };
+    /// Resolves [virtual_addr, virtual_addr + size) to backing spans for the
+    /// stream copy lane. Returns the span count, or 0 when any part of the
+    /// range lacks physical backing (the caller copies inline instead).
+    u32 ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out, u32 max_spans);
+
+    /// Called (if registered) before an unmap edits the address space, so the
+    /// stream copy lane can drain jobs whose backing pointers would dangle.
+    static void RegisterUnmapDrain(void (*drain)(void*), void* user);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);

@@ -493,6 +493,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              EmulatorSettings.GetStreamUploadMirrorMode());
     LOG_INFO(Config, "GPU faultWidenBytes: {}", EmulatorSettings.GetFaultWidenBytes());
     LOG_INFO(Config, "GPU pendingPopThrottle: {}", EmulatorSettings.GetPendingPopThrottle());
+    LOG_INFO(Config, "GPU streamCopyWorkers: {}", EmulatorSettings.GetStreamCopyWorkers());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
     LOG_INFO(Config, "GPU guestCopyLockBatch: {}", EmulatorSettings.IsGuestCopyLockBatch());

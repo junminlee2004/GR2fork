@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
+#include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -240,6 +241,36 @@ public:
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
+        // Deferred drain lane: large-enough guest-addressed sources are copied
+        // by worker threads reading the physical backing view (never
+        // protected, so a worker cannot fault). Host-pointer sources are
+        // stack- or heap-locals whose lifetime ends with the caller and must
+        // stay inline. The 64-byte alignment keeps a job's write-combining
+        // lines private to one core; padding costs are absorbed by the ring.
+        if (auto& lane = StreamCopyLane::Instance(); lane.Enabled() && size >= 192) {
+            auto* memory = Core::Memory::Instance();
+            if (memory->IsValidMapping(src_vaddr)) {
+                Core::MemoryManager::BackingSpan spans[2];
+                const u32 num_spans = memory->ResolveBackingSpans(src_vaddr, size, spans, 2);
+                if (num_spans != 0) {
+                    const auto [data, offset] = Map(size, alignment < 64 ? 64 : alignment);
+                    u8* dst = data;
+                    bool queued = true;
+                    for (u32 i = 0; i < num_spans; ++i) {
+                        if (queued) {
+                            queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
+                        }
+                        if (!queued) {
+                            std::memcpy(dst, spans[i].ptr, spans[i].size);
+                        }
+                        dst += spans[i].size;
+                    }
+                    Commit();
+                    return offset;
+                }
+                lane.NoteInlineUnresolved();
+            }
+        }
         // Guest sources are written by game threads on other cores and read
         // exactly once here, so their lines are cold. Requesting them before
         // the ring bookkeeping and address resolution overlaps the memory

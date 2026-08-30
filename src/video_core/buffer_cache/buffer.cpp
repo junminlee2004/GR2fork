@@ -232,6 +232,8 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
 }
 
 void StreamBuffer::MapWrap() {
+    // The new lap reuses offsets this lap's queued jobs may still be writing.
+    StreamCopyLane::Instance().DrainProducer();
     ++ring_stats_.wraps;
     // The buffer would overflow, save the amount of used watches and reset the state.
     invalidation_mark = current_watch_cursor;
