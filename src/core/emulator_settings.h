@@ -472,6 +472,10 @@ struct GPUSettings {
     // that thread; only the byte movement moves off it, fenced before every
     // submit. 0 copies inline (today's behavior).
     Setting<u32> stream_copy_workers{0};
+    // Skip the eager FindBuffer in binding pass 1 for read-only descriptors
+    // small enough for the stream path, which never dereferences the id.
+    // DMA-using stages keep the eager call (BDA page-table registration).
+    Setting<bool> stream_findbuffer_elide{false};
     // Resolves shader permutations through an address-masked specialization
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.
@@ -533,6 +537,8 @@ struct GPUSettings {
             make_override<GPUSettings>("fault_widen_bytes", &GPUSettings::fault_widen_bytes),
             make_override<GPUSettings>("pending_pop_throttle", &GPUSettings::pending_pop_throttle),
             make_override<GPUSettings>("stream_copy_workers", &GPUSettings::stream_copy_workers),
+            make_override<GPUSettings>("stream_findbuffer_elide",
+                                       &GPUSettings::stream_findbuffer_elide),
             make_override<GPUSettings>("spec_fp_cache", &GPUSettings::spec_fp_cache),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
@@ -552,7 +558,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
-    stream_copy_workers)
+    stream_copy_workers, stream_findbuffer_elide)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -822,6 +828,7 @@ public:
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)
+    SETTING_FORWARD_BOOL(m_gpu, StreamFindBufferElide, stream_findbuffer_elide)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpCache, spec_fp_cache)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)

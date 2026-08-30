@@ -1009,24 +1009,36 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
     buffer_bindings.clear();
 
+    static const bool elide_findbuffer = EmulatorSettings.IsStreamFindBufferElide();
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
-            buffer_bindings.emplace_back(buffer_id, vsharp, size);
+            // Stream-eligible read-only bindings never dereference the id:
+            // ObtainBuffer's stream path returns before touching it and
+            // re-resolves on its own when it falls through to the slot path.
+            // FindBuffer here is three dependent cache-missing loads. DMA
+            // stages keep the eager call so registration still feeds the BDA
+            // page table. The predicate is a hint: a mismatch with
+            // ObtainBuffer's guard costs one late FindBuffer, never
+            // correctness.
+            const bool defer = elide_findbuffer && !desc.is_written &&
+                               size <= VideoCore::BufferCache::CACHING_PAGESIZE && !stage.uses_dma;
+            const auto buffer_id =
+                defer ? VideoCore::BufferId{} : buffer_cache.FindBuffer(vsharp.base_address, size);
+            buffer_bindings.emplace_back(buffer_id, vsharp, size, true);
         } else {
-            buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
+            buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0, false);
         }
     }
 
     // Second pass to re-bind buffers that were updated after binding
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
-        const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
+        const auto& [buffer_id, vsharp, size, is_guest] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
         const u32 alignment = instance.StorageMinAlignment();
         // Buffer is not from the cache, either a special buffer or unbound.
-        if (!buffer_id) {
+        if (!is_guest) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
