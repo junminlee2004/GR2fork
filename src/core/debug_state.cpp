@@ -134,6 +134,8 @@ void DebugStateImpl::PushQueueDump(QueueDump dump) {
                     reinterpret_cast<uintptr_t>(header) - reinterpret_cast<uintptr_t>(initial_data);
                 const auto addr = dump.base_addr + offset;
                 waiting_reg_dumps.emplace(addr, &frame);
+                waiting_reg_dumps_count.store(static_cast<u32>(waiting_reg_dumps.size()),
+                                              std::memory_order_relaxed);
                 waiting_reg_dumps_dbg.emplace(
                     addr,
                     fmt::format("#{} h({}) queue {} {} {}",
@@ -153,6 +155,8 @@ std::optional<RegDump*> DebugStateImpl::GetRegDump(uintptr_t base_addr, uintptr_
     }
     auto& frame = *it->second;
     waiting_reg_dumps.erase(it);
+    waiting_reg_dumps_count.store(static_cast<u32>(waiting_reg_dumps.size()),
+                                  std::memory_order_relaxed);
     waiting_reg_dumps_dbg.erase(waiting_reg_dumps_dbg.find(header_addr));
     return &frame.regs[header_addr - base_addr];
 }

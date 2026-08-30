@@ -57,6 +57,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
+    batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
+    elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
     // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
@@ -417,7 +419,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
         copy_scope.emplace(Core::Memory::Instance());
@@ -476,7 +478,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
         copy_scope.emplace(Core::Memory::Instance());
@@ -568,7 +570,7 @@ void Rasterizer::DispatchDirect() {
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
         copy_scope.emplace(Core::Memory::Instance());
@@ -1002,14 +1004,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     // One shared-lock hold covers every guest copy this stage stages
     // (flatbuf, clip planes, stream uploads); see GuestCopyScope.
-    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
         copy_scope.emplace(Core::Memory::Instance());
     }
     buffer_bindings.clear();
 
-    static const bool elide_findbuffer = EmulatorSettings.IsStreamFindBufferElide();
+    const bool elide_findbuffer = elide_findbuffer_;
     for (const auto& desc : stage.buffers) {
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {

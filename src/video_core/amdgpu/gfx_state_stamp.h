@@ -33,10 +33,43 @@ struct GfxStateStamp {
             std::memcpy(dst, src, bytes);
             return;
         }
+        pending |= FusedCompareStore(dst, src, bytes);
+    }
+
+    /// One fused compare-and-store pass for the small register blocks this
+    /// path sees, instead of a libc memcmp plus memcpy call pair. Returns
+    /// exactly memcmp's changed verdict: any differing byte.
+    static bool FusedCompareStore(void* dst, const void* src, size_t bytes) {
+        if (bytes <= 64 && (bytes & 3) == 0) {
+            u8* d = static_cast<u8*>(dst);
+            const u8* c = static_cast<const u8*>(src);
+            bool changed = false;
+            size_t i = 0;
+            for (; i + 8 <= bytes; i += 8) {
+                u64 a, b;
+                std::memcpy(&a, d + i, 8);
+                std::memcpy(&b, c + i, 8);
+                if (a != b) {
+                    changed = true;
+                    std::memcpy(d + i, c + i, 8);
+                }
+            }
+            for (; i < bytes; i += 4) {
+                u32 a, b;
+                std::memcpy(&a, d + i, 4);
+                std::memcpy(&b, c + i, 4);
+                if (a != b) {
+                    changed = true;
+                    std::memcpy(d + i, c + i, 4);
+                }
+            }
+            return changed;
+        }
         if (std::memcmp(dst, src, bytes) != 0) {
             std::memcpy(dst, src, bytes);
-            pending = true;
+            return true;
         }
+        return false;
     }
 
     // Immediate change-detected write for the async-compute queue's writes
@@ -46,8 +79,7 @@ struct GfxStateStamp {
             std::memcpy(dst, src, bytes);
             return;
         }
-        if (std::memcmp(dst, src, bytes) != 0) {
-            std::memcpy(dst, src, bytes);
+        if (FusedCompareStore(dst, src, bytes)) {
             ++value;
         }
     }

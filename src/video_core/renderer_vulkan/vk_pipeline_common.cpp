@@ -25,30 +25,37 @@ namespace {
 // overflow: unknowns fail toward the slow path.
 size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
                                  std::array<u8, 16384>& out) {
-    size_t off = 0;
-    const auto put = [&](const void* p, size_t n) {
-        if (off + n > out.size()) {
-            return false;
-        }
-        std::memcpy(out.data() + off, p, n);
-        off += n;
-        return true;
-    };
-    const auto put64 = [&](u64 v) { return put(&v, sizeof(v)); };
-    const auto put32 = [&](u32 v) { return put(&v, sizeof(v)); };
+    // One up-front capacity check instead of a bounds test per field: the
+    // worst case per write is a 16-byte header plus 24 bytes per descriptor.
+    // Overestimating (images serialize 20) only ever fails toward the slow
+    // path, same as the old mid-stream overflow return.
+    size_t need = 0;
     for (const auto& w : writes) {
-        if (!put32(w.dstBinding) || !put32(w.dstArrayElement) || !put32(w.descriptorCount) ||
-            !put32(static_cast<u32>(w.descriptorType))) {
-            return 0;
-        }
+        need += 16 + size_t{w.descriptorCount} * 24;
+    }
+    if (need > out.size()) {
+        return 0;
+    }
+    u8* cursor = out.data();
+    const auto put = [&](const void* p, size_t n) {
+        std::memcpy(cursor, p, n);
+        cursor += n;
+    };
+    const auto put64 = [&](u64 v) { put(&v, sizeof(v)); };
+    const auto put32 = [&](u32 v) { put(&v, sizeof(v)); };
+    for (const auto& w : writes) {
+        put32(w.dstBinding);
+        put32(w.dstArrayElement);
+        put32(w.descriptorCount);
+        put32(static_cast<u32>(w.descriptorType));
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
         case vk::DescriptorType::eStorageBuffer:
             for (u32 i = 0; i < w.descriptorCount; ++i) {
                 const auto& b = w.pBufferInfo[i];
-                if (!put64(std::bit_cast<u64>(b.buffer)) || !put64(b.offset) || !put64(b.range)) {
-                    return 0;
-                }
+                put64(std::bit_cast<u64>(b.buffer));
+                put64(b.offset);
+                put64(b.range);
             }
             break;
         case vk::DescriptorType::eSampledImage:
@@ -57,26 +64,22 @@ size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
         case vk::DescriptorType::eSampler:
             for (u32 i = 0; i < w.descriptorCount; ++i) {
                 const auto& im = w.pImageInfo[i];
-                if (!put64(std::bit_cast<u64>(im.sampler)) ||
-                    !put64(std::bit_cast<u64>(im.imageView)) ||
-                    !put32(static_cast<u32>(im.imageLayout))) {
-                    return 0;
-                }
+                put64(std::bit_cast<u64>(im.sampler));
+                put64(std::bit_cast<u64>(im.imageView));
+                put32(static_cast<u32>(im.imageLayout));
             }
             break;
         case vk::DescriptorType::eUniformTexelBuffer:
         case vk::DescriptorType::eStorageTexelBuffer:
             for (u32 i = 0; i < w.descriptorCount; ++i) {
-                if (!put64(std::bit_cast<u64>(w.pTexelBufferView[i]))) {
-                    return 0;
-                }
+                put64(std::bit_cast<u64>(w.pTexelBufferView[i]));
             }
             break;
         default:
             return 0;
         }
     }
-    return off;
+    return static_cast<size_t>(cursor - out.data());
 }
 
 } // namespace

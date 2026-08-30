@@ -46,6 +46,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
+    batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
@@ -653,7 +654,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
-    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
         copy_scope.emplace(Core::Memory::Instance());
@@ -840,6 +841,9 @@ void BufferCache::BindVertexBuffers(
     Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
     Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
     Vulkan::VertexInputs<vk::DeviceSize> host_strides;
+    // Sizes and strides feed only the bindVertexBuffers2 fallback; on devices
+    // with vertex-input dynamic state the fills are dead.
+    const bool needs_sizes_strides = !instance.IsVertexInputDynamicState();
     for (const auto& buffer : guest_buffers) {
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
             const auto host_buffer_info =
@@ -855,8 +859,10 @@ void BufferCache::BindVertexBuffers(
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
-        host_sizes.push_back(buffer.GetSize());
-        host_strides.push_back(buffer.GetStride());
+        if (needs_sizes_strides) {
+            host_sizes.push_back(buffer.GetSize());
+            host_strides.push_back(buffer.GetStride());
+        }
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -871,7 +877,7 @@ void BufferCache::BindVertexBuffers(
 
 void BufferCache::BindIndexBuffer(
     u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
-    static const bool batch_copy_lock = EmulatorSettings.IsGuestCopyLockBatch();
+    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
         copy_scope.emplace(Core::Memory::Instance());

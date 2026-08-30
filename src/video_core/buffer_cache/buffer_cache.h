@@ -414,6 +414,7 @@ private:
     MirrorSinkCounters mirror_sink_;
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
+    bool batch_copy_lock_{};
 };
 
 } // namespace VideoCore

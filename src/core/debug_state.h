@@ -152,6 +152,10 @@ class DebugStateImpl {
     std::atomic<float> dispatch_count_avg = 0.0f;
 
     s32 gnm_frame_dump_request_count = -1;
+    // Relaxed mirror of waiting_reg_dumps.size(), written under the same
+    // lock, so the per-register-write query below stays lock-free while the
+    // list is empty (always, outside a requested dump).
+    std::atomic<u32> waiting_reg_dumps_count{0};
     std::unordered_map<size_t, FrameDump*> waiting_reg_dumps;
     std::unordered_map<size_t, std::string> waiting_reg_dumps_dbg;
     bool waiting_submit_pause = false;
@@ -209,11 +213,16 @@ public:
     }
 
     void IncDrawCall() noexcept {
-        draw_call_count.fetch_add(1, std::memory_order_relaxed);
+        // Single writer (the GPU command thread): a plain load/store pair
+        // avoids the locked RMW on the draw path. Readers are stats-only and
+        // may miss a transient count.
+        draw_call_count.store(draw_call_count.load(std::memory_order_relaxed) + 1,
+                              std::memory_order_relaxed);
     }
 
     void IncDispatch() noexcept {
-        dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        dispatch_count.store(dispatch_count.load(std::memory_order_relaxed) + 1,
+                             std::memory_order_relaxed);
     }
 
     [[nodiscard]] float GetDrawCallsAvg() const noexcept {
@@ -238,6 +247,9 @@ public:
     }
 
     bool DumpingCurrentReg() {
+        if (waiting_reg_dumps_count.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
         std::shared_lock lock{frame_dump_list_mutex};
         return !waiting_reg_dumps.empty();
     }
