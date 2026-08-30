@@ -42,6 +42,55 @@ namespace {
 // GR2 measured 0 collisions over 12.2M samples. Callers exclude HS/DS (their spec folds tess
 // constant-buffer contents read from guest memory). ri_bytes_hash is the raw-byte hash of the
 // stage's persistent RuntimeInfo member.
+// Hash only the header plus the stage-active union member. RuntimeInfo's
+// operator== switches on stage and compares only the active member, so
+// header+active is a superset of what equality consults and can only
+// over-discriminate. The full struct is 8 bytes past XXH3's midsize cutoff,
+// which forced every GetProgram through the hashLong path for union bytes
+// equality never reads. Sizes come from sizeof only: MSVC packs the
+// bitfields of FragmentRuntimeInfo differently, so literals would be wrong
+// there. A garbage stage falls back to the whole union extent, never past it.
+u64 RuntimeInfoProxyHash(const Shader::RuntimeInfo& ri) noexcept {
+    // Not offsetof: the union members inherit, making RuntimeInfo
+    // non-standard-layout, where offsetof is only conditionally supported.
+    // The pointer difference folds to the same constant.
+    const size_t header = static_cast<size_t>(reinterpret_cast<const char*>(&ri.ls_info) -
+                                              reinterpret_cast<const char*>(&ri));
+    const size_t union_extent = sizeof(Shader::RuntimeInfo) - header;
+    size_t active = union_extent;
+    switch (ri.stage) {
+    case Shader::Stage::Local:
+        active = sizeof(Shader::LocalRuntimeInfo);
+        break;
+    case Shader::Stage::Export:
+        active = sizeof(Shader::ExportRuntimeInfo);
+        break;
+    case Shader::Stage::Vertex:
+        active = sizeof(Shader::VertexRuntimeInfo);
+        break;
+    case Shader::Stage::Hull:
+        active = sizeof(Shader::HullRuntimeInfo);
+        break;
+    case Shader::Stage::Geometry:
+        active = sizeof(Shader::GeometryRuntimeInfo);
+        break;
+    case Shader::Stage::Fragment:
+        active = sizeof(Shader::FragmentRuntimeInfo);
+        break;
+    case Shader::Stage::Compute:
+        active = sizeof(Shader::ComputeRuntimeInfo);
+        break;
+    default:
+        break;
+    }
+    // The header hash covers stage, so equal active bytes under different
+    // stages (and therefore different lengths) cannot collide.
+    const u64 h_header = XXH3_64bits(&ri, header);
+    const u64 h_active =
+        XXH3_64bits(reinterpret_cast<const u8*>(&ri) + header, std::min(active, union_extent));
+    return h_header ^ (h_active * 0x9E3779B97F4A7C15ull);
+}
+
 u64 ComputeSpecProxyFp(const Shader::Info& info,
                        const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
                        u64 ri_bytes_hash, const Shader::Backend::Bindings& start) noexcept {
@@ -831,7 +880,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         // across calls, so the raw-byte hash repeats; a padding mismatch could only
         // over-discriminate into a miss, never wrongly hit.
         const auto& ri_member = runtime_infos[static_cast<u32>(l_stage)];
-        const u64 ri_fp_hash = XXH3_64bits(&ri_member, sizeof(ri_member));
+        const u64 ri_fp_hash = RuntimeInfoProxyHash(ri_member);
         spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data, ri_fp_hash,
                                      binding);
         // MRU front: consecutive draws overwhelmingly repeat the fingerprint,
