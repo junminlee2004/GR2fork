@@ -151,15 +151,21 @@ public:
     }
 
 private:
-    static constexpr u32 kMaxEntries = 1024;
-    static constexpr u32 kBuckets = 4096; // power of two
-    static constexpr u32 kEvictBudget = 32;
-    static constexpr u32 kAdmitBudget = 64;
+    // Observe-mode telemetry on CUSA00575 measured ~4300 eligible draws per
+    // frame against the original 1024 entries: live pinned at the cap and ~90%
+    // of draws declined on budget, collapsing the would-hit rate to ~1%. The
+    // table must hold roughly two frames of working set to see cross-frame
+    // repeats, and eviction/reclaim must at least match the admission rate or
+    // a full table can never turn over.
+    static constexpr u32 kMaxEntries = 8192;
+    static constexpr u32 kBuckets = 32768; // power of two
+    static constexpr u32 kEvictBudget = 256;
+    static constexpr u32 kAdmitBudget = 256;
     static constexpr u64 kMaxAgeTicks = 256;
-    static constexpr u32 kHighWater = 896; // kMaxEntries * 7/8
+    static constexpr u32 kHighWater = 7168; // kMaxEntries * 7/8
     static constexpr u32 kInitialPools = 2;
-    static constexpr u32 kMaxPools = 8;
-    static constexpr u32 kPoolMaxSets = 512;
+    static constexpr u32 kMaxPools = 16;
+    static constexpr u32 kPoolMaxSets = 1024;
     /// UPPER bound on one vkAllocateDescriptorSets batch, not the batch itself. A class's batch
     /// grows geometrically from one (see AcquireSet): a fixed batch made set consumption scale with
     /// kSetBatch * the number of layout classes rather than with demand, because a set never leaves
@@ -173,7 +179,7 @@ private:
     static constexpr u32 kInvalidIdx = 0xFFFFFFFFu;
     /// LRU steps the last-resort set reclaim is allowed to walk. Bounded like every other pass in
     /// this class; it only runs when the alternative is DescriptorHeap::Commit.
-    static constexpr u32 kReclaimBudget = 64;
+    static constexpr u32 kReclaimBudget = 128;
 
     /// One verified descriptor element. Packed by construction - three u64 and no padding.
     struct DescElem {
