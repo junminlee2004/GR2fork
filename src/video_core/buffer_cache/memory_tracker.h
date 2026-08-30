@@ -263,7 +263,7 @@ public:
                         return;
                     }
                     const VAddr lo = std::max(chunk_addr, orig_addr);
-                    const VAddr hi = std::min(chunk_addr + size, orig_addr + orig_size);
+                    const VAddr hi = std::min<VAddr>(chunk_addr + size, orig_addr + orig_size);
                     if (lo >= hi) {
                         return; // pure widening over GPU data: leave untouched
                     }
