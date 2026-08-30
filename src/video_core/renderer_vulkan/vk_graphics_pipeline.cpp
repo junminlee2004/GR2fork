@@ -32,7 +32,7 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader_,
     std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {

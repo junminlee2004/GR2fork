@@ -515,9 +515,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos,
-            fetch_shader_ref
-                ? std::optional<const Shader::Gcn::FetchShaderData>{*fetch_shader_ref.Get()}
-                : std::optional<const Shader::Gcn::FetchShaderData>{},
+            fetch_shader_ref ? fetch_shader_ref.Get()
+                             : std::optional<Shader::Gcn::FetchShaderData>{},
             modules, sdata, false);
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
