@@ -162,10 +162,16 @@ ImageInfoMemo& GetImageInfoMemo() {
 
 } // Anonymous namespace
 
-ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
+ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
+    : ImageInfo{image, desc.is_depth} {}
+
+// The shader-resource ctor consumes only is_depth from the resource; this
+// form is what ImageDesc's deferred build uses, since the resource itself is
+// out of scope by the time a staged binding first needs the info.
+ImageInfo::ImageInfo(const AmdGpu::Image& image, bool is_depth) noexcept {
     const auto raw = std::bit_cast<std::array<u64, 4>>(image);
     auto& entry = GetImageInfoMemo().entries[ImageInfoMemo::Index(raw)];
-    if (entry.valid && entry.tsharp == raw && entry.is_depth == desc.is_depth) {
+    if (entry.valid && entry.tsharp == raw && entry.is_depth == is_depth) {
         *this = entry.info;
         return;
     }
@@ -173,7 +179,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     tile_mode = image.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
     pixel_format = LiverpoolToVK::SurfaceFormat(image.GetDataFmt(), image.GetNumberFmt());
-    if (desc.is_depth) {
+    if (is_depth) {
         pixel_format = LiverpoolToVK::PromoteFormatToDepth(pixel_format);
         props.is_depth = true;
     }
@@ -198,7 +204,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     UpdateSize();
 
     entry.tsharp = raw;
-    entry.is_depth = desc.is_depth;
+    entry.is_depth = is_depth;
     entry.info = *this;
     entry.valid = true;
 }

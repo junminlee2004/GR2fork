@@ -71,24 +71,49 @@ public:
     };
 
     struct ImageDesc {
-        ImageInfo info;
+        // Lazy for shader-resource bindings: a FINDIMG memo hit reads only
+        // type and view_info afterwards, so the 376-byte build (NSDMI
+        // prologue, TLS memo probe, copy-out) is deferred until a route that
+        // actually reaches FindImage materializes it via Info(). Target
+        // ctors (CB/DB/VideoOut) stay eager: FindRenderTarget and
+        // FindDepthTarget read the engaged value through the const accessor.
+        std::optional<ImageInfo> info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
+        AmdGpu::Image deferred_tsharp{};
+        bool deferred_is_depth{};
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
-            : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+            : view_info{image, desc},
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture},
+              deferred_tsharp{image}, deferred_is_depth{desc.is_depth} {}
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
-            : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
+            : info{std::in_place, buffer, hint}, view_info{buffer},
+              type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
                   AmdGpu::DepthControl ctl, VAddr htile_address, AmdGpu::CbDbExtent hint,
                   bool write_buffer = false)
-            : info{buffer, view.NumSlices(), htile_address, hint, write_buffer},
+            : info{std::in_place, buffer, view.NumSlices(), htile_address, hint, write_buffer},
               view_info{buffer, view, ctl}, type{BindingType::DepthTarget} {}
         ImageDesc(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address)
-            : info{group, cpu_address}, type{BindingType::VideoOut} {}
+            : info{std::in_place, group, cpu_address}, type{BindingType::VideoOut} {}
+
+        // Emplace, never assign: assignment would build a 376-byte temporary
+        // and move it, reintroducing the copy this deferral deletes.
+        ImageInfo& Info() {
+            if (!info) {
+                info.emplace(deferred_tsharp, deferred_is_depth);
+            }
+            return *info;
+        }
+        const ImageInfo& Info() const {
+            return *info;
+        }
     };
+    // Rasterizer target descs are rebuilt with construct_at over an engaged
+    // object; that stays legal only while nothing here needs a destructor.
+    static_assert(std::is_trivially_destructible_v<ImageDesc>);
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,

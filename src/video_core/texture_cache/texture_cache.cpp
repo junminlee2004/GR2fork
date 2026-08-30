@@ -631,7 +631,10 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
-    const auto& info = desc.info;
+    // Materialized here, before the lock: a first build under the texture
+    // mutex would drag the whole ImageInfo construction into the critical
+    // section.
+    const auto& info = desc.Info();
     ASSERT(info.guest_address != 0);
 
     std::scoped_lock lock{mutex};
@@ -727,7 +730,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 ImageId TextureCache::FindImageSlow(ImageDesc& desc, bool exact_fmt, ImageId image_id,
                                     const ImageIds& image_ids, int& out_view_mip,
                                     int& out_view_slice) {
-    const auto& info = desc.info;
+    const auto& info = desc.Info();
 
     // Try to resolve overlaps (if any)
     if (!image_id) {
@@ -825,18 +828,18 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     UpdateImage(image_id);
 
     // Register meta data for this color buffer
-    if (desc.info.meta_info.cmask_addr) {
-        MetaBloomInsert(desc.info.meta_info.cmask_addr);
-        surface_metas.emplace(desc.info.meta_info.cmask_addr,
+    if (desc.Info().meta_info.cmask_addr) {
+        MetaBloomInsert(desc.Info().meta_info.cmask_addr);
+        surface_metas.emplace(desc.Info().meta_info.cmask_addr,
                               MetaDataInfo{.type = MetaType::CMask});
-        image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
+        image.info.meta_info.cmask_addr = desc.Info().meta_info.cmask_addr;
     }
 
-    if (desc.info.meta_info.fmask_addr) {
-        MetaBloomInsert(desc.info.meta_info.fmask_addr);
-        surface_metas.emplace(desc.info.meta_info.fmask_addr,
+    if (desc.Info().meta_info.fmask_addr) {
+        MetaBloomInsert(desc.Info().meta_info.fmask_addr);
+        surface_metas.emplace(desc.Info().meta_info.fmask_addr,
                               MetaDataInfo{.type = MetaType::FMask});
-        image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
+        image.info.meta_info.fmask_addr = desc.Info().meta_info.fmask_addr;
     }
 
     return image.FindView(desc.view_info, false);
@@ -849,28 +852,28 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     UpdateImage(image_id);
 
     // Register meta data for this depth buffer
-    if (desc.info.meta_info.htile_addr) {
-        MetaBloomInsert(desc.info.meta_info.htile_addr);
-        surface_metas.emplace(desc.info.meta_info.htile_addr,
+    if (desc.Info().meta_info.htile_addr) {
+        MetaBloomInsert(desc.Info().meta_info.htile_addr);
+        surface_metas.emplace(desc.Info().meta_info.htile_addr,
                               MetaDataInfo{.type = MetaType::HTile,
                                            .clear_mask = image.info.meta_info.htile_clear_mask});
-        image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
+        image.info.meta_info.htile_addr = desc.Info().meta_info.htile_addr;
     }
 
     // If there is a stencil attachment, link depth and stencil.
-    if (desc.info.stencil_addr != 0) {
+    if (desc.Info().stencil_addr != 0) {
         ImageId stencil_id{};
-        ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
+        ForEachImageInRegion(desc.Info().stencil_addr, desc.Info().stencil_size,
                              [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
+                                 if (image.info.guest_address == desc.Info().stencil_addr) {
                                      stencil_id = image_id;
                                  }
                              });
         if (!stencil_id) {
             ImageInfo info{};
-            info.guest_address = desc.info.stencil_addr;
-            info.guest_size = desc.info.stencil_size;
-            info.size = desc.info.size;
+            info.guest_address = desc.Info().stencil_addr;
+            info.guest_size = desc.Info().stencil_size;
+            info.size = desc.Info().size;
             stencil_id =
                 slot_images.insert(instance, scheduler, blit_helper, slot_image_views, info);
             RegisterImage(stencil_id);
