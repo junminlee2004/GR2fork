@@ -294,6 +294,11 @@ public:
     /// stream copy lane can drain jobs whose backing pointers would dangle.
     static void RegisterUnmapDrain(void (*drain)(void*), void* user);
 
+    /// Ends the push window ResolveBackingSpans opened: spans resolved under
+    /// the shared lock stay unmap-safe until the caller queued its jobs, and
+    /// the unmap drain waits the window out before snapshotting the queue.
+    static void EndBackingPush();
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);

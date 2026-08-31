@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <thread>
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
@@ -214,6 +215,15 @@ void SetBackingWriteObserver(BackingWriteObserver observer, void* user) {
 
 static std::atomic<void (*)(void*)> g_unmap_drain{nullptr};
 static std::atomic<void*> g_unmap_drain_user{nullptr};
+// Open push windows: incremented by ResolveBackingSpans while it still holds
+// the shared lock, closed by EndBackingPush after the jobs are queued. The
+// holder never blocks between the two (queueing is lock-free), so the unmap
+// side's bounded wait cannot deadlock.
+static std::atomic<u32> g_backing_push_windows{0};
+
+void MemoryManager::EndBackingPush() {
+    g_backing_push_windows.fetch_sub(1, std::memory_order_release);
+}
 
 void MemoryManager::RegisterUnmapDrain(void (*drain)(void*), void* user) {
     g_unmap_drain_user.store(user, std::memory_order_release);
@@ -244,6 +254,7 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
         if (entry.generation == vma_generation && virtual_addr >= entry.base &&
             virtual_addr + size <= entry.end) {
             out[0] = BackingSpan{entry.backing + (virtual_addr - entry.base), size};
+            g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
             return 1;
         }
     }
@@ -293,6 +304,10 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
             }
         }
     }
+    // A successful resolve opens the push window before the shared lock
+    // drops; the caller closes it with EndBackingPush once its jobs are
+    // queued, and the unmap drain below waits the window out first.
+    g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
     return num_spans;
 }
 
@@ -1136,7 +1151,14 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 
 s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
     // Backing pointers held by queued stream-lane jobs must not outlive the
-    // mapping they resolve into.
+    // mapping they resolve into. Wait out open push windows first: a span
+    // resolved before this unmap took the lock may not have reached the
+    // queue yet, and a drain snapshot taken now would miss it. The window
+    // holder never takes this mutex between resolve and queue, so the wait
+    // is bounded by a lock-free push (worst case one ring-wrap drain).
+    while (g_backing_push_windows.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
     if (const auto drain = g_unmap_drain.load(std::memory_order_acquire)) {
         drain(g_unmap_drain_user.load(std::memory_order_acquire));
     }

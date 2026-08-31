@@ -23,6 +23,7 @@ void StreamCopyLane::Init(u32 num_workers) {
         slots_[i].seq.store(i, std::memory_order_relaxed);
     }
     stop_.store(false, std::memory_order_relaxed);
+    producer_tid_.store(0, std::memory_order_relaxed);
     threads_.reserve(num_workers);
     for (u32 i = 0; i < num_workers; ++i) {
         threads_.emplace_back([this] { WorkerLoop(); });
@@ -47,8 +48,18 @@ void StreamCopyLane::Shutdown() {
 }
 
 bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
-    // Only this thread writes enqueue_pos_, so one read serves the whole job;
-    // reading the member again would reload it across the slot stores.
+    // Single-producer contract, enforced: readback fault paths run emulator
+    // code on guest threads, and a second producer would corrupt the plain
+    // enqueue cursor. A foreign caller copies inline instead.
+    const u64 tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    if (producer_tid_.load(std::memory_order_relaxed) != tid) {
+        u64 expected = 0;
+        if (!producer_tid_.compare_exchange_strong(expected, tid, std::memory_order_relaxed)) {
+            return false;
+        }
+    }
+    // Only the producer writes enqueue_pos_, so one read serves the whole
+    // job; reading the member again would reload it across the slot stores.
     const u64 pos = enqueue_pos_;
     Slot& slot = slots_[pos & (kRingSlots - 1)];
     if (slot.seq.load(std::memory_order_acquire) != pos) {
@@ -122,7 +133,10 @@ void StreamCopyLane::DrainProducer() {
     if (!Enabled()) {
         return;
     }
-    const u64 target = enqueue_pos_;
+    // published_ rather than the producer-plain cursor: fault-path flushes
+    // reach this from guest threads, and on the producer itself the two are
+    // always equal (published_ is stored on every push).
+    const u64 target = published_.load(std::memory_order_acquire);
     if (copies_done_.load(std::memory_order_acquire) >= target) {
         return;
     }

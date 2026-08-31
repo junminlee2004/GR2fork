@@ -95,6 +95,8 @@ private:
     u64 barriers_{};
     u64 barrier_wait_ns_{};
 
+    std::atomic<u64> producer_tid_{0};
+
     alignas(64) std::atomic<u64> published_{};
     alignas(64) std::atomic<u64> dequeue_pos_{};
     alignas(64) std::atomic<u64> copies_done_{};

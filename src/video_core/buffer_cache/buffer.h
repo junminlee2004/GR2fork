@@ -265,6 +265,7 @@ public:
                         }
                         dst += spans[i].size;
                     }
+                    Core::MemoryManager::EndBackingPush();
                     Commit();
                     return offset;
                 }
