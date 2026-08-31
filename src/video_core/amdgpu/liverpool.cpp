@@ -498,8 +498,6 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             if (regs.index_buffer_type.raw != index_type->raw) {
                 regs.index_buffer_type.raw = index_type->raw;
                 gfx_stamp.MarkDirty();
-            } else {
-                regs.index_buffer_type.raw = index_type->raw;
             }
             break;
         }
