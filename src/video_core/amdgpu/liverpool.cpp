@@ -51,6 +51,21 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+// Measurement build: every draw carrying the predicate header bit is culled as
+// if a predicate were set and read "occluded". Register side effects of the
+// packet are kept; only the rasterizer call is skipped, so state stays exactly
+// as a real predicated skip would leave it.
+static bool CullPredicatedDraw(const PM4Header* header) {
+    if (header->type3.predicate.Value() != PM4Predicate::PredEnable) {
+        return false;
+    }
+    static u64 culled = 0;
+    if ((culled++ & 0xFFF) == 0) {
+        LOG_WARNING(Render, "predicated draw culled ({} so far)", culled);
+    }
+    return true;
+}
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
         LOG_ERROR(
@@ -412,6 +427,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
                 break;
             }
+            case PM4ItOpcode::OcclusionQuery: {
+                // Measurement build: consumed rather than crashing, so a title
+                // that emits it shows up as a count instead of an abort. No
+                // result is written; the packet layout is unverified and a
+                // guessed store could corrupt guest memory.
+                static u64 seen = 0;
+                if ((seen++ & 0xFF) == 0) {
+                    LOG_WARNING(Render, "IT_OCCLUSION_QUERY consumed ({} so far)", seen);
+                }
+                break;
+            }
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
                 regs.index_buffer_type.raw = index_type->raw;
@@ -427,7 +453,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DrawIndex2", cmd_address));
@@ -448,7 +474,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
@@ -468,7 +494,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
@@ -488,7 +514,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
@@ -508,7 +534,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
@@ -531,7 +557,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
@@ -551,7 +577,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
@@ -575,7 +601,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
-                if (rasterizer) {
+                if (rasterizer && !CullPredicatedDraw(header)) {
                     const auto cmd_address = reinterpret_cast<const void*>(header);
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
