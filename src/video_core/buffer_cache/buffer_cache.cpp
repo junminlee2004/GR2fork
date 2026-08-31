@@ -667,48 +667,64 @@ void BufferCache::BindVertexBuffers(
     pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
+    struct BufferRange {
+        VAddr base_address;
+        VAddr end_address;
+        vk::Buffer vk_buffer;
+        u64 offset;
+
+        [[nodiscard]] size_t GetSize() const {
+            return end_address - base_address;
+        }
+    };
+
     // Signatures over the RESOLVED inputs: the vertex input layout feeds
-    // setVertexInputEXT and depends only on bindings/attributes/divisors; the
-    // full bind signature adds the guest V# contents. Content-keyed, so the
-    // user_data churn that defeats raw-register memos does not apply.
+    // setVertexInputEXT, the full bind signature adds the guest V# contents.
+    // Content-keyed, so the user_data churn that defeats raw-register memos
+    // does not apply. location, binding, inputRate, offset and the divisor
+    // class are all read out of the pipeline's own fetch shader, so the
+    // pipeline pointer and the two step rates already key them; only stride
+    // and format vary under a fixed pipeline. divisors is empty here because
+    // the bindings carry the divisor inline on the 2EXT path.
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     const bool memo_active = skipcache.Active();
+    const auto mix = [](u64& h, u64 v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
     u64 input_sig = 0xcbf29ce484222325ULL;
     u64 bind_sig = 0;
+    // Decoded once per binding and reused by the signature, the memo span, the
+    // merged range list and the final offsets; on a memo hit those consumers
+    // never run and the list is discarded, and the loop cannot be deferred
+    // because the key that decides the hit is not complete until it ends. An
+    // unbound binding takes {~0, 0} so the span reduction needs no second
+    // predicate. Indexing attributes and bindings in parallel is exact only
+    // because GetVertexInputs pushes to all three vectors once per fetch
+    // shader attribute.
+    Vulkan::VertexInputs<BufferRange> spans;
+    VAddr span_lo = ~VAddr{0};
+    VAddr span_hi = 0;
+    for (size_t i = 0; i < guest_buffers.size(); ++i) {
+        const auto& gb = guest_buffers[i];
+        const VAddr base = gb.base_address;
+        const u32 size = gb.GetSize();
+        const bool bound = base != 0 && size > 0;
+        const VAddr lo = bound ? base : ~VAddr{0};
+        const VAddr hi = bound ? base + size : VAddr{0};
+        spans.emplace_back(lo, hi);
+        if (memo_active) {
+            mix(input_sig, (static_cast<u64>(static_cast<u32>(attributes[i].format)) << 32) |
+                               static_cast<u64>(bindings[i].stride));
+            mix(bind_sig, static_cast<u64>(base));
+            mix(bind_sig, static_cast<u64>(size));
+            span_lo = std::min<VAddr>(span_lo, lo);
+            span_hi = std::max<VAddr>(span_hi, hi);
+        }
+    }
     if (memo_active) {
-        const auto mix = [](u64& h, u64 v) {
-            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        };
         mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
         mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
         mix(input_sig, reinterpret_cast<u64>(&pipeline));
-        for (const auto& b : bindings) {
-            mix(input_sig, (static_cast<u64>(b.binding) << 32) | static_cast<u64>(b.stride));
-            mix(input_sig, static_cast<u64>(static_cast<u32>(b.inputRate)));
-        }
-        for (const auto& a : attributes) {
-            mix(input_sig, (static_cast<u64>(a.location) << 32) | static_cast<u64>(a.binding));
-            mix(input_sig,
-                (static_cast<u64>(static_cast<u32>(a.format)) << 32) | static_cast<u64>(a.offset));
-        }
-        for (const auto& d : divisors) {
-            mix(input_sig, (static_cast<u64>(d.binding) << 32) | static_cast<u64>(d.divisor));
-        }
-        bind_sig = input_sig;
-        for (const auto& gb : guest_buffers) {
-            mix(bind_sig, static_cast<u64>(gb.base_address));
-            mix(bind_sig, static_cast<u64>(gb.GetSize()));
-            mix(bind_sig, static_cast<u64>(gb.GetStride()));
-        }
+        mix(bind_sig, input_sig);
         const u64 tick = scheduler.CurrentTick();
-        VAddr span_lo = ~VAddr{0};
-        VAddr span_hi = 0;
-        for (const auto& gb : guest_buffers) {
-            if (gb.base_address != 0 && gb.GetSize() > 0) {
-                span_lo = std::min<VAddr>(span_lo, gb.base_address);
-                span_hi = std::max<VAddr>(span_hi, gb.base_address + gb.GetSize());
-            }
-        }
         // The memo keys on the bound span's word-epoch sum under the mirror
         // mode, so faults outside the span no longer invalidate it; the
         // certificate is the same one the sync memo relies on.
@@ -770,40 +786,36 @@ void BufferCache::BindVertexBuffers(
         return;
     }
 
-    struct BufferRange {
-        VAddr base_address;
-        VAddr end_address;
-        vk::Buffer vk_buffer;
-        u64 offset;
-
-        [[nodiscard]] size_t GetSize() const {
-            return end_address - base_address;
-        }
-    };
-
-    // Build list of ranges covering the requested buffers
-    Vulkan::VertexInputs<BufferRange> ranges{};
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
-        }
-    }
-
-    // Merge connecting ranges together
+    // Coalesce the bound spans into disjoint ranges. Every entry the span
+    // touches collapses into it, which is the whole merge: the interleaved
+    // attribute layout yields one range, so this costs a compare per binding
+    // where sorting the spans first costs a 32-byte move per binding.
     Vulkan::VertexInputs<BufferRange> ranges_merged{};
-    if (!ranges.empty()) {
-        std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) {
+    for (const auto& span : spans) {
+        if (span.end_address == 0) {
+            continue;
+        }
+        VAddr lo = span.base_address;
+        VAddr hi = span.end_address;
+        size_t kept = 0;
+        for (size_t i = 0; i < ranges_merged.size(); ++i) {
+            const BufferRange range = ranges_merged[i];
+            if (range.end_address < lo || hi < range.base_address) {
+                ranges_merged[kept++] = range;
+                continue;
+            }
+            lo = std::min<VAddr>(lo, range.base_address);
+            hi = std::max<VAddr>(hi, range.end_address);
+        }
+        ranges_merged.resize(kept);
+        ranges_merged.emplace_back(lo, hi);
+    }
+    // Ascending order is what the buffer creation path saw before, and the
+    // merged list is one entry in the common case.
+    if (ranges_merged.size() > 1) {
+        std::ranges::sort(ranges_merged, [](const BufferRange& lhv, const BufferRange& rhv) {
             return lhv.base_address < rhv.base_address;
         });
-        ranges_merged.emplace_back(ranges[0]);
-        for (auto range : ranges) {
-            auto& prev_range = ranges_merged.back();
-            if (prev_range.end_address < range.base_address) {
-                ranges_merged.emplace_back(range);
-            } else {
-                prev_range.end_address = std::max(prev_range.end_address, range.end_address);
-            }
-        }
     }
 
     // Map buffers for merged ranges
@@ -844,24 +856,24 @@ void BufferCache::BindVertexBuffers(
     // Sizes and strides feed only the bindVertexBuffers2 fallback; on devices
     // with vertex-input dynamic state the fills are dead.
     const bool needs_sizes_strides = !instance.IsVertexInputDynamicState();
-    for (const auto& buffer : guest_buffers) {
-        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const VAddr base = spans[i].base_address;
+        if (spans[i].end_address != 0) {
             const auto host_buffer_info =
                 std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
-                    return buffer.base_address >= range.base_address &&
-                           buffer.base_address < range.end_address;
+                    return base >= range.base_address && base < range.end_address;
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
             host_buffers.emplace_back(host_buffer_info->vk_buffer);
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+            host_offsets.push_back(host_buffer_info->offset + base -
                                    host_buffer_info->base_address);
         } else {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
         if (needs_sizes_strides) {
-            host_sizes.push_back(buffer.GetSize());
-            host_strides.push_back(buffer.GetStride());
+            host_sizes.push_back(guest_buffers[i].GetSize());
+            host_strides.push_back(guest_buffers[i].GetStride());
         }
     }
 
