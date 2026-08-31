@@ -69,6 +69,31 @@ static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t 
     return span.subspan(offset);
 }
 
+// The messages are formatted here rather than in the parser loop: fmt binds its
+// arguments by reference, and an address-exposed local in a coroutine is pinned
+// to the frame and written through a spilled pointer on every packet.
+[[noreturn]] static SHAD_NO_INLINE void UnhandledPm4Type(const PM4Header* header) {
+    if (header->type == 0) {
+        UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
+                        header->type0.base.Value(), header->type0.NumWords());
+    }
+    UNREACHABLE_MSG("Wrong PM4 type {}", header->type.Value());
+}
+
+[[noreturn]] static SHAD_NO_INLINE void UnknownPm4Opcode(u32 opcode, u32 count) {
+    UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}", opcode, count);
+}
+
+// Must be the first statement of every draw arm, above the rasterizer guard, so
+// the counts are identical with and without a rasterizer. There is no central
+// opcode list any more: a new draw opcode needs its own call here.
+static void CountDraw(Liverpool::PacketStats& stats, const PM4Header* header) {
+    ++stats.draws;
+    if (header->type3.predicate.Value() == PM4Predicate::PredEnable) {
+        ++stats.predicated_draws;
+    }
+}
+
 // The per-stage user_data words are excluded from the graphics state stamp by
 // contract: engines rewrite them every draw, and marking them would advance
 // the stamp per draw and starve every stamp-keyed cache for zero correctness
@@ -83,6 +108,31 @@ static bool IsGfxUserDataWrite(const Regs& regs, u32 word_addr, u32 num_words) {
     };
     return in_ud(regs.ps_program) || in_ud(regs.vs_program) || in_ud(regs.gs_program) ||
            in_ud(regs.es_program) || in_ud(regs.hs_program) || in_ud(regs.ls_program);
+}
+
+// Only for blocks IsGfxUserDataWrite has already bounded to NUM_USER_DATA
+// words, so every real call lands on a fixed-size arm; the >64 arm carries the
+// malformed packet whose NumWords() masked to 0 and underflowed the size, which
+// faults the same way either way. Every copy must stay a constant size - a
+// length-driven loop is turned back into a memcpy call.
+static void StoreRegBlock(void* dst, const void* src, size_t bytes) {
+    auto* d = static_cast<u8*>(dst);
+    const auto* s = static_cast<const u8*>(src);
+    if (bytes > 64) [[unlikely]] {
+        std::memcpy(d, s, bytes);
+    } else if (bytes > 32) {
+        std::memcpy(d, s, 32);
+        std::memcpy(d + bytes - 32, s + bytes - 32, 32);
+    } else if (bytes > 16) {
+        std::memcpy(d, s, 16);
+        std::memcpy(d + bytes - 16, s + bytes - 16, 16);
+    } else if (bytes > 8) {
+        std::memcpy(d, s, 8);
+        std::memcpy(d + bytes - 8, s + bytes - 8, 8);
+    } else if (bytes >= 4) {
+        std::memcpy(d, s, 4);
+        std::memcpy(d + bytes - 4, s + bytes - 4, 4);
+    }
 }
 
 Liverpool::Liverpool() {
@@ -267,710 +317,682 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
-        const u32 type = header->type;
-
-        switch (type) {
-        default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
-        case 2:
-            // Type-2 packet are used for padding purposes
+        if (header->type != 3) [[unlikely]] {
+            // Type-2 packets are used for padding purposes.
+            if (header->type != 2) {
+                UnhandledPm4Type(header);
+            }
             dcb = NextPacket(dcb, 1);
             continue;
-        case 3:
-            const u32 count = header->type3.NumWords();
-            const PM4ItOpcode opcode = header->type3.opcode;
-            switch (opcode) {
-            case PM4ItOpcode::DrawIndex2:
-            case PM4ItOpcode::DrawIndexOffset2:
-            case PM4ItOpcode::DrawIndexAuto:
-            case PM4ItOpcode::DrawIndirect:
-            case PM4ItOpcode::DrawIndirectMulti:
-            case PM4ItOpcode::DrawIndexIndirect:
-            case PM4ItOpcode::DrawIndexIndirectMulti:
-            case PM4ItOpcode::DrawIndexIndirectCountMulti:
-                ++packet_stats.draws;
-                if (header->type3.predicate.Value() == PM4Predicate::PredEnable) {
-                    ++packet_stats.predicated_draws;
+        }
+
+        const u32 count = header->type3.NumWords();
+        const PM4ItOpcode opcode = header->type3.opcode;
+        switch (opcode) {
+        case PM4ItOpcode::Nop: {
+            const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            if (nop->header.count.Value() == 0) {
+                break;
+            }
+
+            switch (nop->data_block[0]) {
+            case PM4CmdNop::PayloadType::PatchedFlip: {
+                // There is no evidence that GPU CP drives flip events by parsing
+                // special NOP packets. For convenience lets assume that it does.
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                break;
+            }
+            case PM4CmdNop::PayloadType::DebugMarkerPush: {
+                if (guest_markers_enabled) {
+                    const auto marker_sz = nop->header.count.Value() * 2;
+                    const std::string_view label{reinterpret_cast<const char*>(&nop->data_block[1]),
+                                                 marker_sz};
+                    rasterizer->ScopeMarkerBegin(label, true);
                 }
                 break;
+            }
+            case PM4CmdNop::PayloadType::DebugColorMarkerPush: {
+                if (guest_markers_enabled) {
+                    const auto marker_sz = nop->header.count.Value() * 2;
+                    const std::string_view label{reinterpret_cast<const char*>(&nop->data_block[1]),
+                                                 marker_sz};
+                    const u32 color = *reinterpret_cast<const u32*>(
+                        reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
+                    rasterizer->ScopedMarkerInsertColor(label, color, true);
+                }
+                break;
+            }
+            case PM4CmdNop::PayloadType::DebugMarkerPop: {
+                if (guest_markers_enabled) {
+                    rasterizer->ScopeMarkerEnd(true);
+                }
+                break;
+            }
             default:
                 break;
             }
-            switch (opcode) {
-            case PM4ItOpcode::Nop: {
-                const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-                if (nop->header.count.Value() == 0) {
-                    break;
-                }
+            break;
+        }
+        case PM4ItOpcode::ContextControl: {
+            break;
+        }
+        case PM4ItOpcode::ClearState: {
+            regs.SetDefaults();
+            gfx_stamp.MarkDirty();
+            break;
+        }
+        case PM4ItOpcode::SetConfigReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
+            const auto* payload = reinterpret_cast<const u32*>(header + 2);
+            gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+            break;
+        }
+        case PM4ItOpcode::SetContextReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+            const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-                switch (nop->data_block[0]) {
-                case PM4CmdNop::PayloadType::PatchedFlip: {
-                    // There is no evidence that GPU CP drives flip events by parsing
-                    // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugMarkerPush: {
-                    if (guest_markers_enabled) {
-                        const auto marker_sz = nop->header.count.Value() * 2;
-                        const std::string_view label{
-                            reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        rasterizer->ScopeMarkerBegin(label, true);
-                    }
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugColorMarkerPush: {
-                    if (guest_markers_enabled) {
-                        const auto marker_sz = nop->header.count.Value() * 2;
-                        const std::string_view label{
-                            reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        const u32 color = *reinterpret_cast<const u32*>(
-                            reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
-                        rasterizer->ScopedMarkerInsertColor(label, color, true);
-                    }
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugMarkerPop: {
-                    if (guest_markers_enabled) {
-                        rasterizer->ScopeMarkerEnd(true);
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
-                break;
-            }
-            case PM4ItOpcode::ContextControl: {
-                break;
-            }
-            case PM4ItOpcode::ClearState: {
-                regs.SetDefaults();
-                gfx_stamp.MarkDirty();
-                break;
-            }
-            case PM4ItOpcode::SetConfigReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-                break;
-            }
-            case PM4ItOpcode::SetContextReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
+            gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
 
-                gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+            // In the case of HW, render target memory has alignment as color block operates on
+            // tiles. There is no information of actual resource extents stored in CB context
+            // regs, so any deduction of it from slices/pitch will lead to a larger surface
+            // created. The same applies to the depth targets. Fortunately, the guest always
+            // sends a trailing NOP packet right after the context regs setup, so we can use the
+            // heuristic below and extract the hint to determine actual resource dims.
 
-                // In the case of HW, render target memory has alignment as color block operates on
-                // tiles. There is no information of actual resource extents stored in CB context
-                // regs, so any deduction of it from slices/pitch will lead to a larger surface
-                // created. The same applies to the depth targets. Fortunately, the guest always
-                // sends a trailing NOP packet right after the context regs setup, so we can use the
-                // heuristic below and extract the hint to determine actual resource dims.
+            switch (reg_addr) {
+            case ContextRegs::CbColor0Base:
+            case ContextRegs::CbColor1Base:
+            case ContextRegs::CbColor2Base:
+            case ContextRegs::CbColor3Base:
+            case ContextRegs::CbColor4Base:
+            case ContextRegs::CbColor5Base:
+            case ContextRegs::CbColor6Base:
+            case ContextRegs::CbColor7Base: {
+                const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
+                                        (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
+                ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
 
-                switch (reg_addr) {
-                case ContextRegs::CbColor0Base:
-                case ContextRegs::CbColor1Base:
-                case ContextRegs::CbColor2Base:
-                case ContextRegs::CbColor3Base:
-                case ContextRegs::CbColor4Base:
-                case ContextRegs::CbColor5Base:
-                case ContextRegs::CbColor6Base:
-                case ContextRegs::CbColor7Base: {
-                    const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
-                                            (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
-                            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                            gfx_stamp.MarkDirty();
-                        }
-                    } else if (last_cb_extent[col_buf_id].raw != 0) {
-                        last_cb_extent[col_buf_id].raw = 0;
+                const auto nop_offset = header->type3.count;
+                if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+                    ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                               "NOP hint is missing in CB setup sequence");
+                    if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
+                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
                         gfx_stamp.MarkDirty();
                     }
-                    break;
-                }
-                case ContextRegs::CbColor0Cmask:
-                case ContextRegs::CbColor1Cmask:
-                case ContextRegs::CbColor2Cmask:
-                case ContextRegs::CbColor3Cmask:
-                case ContextRegs::CbColor4Cmask:
-                case ContextRegs::CbColor5Cmask:
-                case ContextRegs::CbColor6Cmask:
-                case ContextRegs::CbColor7Cmask: {
-                    const auto col_buf_id =
-                        (reg_addr - ContextRegs::CbColor0Cmask) /
-                        (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x04) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
-                            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                            gfx_stamp.MarkDirty();
-                        }
-                    }
-                    break;
-                }
-                case ContextRegs::DbZInfo: {
-                    if (header->type3.count == 8) {
-                        ASSERT_MSG(payload[20] == 0xc0001000,
-                                   "NOP hint is missing in DB setup sequence");
-                        if (last_db_extent.raw != payload[21]) {
-                            last_db_extent.raw = payload[21];
-                            gfx_stamp.MarkDirty();
-                        }
-                    } else if (last_db_extent.raw != 0) {
-                        last_db_extent.raw = 0;
-                        gfx_stamp.MarkDirty();
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
-                break;
-            }
-            case PM4ItOpcode::SetShReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto set_size = (count - 1) * sizeof(u32);
-
-                if (set_data->reg_offset >= 0x200 &&
-                    set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                    ASSERT(set_size <= sizeof(ComputeProgram));
-                    auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
-                                 (set_data->reg_offset - 0x200);
-                    std::memcpy(addr, header + 2, set_size);
-                } else {
-                    const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
-                    if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
-                        std::memcpy(&regs.reg_array[word], header + 2, set_size);
-                    } else {
-                        gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::SetUconfigReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                gfx_stamp.WriteRegs(
-                    &regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset], header + 2,
-                    (count - 1) * sizeof(u32));
-                break;
-            }
-            case PM4ItOpcode::SetPredication: {
-                ++packet_stats.set_predication;
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
-                break;
-            }
-            case PM4ItOpcode::IndexType: {
-                const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
-                if (regs.index_buffer_type.raw != index_type->raw) {
-                    regs.index_buffer_type.raw = index_type->raw;
+                } else if (last_cb_extent[col_buf_id].raw != 0) {
+                    last_cb_extent[col_buf_id].raw = 0;
                     gfx_stamp.MarkDirty();
+                }
+                break;
+            }
+            case ContextRegs::CbColor0Cmask:
+            case ContextRegs::CbColor1Cmask:
+            case ContextRegs::CbColor2Cmask:
+            case ContextRegs::CbColor3Cmask:
+            case ContextRegs::CbColor4Cmask:
+            case ContextRegs::CbColor5Cmask:
+            case ContextRegs::CbColor6Cmask:
+            case ContextRegs::CbColor7Cmask: {
+                const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Cmask) /
+                                        (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
+                ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+                const auto nop_offset = header->type3.count;
+                if (nop_offset == 0x04) {
+                    ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                               "NOP hint is missing in CB setup sequence");
+                    if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
+                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+                        gfx_stamp.MarkDirty();
+                    }
+                }
+                break;
+            }
+            case ContextRegs::DbZInfo: {
+                if (header->type3.count == 8) {
+                    ASSERT_MSG(payload[20] == 0xc0001000,
+                               "NOP hint is missing in DB setup sequence");
+                    if (last_db_extent.raw != payload[21]) {
+                        last_db_extent.raw = payload[21];
+                        gfx_stamp.MarkDirty();
+                    }
+                } else if (last_db_extent.raw != 0) {
+                    last_db_extent.raw = 0;
+                    gfx_stamp.MarkDirty();
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            break;
+        }
+        case PM4ItOpcode::SetShReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const auto set_size = (count - 1) * sizeof(u32);
+
+            if (set_data->reg_offset >= 0x200 &&
+                set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+                ASSERT(set_size <= sizeof(ComputeProgram));
+                auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
+                             (set_data->reg_offset - 0x200);
+                std::memcpy(addr, header + 2, set_size);
+            } else {
+                const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+                if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+                    StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
                 } else {
-                    regs.index_buffer_type.raw = index_type->raw;
+                    gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
                 }
-                break;
             }
-            case PM4ItOpcode::DrawIndex2: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
-                regs.max_index_size = draw_index->max_size;
-                regs.index_base_address.base_addr_lo = draw_index->index_base_lo;
-                regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
-                regs.num_indices = draw_index->index_count;
-                regs.draw_initiator = draw_index->draw_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            break;
+        }
+        case PM4ItOpcode::SetUconfigReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            gfx_stamp.WriteRegs(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
+                                header + 2, (count - 1) * sizeof(u32));
+            break;
+        }
+        case PM4ItOpcode::SetPredication: {
+            ++packet_stats.set_predication;
+            LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+            break;
+        }
+        case PM4ItOpcode::IndexType: {
+            const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
+            if (regs.index_buffer_type.raw != index_type->raw) {
+                regs.index_buffer_type.raw = index_type->raw;
+                gfx_stamp.MarkDirty();
+            } else {
+                regs.index_buffer_type.raw = index_type->raw;
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndex2: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
+            regs.max_index_size = draw_index->max_size;
+            regs.index_base_address.base_addr_lo = draw_index->index_base_lo;
+            regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
+            regs.num_indices = draw_index->index_count;
+            regs.draw_initiator = draw_index->draw_initiator;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DrawIndex2", cmd_address));
+                    rasterizer->Draw(true);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->Draw(true);
                 }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexOffset2: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_index_off = reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
+            regs.max_index_size = draw_index_off->max_size;
+            regs.num_indices = draw_index_off->index_count;
+            regs.draw_initiator = draw_index_off->draw_initiator;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(
+                        fmt::format("gfx:{}:DrawIndexOffset2", cmd_address));
+                    rasterizer->Draw(true, draw_index_off->index_offset);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->Draw(true, draw_index_off->index_offset);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexAuto: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
+            regs.num_indices = draw_index->index_count;
+            regs.draw_initiator = draw_index->draw_initiator;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DrawIndexAuto", cmd_address));
+                    rasterizer->Draw(false);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->Draw(false);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndirect: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirect*>(header);
+            const auto offset = draw_indirect->data_offset;
+            const auto stride = sizeof(DrawIndirectArgs);
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DrawIndirect", cmd_address));
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndirectMulti: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
+            const auto offset = draw_indirect->data_offset;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(
+                        fmt::format("gfx:{}:DrawIndirectMulti", cmd_address));
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset,
+                                             draw_indirect->stride, draw_indirect->count, 0);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset,
+                                             draw_indirect->stride, draw_indirect->count, 0);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirect: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_index_indirect =
+                reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
+            const auto offset = draw_index_indirect->data_offset;
+            const auto stride = sizeof(DrawIndexedIndirectArgs);
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(
+                        fmt::format("gfx:{}:DrawIndexIndirect", cmd_address));
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirectMulti: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_index_indirect =
+                reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
+            const auto offset = draw_index_indirect->data_offset;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(
+                        fmt::format("gfx:{}:DrawIndexIndirectMulti", cmd_address));
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
+                                             draw_index_indirect->stride,
+                                             draw_index_indirect->count, 0);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
+                                             draw_index_indirect->stride,
+                                             draw_index_indirect->count, 0);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirectCountMulti: {
+            CountDraw(packet_stats, header);
+            gfx_stamp.FlushAtDraw();
+            const auto* draw_index_indirect =
+                reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
+            const auto offset = draw_index_indirect->data_offset;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(
+                        fmt::format("gfx:{}:DrawIndexIndirectCountMulti", cmd_address));
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
+                                             draw_index_indirect->stride,
+                                             draw_index_indirect->count,
+                                             draw_index_indirect->count_indirect_enable.Value()
+                                                 ? draw_index_indirect->count_addr
+                                                 : 0);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
+                                             draw_index_indirect->stride,
+                                             draw_index_indirect->count,
+                                             draw_index_indirect->count_indirect_enable.Value()
+                                                 ? draw_index_indirect->count_addr
+                                                 : 0);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchDirect: {
+            ++packet_stats.dispatches;
+            gfx_stamp.FlushAtDraw();
+            const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            auto& cs_program = GetCsRegs();
+            cs_program.dim_x = dispatch_direct->dim_x;
+            cs_program.dim_y = dispatch_direct->dim_y;
+            cs_program.dim_z = dispatch_direct->dim_z;
+            cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
+                                               cs_program);
+            }
+            if (rasterizer && (cs_program.dispatch_initiator & 1)) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DispatchDirect", cmd_address));
+                    rasterizer->DispatchDirect();
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DispatchDirect();
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchIndirect: {
+            gfx_stamp.FlushAtDraw();
+            const auto* dispatch_indirect = reinterpret_cast<const PM4CmdDispatchIndirect*>(header);
+            auto& cs_program = GetCsRegs();
+            const auto offset = dispatch_indirect->data_offset;
+            const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
+            if (DebugState.DumpingCurrentReg()) {
+                DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
+                                               cs_program);
+            }
+            if (rasterizer && (cs_program.dispatch_initiator & 1)) {
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                if (host_markers_enabled) {
+                    rasterizer->ScopeMarkerBegin(
+                        fmt::format("gfx:{}:DispatchIndirect", cmd_address));
+                    rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
+                    rasterizer->ScopeMarkerEnd();
+                } else {
+                    rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::NumInstances: {
+            const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
+            regs.num_instances.num_instances = num_instances->num_instances;
+            break;
+        }
+        case PM4ItOpcode::IndexBase: {
+            const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
+            regs.index_base_address.base_addr_lo = index_base->addr_lo;
+            regs.index_base_address.base_addr_hi = index_base->addr_hi;
+            break;
+        }
+        case PM4ItOpcode::IndexBufferSize: {
+            const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
+            regs.num_indices = index_size->num_indices;
+            break;
+        }
+        case PM4ItOpcode::SetBase: {
+            const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
+            ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
+            indirect_args_addr = set_base->Address<u64>();
+            break;
+        }
+        case PM4ItOpcode::EventWrite: {
+            const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
+                      magic_enum::enum_name(event->event_type.Value()),
+                      magic_enum::enum_name(event->event_index.Value()));
+            if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+                // TODO: handle proper synchronization, for now signal that update is done
+                // immediately
+                regs.cp_strmout_cntl.offset_update_done = 1;
+            } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+                if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                    ++packet_stats.occlusion_events;
+                    static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+                    static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+                    u64* results = event->Address<u64*>();
+                    for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                        *results = pixel_counter | OcclusionCounterValidMask;
+                    }
+                    pixel_counter += OcclusionCounterStep;
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::EventWriteEos: {
+            const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+            if (rasterizer) {
+                rasterizer->ProcessDownloadImages();
+            }
+            event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                    memcpy(address, &data, num_bytes);
+                }
+            });
+            if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+                ASSERT(event_eos->size == 1);
                 if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DrawIndex2", cmd_address));
-                        rasterizer->Draw(true);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->Draw(true);
-                    }
+                    rasterizer->Finish();
+                    const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                    *event_eos->Address() = value;
                 }
-                break;
             }
-            case PM4ItOpcode::DrawIndexOffset2: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_index_off =
-                    reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
-                regs.max_index_size = draw_index_off->max_size;
-                regs.num_indices = draw_index_off->index_count;
-                regs.draw_initiator = draw_index_off->draw_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndexOffset2", cmd_address));
-                        rasterizer->Draw(true, draw_index_off->index_offset);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->Draw(true, draw_index_off->index_offset);
-                    }
-                }
-                break;
+            break;
+        }
+        case PM4ItOpcode::EventWriteEop: {
+            const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+            if (rasterizer) {
+                rasterizer->ProcessDownloadImages();
             }
-            case PM4ItOpcode::DrawIndexAuto: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
-                regs.num_indices = draw_index->index_count;
-                regs.draw_initiator = draw_index->draw_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndexAuto", cmd_address));
-                        rasterizer->Draw(false);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->Draw(false);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DrawIndirect: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirect*>(header);
-                const auto offset = draw_indirect->data_offset;
-                const auto stride = sizeof(DrawIndirectArgs);
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndirect", cmd_address));
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DrawIndirectMulti: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
-                const auto offset = draw_indirect->data_offset;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndirectMulti", cmd_address));
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                                 draw_indirect->stride, draw_indirect->count, 0);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                                 draw_indirect->stride, draw_indirect->count, 0);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DrawIndexIndirect: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_index_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
-                const auto offset = draw_index_indirect->data_offset;
-                const auto stride = sizeof(DrawIndexedIndirectArgs);
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndexIndirect", cmd_address));
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DrawIndexIndirectMulti: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_index_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
-                const auto offset = draw_index_indirect->data_offset;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndexIndirectMulti", cmd_address));
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count, 0);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count, 0);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DrawIndexIndirectCountMulti: {
-                gfx_stamp.FlushAtDraw();
-                const auto* draw_index_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
-                const auto offset = draw_index_indirect->data_offset;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (rasterizer) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DrawIndexIndirectCountMulti", cmd_address));
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count,
-                                                 draw_index_indirect->count_indirect_enable.Value()
-                                                     ? draw_index_indirect->count_addr
-                                                     : 0);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                                 draw_index_indirect->stride,
-                                                 draw_index_indirect->count,
-                                                 draw_index_indirect->count_indirect_enable.Value()
-                                                     ? draw_index_indirect->count_addr
-                                                     : 0);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DispatchDirect: {
-                ++packet_stats.dispatches;
-                gfx_stamp.FlushAtDraw();
-                const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
-                auto& cs_program = GetCsRegs();
-                cs_program.dim_x = dispatch_direct->dim_x;
-                cs_program.dim_y = dispatch_direct->dim_y;
-                cs_program.dim_z = dispatch_direct->dim_z;
-                cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
-                                                   cs_program);
-                }
-                if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DispatchDirect", cmd_address));
-                        rasterizer->DispatchDirect();
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DispatchDirect();
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::DispatchIndirect: {
-                gfx_stamp.FlushAtDraw();
-                const auto* dispatch_indirect =
-                    reinterpret_cast<const PM4CmdDispatchIndirect*>(header);
-                auto& cs_program = GetCsRegs();
-                const auto offset = dispatch_indirect->data_offset;
-                const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
-                                                   cs_program);
-                }
-                if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                    const auto cmd_address = reinterpret_cast<const void*>(header);
-                    if (host_markers_enabled) {
-                        rasterizer->ScopeMarkerBegin(
-                            fmt::format("gfx:{}:DispatchIndirect", cmd_address));
-                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
-                        rasterizer->ScopeMarkerEnd();
-                    } else {
-                        rasterizer->DispatchIndirect(indirect_args_addr, offset, size);
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::NumInstances: {
-                const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
-                regs.num_instances.num_instances = num_instances->num_instances;
-                break;
-            }
-            case PM4ItOpcode::IndexBase: {
-                const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
-                regs.index_base_address.base_addr_lo = index_base->addr_lo;
-                regs.index_base_address.base_addr_hi = index_base->addr_hi;
-                break;
-            }
-            case PM4ItOpcode::IndexBufferSize: {
-                const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
-                regs.num_indices = index_size->num_indices;
-                break;
-            }
-            case PM4ItOpcode::SetBase: {
-                const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
-                ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
-                indirect_args_addr = set_base->Address<u64>();
-                break;
-            }
-            case PM4ItOpcode::EventWrite: {
-                const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
-                LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
-                          magic_enum::enum_name(event->event_type.Value()),
-                          magic_enum::enum_name(event->event_index.Value()));
-                if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
-                    // TODO: handle proper synchronization, for now signal that update is done
-                    // immediately
-                    regs.cp_strmout_cntl.offset_update_done = 1;
-                } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        ++packet_stats.occlusion_events;
-                        static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                        }
-                        pixel_counter += OcclusionCounterStep;
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::EventWriteEos: {
-                const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+            event_eop->SignalFence(
+                [](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                         memcpy(address, &data, num_bytes);
                     }
-                });
-                if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
-                    ASSERT(event_eos->size == 1);
-                    if (rasterizer) {
-                        rasterizer->Finish();
-                        const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        *event_eos->Address() = value;
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::EventWriteEop: {
-                const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
-                    rasterizer->ProcessDownloadImages();
-                }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            memcpy(address, &data, num_bytes);
-                        }
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                break;
-            }
-            case PM4ItOpcode::DmaData: {
-                const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
-                if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
-                    break;
-                }
-                if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                           dma_data->data, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                           dma_data->data, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                           dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
-                } else {
-                    UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
-                                    u32(dma_data->src_sel.Value()), u32(dma_data->dst_sel.Value()));
-                }
-                break;
-            }
-            case PM4ItOpcode::WriteData: {
-                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-                ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-                const u32 data_size = (header->type3.count.Value() - 2) * 4;
-                u64* address = write_data->Address<u64*>();
-                if (!write_data->wr_one_addr.Value()) {
-                    std::memcpy(address, write_data->data, data_size);
-                } else {
-                    UNREACHABLE();
-                }
-                break;
-            }
-            case PM4ItOpcode::CopyData: {
-                const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-                LOG_WARNING(Render,
-                            "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                            "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                            u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                            copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                            u32(copy_data->engine_sel.Value()));
-                break;
-            }
-            case PM4ItOpcode::MemSemaphore: {
-                const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-                if (mem_semaphore->IsSignaling()) {
-                    mem_semaphore->Signal();
-                } else {
-                    while (!mem_semaphore->Signaled()) {
-                        YIELD_GFX();
-                    }
-                    mem_semaphore->Decrement();
-                }
-                break;
-            }
-            case PM4ItOpcode::AcquireMem: {
-                // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
-                break;
-            }
-            case PM4ItOpcode::Rewind: {
-                if (!rasterizer) {
-                    break;
-                }
-                const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
-                while (!rewind->Valid()) {
-                    YIELD_GFX();
-                }
-                break;
-            }
-            case PM4ItOpcode::WaitRegMem: {
-                const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
-                // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-                // Optimization: VO label waits are special because the emulator
-                // will write to the label when presentation is finished. So if
-                // there are no other submits to yield to we can sleep the thread
-                // instead and allow other tasks to run.
-                const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (vo_port->IsVoLabel(wait_addr) &&
-                    num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
-                    break;
-                }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
-                }
-                break;
-            }
-            case PM4ItOpcode::IndirectBuffer: {
-                const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
-                RESUME_GFX(task);
-
-                while (!task.handle.done()) {
-                    YIELD_GFX();
-                    RESUME_GFX(task);
-                }
-                break;
-            }
-            case PM4ItOpcode::IncrementDeCounter: {
-                ++cblock.de_count;
-                break;
-            }
-            case PM4ItOpcode::WaitOnCeCounter: {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
-                    RESUME_GFX(ce_task);
-                }
-                break;
-            }
-            case PM4ItOpcode::PfpSyncMe: {
-                if (rasterizer) {
-                    rasterizer->CpSync();
-                }
-                break;
-            }
-            case PM4ItOpcode::StrmoutBufferUpdate: {
-                const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-                LOG_WARNING(Render_Vulkan,
-                            "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                            "source_select = {}, buffer_select = {}",
-                            strmout->update_memory.Value(),
-                            magic_enum::enum_name(strmout->source_select.Value()),
-                            strmout->buffer_select.Value());
-                break;
-            }
-            case PM4ItOpcode::GetLodStats: {
-                LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
-                break;
-            }
-            case PM4ItOpcode::CondExec: {
-                const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
-                if (cond_exec->command.Value() != 0) {
-                    LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
-                }
-                const auto skip = *cond_exec->Address() == false;
-                if (skip) {
-                    dcb = NextPacket(dcb,
-                                     header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
-                    continue;
-                }
-                break;
-            }
-            default:
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
-            }
-            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+                },
+                [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
             break;
         }
+        case PM4ItOpcode::DmaData: {
+            const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
+            if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
+                break;
+            }
+            if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+                rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
+                                       true);
+            } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                        dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                       dma_data->dst_sel == DmaDataDst::Gds) {
+                rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                                       dma_data->NumBytes(), true, false);
+            } else if (dma_data->src_sel == DmaDataSrc::Data &&
+                       (dma_data->dst_sel == DmaDataDst::Memory ||
+                        dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                       dma_data->data, false);
+            } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+                       (dma_data->dst_sel == DmaDataDst::Memory ||
+                        dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
+                                       dma_data->NumBytes(), false, true);
+            } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                        dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                       (dma_data->dst_sel == DmaDataDst::Memory ||
+                        dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(),
+                                       dma_data->NumBytes(), false, false);
+            } else {
+                UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
+                                u32(dma_data->src_sel.Value()), u32(dma_data->dst_sel.Value()));
+            }
+            break;
+        }
+        case PM4ItOpcode::WriteData: {
+            const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+            ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
+            const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            u64* address = write_data->Address<u64*>();
+            if (!write_data->wr_one_addr.Value()) {
+                std::memcpy(address, write_data->data, data_size);
+            } else {
+                UNREACHABLE();
+            }
+            break;
+        }
+        case PM4ItOpcode::CopyData: {
+            const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
+            LOG_WARNING(Render,
+                        "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
+                        "count_sel = {}, wr_confirm = {}, engine_sel = {}",
+                        u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
+                        copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
+                        u32(copy_data->engine_sel.Value()));
+            break;
+        }
+        case PM4ItOpcode::MemSemaphore: {
+            const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            if (mem_semaphore->IsSignaling()) {
+                mem_semaphore->Signal();
+            } else {
+                while (!mem_semaphore->Signaled()) {
+                    YIELD_GFX();
+                }
+                mem_semaphore->Decrement();
+            }
+            break;
+        }
+        case PM4ItOpcode::AcquireMem: {
+            // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
+            break;
+        }
+        case PM4ItOpcode::Rewind: {
+            if (!rasterizer) {
+                break;
+            }
+            const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            while (!rewind->Valid()) {
+                YIELD_GFX();
+            }
+            break;
+        }
+        case PM4ItOpcode::WaitRegMem: {
+            const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            // Optimization: VO label waits are special because the emulator
+            // will write to the label when presentation is finished. So if
+            // there are no other submits to yield to we can sleep the thread
+            // instead and allow other tasks to run.
+            const u64* wait_addr = wait_reg_mem->Address<u64*>();
+            if (vo_port->IsVoLabel(wait_addr) &&
+                num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                break;
+            }
+            while (!wait_reg_mem->Test(regs.reg_array)) {
+                YIELD_GFX();
+            }
+            break;
+        }
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            auto task = ProcessGraphics(
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+            RESUME_GFX(task);
+
+            while (!task.handle.done()) {
+                YIELD_GFX();
+                RESUME_GFX(task);
+            }
+            break;
+        }
+        case PM4ItOpcode::IncrementDeCounter: {
+            ++cblock.de_count;
+            break;
+        }
+        case PM4ItOpcode::WaitOnCeCounter: {
+            while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                RESUME_GFX(ce_task);
+            }
+            break;
+        }
+        case PM4ItOpcode::PfpSyncMe: {
+            if (rasterizer) {
+                rasterizer->CpSync();
+            }
+            break;
+        }
+        case PM4ItOpcode::StrmoutBufferUpdate: {
+            const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
+            LOG_WARNING(Render_Vulkan,
+                        "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
+                        "source_select = {}, buffer_select = {}",
+                        strmout->update_memory.Value(),
+                        magic_enum::enum_name(strmout->source_select.Value()),
+                        strmout->buffer_select.Value());
+            break;
+        }
+        case PM4ItOpcode::GetLodStats: {
+            LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (cond_exec->command.Value() != 0) {
+                LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
+            }
+            const auto skip = *cond_exec->Address() == false;
+            if (skip) {
+                dcb = NextPacket(dcb, count + 1 + cond_exec->exec_count.Value());
+                continue;
+            }
+            break;
+        }
+        default:
+            UnknownPm4Opcode(static_cast<u32>(opcode), count);
+        }
+        dcb = NextPacket(dcb, count + 1);
     }
 
     if (ce_task.handle) {
@@ -1130,7 +1152,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
                 if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
-                    std::memcpy(&regs.reg_array[word], header + 2, set_size);
+                    StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
                 } else {
                     gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size);
                 }
