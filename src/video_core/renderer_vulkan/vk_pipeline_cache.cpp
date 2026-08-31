@@ -624,6 +624,10 @@ bool PipelineCache::RefreshGraphicsKey() {
     // Second pass to mask out render targets not written by shader and fill remaining info
     u8 color_samples = 0;
     bool all_color_samples_same = true;
+    // Accumulated in a local: maxing through the persistent key byte made the
+    // loop carry its dependency through a store-forward round trip per
+    // attachment, and nothing inside the loop reads key.num_samples.
+    u8 num_samples = key.num_samples;
     for (s32 cb = 0; cb < key.num_color_attachments && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
         const u32 target_mask = regs.color_target_mask.GetMask(cb);
@@ -648,8 +652,9 @@ bool PipelineCache::RefreshGraphicsKey() {
         const u8 prev_color_samples = std::exchange(color_samples, col_buf.NumSamples());
         all_color_samples_same &= color_samples == prev_color_samples || prev_color_samples == 0;
         key.color_samples[cb] = color_samples;
-        key.num_samples = std::max(key.num_samples, color_samples);
+        num_samples = std::max(num_samples, color_samples);
     }
+    key.num_samples = num_samples;
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
     if (color_samples != 0) {
