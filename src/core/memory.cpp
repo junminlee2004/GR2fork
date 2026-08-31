@@ -231,7 +231,7 @@ void MemoryManager::RegisterUnmapDrain(void (*drain)(void*), void* user) {
 }
 
 u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out,
-                                       u32 max_spans) {
+                                       u32 max_spans, bool open_push_window) {
     // The batch scope already holds the shared lock for this thread (see
     // CopySparseMemory); the vma map and phys_areas are stable underneath it.
     std::shared_lock lk{mutex, std::defer_lock};
@@ -254,7 +254,9 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
         if (entry.generation == vma_generation && virtual_addr >= entry.base &&
             virtual_addr + size <= entry.end) {
             out[0] = BackingSpan{entry.backing + (virtual_addr - entry.base), size};
-            g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
+            if (open_push_window) {
+                g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
+            }
             return 1;
         }
     }
@@ -306,8 +308,11 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
     }
     // A successful resolve opens the push window before the shared lock
     // drops; the caller closes it with EndBackingPush once its jobs are
-    // queued, and the unmap drain below waits the window out first.
-    g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
+    // queued, and the unmap drain waits the window out first. The lane's
+    // unsafe mode runs without windows and accepts the unmap race.
+    if (open_push_window) {
+        g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
+    }
     return num_spans;
 }
 

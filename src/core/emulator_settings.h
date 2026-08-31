@@ -467,10 +467,11 @@ struct GPUSettings {
     // pop (a lock plus a fence-query ioctl) once per this many draw-rate
     // polls instead of every draw. 0 polls every call.
     Setting<u32> pending_pop_throttle{0};
-    // Number of worker threads that drain guest -> stream-ring copies queued
-    // by the GPU command thread. Ring offsets are still allocated in order on
-    // that thread; only the byte movement moves off it, fenced before every
-    // submit. 0 copies inline (today's behavior).
+    // Stream copy lane mode. 0 disables it (copies stay inline on the GPU
+    // command thread). 1 runs the unsafe fast path: no foreign-producer
+    // refusal and no unmap push windows - only for titles that never unmap
+    // mid-play. 2 runs the hardened path, safe everywhere. Both modes drain
+    // through two worker threads, fenced before every submit.
     Setting<u32> stream_copy_workers{0};
     // Skip the eager FindBuffer in binding pass 1 for read-only descriptors
     // small enough for the stream path, which never dereferences the id.

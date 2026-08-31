@@ -251,7 +251,9 @@ public:
             auto* memory = Core::Memory::Instance();
             if (memory->IsValidMapping(src_vaddr)) {
                 Core::MemoryManager::BackingSpan spans[2];
-                const u32 num_spans = memory->ResolveBackingSpans(src_vaddr, size, spans, 2);
+                const bool hardened = lane.Hardened();
+                const u32 num_spans =
+                    memory->ResolveBackingSpans(src_vaddr, size, spans, 2, hardened);
                 if (num_spans != 0) {
                     const auto [data, offset] = Map(size, alignment < 64 ? 64 : alignment);
                     u8* dst = data;
@@ -265,7 +267,9 @@ public:
                         }
                         dst += spans[i].size;
                     }
-                    Core::MemoryManager::EndBackingPush();
+                    if (hardened) {
+                        Core::MemoryManager::EndBackingPush();
+                    }
                     Commit();
                     return offset;
                 }

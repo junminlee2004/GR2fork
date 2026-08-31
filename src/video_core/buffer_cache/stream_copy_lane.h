@@ -31,7 +31,14 @@ class StreamCopyLane {
 public:
     static StreamCopyLane& Instance();
 
-    void Init(u32 num_workers);
+    void Init(u32 num_workers, bool hardened);
+
+    /// Safe mode: foreign-producer refusal, atomic barrier targets and the
+    /// resolver push windows. Unsafe mode is byte-for-byte the original hot
+    /// path and must only run for titles that never unmap mid-play.
+    bool Hardened() const {
+        return hardened_;
+    }
     void Shutdown();
 
     bool Enabled() const {
@@ -84,6 +91,7 @@ private:
     std::vector<std::thread> threads_;
     std::atomic<u32> num_workers_{0};
     std::atomic<bool> stop_{false};
+    bool hardened_{true};
 
     // Producer-owned (GPU command thread); plain because single-writer. The
     // alignas(64) on published_ keeps the worker-touched atomics off this line.

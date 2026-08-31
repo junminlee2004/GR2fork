@@ -288,7 +288,8 @@ public:
     /// Resolves [virtual_addr, virtual_addr + size) to backing spans for the
     /// stream copy lane. Returns the span count, or 0 when any part of the
     /// range lacks physical backing (the caller copies inline instead).
-    u32 ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out, u32 max_spans);
+    u32 ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out, u32 max_spans,
+                            bool open_push_window);
 
     /// Called (if registered) before an unmap edits the address space, so the
     /// stream copy lane can drain jobs whose backing pointers would dangle.

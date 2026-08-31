@@ -14,10 +14,11 @@ StreamCopyLane& StreamCopyLane::Instance() {
     return lane;
 }
 
-void StreamCopyLane::Init(u32 num_workers) {
+void StreamCopyLane::Init(u32 num_workers, bool hardened) {
     if (num_workers == 0 || !threads_.empty()) {
         return;
     }
+    hardened_ = hardened;
     slots_ = std::make_unique<Slot[]>(kRingSlots);
     for (size_t i = 0; i < kRingSlots; ++i) {
         slots_[i].seq.store(i, std::memory_order_relaxed);
@@ -48,14 +49,16 @@ void StreamCopyLane::Shutdown() {
 }
 
 bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
-    // Single-producer contract, enforced: readback fault paths run emulator
-    // code on guest threads, and a second producer would corrupt the plain
-    // enqueue cursor. A foreign caller copies inline instead.
-    const u64 tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
-    if (producer_tid_.load(std::memory_order_relaxed) != tid) {
-        u64 expected = 0;
-        if (!producer_tid_.compare_exchange_strong(expected, tid, std::memory_order_relaxed)) {
-            return false;
+    // Single-producer contract, enforced in safe mode: readback fault paths
+    // run emulator code on guest threads, and a second producer would corrupt
+    // the plain enqueue cursor. A foreign caller copies inline instead.
+    if (hardened_) {
+        const u64 tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        if (producer_tid_.load(std::memory_order_relaxed) != tid) {
+            u64 expected = 0;
+            if (!producer_tid_.compare_exchange_strong(expected, tid, std::memory_order_relaxed)) {
+                return false;
+            }
         }
     }
     // Only the producer writes enqueue_pos_, so one read serves the whole
@@ -133,10 +136,10 @@ void StreamCopyLane::DrainProducer() {
     if (!Enabled()) {
         return;
     }
-    // published_ rather than the producer-plain cursor: fault-path flushes
-    // reach this from guest threads, and on the producer itself the two are
-    // always equal (published_ is stored on every push).
-    const u64 target = published_.load(std::memory_order_acquire);
+    // Safe mode targets published_ rather than the producer-plain cursor:
+    // fault-path flushes reach this from guest threads, and on the producer
+    // itself the two are always equal (published_ is stored on every push).
+    const u64 target = hardened_ ? published_.load(std::memory_order_acquire) : enqueue_pos_;
     if (copies_done_.load(std::memory_order_acquire) >= target) {
         return;
     }

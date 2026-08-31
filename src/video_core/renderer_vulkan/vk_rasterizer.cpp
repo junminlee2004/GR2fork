@@ -69,9 +69,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
     tsc_hz_ = Common::EstimateRDTSCFrequency();
-    const u32 lane_workers = std::min<u32>(EmulatorSettings.GetStreamCopyWorkers(), 3);
-    if (lane_workers != 0) {
-        VideoCore::StreamCopyLane::Instance().Init(lane_workers);
+    // Mode, not a worker count: 0 disables the lane, 1 is the unsafe fast
+    // path (titles that never unmap mid-play), 2 and above the hardened one.
+    // Both modes run two workers, the measured knee.
+    const u32 lane_mode = EmulatorSettings.GetStreamCopyWorkers();
+    if (lane_mode != 0) {
+        VideoCore::StreamCopyLane::Instance().Init(2, lane_mode >= 2);
         Core::MemoryManager::RegisterUnmapDrain(
             [](void*) { VideoCore::StreamCopyLane::Instance().DrainRemote(); }, nullptr);
     }
