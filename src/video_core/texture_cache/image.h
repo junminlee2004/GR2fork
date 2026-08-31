@@ -247,17 +247,10 @@ public:
     };
     struct BackingImage {
         UniqueImage image;
-        State state;
-        std::vector<State> subresource_states;
-        // Number of subresource_states entries whose layout or access differ
-        // from `state`, or that carry write access. While the vector is alive
-        // `state` is frozen, so this is stable; when it is zero every entry
-        // would no-op any matching-state scan and the vector is equivalent to
-        // empty. Stages are deliberately excluded (they do not affect the
-        // scan's skip condition); stage_union tracks them so a collapse can
-        // widen the source stage mask conservatively instead.
-        u32 subres_divergent{};
-        vk::PipelineStageFlags2 subres_stage_union{};
+        // The draw path's reads cluster below, aligned so the barrier-noop
+        // memo probe, the state compare and the descriptor write's layout pay
+        // for one line instead of three scattered ones.
+        alignas(64) State state;
 
         // Negative-result memo for GetBarriers. Transitioning an image to a
         // state it already holds is by far the common case (the same textures
@@ -271,12 +264,26 @@ public:
         vk::AccessFlags2 noop_access{};
         vk::PipelineStageFlags2 noop_stage{};
         u64 noop_range{};
+        std::vector<State> subresource_states;
+        // Number of subresource_states entries whose layout or access differ
+        // from `state`, or that carry write access. While the vector is alive
+        // `state` is frozen, so this is stable; when it is zero every entry
+        // would no-op any matching-state scan and the vector is equivalent to
+        // empty. Stages are deliberately excluded (they do not affect the
+        // scan's skip condition); stage_union tracks them so a collapse can
+        // widen the source stage mask conservatively instead.
+        u32 subres_divergent{};
+        vk::PipelineStageFlags2 subres_stage_union{};
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
+    // Mirror of backing->num_samples: FindView's per-bind sample check read
+    // the LAST field of the 528-byte backing, a line nothing else on the draw
+    // path touches. Updated wherever backing or its sample count changes.
+    u32 backing_num_samples{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
     u64 lru_id{};

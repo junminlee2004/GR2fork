@@ -191,6 +191,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
+    backing_num_samples = info.num_samples;
     backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
     backing->image.Create(image_ci);
 
@@ -204,7 +205,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
 Image::~Image() = default;
 
 ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_samples) {
-    if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
+    if (ensure_guest_samples && backing_num_samples > 1 != info.num_samples > 1) {
         SetBackingSamples(info.num_samples);
     }
     const auto& view_infos = backing->image_view_infos;
@@ -961,6 +962,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
     }
 
     backing = new_backing;
+    backing_num_samples = new_backing->num_samples;
 }
 
 } // namespace VideoCore
