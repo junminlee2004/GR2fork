@@ -144,6 +144,26 @@ public:
         return stats;
     }
 
+    // Telemetry for the DMA-draw full-overlap sync (the round-5 rank-2
+    // instrumentation): how many range syncs run, how many buffers each walk
+    // touches, and how many bytes each pass asks SynchronizeBuffer to cover.
+    // Sizes the bound before any narrowing is designed.
+    struct DmaSyncStats {
+        u64 calls;
+        u64 buffers;
+        u64 bytes;
+        u64 max_bytes;
+    };
+    DmaSyncStats DrainDmaSyncStats() {
+        const DmaSyncStats stats{dmasync_calls_, dmasync_buffers_, dmasync_bytes_,
+                                 dmasync_max_bytes_};
+        dmasync_calls_ = 0;
+        dmasync_buffers_ = 0;
+        dmasync_bytes_ = 0;
+        dmasync_max_bytes_ = 0;
+        return stats;
+    }
+
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
@@ -415,6 +435,10 @@ private:
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
     bool batch_copy_lock_{};
+    u64 dmasync_calls_{};
+    u64 dmasync_buffers_{};
+    u64 dmasync_bytes_{};
+    u64 dmasync_max_bytes_{};
 };
 
 } // namespace VideoCore

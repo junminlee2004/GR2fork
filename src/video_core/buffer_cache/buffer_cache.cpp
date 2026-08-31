@@ -1706,11 +1706,15 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
 
 void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
     const VAddr device_addr_end = device_addr + size;
+    ++dmasync_calls_;
     ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
         RENDERER_TRACE;
         VAddr start = std::max(buffer.CpuAddr(), device_addr);
         VAddr end = std::min(buffer.CpuAddr() + buffer.SizeBytes(), device_addr_end);
         u32 size = static_cast<u32>(end - start);
+        ++dmasync_buffers_;
+        dmasync_bytes_ += size;
+        dmasync_max_bytes_ = std::max<u64>(dmasync_max_bytes_, size);
         SynchronizeBuffer(buffer, start, size, false, false);
     });
 }

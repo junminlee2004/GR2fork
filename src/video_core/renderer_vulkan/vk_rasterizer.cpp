@@ -693,6 +693,12 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] STREAMCOPY hits={} probes={} per300f",
                          sc.hits, sc.probes);
             }
+            const auto ds = buffer_cache.DrainDmaSyncStats();
+            if (ds.calls) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] DMASYNC calls={} buffers={} MiB={} maxMiB={} per300f",
+                         ds.calls, ds.buffers, ds.bytes >> 20, ds.max_bytes >> 20);
+            }
             if (auto& lane = VideoCore::StreamCopyLane::Instance(); lane.Enabled()) {
                 const auto ls = lane.DrainStats();
                 LOG_INFO(Render_Skipcache,
