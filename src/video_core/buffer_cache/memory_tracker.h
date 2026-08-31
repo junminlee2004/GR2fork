@@ -342,34 +342,40 @@ public:
             [&func, is_written, &skipped, &index](RegionManager* manager, u64 offset, size_t size) {
                 // Read-only binds almost never have anything to upload, and
                 // proving it under the lock is the hottest contended site in
-                // the frame. Written binds can skip too when there is nothing
-                // to upload and the range is already marked, which also avoids
-                // re-applying its protection.
-                const u32 i = index++;
+                // the frame.
                 const bool nothing_to_upload =
                     !manager->template PeekRegionModified<Type::CPU>(offset, size);
-                const bool skippable =
-                    nothing_to_upload &&
-                    (!is_written ||
-                     (i < 64 && manager->template PeekRegionFullySet<Type::GPU>(offset, size)));
-                if (skippable) {
-                    if (is_written) {
-                        skipped |= u64{1} << i;
-                        // The bits stay as they are, but this is still a new
-                        // GPU write to the region: the write sequence must
-                        // advance or a snapshot taken before this bind could
-                        // not tell that its downloaded bytes are now stale.
-                        // GPU-command-thread confined, like the counter.
-                        ++manager->gpu_write_seq;
+                if (!is_written) {
+                    // The counter and the skip set it indexes are consumed only
+                    // by the second pass, which a read-only bind returns before
+                    // reaching.
+                    if (nothing_to_upload) {
+                        return;
                     }
+                    manager->lock.lock();
+                    manager->template ForEachModifiedRange<Type::CPU, true>(
+                        manager->GetCpuAddr() + offset, size, func);
+                    manager->lock.unlock();
+                    return;
+                }
+                // Written binds can skip too when there is nothing to upload and
+                // the range is already marked, which also avoids re-applying its
+                // protection.
+                const u32 i = index++;
+                if (nothing_to_upload && i < 64 &&
+                    manager->template PeekRegionFullySet<Type::GPU>(offset, size)) {
+                    skipped |= u64{1} << i;
+                    // The bits stay as they are, but this is still a new GPU
+                    // write to the region: the write sequence must advance or a
+                    // snapshot taken before this bind could not tell that its
+                    // downloaded bytes are now stale. GPU-command-thread
+                    // confined, like the counter.
+                    ++manager->gpu_write_seq;
                     return;
                 }
                 manager->lock.lock();
                 manager->template ForEachModifiedRange<Type::CPU, true>(
                     manager->GetCpuAddr() + offset, size, func);
-                if (!is_written) {
-                    manager->lock.unlock();
-                }
             });
         on_upload();
         if (!is_written) {
@@ -475,10 +481,18 @@ private:
         std::size_t remaining_size{size};
         std::size_t page_index{cpu_address >> TRACKER_HIGHER_PAGE_BITS};
         u64 page_offset{cpu_address & TRACKER_HIGHER_PAGE_MASK};
+        // Only a walk's first region is a scattered lookup; the rest are the
+        // next entries of top_tier, a unit stride the prefetcher covers.
+        // Indexing directly returns exactly what the memo would, since a slot
+        // only ever goes from null to a manager and is never cleared or
+        // reassigned. Memoising the rest would evict the entries the
+        // single-region callers hit on and still load top_tier on every miss.
+        bool scattered = true;
         while (remaining_size > 0) {
             const std::size_t copy_amount{
                 std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
-            auto* manager{LookupRegion(page_index)};
+            auto* manager{scattered ? LookupRegion(page_index) : top_tier[page_index]};
+            scattered = false;
             if (manager) {
                 if constexpr (BOOL_BREAK) {
                     if (func(manager, page_offset, copy_amount)) {
