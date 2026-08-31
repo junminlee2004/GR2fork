@@ -122,6 +122,7 @@ struct Image {
     }
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
+    ImageViewId InsertView(const ImageViewInfo& view_info);
 
     // Inline capacity 2: nearly every call emits 0-1 barriers, and the old
     // 32-slot inline buffer made every GetBarriers reserve a 3.5KB frame.

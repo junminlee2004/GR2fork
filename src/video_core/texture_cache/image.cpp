@@ -208,15 +208,19 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
         SetBackingSamples(info.num_samples);
     }
     const auto& view_infos = backing->image_view_infos;
-    const auto it = std::ranges::find(view_infos, view_info);
-    if (it != view_infos.end()) {
-        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
-        return (*slot_image_views)[view_id];
+    for (size_t i = 0; i < view_infos.size(); ++i) {
+        if (view_infos[i] == view_info) {
+            return (*slot_image_views)[backing->image_view_ids[i]];
+        }
     }
+    return (*slot_image_views)[InsertView(view_info)];
+}
+
+SHAD_NO_INLINE ImageViewId Image::InsertView(const ImageViewInfo& view_info) {
     const auto view_id = slot_image_views->insert(*instance, view_info, *this);
     backing->image_view_infos.emplace_back(view_info);
     backing->image_view_ids.emplace_back(view_id);
-    return (*slot_image_views)[view_id];
+    return view_id;
 }
 
 void Image::RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,

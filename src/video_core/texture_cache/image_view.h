@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <cstring>
+#include <type_traits>
+
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -36,7 +40,14 @@ struct ImageViewInfo {
     vk::ComponentMapping mapping{};
     u32 min_lod = 0;
     bool is_storage = false;
+    // Explicit tail: with every byte owned, the equality below may legally be
+    // one memcmp, which vectorizes where the memberwise walk did not.
+    std::array<u8, 7> reserved{};
 
+    bool operator==(const ImageViewInfo& other) const noexcept {
+        static_assert(std::has_unique_object_representations_v<ImageViewInfo>);
+        return std::memcmp(this, &other, sizeof(other)) == 0;
+    }
     auto operator<=>(const ImageViewInfo&) const = default;
 };
 
