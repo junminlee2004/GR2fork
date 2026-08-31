@@ -1160,7 +1160,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         // The reject paths below must consume the descriptor count the layout
         // declared for this image, or every later binding number in this stage
         // and in the stages after it drifts off the layout.
-        const u32 num_bindings = image_desc.NumBindings(stage);
+        const u32 num_bindings = image_desc.NumBindings(tsharp);
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
             for (u32 i = 0; i < num_bindings; ++i) {
                 image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});

@@ -97,14 +97,19 @@ struct ImageResource {
         return image;
     }
 
-    u32 NumBindings(const auto& info) const {
-        const AmdGpu::Image tsharp = GetSharp(info);
+    // Bind sites already holding the decoded T# take this form: the other one
+    // re-reads 32 bytes of user data per image per draw to reach the same count.
+    u32 NumBindings(const AmdGpu::Image& tsharp) const {
         // A malformed or rejected T# carries unordered 4-bit level fields; the promoted
         // subtraction is signed, so an inverted pair would wrap this u32 to ~4e9 descriptors.
         return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex &&
                 tsharp.last_level >= tsharp.base_level)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
+    }
+
+    u32 NumBindings(const auto& info) const {
+        return NumBindings(GetSharp(info));
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
