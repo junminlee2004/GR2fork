@@ -679,24 +679,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         const VAddr addr = event->Address<VAddr>();
-                        static constexpr bool RealOcclusionQueries = true;
-                        if (RealOcclusionQueries && rasterizer &&
-                            rasterizer->SupportsOcclusionQueries()) {
-                            // Occlusion results are [begin, end] u64 snapshot pairs per render
-                            // backend; the begin dump targets base + 0 and the end dump base + 8,
-                            // with the queried draws submitted between the two dumps.
-                            if ((addr & 0xf) == 8) {
-                                rasterizer->OcclusionQueryEnd(addr, num_counter_pairs);
-                            } else {
-                                rasterizer->OcclusionQueryBegin(addr, num_counter_pairs);
-                            }
-                        } else {
-                            static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                            u64* results = reinterpret_cast<u64*>(addr);
-                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                                *results = pixel_counter | OcclusionCounterValidMask;
-                            }
-                            pixel_counter += OcclusionCounterStep;
+                        // Measurement build: every counter snapshot reads zero,
+                        // so every query sums to zero passed pixels and the
+                        // guest sees every tested object as fully occluded. The
+                        // guest work that disappears under this answer is the
+                        // total the query channel can ever cull.
+                        u64* results = reinterpret_cast<u64*>(addr);
+                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                            *results = OcclusionCounterValidMask;
                         }
                     }
                 }

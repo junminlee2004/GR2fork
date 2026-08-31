@@ -204,6 +204,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     scheduler.PopPendingOperations();
 
+    // Measurement build: guest draw submissions per second, counted ahead of
+    // any filtering so the number reflects what the guest asked for.
+    ++submitted_draws_;
+    if (const auto now = std::chrono::steady_clock::now();
+        now - draws_last_log_ >= std::chrono::seconds(1)) {
+        LOG_INFO(Render_Vulkan, "guest draws submitted in the last second: {}", submitted_draws_);
+        submitted_draws_ = 0;
+        draws_last_log_ = now;
+    }
+
     if (!FilterDraw()) {
         return;
     }
@@ -254,6 +264,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+
+    // Measurement build: guest draw submissions per second, counted ahead of
+    // any filtering so the number reflects what the guest asked for.
+    ++submitted_draws_;
+    if (const auto now = std::chrono::steady_clock::now();
+        now - draws_last_log_ >= std::chrono::seconds(1)) {
+        LOG_INFO(Render_Vulkan, "guest draws submitted in the last second: {}", submitted_draws_);
+        submitted_draws_ = 0;
+        draws_last_log_ = now;
+    }
 
     if (!FilterDraw()) {
         return;

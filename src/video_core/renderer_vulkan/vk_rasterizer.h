@@ -164,6 +164,8 @@ private:
     u32 occlusion_count{};
     bool occlusion_active{};
     std::atomic<u32> occlusion_in_flight{};
+    u64 submitted_draws_{};
+    std::chrono::steady_clock::time_point draws_last_log_{};
     u64 occ_brackets{};
     u64 occ_empty{};
     u64 occ_draws{};
