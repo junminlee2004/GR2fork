@@ -66,17 +66,22 @@ bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
 
 bool StreamCopyLane::TryDrainOne() {
     u64 pos = dequeue_pos_.load(std::memory_order_relaxed);
-    Slot& slot = slots_[pos & (kRingSlots - 1)];
-    if (slot.seq.load(std::memory_order_acquire) != pos + 1) {
-        return false;
+    Slot* slot = nullptr;
+    while (true) {
+        // The slot must be re-derived every lap: a lost exchange leaves pos
+        // holding the winner's cursor. The acquire orders every read of job.
+        slot = &slots_[pos & (kRingSlots - 1)];
+        if (slot->seq.load(std::memory_order_acquire) != pos + 1) {
+            return false;
+        }
+        if (dequeue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+            break;
+        }
     }
-    if (!dequeue_pos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-        return true; // another worker took it; there may be more
-    }
-    const Job job = slot.job;
+    const Job job = slot->job;
     // Recycle the slot before the copy: the producer only reuses it a full
     // lap later, and the payload bytes are ordered by copies_done_ below.
-    slot.seq.store(pos + kRingSlots, std::memory_order_release);
+    slot->seq.store(pos + kRingSlots, std::memory_order_release);
     std::memcpy(job.dst, job.src, job.size);
     copies_done_.fetch_add(1, std::memory_order_release);
     return true;

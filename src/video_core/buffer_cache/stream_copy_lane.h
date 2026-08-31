@@ -77,13 +77,17 @@ private:
     void WorkerLoop();
     bool TryDrainOne();
 
-    std::unique_ptr<Slot[]> slots_;
+    // Written only by Init/Shutdown. Every worker loads slots_ on each drain
+    // attempt and every Copy loads num_workers_, so a per-frame store to any
+    // of these four would put the poll line back under the producer's writes.
+    alignas(64) std::unique_ptr<Slot[]> slots_;
     std::vector<std::thread> threads_;
     std::atomic<u32> num_workers_{0};
     std::atomic<bool> stop_{false};
 
-    // Producer-owned (GPU command thread); plain because single-writer.
-    u64 enqueue_pos_{};
+    // Producer-owned (GPU command thread); plain because single-writer. These
+    // seven fill one line exactly; an eighth would re-share published_'s.
+    alignas(64) u64 enqueue_pos_{};
     u64 jobs_{};
     u64 bytes_{};
     u64 inline_unresolved_{};
@@ -94,7 +98,7 @@ private:
     alignas(64) std::atomic<u64> published_{};
     alignas(64) std::atomic<u64> dequeue_pos_{};
     alignas(64) std::atomic<u64> copies_done_{};
-    std::atomic<u32> sleepers_{};
+    alignas(64) std::atomic<u32> sleepers_{};
 };
 
 } // namespace VideoCore
