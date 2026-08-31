@@ -679,15 +679,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         const VAddr addr = event->Address<VAddr>();
-                        // Measurement build: every counter snapshot reads zero,
-                        // so every query sums to zero passed pixels and the
-                        // guest sees every tested object as fully occluded. The
-                        // guest work that disappears under this answer is the
-                        // total the query channel can ever cull.
+                        // Measurement baseline: the always-visible answer, as
+                        // upstream ships, paired with the same submission
+                        // counter as the fully-occluded build. The difference
+                        // between the two builds' counts at one spot is the
+                        // exact number of draws the query channel gates.
+                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = reinterpret_cast<u64*>(addr);
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = OcclusionCounterValidMask;
+                            *results = pixel_counter | OcclusionCounterValidMask;
                         }
+                        pixel_counter += OcclusionCounterStep;
                     }
                 }
                 break;
