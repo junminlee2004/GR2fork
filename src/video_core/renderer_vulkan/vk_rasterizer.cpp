@@ -227,8 +227,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
-    OpenOcclusionQuery();
     scheduler.BeginRendering(state);
+    OpenOcclusionQuery();
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -297,8 +297,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
-    OpenOcclusionQuery();
     scheduler.BeginRendering(state);
+    OpenOcclusionQuery();
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
@@ -365,7 +365,8 @@ void Rasterizer::OpenOcclusionQuery() {
     const u32 in_flight = occlusion_in_flight.fetch_add(1) + 1;
     occ_inflight_peak = std::max(occ_inflight_peak, in_flight);
     ++occ_segments;
-    // Opening the query splits the rendering scope like a dispatch does.
+    // The query opens inside the draw's own render pass instance; anything that
+    // ends the pass closes it, and the next bracketed draw takes a new slot.
     scheduler.BeginQuery(occlusion_pool.get(), slot,
                          instance.IsOcclusionQueryPreciseSupported()
                              ? vk::QueryControlFlagBits::ePrecise

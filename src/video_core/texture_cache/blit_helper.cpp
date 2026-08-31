@@ -97,8 +97,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     state.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthAttachmentOptimal;
     state.depth_stencil_attachment.has_depth = true;
     state.depth_stencil_attachment.depth_clear = true;
-    // Internal draws must not contribute to an open guest occlusion query scope.
-    scheduler.EndQuery();
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -200,8 +198,6 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     state.color_attachments[0].image_view = dst_view;
     state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
     state.color_attachments[0].is_clear = true;
-    // Internal draws must not contribute to an open guest occlusion query scope.
-    scheduler.EndQuery();
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();

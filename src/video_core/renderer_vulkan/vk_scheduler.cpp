@@ -87,14 +87,19 @@ void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    // A query must begin and end inside the same render pass instance, so an
+    // open query is closed with the pass. The bracket owner allocates a fresh
+    // slot for its next draw and sums the per-segment results at harvest.
+    EndQuery();
     is_rendering = false;
     current_cmdbuf.endRendering();
 }
 
 void Scheduler::BeginQuery(vk::QueryPool pool, u32 slot, vk::QueryControlFlags flags) {
-    // The query is begun outside of a rendering scope so it may contain entire render
-    // pass instances.
-    EndRendering();
+    // The query is begun inside the current render pass instance: splitting the
+    // pass around every bracket costs an attachment store/load cycle and a full
+    // state re-record per light test, several times a frame.
+    DEBUG_ASSERT(is_rendering);
     current_cmdbuf.beginQuery(pool, slot, flags);
     active_query_pool = pool;
     active_query_slot = slot;
@@ -104,7 +109,6 @@ void Scheduler::EndQuery() {
     if (!IsQueryActive()) {
         return;
     }
-    EndRendering();
     current_cmdbuf.endQuery(active_query_pool, active_query_slot);
     active_query_pool = vk::QueryPool{};
 }

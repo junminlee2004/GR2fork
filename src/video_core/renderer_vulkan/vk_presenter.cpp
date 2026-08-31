@@ -697,8 +697,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     };
 
     draw_scheduler.EndRendering();
-    // Present passes must not contribute to an open guest occlusion query scope.
-    draw_scheduler.EndQuery();
     const auto cmdbuf = draw_scheduler.CommandBuffer();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,

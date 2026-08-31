@@ -373,7 +373,8 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
-    /// Starts a query scope outside of rendering; only one can be active at a time.
+    /// Starts a query scope inside the current render pass instance; only one
+    /// can be active at a time, and it is closed automatically with the pass.
     void BeginQuery(vk::QueryPool pool, u32 slot, vk::QueryControlFlags flags);
 
     /// Ends the active query scope, if any.
