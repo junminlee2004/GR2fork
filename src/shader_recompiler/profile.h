@@ -13,6 +13,7 @@ struct Profile {
     u32 max_shared_memory_size{};
     u32 supported_spirv{0x00010000};
     u32 subgroup_size{};
+    bool supports_required_subgroup_size_32{};
     bool support_int8{};
     bool support_int16{};
     bool support_int64{};

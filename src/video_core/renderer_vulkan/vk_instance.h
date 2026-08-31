@@ -233,6 +233,14 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
+    /// Returns true if compute pipelines can pin the 32-wide subgroup size
+    bool IsSubgroupSize32Supported() const {
+        return vk13_features.subgroupSizeControl && vk13_props.minSubgroupSize <= 32 &&
+               vk13_props.maxSubgroupSize >= 32 &&
+               (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute) &&
+               vk13_props.maxComputeWorkgroupSubgroups >= 32;
+    }
+
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
     bool IsWorkgroupMemoryExplicitLayoutSupported() const {
         return workgroup_memory_explicit_layout &&

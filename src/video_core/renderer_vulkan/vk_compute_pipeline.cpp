@@ -21,11 +21,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     info = &info_;
     const auto debug_str = GetDebugString();
 
+    const bool is_wave32 = instance.SubgroupSize() == 32;
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
+        .requiredSubgroupSize = is_wave32 ? 32u : 64u,
     };
+    const bool pin_subgroup_size =
+        is_wave32 ? instance.IsSubgroupSize32Supported() : instance.IsSubgroupSize64Supported();
     const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+        .pNext = pin_subgroup_size ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
         .pName = "main",

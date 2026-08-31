@@ -120,6 +120,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
     Shader::Optimization::SharedMemoryToStoragePass(program, runtime_info, profile);
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
+    Shader::Optimization::Wave64EmulationPass(program, runtime_info, profile);
 
     // Prepare for structurization by clearing flow graph and lowering phis
     for (auto* ir_block : program.blocks) {
