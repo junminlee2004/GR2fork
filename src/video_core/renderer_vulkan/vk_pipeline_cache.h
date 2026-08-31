@@ -80,6 +80,12 @@ struct Program {
     // bound; modules are append-only, ReplaceShader swaps in place).
     u64 mru_fp{};
     u32 mru_perm_idx{};
+    // Bit i set = modules[i].spec.fetch_shader_data is engaged. Read by
+    // FetchShaderRef::operator bool so the per-stage probe stops striding into
+    // the 1520-byte Module array for one engaged byte. ASSIGNED, never OR-ed:
+    // InsertPermut's resize default-constructs gap Modules with disengaged
+    // fetch data, and a twice-written slot must not keep a stale set bit.
+    u64 fetch_mask{};
     static constexpr size_t kSpecFpCacheSize = 4096;
     std::unique_ptr<std::array<SpecFpCacheEntry, kSpecFpCacheSize>> spec_fp_lru{};
 
@@ -93,6 +99,7 @@ struct Program {
         // signature was never computed (spec_fp_cache off), so the map stays empty.
         const u64 sig = spec.sig;
         modules.emplace_back(module, std::move(spec));
+        SetFetchBit(modules.size() - 1);
         if (sig != 0) {
             perm_index_by_sig.try_emplace(sig, modules.size() - 1);
         }
@@ -103,8 +110,17 @@ struct Program {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         const u64 sig = spec.sig;
         modules[perm_idx] = {module, std::move(spec)};
+        SetFetchBit(perm_idx);
         if (sig != 0) {
             perm_index_by_sig.try_emplace(sig, perm_idx);
+        }
+    }
+
+    void SetFetchBit(size_t perm_idx) {
+        if (perm_idx < 64) {
+            const u64 bit = u64{1} << perm_idx;
+            fetch_mask = modules[perm_idx].spec.fetch_shader_data.has_value() ? fetch_mask | bit
+                                                                              : fetch_mask & ~bit;
         }
     }
 };
@@ -120,7 +136,10 @@ struct FetchShaderRef {
     }
 
     explicit operator bool() const {
-        return program != nullptr && Get().has_value();
+        // The mask read replaces a 1520-byte-strided probe into the Module
+        // array; indices past the mask width fall back to the direct check.
+        return program != nullptr &&
+               (perm_idx < 64 ? ((program->fetch_mask >> perm_idx) & 1) != 0 : Get().has_value());
     }
 };
 
