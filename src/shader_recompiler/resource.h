@@ -99,7 +99,10 @@ struct ImageResource {
 
     u32 NumBindings(const auto& info) const {
         const AmdGpu::Image tsharp = GetSharp(info);
-        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
+        // A malformed or rejected T# carries unordered 4-bit level fields; the promoted
+        // subtraction is signed, so an inverted pair would wrap this u32 to ~4e9 descriptors.
+        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex &&
+                tsharp.last_level >= tsharp.base_level)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
     }
