@@ -293,8 +293,7 @@ public:
             RENDERER_TRACE;
             RegionManager* manager = LookupRegion(first_page);
             if (manager == nullptr) [[unlikely]] {
-                CreateRegion(first_page);
-                manager = LookupRegion(first_page);
+                manager = CreateRegion(first_page);
             }
             const u64 offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
             const bool nothing_to_upload =
@@ -427,34 +426,42 @@ private:
      * path; a shared table could tear a key against a neighbouring value and
      * hand back the wrong manager.
      */
+    static constexpr std::size_t NUM_LOOKUP_SLOTS = 128; // power of two
+    // Keys are stored biased by one so that a zeroed table reads as empty.
+    // That keeps the memo constant initialized, which lets the thread local
+    // be reached directly instead of through an initialization guard;
+    // constinit turns a regression of that property into a compile error.
+    // A slot carries its key and value together, 16 byte aligned, so a
+    // probe touches exactly one cache line.
+    struct alignas(16) LookupSlot {
+        std::size_t key;
+        RegionManager* val;
+    };
+    static_assert(sizeof(LookupSlot) == 16 && alignof(LookupSlot) == 16,
+                  "a slot must fit one cache line");
+    struct LookupMemo {
+        const MemoryTracker* owner;
+        std::array<LookupSlot, NUM_LOOKUP_SLOTS> slots;
+    };
+
+    // Outlined: the ~420-byte zeroing body was emitted in line at every
+    // inlined lookup while being reachable only when a second tracker
+    // instance aliases the thread's memo.
+    SHAD_NO_INLINE static void ResetLookupMemo(LookupMemo& memo,
+                                               const MemoryTracker* owner) noexcept {
+        memo.owner = owner;
+        for (LookupSlot& reset_slot : memo.slots) {
+            reset_slot.key = 0;
+        }
+    }
+
     [[nodiscard]] RegionManager* LookupRegion(std::size_t page_index) noexcept {
-        static constexpr std::size_t NUM_SLOTS = 128; // power of two
-        // Keys are stored biased by one so that a zeroed table reads as empty.
-        // That keeps the memo constant initialized, which lets the thread local
-        // be reached directly instead of through an initialization guard;
-        // constinit turns a regression of that property into a compile error.
-        // A slot carries its key and value together, 16 byte aligned, so a
-        // probe touches exactly one cache line.
-        struct alignas(16) LookupSlot {
-            std::size_t key;
-            RegionManager* val;
-        };
-        static_assert(sizeof(LookupSlot) == 16 && alignof(LookupSlot) == 16,
-                      "a slot must fit one cache line");
-        struct LookupMemo {
-            const MemoryTracker* owner;
-            std::array<LookupSlot, NUM_SLOTS> slots;
-        };
         static thread_local constinit LookupMemo memo{};
         if (memo.owner != this) [[unlikely]] {
-            // Guards against a second tracker aliasing this thread's memo.
-            memo.owner = this;
-            for (LookupSlot& reset_slot : memo.slots) {
-                reset_slot.key = 0;
-            }
+            ResetLookupMemo(memo, this);
         }
         const std::size_t key = page_index + 1;
-        LookupSlot& slot = memo.slots[page_index & (NUM_SLOTS - 1)];
+        LookupSlot& slot = memo.slots[page_index & (NUM_LOOKUP_SLOTS - 1)];
         if (slot.key == key) {
             return slot.val;
         }
@@ -502,8 +509,7 @@ private:
                     func(manager, page_offset, copy_amount);
                 }
             } else if constexpr (create_region_on_fail) {
-                CreateRegion(page_index);
-                manager = LookupRegion(page_index);
+                manager = CreateRegion(page_index);
                 if constexpr (BOOL_BREAK) {
                     if (func(manager, page_offset, copy_amount)) {
                         return true;
@@ -519,7 +525,7 @@ private:
         return false;
     }
 
-    void CreateRegion(std::size_t page_index) {
+    RegionManager* CreateRegion(std::size_t page_index) {
         const VAddr base_cpu_addr = page_index << TRACKER_HIGHER_PAGE_BITS;
         if (free_managers.empty()) {
             manager_pool.emplace_back();
@@ -534,6 +540,10 @@ private:
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
+        // Returned directly: re-probing the lookup memo twenty instructions
+        // after it just missed only re-derives this pointer. The memo entry
+        // for the fresh page fills on the page's next scattered lookup.
+        return new_manager;
     }
 
     PageManager* tracker;
