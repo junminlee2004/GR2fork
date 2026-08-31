@@ -47,15 +47,18 @@ void StreamCopyLane::Shutdown() {
 }
 
 bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
-    Slot& slot = slots_[enqueue_pos_ & (kRingSlots - 1)];
-    if (slot.seq.load(std::memory_order_acquire) != enqueue_pos_) {
+    // Only this thread writes enqueue_pos_, so one read serves the whole job;
+    // reading the member again would reload it across the slot stores.
+    const u64 pos = enqueue_pos_;
+    Slot& slot = slots_[pos & (kRingSlots - 1)];
+    if (slot.seq.load(std::memory_order_acquire) != pos) {
         ++inline_full_; // a whole lap is still in flight
         return false;
     }
     slot.job = Job{src, dst, size};
-    slot.seq.store(enqueue_pos_ + 1, std::memory_order_release);
-    ++enqueue_pos_;
-    published_.store(enqueue_pos_, std::memory_order_release);
+    slot.seq.store(pos + 1, std::memory_order_release);
+    enqueue_pos_ = pos + 1;
+    published_.store(pos + 1, std::memory_order_release);
     if (sleepers_.load(std::memory_order_relaxed) != 0) {
         published_.notify_all();
     }

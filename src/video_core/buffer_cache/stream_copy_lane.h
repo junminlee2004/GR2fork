@@ -98,6 +98,7 @@ private:
     alignas(64) std::atomic<u64> published_{};
     alignas(64) std::atomic<u64> dequeue_pos_{};
     alignas(64) std::atomic<u64> copies_done_{};
+    // Read by the producer on every Push; copies_done_ is a per-job RMW.
     alignas(64) std::atomic<u32> sleepers_{};
 };
 
