@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <string_view>
 #include <fmt/format.h>
 #include "common/assert.h"
@@ -210,7 +211,8 @@ constexpr DataFormat RemapDataFormat(const DataFormat format) {
     }
 }
 
-constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
+constexpr NumberFormat RemapNumberFormatCases(const NumberFormat format,
+                                              const DataFormat data_format) {
     switch (format) {
     case NumberFormat::Unorm: {
         switch (data_format) {
@@ -314,8 +316,12 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     }
 }
 
-constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
-                                               const DataFormat data_fmt) {
+// Sentinel for combinations the case body declares unreachable; the table
+// accessor turns it back into the crash so the diagnostic is preserved.
+inline constexpr u8 kInvalidNumberConversion = 0xFF;
+
+constexpr NumberConversion MapNumberConversionCases(const NumberFormat num_fmt,
+                                                    const DataFormat data_fmt) {
     switch (num_fmt) {
     case NumberFormat::Unorm: {
         switch (data_fmt) {
@@ -356,12 +362,58 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            return static_cast<NumberConversion>(kInvalidNumberConversion);
         }
     }
     default:
         return NumberConversion::None;
     }
+}
+
+// The two mappings above run per color target and per sharp at draw rate, and
+// the compiler lowers the nested switches to mispredicting jump tables. The
+// lookup tables are built at compile time by evaluating the case bodies, so
+// the mapping stays defined in one place. Number formats come from 4-bit and
+// data formats from 6-bit hardware fields, which the masks make explicit.
+namespace detail {
+consteval std::array<std::array<u8, 64>, 16> BuildRemapNumberFormatLut() {
+    std::array<std::array<u8, 64>, 16> lut{};
+    for (u32 nf = 0; nf < lut.size(); ++nf) {
+        for (u32 df = 0; df < lut[nf].size(); ++df) {
+            lut[nf][df] = static_cast<u8>(
+                RemapNumberFormatCases(static_cast<NumberFormat>(nf), static_cast<DataFormat>(df)));
+        }
+    }
+    return lut;
+}
+consteval std::array<std::array<u8, 64>, 16> BuildMapNumberConversionLut() {
+    std::array<std::array<u8, 64>, 16> lut{};
+    for (u32 nf = 0; nf < lut.size(); ++nf) {
+        for (u32 df = 0; df < lut[nf].size(); ++df) {
+            lut[nf][df] = static_cast<u8>(MapNumberConversionCases(static_cast<NumberFormat>(nf),
+                                                                   static_cast<DataFormat>(df)));
+        }
+    }
+    return lut;
+}
+inline constexpr auto kRemapNumberFormatLut = BuildRemapNumberFormatLut();
+inline constexpr auto kMapNumberConversionLut = BuildMapNumberConversionLut();
+} // namespace detail
+
+constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
+    return static_cast<NumberFormat>(
+        detail::kRemapNumberFormatLut[static_cast<u32>(format) & 15]
+                                     [static_cast<u32>(data_format) & 63]);
+}
+
+constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
+                                               const DataFormat data_fmt) {
+    const u8 conv = detail::kMapNumberConversionLut[static_cast<u32>(num_fmt) & 15]
+                                                   [static_cast<u32>(data_fmt) & 63];
+    if (conv == kInvalidNumberConversion) {
+        UNREACHABLE_MSG("num_fmt = {}, data_fmt = {}", u32(num_fmt), u32(data_fmt));
+    }
+    return static_cast<NumberConversion>(conv);
 }
 
 constexpr NumberClass GetNumberClass(const NumberFormat nfmt) {
