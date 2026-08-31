@@ -260,7 +260,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     switch (format) {
     case DataFormat::Format1_5_5_5:
     case DataFormat::Format11_11_10: {
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.b;
         result.g = swizzle.g;
         result.b = swizzle.r;
@@ -268,7 +268,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
         return result;
     }
     case DataFormat::Format10_10_10_2: {
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.a;
         result.g = swizzle.b;
         result.b = swizzle.g;
@@ -277,7 +277,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     }
     case DataFormat::Format4_4_4_4: {
         // Remap to a more supported component order.
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.g;
         result.g = swizzle.b;
         result.b = swizzle.a;
@@ -286,7 +286,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     }
     case DataFormat::Format5_6_5: {
         // Remap to a more supported component order.
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.b;
         result.g = swizzle.g;
         result.b = swizzle.r;
@@ -446,6 +446,53 @@ constexpr bool IsFmask(DataFormat format) {
 
 std::string_view NameOf(DataFormat fmt);
 std::string_view NameOf(NumberFormat fmt);
+
+// In the header so compile-time tables can be built from it; 0 marks a format
+// code the hardware does not define.
+inline constexpr std::array NUM_COMPONENTS = {
+    0, //  0 FormatInvalid
+    1, //  1 Format8
+    1, //  2 Format16
+    2, //  3 Format8_8
+    1, //  4 Format32
+    2, //  5 Format16_16
+    3, //  6 Format10_11_11
+    3, //  7 Format11_11_10
+    4, //  8 Format10_10_10_2
+    4, //  9 Format2_10_10_10
+    4, // 10 Format8_8_8_8
+    2, // 11 Format32_32
+    4, // 12 Format16_16_16_16
+    3, // 13 Format32_32_32
+    4, // 14 Format32_32_32_32
+    0, // 15
+    3, // 16 Format5_6_5
+    4, // 17 Format1_5_5_5
+    4, // 18 Format5_5_5_1
+    4, // 19 Format4_4_4_4
+    2, // 20 Format8_24
+    2, // 21 Format24_8
+    2, // 22 FormatX24_8_32
+    0, // 23
+    0, // 24
+    0, // 25
+    0, // 26
+    0, // 27
+    0, // 28
+    0, // 29
+    0, // 30
+    0, // 31
+    3, // 32 FormatGB_GR
+    3, // 33 FormatBG_RG
+    4, // 34 Format5_9_9_9
+    4, // 35 FormatBc1
+    4, // 36 FormatBc2
+    4, // 37 FormatBc3
+    1, // 38 FormatBc4
+    2, // 39 FormatBc5
+    3, // 40 FormatBc6
+    4, // 41 FormatBc7
+};
 
 u32 NumComponents(DataFormat format);
 u32 NumBitsPerBlock(DataFormat format);

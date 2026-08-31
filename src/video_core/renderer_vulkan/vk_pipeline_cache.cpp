@@ -644,9 +644,11 @@ bool PipelineCache::RefreshGraphicsKey() {
             key.blend_controls[cb] = regs.blend_control[cb];
         }
 
-        // Apply swizzle to target mask
-        key.write_masks[cb] =
-            vk::ColorComponentFlags{key.color_buffers[cb].swizzle.ApplyMask(target_mask)};
+        // Apply swizzle to target mask. Reading the register rather than the key line
+        // pass one wrote is safe for the same reason the loop's own reads of
+        // col_buf.info.blend_bypass and col_buf.NumSamples() are: regs cannot change
+        // across RefreshGraphicsStages().
+        key.write_masks[cb] = vk::ColorComponentFlags{col_buf.Swizzle().ApplyMask(target_mask)};
 
         // Fill color samples
         const u8 prev_color_samples = std::exchange(color_samples, col_buf.NumSamples());
@@ -709,6 +711,9 @@ bool PipelineCache::RefreshGraphicsStages() {
 
     const auto* fs_info = infos[static_cast<u32>(LogicalStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
+    // Shader::Info::mrt_mask is u8, which is the only thing bounding this to
+    // NUM_COLOR_BUFFERS; the second color loop indexes both regs.color_buffers and
+    // key.color_buffers with it.
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
     switch (regs.stage_enable.raw) {
@@ -775,7 +780,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     }
 
     const auto* vs_info = infos[static_cast<u32>(Shader::LogicalStage::Vertex)];
-    if (vs_info && fetch_shader_ref && !instance.IsVertexInputDynamicState()) {
+    if (!instance.IsVertexInputDynamicState() && vs_info && fetch_shader_ref) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
