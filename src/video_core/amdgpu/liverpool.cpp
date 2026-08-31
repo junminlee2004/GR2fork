@@ -295,6 +295,108 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+void Liverpool::SetContextRegPacket(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+    const auto* payload = reinterpret_cast<const u32*>(header + 2);
+
+    gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+
+    // In the case of HW, render target memory has alignment as color block operates on
+    // tiles. There is no information of actual resource extents stored in CB context
+    // regs, so any deduction of it from slices/pitch will lead to a larger surface
+    // created. The same applies to the depth targets. Fortunately, the guest always
+    // sends a trailing NOP packet right after the context regs setup, so we can use the
+    // heuristic below and extract the hint to determine actual resource dims.
+
+    switch (reg_addr) {
+    case ContextRegs::CbColor0Base:
+    case ContextRegs::CbColor1Base:
+    case ContextRegs::CbColor2Base:
+    case ContextRegs::CbColor3Base:
+    case ContextRegs::CbColor4Base:
+    case ContextRegs::CbColor5Base:
+    case ContextRegs::CbColor6Base:
+    case ContextRegs::CbColor7Base: {
+        const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
+                                (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
+        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+        const auto nop_offset = header->type3.count;
+        if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                       "NOP hint is missing in CB setup sequence");
+            if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
+                last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+                gfx_stamp.MarkDirty();
+            }
+        } else if (last_cb_extent[col_buf_id].raw != 0) {
+            last_cb_extent[col_buf_id].raw = 0;
+            gfx_stamp.MarkDirty();
+        }
+        break;
+    }
+    case ContextRegs::CbColor0Cmask:
+    case ContextRegs::CbColor1Cmask:
+    case ContextRegs::CbColor2Cmask:
+    case ContextRegs::CbColor3Cmask:
+    case ContextRegs::CbColor4Cmask:
+    case ContextRegs::CbColor5Cmask:
+    case ContextRegs::CbColor6Cmask:
+    case ContextRegs::CbColor7Cmask: {
+        const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Cmask) /
+                                (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
+        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+        const auto nop_offset = header->type3.count;
+        if (nop_offset == 0x04) {
+            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                       "NOP hint is missing in CB setup sequence");
+            if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
+                last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+                gfx_stamp.MarkDirty();
+            }
+        }
+        break;
+    }
+    case ContextRegs::DbZInfo: {
+        if (header->type3.count == 8) {
+            ASSERT_MSG(payload[20] == 0xc0001000, "NOP hint is missing in DB setup sequence");
+            if (last_db_extent.raw != payload[21]) {
+                last_db_extent.raw = payload[21];
+                gfx_stamp.MarkDirty();
+            }
+        } else if (last_db_extent.raw != 0) {
+            last_db_extent.raw = 0;
+            gfx_stamp.MarkDirty();
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void Liverpool::SetShRegPacket(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (count - 1) * sizeof(u32);
+
+    if (set_data->reg_offset >= 0x200 &&
+        set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+        ASSERT(set_size <= sizeof(ComputeProgram));
+        auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
+                     (set_data->reg_offset - 0x200);
+        std::memcpy(addr, header + 2, set_size);
+    } else {
+        const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+        if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+            StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
+        } else {
+            gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
+        }
+    }
+}
+
 std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                    uintptr_t base_addr) {
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -319,6 +421,21 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
 
         const u32 count = header->type3.NumWords();
         const PM4ItOpcode opcode = header->type3.opcode;
+        // Register-write runs dominate the packet mix; one masked compare on
+        // type+opcode routes them past the 142-target indirect jump. The mask
+        // drops predicate and shader_type, which both handlers ignore, so the
+        // routing is bit-identical to the switch arms below.
+        const u32 hdr_masked = header->raw & 0xC000FF00u;
+        if (hdr_masked == 0xC0007600u) { // SetShReg
+            SetShRegPacket(header, count);
+            dcb = NextPacket(dcb, count + 1);
+            continue;
+        }
+        if (hdr_masked == 0xC0006900u) { // SetContextReg
+            SetContextRegPacket(header, count);
+            dcb = NextPacket(dcb, count + 1);
+            continue;
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -380,106 +497,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::SetContextReg: {
-            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-            const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-            const auto* payload = reinterpret_cast<const u32*>(header + 2);
-
-            gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-
-            // In the case of HW, render target memory has alignment as color block operates on
-            // tiles. There is no information of actual resource extents stored in CB context
-            // regs, so any deduction of it from slices/pitch will lead to a larger surface
-            // created. The same applies to the depth targets. Fortunately, the guest always
-            // sends a trailing NOP packet right after the context regs setup, so we can use the
-            // heuristic below and extract the hint to determine actual resource dims.
-
-            switch (reg_addr) {
-            case ContextRegs::CbColor0Base:
-            case ContextRegs::CbColor1Base:
-            case ContextRegs::CbColor2Base:
-            case ContextRegs::CbColor3Base:
-            case ContextRegs::CbColor4Base:
-            case ContextRegs::CbColor5Base:
-            case ContextRegs::CbColor6Base:
-            case ContextRegs::CbColor7Base: {
-                const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
-                                        (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
-                ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                const auto nop_offset = header->type3.count;
-                if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-                    ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                               "NOP hint is missing in CB setup sequence");
-                    if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                        gfx_stamp.MarkDirty();
-                    }
-                } else if (last_cb_extent[col_buf_id].raw != 0) {
-                    last_cb_extent[col_buf_id].raw = 0;
-                    gfx_stamp.MarkDirty();
-                }
-                break;
-            }
-            case ContextRegs::CbColor0Cmask:
-            case ContextRegs::CbColor1Cmask:
-            case ContextRegs::CbColor2Cmask:
-            case ContextRegs::CbColor3Cmask:
-            case ContextRegs::CbColor4Cmask:
-            case ContextRegs::CbColor5Cmask:
-            case ContextRegs::CbColor6Cmask:
-            case ContextRegs::CbColor7Cmask: {
-                const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Cmask) /
-                                        (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
-                ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                const auto nop_offset = header->type3.count;
-                if (nop_offset == 0x04) {
-                    ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                               "NOP hint is missing in CB setup sequence");
-                    if (last_cb_extent[col_buf_id].raw != payload[nop_offset + 1]) {
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                        gfx_stamp.MarkDirty();
-                    }
-                }
-                break;
-            }
-            case ContextRegs::DbZInfo: {
-                if (header->type3.count == 8) {
-                    ASSERT_MSG(payload[20] == 0xc0001000,
-                               "NOP hint is missing in DB setup sequence");
-                    if (last_db_extent.raw != payload[21]) {
-                        last_db_extent.raw = payload[21];
-                        gfx_stamp.MarkDirty();
-                    }
-                } else if (last_db_extent.raw != 0) {
-                    last_db_extent.raw = 0;
-                    gfx_stamp.MarkDirty();
-                }
-                break;
-            }
-            default:
-                break;
-            }
+            SetContextRegPacket(header, count);
             break;
         }
         case PM4ItOpcode::SetShReg: {
-            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-            const auto set_size = (count - 1) * sizeof(u32);
-
-            if (set_data->reg_offset >= 0x200 &&
-                set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                ASSERT(set_size <= sizeof(ComputeProgram));
-                auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
-                             (set_data->reg_offset - 0x200);
-                std::memcpy(addr, header + 2, set_size);
-            } else {
-                const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
-                if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
-                    StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
-                } else {
-                    gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
-                }
-            }
+            SetShRegPacket(header, count);
             break;
         }
         case PM4ItOpcode::SetUconfigReg: {

@@ -208,6 +208,10 @@ private:
     /// into the coroutine, `this` becomes an escaped-frame load again.
     SHAD_NO_INLINE std::span<const u32> RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                            uintptr_t base_addr);
+    // The two hottest packet arms, shared by the pre-dispatch fast path and
+    // their switch cases so the routes cannot drift.
+    void SetContextRegPacket(const union PM4Header* header, u32 count);
+    void SetShRegPacket(const union PM4Header* header, u32 count);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
