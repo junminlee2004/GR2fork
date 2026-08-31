@@ -63,6 +63,7 @@ enum class CacheId : u8 {
     Sampler = 6,
     DescDelta = 7,
     StreamMirror = 8,
+    DynState = 9,
     Count
 };
 enum class State : u8 { Off = 0, Learning, Shadow, Enabled, Quarantined };
@@ -88,6 +89,8 @@ constexpr const char* CacheName(CacheId id) {
         return "MIRROR";
     case CacheId::DescDelta:
         return "DESCDELTA";
+    case CacheId::DynState:
+        return "DYNSTATE";
     default:
         return "?";
     }

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -93,6 +94,17 @@ struct StencilOps {
                depth_fail_op == other.depth_fail_op && compare_op == other.compare_op;
     }
 };
+
+// Games can leave float dynamic-state registers non-finite; NaN != NaN makes a
+// value compare re-arm the dirty bit and re-emit the command on every draw.
+// The bit_cast only compiles for a padding-free T, so every byte compared is a
+// value byte.
+template <typename T>
+bool SameFloatBits(const T& a, const T& b) {
+    using Bits = std::array<u32, sizeof(T) / sizeof(u32)>;
+    return std::bit_cast<Bits>(a) == std::bit_cast<Bits>(b);
+}
+
 struct DynamicState {
     struct {
         bool viewports : 1;
@@ -165,16 +177,36 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
+    // Every re-arm of the dirty bits bumps this; a consumer that skipped a
+    // Commit must run once past it. GPU-command-thread confined like
+    // dirty_state.
+    u64 invalidate_gen{1};
+
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        ++invalidate_gen;
+    }
+
+    u64 InvalidateGen() const {
+        return invalidate_gen;
+    }
+
+    // Raw view of the dirty bitfield for skip-cache verification. Unused bits
+    // are stable between two reads of the same object, so they cannot forge a
+    // mismatch either way.
+    u32 DirtyBits() const {
+        u32 bits{};
+        static_assert(sizeof(dirty_state) <= sizeof(bits));
+        std::memcpy(&bits, &dirty_state, sizeof(dirty_state));
+        return bits;
     }
 
     void SetViewports(const Viewports& viewports_) {
-        if (!std::ranges::equal(viewports, viewports_)) {
+        if (!std::ranges::equal(viewports, viewports_, SameFloatBits<vk::Viewport>)) {
             viewports = viewports_;
             dirty_state.viewports = true;
         }
@@ -216,11 +248,7 @@ struct DynamicState {
     }
 
     void SetDepthBounds(const float min, const float max) {
-        // Games can leave the depth bounds registers non-finite; NaN != NaN
-        // makes a float compare re-arm the dirty bit and re-emit
-        // vkCmdSetDepthBounds every draw. Compare bit patterns instead.
-        if (std::bit_cast<u32>(depth_bounds_min) != std::bit_cast<u32>(min) ||
-            std::bit_cast<u32>(depth_bounds_max) != std::bit_cast<u32>(max)) {
+        if (!SameFloatBits(depth_bounds_min, min) || !SameFloatBits(depth_bounds_max, max)) {
             depth_bounds_min = min;
             depth_bounds_max = max;
             dirty_state.depth_bounds = true;
@@ -235,8 +263,8 @@ struct DynamicState {
     }
 
     void SetDepthBias(const float constant, const float clamp, const float slope) {
-        if (depth_bias_constant != constant || depth_bias_clamp != clamp ||
-            depth_bias_slope != slope) {
+        if (!SameFloatBits(depth_bias_constant, constant) ||
+            !SameFloatBits(depth_bias_clamp, clamp) || !SameFloatBits(depth_bias_slope, slope)) {
             depth_bias_constant = constant;
             depth_bias_clamp = clamp;
             depth_bias_slope = slope;
@@ -317,7 +345,7 @@ struct DynamicState {
     }
 
     void SetBlendConstants(const std::array<float, 4> blend_constants_) {
-        if (blend_constants != blend_constants_) {
+        if (!SameFloatBits(blend_constants, blend_constants_)) {
             blend_constants = blend_constants_;
             dirty_state.blend_constants = true;
         }
@@ -338,7 +366,7 @@ struct DynamicState {
     }
 
     void SetLineWidth(const float width) {
-        if (line_width != width) {
+        if (!SameFloatBits(line_width, width)) {
             line_width = width;
             dirty_state.line_width = true;
         }

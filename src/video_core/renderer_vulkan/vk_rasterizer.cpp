@@ -59,6 +59,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
+    // The register stamp is armed once from the boot value of the skip-cache
+    // mode; enabling the framework later from the settings dialog leaves it
+    // pinned, and a frozen stamp compares every draw register-identical.
+    dyn_memo_enabled_ =
+        EmulatorSettings.IsDynStateMemo() &&
+        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
     // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
@@ -1966,15 +1972,102 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     Skipcache::Framework::Instance().BumpMemGen();
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+bool Rasterizer::DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 reg_stamp,
+                              u64 dyn_gen, u64 pipe_gen) {
+    using namespace VideoCore::Skipcache;
+    auto& ctr = Skipcache::Framework::Instance().Counters(CacheId::DynState);
+    const auto& m = dyn_memo_;
+    if (m.flags == 0) {
+        ++ctr.miss_cold;
+        return false;
+    }
+    if (m.reg_stamp != reg_stamp) {
+        ++ctr.miss_gen[LaneReg];
+        return false;
+    }
+    if (m.flags != flags || m.pipeline != pipeline) {
+        ++ctr.miss_key;
+        return false;
+    }
+    if (m.dyn_gen != dyn_gen) {
+        ++ctr.miss_gen[LaneTick];
+        return false;
+    }
+    if (m.pipe_gen != pipe_gen) {
+        ++ctr.miss_gen[LanePipe];
+        return false;
+    }
+    return true;
+}
+
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) {
+    using VideoCore::Skipcache::CacheId;
+    // Null is the disabled path's stand-in: every dereference below sits under
+    // probing or verifying, both false whenever it is null.
+    auto* const skipcache = dyn_memo_enabled_ ? &Skipcache::Framework::Instance() : nullptr;
+    auto& dynamic_state = scheduler.GetDynamicState();
+    const bool probing =
+        skipcache != nullptr && skipcache->Active() && skipcache->ShouldProbe(CacheId::DynState);
+    // is_indexed stays keyed: the primitive-restart ASSERT_MSG is live in
+    // release builds, so an indexed transition must re-evaluate it.
+    const u32 flags = 1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2);
+    u64 dyn_stamp{}, dyn_gen{}, dyn_pipe_gen{};
+    bool dyn_would_hit = false, verifying = false;
+    if (probing) {
+        auto& ctr = skipcache->Counters(CacheId::DynState);
+        ++ctr.eligible;
+        const bool timed = skipcache->SampleTimer(CacheId::DynState);
+        const u64 t0 = timed ? skipcache->Now() : 0;
+        dyn_stamp = liverpool->GetGfxStateStamp();
+        // Read live, never from a draw-entry token: the binds that run before
+        // this can flush the command buffer and re-arm every dirty bit.
+        dyn_gen = dynamic_state.InvalidateGen();
+        dyn_pipe_gen = skipcache->Gens().pipe_gen.load(std::memory_order_acquire);
+        dyn_would_hit = DynMemoProbe(pipeline, flags, dyn_stamp, dyn_gen, dyn_pipe_gen);
+        if (timed) {
+            ctr.guard_ns += skipcache->CorrectSample(skipcache->Now() - t0);
+            ++ctr.guard_samples;
+        }
+        if (dyn_would_hit) {
+            ++ctr.hits;
+            verifying = skipcache->ShouldVerify(CacheId::DynState);
+            if (skipcache->MayConsume(CacheId::DynState) && !verifying) {
+                return;
+            }
+        }
+    }
+    const bool timed_miss = probing && !dyn_would_hit && skipcache->SampleTimer(CacheId::DynState);
+    const u64 miss_t0 = timed_miss ? skipcache->Now() : 0;
+    const u32 before = verifying ? dynamic_state.DirtyBits() : 0u;
+
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
-    auto& dynamic_state = scheduler.GetDynamicState();
+    // Sampled before Commit, which clears every bit it emits.
+    if (verifying) {
+        if (dynamic_state.DirtyBits() != before) {
+            skipcache->RecordDivergence(CacheId::DynState, "dirty bit set under would-hit");
+            dyn_memo_.flags = 0;
+        } else {
+            skipcache->RecordVerifyClean(CacheId::DynState);
+        }
+    }
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
+
+    if (probing && !dyn_would_hit) {
+        auto& ctr = skipcache->Counters(CacheId::DynState);
+        if (timed_miss) {
+            ctr.miss_ns += skipcache->CorrectSample(skipcache->Now() - miss_t0);
+            ++ctr.miss_samples;
+        }
+        // The body writes no register and bumps neither generation, so all
+        // three lanes still hold their probe-time values.
+        dyn_memo_ = {dyn_stamp, dyn_gen, dyn_pipe_gen, pipeline, flags};
+        skipcache->NotifyPopulated(CacheId::DynState);
+    }
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

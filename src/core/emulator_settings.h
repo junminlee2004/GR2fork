@@ -480,6 +480,11 @@ struct GPUSettings {
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.
     Setting<bool> spec_fp_cache{false};
+    // Skips the five dynamic-state updaters and their commit when the stamped
+    // graphics registers, the pipeline and the dirty-bit re-arm generation all
+    // match the previous draw's, which can set no bit the commit has not
+    // already emitted.
+    Setting<bool> dyn_state_memo{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -540,6 +545,7 @@ struct GPUSettings {
             make_override<GPUSettings>("stream_findbuffer_elide",
                                        &GPUSettings::stream_findbuffer_elide),
             make_override<GPUSettings>("spec_fp_cache", &GPUSettings::spec_fp_cache),
+            make_override<GPUSettings>("dyn_state_memo", &GPUSettings::dyn_state_memo),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -558,7 +564,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
-    stream_copy_workers, stream_findbuffer_elide)
+    stream_copy_workers, stream_findbuffer_elide, dyn_state_memo)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -830,6 +836,7 @@ public:
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)
     SETTING_FORWARD_BOOL(m_gpu, StreamFindBufferElide, stream_findbuffer_elide)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpCache, spec_fp_cache)
+    SETTING_FORWARD_BOOL(m_gpu, DynStateMemo, dyn_state_memo)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

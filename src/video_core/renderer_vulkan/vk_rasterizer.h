@@ -90,7 +90,7 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -200,6 +200,24 @@ private:
     void RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pipeline, u64 reg_stamp,
                               u64 tex_gen, u64 pipe_gen);
     PrepareRtMemo rt_memo_{};
+
+    // UpdateDynamicState memo: every value the five updaters compute is a pure
+    // function of the stamped graphics registers, the pipeline write masks, the
+    // feedback-loop flag and immutable device caps, and each setter marks a
+    // dirty bit exactly when it writes one - so an unchanged key marks nothing
+    // and Commit emits nothing. dyn_gen covers the three Invalidate() sites,
+    // which re-arm every bit without changing a value.
+    struct DynStateMemo {
+        u64 reg_stamp{};
+        u64 dyn_gen{};
+        u64 pipe_gen{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        u32 flags{}; // 0 invalid; bit0 valid, bit1 feedback loop, bit2 indexed
+    };
+    bool DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 reg_stamp, u64 dyn_gen,
+                      u64 pipe_gen);
+    DynStateMemo dyn_memo_{};
+    bool dyn_memo_enabled_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
