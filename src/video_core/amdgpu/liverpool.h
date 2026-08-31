@@ -66,6 +66,9 @@ struct Liverpool {
     u64 GetGfxStateStamp() const noexcept {
         return gfx_stamp.value;
     }
+    bool IsGfxStampActive() const noexcept {
+        return gfx_stamp.active;
+    }
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 

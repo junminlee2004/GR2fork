@@ -226,6 +226,21 @@ private:
     u64 last_graphics_pipe_gen{};
     // Cached value of the spec_mru_perm_probe setting, read once at construction.
     bool spec_mru_perm_probe{};
+    // Stamp gate for BuildRuntimeInfo: while the graphics register stamp and
+    // stage repeat, the rebuilt struct and its fingerprint hash are byte
+    // identical, so both are skipped. Vertex and Fragment only - the other
+    // arms read guest memory or untracked state. hash_valid is cleared on
+    // every restamp: the new-program resolve returns before the hash site,
+    // so a stale hash would alias the fingerprint of the PREVIOUS state.
+    struct RuntimeInfoStamp {
+        u64 stamp{};
+        u64 ri_fp_hash{};
+        u8 stage{};
+        bool valid{};
+        bool hash_valid{};
+    };
+    std::array<RuntimeInfoStamp, MaxShaderStages> ri_stamp{};
+    bool ri_stamp_gate{};
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.

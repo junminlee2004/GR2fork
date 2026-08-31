@@ -482,6 +482,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
     spec_mru_perm_probe = EmulatorSettings.IsSpecMruPermProbe();
+    // The stamp arms once at Liverpool construction; a runtime-enabled
+    // skipcache mode would leave it frozen, so the gate latches the BOOT
+    // stamp state, never Framework::Active().
+    ri_stamp_gate = EmulatorSettings.IsRuntimeInfoStampGate() && liverpool->IsGfxStampActive();
     // Latched before WarmUp so deserialized permutations get signatures computed.
     spec_fp_cache = EmulatorSettings.IsSpecFpCache();
     WarmUp();
@@ -850,7 +854,18 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     // because CompileModule rewrites tess/fragment fields through its
     // reference - and the new-program spec must be built from that SAME
     // mutated copy to keep stored-spec bytes identical to before.
-    const auto& runtime_info = BuildRuntimeInfo(stage, l_stage);
+    auto& ri_slot = ri_stamp[static_cast<u32>(l_stage)];
+    const bool stampable = ri_stamp_gate && (stage == Stage::Vertex || stage == Stage::Fragment);
+    const u64 reg_stamp = stampable ? liverpool->GetGfxStateStamp() : 0;
+    if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
+        ri_slot.stage != static_cast<u8>(stage)) {
+        BuildRuntimeInfo(stage, l_stage);
+        ri_slot.stamp = reg_stamp;
+        ri_slot.stage = static_cast<u8>(stage);
+        ri_slot.valid = stampable;
+        ri_slot.hash_valid = false;
+    }
+    const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
@@ -889,7 +904,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         // across calls, so the raw-byte hash repeats; a padding mismatch could only
         // over-discriminate into a miss, never wrongly hit.
         const auto& ri_member = runtime_infos[static_cast<u32>(l_stage)];
-        const u64 ri_fp_hash = RuntimeInfoProxyHash(ri_member);
+        u64 ri_fp_hash;
+        if (ri_slot.hash_valid) {
+            ri_fp_hash = ri_slot.ri_fp_hash;
+        } else {
+            ri_fp_hash = RuntimeInfoProxyHash(ri_member);
+            ri_slot.ri_fp_hash = ri_fp_hash;
+            ri_slot.hash_valid = ri_slot.valid;
+        }
         spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data, ri_fp_hash,
                                      binding);
         // MRU front: consecutive draws overwhelmingly repeat the fingerprint,
