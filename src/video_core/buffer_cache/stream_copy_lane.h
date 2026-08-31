@@ -85,8 +85,8 @@ private:
     std::atomic<u32> num_workers_{0};
     std::atomic<bool> stop_{false};
 
-    // Producer-owned (GPU command thread); plain because single-writer. These
-    // seven fill one line exactly; an eighth would re-share published_'s.
+    // Producer-owned (GPU command thread); plain because single-writer. The
+    // alignas(64) on published_ keeps the worker-touched atomics off this line.
     alignas(64) u64 enqueue_pos_{};
     u64 jobs_{};
     u64 bytes_{};
