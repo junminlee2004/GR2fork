@@ -208,18 +208,35 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     if (ensure_guest_samples && backing_num_samples > 1 != info.num_samples > 1) {
         SetBackingSamples(info.num_samples);
     }
-    const auto& view_infos = backing->image_view_infos;
-    for (size_t i = 0; i < view_infos.size(); ++i) {
-        if (view_infos[i] == view_info) {
+    const auto& records = backing->view_records;
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (records[i].info == view_info) {
             return (*slot_image_views)[backing->image_view_ids[i]];
         }
     }
     return (*slot_image_views)[InsertView(view_info)];
 }
 
+vk::ImageView Image::FindViewHandle(const ImageViewInfo& view_info, bool ensure_guest_samples) {
+    if (ensure_guest_samples && backing_num_samples > 1 != info.num_samples > 1) {
+        SetBackingSamples(info.num_samples);
+    }
+    const auto& records = backing->view_records;
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (records[i].info == view_info) {
+            return records[i].handle;
+        }
+    }
+    InsertView(view_info);
+    return backing->view_records.back().handle;
+}
+
 SHAD_NO_INLINE ImageViewId Image::InsertView(const ImageViewInfo& view_info) {
     const auto view_id = slot_image_views->insert(*instance, view_info, *this);
-    backing->image_view_infos.emplace_back(view_info);
+    // Handle read through the slot AFTER the insert: a reserve inside it can
+    // move every ImageView. The two pushes stay adjacent (lockstep contract).
+    const vk::ImageView handle = *(*slot_image_views)[view_id].image_view;
+    backing->view_records.push_back(BackingImage::ViewRecord{view_info, handle});
     backing->image_view_ids.emplace_back(view_id);
     return view_id;
 }

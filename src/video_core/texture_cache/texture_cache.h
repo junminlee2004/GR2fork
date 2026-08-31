@@ -143,7 +143,7 @@ public:
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
-    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+    [[nodiscard]] vk::ImageView FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);

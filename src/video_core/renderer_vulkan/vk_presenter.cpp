@@ -709,7 +709,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
 
     auto& image = texture_cache.GetImage(image_id);
-    auto image_view = *image.FindView(view_info).image_view;
+    vk::ImageView image_view = image.FindViewHandle(view_info);
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 

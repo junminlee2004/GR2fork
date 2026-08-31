@@ -799,7 +799,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
-ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
@@ -814,7 +814,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     } else {
         MaybeUpdateImage(image_id);
     }
-    return image.FindView(desc.view_info);
+    return image.FindViewHandle(desc.view_info);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {

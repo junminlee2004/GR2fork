@@ -122,6 +122,7 @@ struct Image {
     }
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
+    vk::ImageView FindViewHandle(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
     ImageViewId InsertView(const ImageViewInfo& view_info);
 
     // Inline capacity 2: nearly every call emits 0-1 barriers, and the old
@@ -274,7 +275,17 @@ public:
         // widen the source stage mask conservatively instead.
         u32 subres_divergent{};
         vk::PipelineStageFlags2 subres_stage_union{};
-        boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
+        // The handle rides beside its key so a view hit ends at this record
+        // instead of chasing the id through the slot vector into the
+        // ImageView object. image_view_ids stays, pushed in lockstep with
+        // view_records: FreeImage's deferred reclaim walks it to erase views,
+        // and an entry present in one vector but not the other leaks the view
+        // for the process lifetime.
+        struct ViewRecord {
+            ImageViewInfo info;
+            vk::ImageView handle{};
+        };
+        boost::container::small_vector<ViewRecord, 4> view_records;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
     };
