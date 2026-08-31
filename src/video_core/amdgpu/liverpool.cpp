@@ -295,24 +295,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
-    FIBER_ENTER(dcb_task_name);
-
-    cblock.Reset();
-
-    // TODO: potentially, ASCs also can depend on CE and in this case the
-    // CE task should be moved into more global scope
-    Task ce_task{};
-
-    if (!ccb.empty()) {
-        // In case of CCB provided kick off CE asap to have the constant heap ready to use
-        ce_task = ProcessCeUpdate(ccb);
-        RESUME_GFX(ce_task);
-    }
+std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
+                                                   uintptr_t base_addr) {
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
+    // Cached only for the length of one run segment: every dump entry a submit
+    // can match is registered before that submit is queued, so a segment that
+    // starts with none pending cannot be handed one it could have matched.
+    const bool dumping_regs = DebugState.DumpingCurrentReg();
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -521,7 +512,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
             regs.num_indices = draw_index->index_count;
             regs.draw_initiator = draw_index->draw_initiator;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -543,7 +534,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             regs.max_index_size = draw_index_off->max_size;
             regs.num_indices = draw_index_off->index_count;
             regs.draw_initiator = draw_index_off->draw_initiator;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -565,7 +556,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
             regs.num_indices = draw_index->index_count;
             regs.draw_initiator = draw_index->draw_initiator;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -586,7 +577,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirect*>(header);
             const auto offset = draw_indirect->data_offset;
             const auto stride = sizeof(DrawIndirectArgs);
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -606,7 +597,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             gfx_stamp.FlushAtDraw();
             const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
             const auto offset = draw_indirect->data_offset;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -631,7 +622,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
             const auto offset = draw_index_indirect->data_offset;
             const auto stride = sizeof(DrawIndexedIndirectArgs);
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -653,7 +644,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const auto* draw_index_indirect =
                 reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
             const auto offset = draw_index_indirect->data_offset;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -679,7 +670,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const auto* draw_index_indirect =
                 reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
             const auto offset = draw_index_indirect->data_offset;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
             if (rasterizer) {
@@ -714,7 +705,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             cs_program.dim_y = dispatch_direct->dim_y;
             cs_program.dim_z = dispatch_direct->dim_z;
             cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                cs_program);
             }
@@ -736,7 +727,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             auto& cs_program = GetCsRegs();
             const auto offset = dispatch_indirect->data_offset;
             const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-            if (DebugState.DumpingCurrentReg()) {
+            if (dumping_regs) {
                 DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                cs_program);
             }
@@ -891,60 +882,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         u32(copy_data->engine_sel.Value()));
             break;
         }
-        case PM4ItOpcode::MemSemaphore: {
-            const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-            if (mem_semaphore->IsSignaling()) {
-                mem_semaphore->Signal();
-            } else {
-                while (!mem_semaphore->Signaled()) {
-                    YIELD_GFX();
-                }
-                mem_semaphore->Decrement();
-            }
-            break;
-        }
+        // The only graphics opcodes whose handling can suspend the parser. They
+        // are returned unconsumed; the coroutine owns them.
+        case PM4ItOpcode::MemSemaphore:
+        case PM4ItOpcode::Rewind:
+        case PM4ItOpcode::WaitRegMem:
+        case PM4ItOpcode::IndirectBuffer:
+            return dcb;
         case PM4ItOpcode::AcquireMem: {
             // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
-            break;
-        }
-        case PM4ItOpcode::Rewind: {
-            if (!rasterizer) {
-                break;
-            }
-            const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
-            while (!rewind->Valid()) {
-                YIELD_GFX();
-            }
-            break;
-        }
-        case PM4ItOpcode::WaitRegMem: {
-            const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
-            // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            // Optimization: VO label waits are special because the emulator
-            // will write to the label when presentation is finished. So if
-            // there are no other submits to yield to we can sleep the thread
-            // instead and allow other tasks to run.
-            const u64* wait_addr = wait_reg_mem->Address<u64*>();
-            if (vo_port->IsVoLabel(wait_addr) &&
-                num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
-                break;
-            }
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_GFX();
-            }
-            break;
-        }
-        case PM4ItOpcode::IndirectBuffer: {
-            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task = ProcessGraphics(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
-            RESUME_GFX(task);
-
-            while (!task.handle.done()) {
-                YIELD_GFX();
-                RESUME_GFX(task);
-            }
             break;
         }
         case PM4ItOpcode::IncrementDeCounter: {
@@ -993,6 +939,90 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             UnknownPm4Opcode(static_cast<u32>(opcode), count);
         }
         dcb = NextPacket(dcb, count + 1);
+    }
+    return dcb;
+}
+
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+    FIBER_ENTER(dcb_task_name);
+
+    cblock.Reset();
+
+    // TODO: potentially, ASCs also can depend on CE and in this case the
+    // CE task should be moved into more global scope
+    Task ce_task{};
+
+    if (!ccb.empty()) {
+        // In case of CCB provided kick off CE asap to have the constant heap ready to use
+        ce_task = ProcessCeUpdate(ccb);
+        RESUME_GFX(ce_task);
+    }
+
+    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    while (true) {
+        dcb = RunGraphicsPackets(dcb, ce_task, base_addr);
+        if (dcb.empty()) {
+            break;
+        }
+
+        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::MemSemaphore: {
+            const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            if (mem_semaphore->IsSignaling()) {
+                mem_semaphore->Signal();
+            } else {
+                while (!mem_semaphore->Signaled()) {
+                    YIELD_GFX();
+                }
+                mem_semaphore->Decrement();
+            }
+            break;
+        }
+        case PM4ItOpcode::Rewind: {
+            if (!rasterizer) {
+                break;
+            }
+            const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            while (!rewind->Valid()) {
+                YIELD_GFX();
+            }
+            break;
+        }
+        case PM4ItOpcode::WaitRegMem: {
+            const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            // Optimization: VO label waits are special because the emulator
+            // will write to the label when presentation is finished. So if
+            // there are no other submits to yield to we can sleep the thread
+            // instead and allow other tasks to run.
+            const u64* wait_addr = wait_reg_mem->Address<u64*>();
+            if (vo_port->IsVoLabel(wait_addr) &&
+                num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                break;
+            }
+            while (!wait_reg_mem->Test(regs.reg_array)) {
+                YIELD_GFX();
+            }
+            break;
+        }
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            auto task = ProcessGraphics(
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+            RESUME_GFX(task);
+
+            while (!task.handle.done()) {
+                YIELD_GFX();
+                RESUME_GFX(task);
+            }
+            break;
+        }
+        default:
+            UNREACHABLE_MSG("Unstoppable PM4 opcode {:#x}", u32(header->type3.opcode.Value()));
+        }
+        dcb = NextPacket(dcb, header->type3.NumWords() + 1);
     }
 
     if (ce_task.handle) {

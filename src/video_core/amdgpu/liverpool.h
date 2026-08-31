@@ -202,6 +202,12 @@ private:
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    /// Consumes every graphics packet whose handling cannot suspend the parser.
+    /// Returns empty when dcb is exhausted, else the cursor on the unconsumed
+    /// packet the coroutine must handle. Out of line by contract: inlined back
+    /// into the coroutine, `this` becomes an escaped-frame load again.
+    SHAD_NO_INLINE std::span<const u32> RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
+                                                           uintptr_t base_addr);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
