@@ -118,6 +118,11 @@ struct Info : InfoPersistent {
 
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;
+    // Sharp reads go through this, not the vector. Aliasing the register block is safe only
+    // because every GetParams feeding GetProgram spans storage that outlives the process
+    // (liverpool->regs.*_program, mapped_queues[].cs_state); a GetParams over a stack copy of a
+    // ShaderProgram would leave this dangling.
+    const u32* flat_ud{};
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
@@ -157,7 +162,7 @@ struct Info : InfoPersistent {
 
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+        return *reinterpret_cast<const T*>(flat_ud + sharp_idx);
     }
 
     template <typename T>
@@ -189,12 +194,16 @@ struct Info : InfoPersistent {
     }
 
     void RefreshFlatBuf() {
-        flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
-        ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
-        std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
-        if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        // The walker's first destination dword is NUM_USER_DATA_REGS, so with no walker the flat
+        // buffer is the 16 user-data registers unchanged.
+        if (!srt_info.walker_func) {
+            flat_ud = user_data.data();
+            return;
         }
+        flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+        std::memcpy(flattened_ud_buf.data(), user_data.data(), NUM_USER_DATA_REGS * sizeof(u32));
+        srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        flat_ud = flattened_ud_buf.data();
     }
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {

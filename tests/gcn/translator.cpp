@@ -51,6 +51,7 @@ std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts) {
     info.flattened_ud_buf.resize(4);
     AmdGpu::Buffer buf = AmdGpu::Buffer::Null();
     std::memcpy(info.flattened_ud_buf.data(), &buf, sizeof(buf));
+    info.flat_ud = info.flattened_ud_buf.data();
 
     IR::Program program{info};
     Pools pools{};

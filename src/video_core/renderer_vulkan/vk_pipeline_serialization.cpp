@@ -399,7 +399,8 @@ void Info::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer info{ar};
 
     info.Write(this, sizeof(InfoPersistent));
-    info.Write(flattened_ud_buf);
+    info.Write(size_t{srt_info.flattened_bufsize_dw});
+    info.Write(flat_ud, srt_info.flattened_bufsize_dw * sizeof(u32));
     srt_info.Serialize(ar);
 }
 
@@ -408,6 +409,8 @@ bool Info::Deserialize(Serialization::Archive& ar) {
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
+    // Preload builds descriptor layouts from these sharps before any draw refreshes them.
+    flat_ud = flattened_ud_buf.data();
 
     return srt_info.Deserialize(ar);
 }
