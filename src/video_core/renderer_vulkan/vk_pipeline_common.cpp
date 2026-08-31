@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#include <cstddef>
 #include <cstring>
 
 #include <boost/container/static_vector.hpp>
@@ -19,62 +20,78 @@ namespace Skipcache = VideoCore::Skipcache;
 
 namespace {
 
+// The four key header fields are contiguous, and so are the payload fields of
+// every info struct, so each run copies as raw bytes. The image copy is 20 and
+// not sizeof: a VkDescriptorImageInfo's four tail padding bytes are never
+// initialised, and feeding them to the memcmp would make it nondeterministic.
+// Offsets are checked on the C structs because MSVC rejects offsetof on the
+// vulkan.hpp wrappers; the wrappers are what gets indexed, so their strides are
+// checked against the C ones.
+static_assert(offsetof(VkWriteDescriptorSet, dstArrayElement) ==
+                  offsetof(VkWriteDescriptorSet, dstBinding) + 4 &&
+              offsetof(VkWriteDescriptorSet, descriptorCount) ==
+                  offsetof(VkWriteDescriptorSet, dstBinding) + 8 &&
+              offsetof(VkWriteDescriptorSet, descriptorType) ==
+                  offsetof(VkWriteDescriptorSet, dstBinding) + 12);
+static_assert(sizeof(vk::DescriptorBufferInfo) == sizeof(VkDescriptorBufferInfo) &&
+              sizeof(VkDescriptorBufferInfo) == 24 &&
+              offsetof(VkDescriptorBufferInfo, buffer) == 0 &&
+              offsetof(VkDescriptorBufferInfo, offset) == 8 &&
+              offsetof(VkDescriptorBufferInfo, range) == 16);
+static_assert(sizeof(vk::DescriptorImageInfo) == sizeof(VkDescriptorImageInfo) &&
+              sizeof(VkDescriptorImageInfo) >= 20 &&
+              offsetof(VkDescriptorImageInfo, sampler) == 0 &&
+              offsetof(VkDescriptorImageInfo, imageView) == 8 &&
+              offsetof(VkDescriptorImageInfo, imageLayout) == 16);
+static_assert(sizeof(vk::BufferView) == 8);
+
 // Serialize a descriptor write list into a deterministic byte stream, payload
-// contents included (the vk structs carry padding, so field-by-field is the
-// only memcmp-safe form). Returns 0 on any unknown descriptor type or
-// overflow: unknowns fail toward the slow path.
+// contents included. Returns 0 on any unknown descriptor type or overflow:
+// unknowns fail toward the slow path.
 size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
                                  std::array<u8, 16384>& out) {
-    // One up-front capacity check instead of a bounds test per field: the
-    // worst case per write is a 16-byte header plus 24 bytes per descriptor.
-    // Overestimating (images serialize 20) only ever fails toward the slow
-    // path, same as the old mid-stream overflow return.
-    size_t need = 0;
-    for (const auto& w : writes) {
-        need += 16 + size_t{w.descriptorCount} * 24;
-    }
-    if (need > out.size()) {
-        return 0;
-    }
     u8* cursor = out.data();
+    const u8* const limit = out.data() + out.size();
     const auto put = [&](const void* p, size_t n) {
         std::memcpy(cursor, p, n);
         cursor += n;
     };
-    const auto put64 = [&](u64 v) { put(&v, sizeof(v)); };
-    const auto put32 = [&](u32 v) { put(&v, sizeof(v)); };
     for (const auto& w : writes) {
-        put32(w.dstBinding);
-        put32(w.dstArrayElement);
-        put32(w.descriptorCount);
-        put32(static_cast<u32>(w.descriptorType));
+        const u32 count = w.descriptorCount;
+        // Bail where the overflow would happen rather than on a whole-list
+        // worst case: 24 bounds every payload, so this can only overestimate.
+        if (static_cast<size_t>(limit - cursor) < 16 + size_t{count} * 24) {
+            return 0;
+        }
+        const VkWriteDescriptorSet& raw = w;
+        put(&raw.dstBinding, 16);
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
-        case vk::DescriptorType::eStorageBuffer:
-            for (u32 i = 0; i < w.descriptorCount; ++i) {
-                const auto& b = w.pBufferInfo[i];
-                put64(std::bit_cast<u64>(b.buffer));
-                put64(b.offset);
-                put64(b.range);
+        case vk::DescriptorType::eStorageBuffer: {
+            const auto* const infos = w.pBufferInfo;
+            for (u32 i = 0; i < count; ++i) {
+                put(&infos[i], 24);
             }
             break;
+        }
         case vk::DescriptorType::eSampledImage:
         case vk::DescriptorType::eStorageImage:
         case vk::DescriptorType::eCombinedImageSampler:
-        case vk::DescriptorType::eSampler:
-            for (u32 i = 0; i < w.descriptorCount; ++i) {
-                const auto& im = w.pImageInfo[i];
-                put64(std::bit_cast<u64>(im.sampler));
-                put64(std::bit_cast<u64>(im.imageView));
-                put32(static_cast<u32>(im.imageLayout));
+        case vk::DescriptorType::eSampler: {
+            const auto* const infos = w.pImageInfo;
+            for (u32 i = 0; i < count; ++i) {
+                put(&infos[i], 20);
             }
             break;
+        }
         case vk::DescriptorType::eUniformTexelBuffer:
-        case vk::DescriptorType::eStorageTexelBuffer:
-            for (u32 i = 0; i < w.descriptorCount; ++i) {
-                put64(std::bit_cast<u64>(w.pTexelBufferView[i]));
+        case vk::DescriptorType::eStorageTexelBuffer: {
+            const auto* const views = w.pTexelBufferView;
+            for (u32 i = 0; i < count; ++i) {
+                put(&views[i], 8);
             }
             break;
+        }
         default:
             return 0;
         }
