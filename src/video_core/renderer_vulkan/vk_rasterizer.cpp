@@ -821,8 +821,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         if (!stage) {
             continue;
         }
-        set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
-                          stage->samplers.size());
+        // A stage's buffers and its samplers each collapse into one write; the
+        // image loop still emits one per descriptor array. Exact, so
+        // set_write_index ends on set_writes.size().
+        set_writes.resize(set_writes.size() + !stage->buffers.empty() + stage->images.size() +
+                          !stage->samplers.empty());
         stage->PushUd(binding, push_data);
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
@@ -1035,6 +1038,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 
     // Second pass to re-bind buffers that were updated after binding
+    const u32 first_info = static_cast<u32>(buffer_infos.size());
+    const u32 first_binding = binding.unified;
     for (u32 i = 0; i < buffer_bindings.size(); i++) {
         const auto& [buffer_id, vsharp, size, is_guest] = buffer_bindings[i];
         const auto& desc = stage.buffers[i];
@@ -1109,14 +1114,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
+        ++binding.buffer;
+    }
+
+    // Every pass-2 arm appends exactly one buffer_info, so the stage's infos
+    // are contiguous and in binding order, and each spanned binding is a
+    // descriptorCount-1 eStorageBuffer carrying this stage's flags - the
+    // identity a consecutive-binding update requires. descriptorCount 0 is
+    // illegal, hence the guard.
+    binding.unified += static_cast<u32>(stage.buffers.size());
+    if (!stage.buffers.empty()) {
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
+        set_write.dstBinding = first_binding;
         set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
+        set_write.descriptorCount = static_cast<u32>(stage.buffers.size());
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
-        set_write.pBufferInfo = &buffer_infos.back();
-        ++binding.buffer;
+        set_write.pBufferInfo = buffer_infos.data() + first_info;
     }
 }
 
@@ -1138,9 +1152,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        // The reject paths below must consume the descriptor count the layout
+        // declared for this image, or every later binding number in this stage
+        // and in the stages after it drifts off the layout.
+        const u32 num_bindings = image_desc.NumBindings(stage);
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            image_descriptor_array_sizes.push_back(1);
+            for (u32 i = 0; i < num_bindings; ++i) {
+                image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            }
+            image_descriptor_array_sizes.push_back(num_bindings);
             continue;
         }
 
@@ -1151,13 +1171,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            image_descriptor_array_sizes.push_back(1);
+            for (u32 i = 0; i < num_bindings; ++i) {
+                image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            }
+            image_descriptor_array_sizes.push_back(num_bindings);
             continue;
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings.emplace_back(
@@ -1264,6 +1285,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    // Both taken after the image writes have finished advancing binding.unified
+    // and appending to image_infos.
+    const u32 first_sampler_info = static_cast<u32>(image_infos.size());
+    const u32 first_sampler_binding = binding.unified;
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (sampler.disable_aniso) {
@@ -1274,13 +1299,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+    }
+
+    // Each spanned binding is a descriptorCount-1 eSampler with this stage's
+    // flags and no immutable sampler, which is what a consecutive-binding
+    // update requires. descriptorCount 0 is illegal, hence the guard.
+    binding.unified += static_cast<u32>(stage.samplers.size());
+    if (!stage.samplers.empty()) {
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified++;
+        set_write.dstBinding = first_sampler_binding;
         set_write.dstArrayElement = 0;
-        set_write.descriptorCount = 1;
+        set_write.descriptorCount = static_cast<u32>(stage.samplers.size());
         set_write.descriptorType = vk::DescriptorType::eSampler;
-        set_write.pImageInfo = &image_infos.back();
+        set_write.pImageInfo = image_infos.data() + first_sampler_info;
     }
 }
 
