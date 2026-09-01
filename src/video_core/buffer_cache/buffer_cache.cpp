@@ -47,6 +47,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
+    upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
@@ -1514,7 +1515,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
-        [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
+        [&] { src_buffer = UploadCopies(buffer, copies, is_written, total_size_bytes); });
 
     if (src_buffer) [[unlikely]] {
         EmitBufferUpload(buffer, src_buffer, copies);
@@ -1605,7 +1606,7 @@ void BufferCache::EmitBufferUpload(Buffer& buffer, vk::Buffer src_buffer,
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     size_t total_size_bytes) {
+                                     bool is_written, size_t total_size_bytes) {
     if (copies.empty()) [[likely]] {
         return VK_NULL_HANDLE;
     }
@@ -1613,6 +1614,19 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     if (staging == nullptr) [[unlikely]] {
         return UploadCopiesFallback(buffer, copies, total_size_bytes);
     }
+    if (is_written) {
+        ++upload_w_calls_;
+        upload_w_bytes_ += total_size_bytes;
+    } else {
+        ++upload_ro_calls_;
+        upload_ro_bytes_ += total_size_bytes;
+    }
+    // Read-only islands may drain through the copy lane workers: the tracker
+    // released the region locks before this runs, DrainProducer already
+    // fences every submit and staging-ring wrap, and written binds keep the
+    // inline copy under their lock discipline.
+    auto& lane = VideoCore::StreamCopyLane::Instance();
+    const bool drain = upload_drain_ && !is_written && lane.Enabled();
     for (size_t i = 0; i < copies.size(); ++i) {
         auto& copy = copies[i];
         // Requesting the next island's source overlaps its misses with this
@@ -1623,6 +1637,30 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
         }
         u8* const src_pointer = staging + copy.srcOffset;
         const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
+        if (drain && copy.size >= 192) {
+            Core::MemoryManager::BackingSpan spans[2];
+            const bool hardened = lane.Hardened();
+            const u32 num_spans =
+                memory->ResolveBackingSpans(device_addr, copy.size, spans, 2, hardened);
+            if (num_spans != 0) {
+                u8* dst = src_pointer;
+                bool queued = true;
+                for (u32 k = 0; k < num_spans; ++k) {
+                    if (queued) {
+                        queued = lane.Push(spans[k].ptr, dst, static_cast<u32>(spans[k].size));
+                    }
+                    if (!queued) {
+                        std::memcpy(dst, spans[k].ptr, spans[k].size);
+                    }
+                    dst += spans[k].size;
+                }
+                if (hardened) {
+                    Core::MemoryManager::EndBackingPush();
+                }
+                copy.srcOffset += offset;
+                continue;
+            }
+        }
         memory->CopySparseMemory(device_addr, src_pointer, copy.size);
         // Apply the staging offset
         copy.srcOffset += offset;

@@ -154,6 +154,24 @@ public:
         u64 bytes;
         u64 max_bytes;
     };
+    // Byte split of the staging upload path by bind writability: the
+    // read-only share is what the upload drain setting can move to the lane.
+    struct UploadCopyStats {
+        u64 ro_calls;
+        u64 ro_bytes;
+        u64 w_calls;
+        u64 w_bytes;
+    };
+    UploadCopyStats DrainUploadCopyStats() {
+        const UploadCopyStats stats{upload_ro_calls_, upload_ro_bytes_, upload_w_calls_,
+                                    upload_w_bytes_};
+        upload_ro_calls_ = 0;
+        upload_ro_bytes_ = 0;
+        upload_w_calls_ = 0;
+        upload_w_bytes_ = 0;
+        return stats;
+    }
+
     DmaSyncStats DrainDmaSyncStats() {
         const DmaSyncStats stats{dmasync_calls_, dmasync_buffers_, dmasync_bytes_,
                                  dmasync_max_bytes_};
@@ -287,7 +305,7 @@ private:
     bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
-    vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+    vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies, bool is_written,
                             size_t total_size_bytes);
 
     /// Records the barriers and copy commands for a completed upload batch.
@@ -435,6 +453,11 @@ private:
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
     bool batch_copy_lock_{};
+    bool upload_drain_{};
+    u64 upload_ro_calls_{};
+    u64 upload_ro_bytes_{};
+    u64 upload_w_calls_{};
+    u64 upload_w_bytes_{};
     u64 dmasync_calls_{};
     u64 dmasync_buffers_{};
     u64 dmasync_bytes_{};

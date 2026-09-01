@@ -494,6 +494,10 @@ struct GPUSettings {
     // visible. Titles that gate effects on visibility (inFAMOUS lens flares)
     // then cull those draws themselves before submission.
     Setting<bool> occlude_all{false};
+    // Drain read-only staging upload copies through the stream copy lane
+    // workers instead of copying inline on the GPU command thread. Written
+    // binds always copy inline under their region locks.
+    Setting<bool> stream_copy_upload_drain{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -558,6 +562,8 @@ struct GPUSettings {
             make_override<GPUSettings>("runtime_info_stamp_gate",
                                        &GPUSettings::runtime_info_stamp_gate),
             make_override<GPUSettings>("occlude_all", &GPUSettings::occlude_all),
+            make_override<GPUSettings>("stream_copy_upload_drain",
+                                       &GPUSettings::stream_copy_upload_drain),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -577,7 +583,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
     stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
-    occlude_all)
+    occlude_all, stream_copy_upload_drain)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -852,6 +858,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DynStateMemo, dyn_state_memo)
     SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoStampGate, runtime_info_stamp_gate)
     SETTING_FORWARD_BOOL(m_gpu, OccludeAll, occlude_all)
+    SETTING_FORWARD_BOOL(m_gpu, StreamCopyUploadDrain, stream_copy_upload_drain)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

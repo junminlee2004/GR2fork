@@ -696,6 +696,11 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] STREAMCOPY hits={} probes={} per300f",
                          sc.hits, sc.probes);
             }
+            const auto us = buffer_cache.DrainUploadCopyStats();
+            if (us.ro_calls || us.w_calls) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
+                         us.ro_calls, us.ro_bytes >> 20, us.w_calls, us.w_bytes >> 20);
+            }
             const auto ds = buffer_cache.DrainDmaSyncStats();
             if (ds.calls) {
                 LOG_INFO(Render_Skipcache,
