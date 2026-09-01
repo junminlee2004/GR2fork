@@ -336,62 +336,106 @@ public:
         // recomputed: without the lock held the bits can change in between.
         u64 skipped = 0;
         u32 index = 0;
-        IteratePages<true>(
-            query_cpu_range, query_size,
-            [&func, is_written, &skipped, &index](RegionManager* manager, u64 offset, size_t size) {
+        {
+            RENDERER_TRACE;
+            // Direct walk, shaped like the fast path above: only the first
+            // region is a scattered lookup, the rest step top_tier linearly,
+            // and the next region's header line is requested one region early
+            // so its first-touch miss overlaps the current region's body.
+            std::size_t remaining_size = query_size;
+            std::size_t page_index = first_page;
+            u64 page_offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
+            bool scattered = true;
+            while (remaining_size > 0) {
+                const std::size_t copy_amount{
+                    std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
+                RegionManager* manager =
+                    scattered ? LookupRegion(page_index) : top_tier[page_index];
+                scattered = false;
+                if (manager == nullptr) {
+                    manager = CreateRegion(page_index);
+                }
+                if (remaining_size > copy_amount) {
+                    if (RegionManager* next = top_tier[page_index + 1]) {
+                        __builtin_prefetch(next, 0, 3);
+                    }
+                }
+                const u64 offset = page_offset;
+                const std::size_t size = copy_amount;
+                page_index++;
+                page_offset = 0;
+                remaining_size -= copy_amount;
                 // Read-only binds almost never have anything to upload, and
                 // proving it under the lock is the hottest contended site in
                 // the frame.
                 const bool nothing_to_upload =
                     !manager->template PeekRegionModified<Type::CPU>(offset, size);
                 if (!is_written) {
-                    // The counter and the skip set it indexes are consumed only
-                    // by the second pass, which a read-only bind returns before
-                    // reaching.
+                    // The counter and the skip set it indexes are consumed
+                    // only by written binds in the second pass.
                     if (nothing_to_upload) {
-                        return;
+                        continue;
                     }
                     manager->lock.lock();
                     manager->template ForEachModifiedRange<Type::CPU, true>(
                         manager->GetCpuAddr() + offset, size, func);
                     manager->lock.unlock();
-                    return;
+                    continue;
                 }
-                // Written binds can skip too when there is nothing to upload and
-                // the range is already marked, which also avoids re-applying its
-                // protection.
+                // Written binds can skip too when there is nothing to upload
+                // and the range is already marked, which also avoids
+                // re-applying its protection.
                 const u32 i = index++;
                 if (nothing_to_upload && i < 64 &&
                     manager->template PeekRegionFullySet<Type::GPU>(offset, size)) {
                     skipped |= u64{1} << i;
                     // The bits stay as they are, but this is still a new GPU
-                    // write to the region: the write sequence must advance or a
-                    // snapshot taken before this bind could not tell that its
-                    // downloaded bytes are now stale. GPU-command-thread
+                    // write to the region: the write sequence must advance or
+                    // a snapshot taken before this bind could not tell that
+                    // its downloaded bytes are now stale. GPU-command-thread
                     // confined, like the counter.
                     ++manager->gpu_write_seq;
-                    return;
+                    continue;
                 }
                 manager->lock.lock();
                 manager->template ForEachModifiedRange<Type::CPU, true>(
                     manager->GetCpuAddr() + offset, size, func);
-            });
+            }
+        }
         on_upload();
         if (!is_written) {
             return;
         }
-        u32 unlock_index = 0;
-        IteratePages<false>(
-            query_cpu_range, query_size,
-            [&skipped, &unlock_index](RegionManager* manager, u64 offset, size_t size) {
+        {
+            // Second pass mirrors the first walk's region sequence exactly; a
+            // region skipped there was never locked here. Regions all exist
+            // by now (pass one created them), so a null slot is skipped the
+            // way the generic no-create walk skipped it.
+            u32 unlock_index = 0;
+            std::size_t remaining_size = query_size;
+            std::size_t page_index = first_page;
+            u64 page_offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
+            while (remaining_size > 0) {
+                const std::size_t copy_amount{
+                    std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
+                RegionManager* const manager = top_tier[page_index];
+                const u64 offset = page_offset;
+                const std::size_t size = copy_amount;
+                page_index++;
+                page_offset = 0;
+                remaining_size -= copy_amount;
+                if (manager == nullptr) {
+                    continue;
+                }
                 const u32 i = unlock_index++;
                 if (i < 64 && (skipped & (u64{1} << i)) != 0) {
-                    return; // never locked in the first pass
+                    continue; // never locked in the first pass
                 }
                 manager->template ChangeRegionState<Type::GPU, true>(manager->GetCpuAddr() + offset,
                                                                      size);
                 manager->lock.unlock();
-            });
+            }
+        }
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
