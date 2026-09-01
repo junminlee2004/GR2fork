@@ -160,6 +160,13 @@ private:
     BeginRenderingCache br_cache_{};
     bool br_readback_gate_{}; // readbackLinearImages snapshot: cache off when set
     bool batch_copy_lock_{};  // settings snapshot, read at draw rate
+    // Interval flush: a readback fence otherwise waits on the whole body
+    // recorded since the last submit. Boot-latched; 0 = off.
+    u32 flush_draw_interval_{};
+    u32 draws_since_flush_{};
+    u64 flush_tick_{};
+    u64 interval_flushes_{};
+    void MaybeIntervalFlush();
     bool elide_findbuffer_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms
 

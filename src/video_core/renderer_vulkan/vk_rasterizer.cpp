@@ -59,6 +59,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
+    if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
+        flush_draw_interval_ = std::max<u32>(interval, 64);
+    }
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
     // pinned, and a frozen stamp compares every draw register-identical.
@@ -466,6 +469,32 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
 
     ResetBindings();
+    if (flush_draw_interval_ != 0) {
+        // The flush submits; it must not run under the guest-copy shared lock.
+        copy_scope.reset();
+        MaybeIntervalFlush();
+    }
+}
+
+void Rasterizer::MaybeIntervalFlush() {
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != flush_tick_) {
+        flush_tick_ = tick;
+        draws_since_flush_ = 0;
+    }
+    if (++draws_since_flush_ < flush_draw_interval_) {
+        return;
+    }
+    // A pending depth or stencil clear belongs to the open render scope:
+    // BeginRendering re-derives the clear load op, so a scope re-begun after
+    // a flush would clear the attachment a second time.
+    const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
+    if (ds.depth_clear || ds.stencil_clear) {
+        return;
+    }
+    scheduler.Flush();
+    draws_since_flush_ = 0;
+    ++interval_flushes_;
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -598,6 +627,10 @@ void Rasterizer::DispatchDirect() {
     DebugState.IncDispatch();
 
     ResetBindings();
+    if (flush_draw_interval_ != 0) {
+        copy_scope.reset();
+        MaybeIntervalFlush();
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -695,6 +728,11 @@ void Rasterizer::OnSubmit() {
             if (sc.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] STREAMCOPY hits={} probes={} per300f",
                          sc.hits, sc.probes);
+            }
+            if (flush_draw_interval_ != 0) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
+                         interval_flushes_);
+                interval_flushes_ = 0;
             }
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {
