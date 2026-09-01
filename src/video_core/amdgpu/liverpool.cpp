@@ -455,6 +455,13 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
 
         const u32 count = header->type3.NumWords();
         const PM4ItOpcode opcode = header->type3.opcode;
+        // Guest-stream lookahead: the header load-use stall dominates this
+        // loop, and the parse position advances every packet, so two lines in
+        // flight cover the next headers and payload while the current handler
+        // runs. Strictly an A/B - the pm4-scout thread nulled on this same
+        // target once; a flat result removes these two lines for good.
+        __builtin_prefetch(dcb.data() + 64, 0, 3);
+        __builtin_prefetch(dcb.data() + 128, 0, 3);
         // Register-write runs dominate the packet mix; one masked compare on
         // type+opcode routes them past the 142-target indirect jump. The mask
         // drops predicate and shader_type, which both handlers ignore, so the
