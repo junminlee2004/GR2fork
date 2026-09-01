@@ -30,6 +30,8 @@ namespace VideoCore {
 struct ImageViewInfo {
     ImageViewInfo() = default;
     ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept;
+    ImageViewInfo(const AmdGpu::Image& image, bool is_storage_, bool is_depth,
+                  bool is_array) noexcept;
     ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept;
     ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
                   AmdGpu::DepthControl ctl);

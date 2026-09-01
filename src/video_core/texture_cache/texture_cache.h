@@ -83,11 +83,23 @@ public:
         AmdGpu::Image deferred_tsharp{};
         bool deferred_is_depth{};
 
+        // Deferred view: a FINDIMG memo hit copies the post-rebase view info
+        // out of the entry, so the 56-byte build (SurfaceFormat, swizzle, view
+        // type) runs only on the routes that reach FindImage. Bindings that
+        // mutate the view before the probe (mip fallback) build it eagerly.
+        bool view_ready{true};
+        bool deferred_is_array{};
+
         ImageDesc() = default;
-        ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
-            : view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture},
-              deferred_tsharp{image}, deferred_is_depth{desc.is_depth} {}
+        ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc,
+                  bool defer_view = false)
+            : type{desc.is_written ? BindingType::Storage : BindingType::Texture},
+              deferred_tsharp{image}, deferred_is_depth{desc.is_depth}, view_ready{!defer_view},
+              deferred_is_array{desc.is_array} {
+            if (!defer_view) {
+                view_info = ImageViewInfo{image, desc};
+            }
+        }
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{std::in_place, buffer, hint}, view_info{buffer},
               type{BindingType::RenderTarget} {}
@@ -109,6 +121,13 @@ public:
         }
         const ImageInfo& Info() const {
             return *info;
+        }
+        void EnsureViewInfo() {
+            if (!view_ready) {
+                view_info = ImageViewInfo{deferred_tsharp, type == BindingType::Storage,
+                                          deferred_is_depth, deferred_is_array};
+                view_ready = true;
+            }
         }
     };
     // Rasterizer target descs are rebuilt with construct_at over an engaged
@@ -424,13 +443,15 @@ private:
         std::array<u64, 4> tsharp_raw{};
         u64 image_uid{};
         u64 tex_gen{};
+        u8 type{};
+        u8 view_key{}; // is_depth | is_array << 1: the view build's other inputs
+        bool valid{};
         u64 access_tick{};
         u64 lru_tick{};
         ImageId image_id{};
-        u32 view_base_level{};
-        u32 view_base_layer{};
-        u8 type{};
-        bool valid{};
+        // Post-rebase view info: a consumed hit hands the binding a complete
+        // view without rebuilding it, and a verify compares all of it.
+        ImageViewInfo view_info{};
     };
     std::array<FindImageMemoEntry, 1024> find_image_memo_{};
 

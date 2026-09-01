@@ -48,22 +48,28 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
 }
 
 ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
-    : is_storage{desc.is_written} {
+    : ImageViewInfo{image, desc.is_written, desc.is_depth, desc.is_array} {}
+
+// The shader-resource ctor consumes three resource bits; this form is what a
+// deferred binding uses once the memo has missed and the resource is gone.
+ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, bool is_storage_, bool is_depth,
+                             bool is_array) noexcept
+    : is_storage{is_storage_} {
     const auto dfmt = image.GetDataFmt();
     auto nfmt = image.GetNumberFmt();
     if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
         nfmt = AmdGpu::NumberFormat::Unorm;
     }
     format = Vulkan::LiverpoolToVK::SurfaceFormat(dfmt, nfmt);
-    if (desc.is_depth) {
+    if (is_depth) {
         format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
     }
 
     range.base.level = image.base_level;
     range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
-    range.extent.levels = image.NumViewLevels(desc.is_array);
-    range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array);
+    range.extent.levels = image.NumViewLevels(is_array);
+    range.extent.layers = image.NumViewLayers(is_array);
+    type = image.GetViewType(is_array);
     min_lod = static_cast<u32>(image.min_lod);
 
     if (!is_storage) {

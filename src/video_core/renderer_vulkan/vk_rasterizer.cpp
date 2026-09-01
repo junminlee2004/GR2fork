@@ -1238,8 +1238,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
 
         for (auto i = 0; i < num_bindings; i++) {
+            // Mip fallback rewrites the view range before the memo probe, so
+            // only fallback-free bindings defer the view build to a memo miss.
             auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
+                std::piecewise_construct, std::tuple{},
+                std::tuple{tsharp, image_desc,
+                           mip_fallback_mode == Shader::MipStorageFallbackMode::None});
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);

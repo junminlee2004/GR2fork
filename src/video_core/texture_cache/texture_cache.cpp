@@ -533,7 +533,9 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     const u64 t0 = timed ? sc.Now() : 0;
     const u64 tex_gen = sc.Gens().tex_gen.load(std::memory_order_acquire);
     const auto raw = std::bit_cast<std::array<u64, 4>>(tsharp);
-    const size_t slot = ((raw[0] >> 8) ^ (raw[0] >> 40) ^ raw[1]) & 1023;
+    const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
+                        static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
+    const size_t slot = ((raw[0] >> 8) ^ (raw[0] >> 40) ^ raw[1] ^ view_key) & 1023;
     FindImageMemoEntry& e = find_image_memo_[slot];
 
     // Hit predicate: identical T#, same binding class, texture-cache structure
@@ -543,7 +545,8 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     bool would_hit = false;
     if (!e.valid) {
         ++ctr.miss_cold;
-    } else if (e.tsharp_raw != raw || e.type != static_cast<u8>(desc.type)) {
+    } else if (e.tsharp_raw != raw || e.type != static_cast<u8>(desc.type) ||
+               e.view_key != view_key) {
         ++ctr.miss_key;
     } else if (e.tex_gen != tex_gen) {
         ++ctr.miss_gen[LaneTex];
@@ -578,12 +581,8 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 e.access_tick = current_tick;
                 e.lru_tick = gc_tick;
             }
-            if (e.view_base_level > 0) {
-                desc.view_info.range.base.level = e.view_base_level;
-            }
-            if (e.view_base_layer > 0) {
-                desc.view_info.range.base.layer = e.view_base_layer;
-            }
+            desc.view_info = e.view_info;
+            desc.view_ready = true;
             return e.image_id;
         }
     }
@@ -591,14 +590,14 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     // served, outside the consumed-hit flow above.
     const ImageId predicted = would_hit ? e.image_id : ImageId{};
     const u64 m0 = timed && !would_hit ? sc.Now() : 0;
+    desc.EnsureViewInfo();
     const ImageId real = FindImage(desc);
     if (timed && !would_hit) {
         ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
         ++ctr.miss_samples;
     }
     if (would_hit && sc.GetState(kCache) != State::Learning) {
-        if (predicted == real && e.view_base_level == desc.view_info.range.base.level &&
-            e.view_base_layer == desc.view_info.range.base.layer) {
+        if (predicted == real && e.view_info == desc.view_info) {
             sc.RecordVerifyClean(kCache);
         } else if (sc.Gens().tex_gen.load(std::memory_order_acquire) != tex_gen) {
             sc.RecordVerifyAborted(kCache);
@@ -614,9 +613,9 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         e.valid = false;
         e.tsharp_raw = raw;
         e.type = static_cast<u8>(desc.type);
+        e.view_key = view_key;
         e.image_id = real;
-        e.view_base_level = desc.view_info.range.base.level;
-        e.view_base_layer = desc.view_info.range.base.layer;
+        e.view_info = desc.view_info;
         {
             const Image& image = slot_images[real];
             e.image_uid = image.image_uid;
@@ -633,7 +632,8 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Materialized here, before the lock: a first build under the texture
     // mutex would drag the whole ImageInfo construction into the critical
-    // section.
+    // section. The view is rebased below, so a deferred one is built first.
+    desc.EnsureViewInfo();
     const auto& info = desc.Info();
     ASSERT(info.guest_address != 0);
 
