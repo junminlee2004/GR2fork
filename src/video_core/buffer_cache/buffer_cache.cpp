@@ -266,10 +266,13 @@ void BufferCache::EmitMirrorTelemetry() {
              mirror_sink_.poisoned.exchange(0, std::memory_order_relaxed));
     LOG_INFO(Render_Skipcache,
              "[SkipCache] MIRRORTIERA hit%={:.1f} hits={} walks={} elig_walks={} "
-             "span_le64%={:.1f} ws_keys={} ws_MiB={:.1f} per300f",
+             "span_le64%={:.1f} ws_keys={} ws_MiB={:.1f} texelro={} texelregions={} per300f",
              pct(mo.tierA_hits, mo.tierA_hits + mo.tierA_walks), mo.tierA_hits, mo.tierA_walks,
              mo.tierA_elig_walks, pct(mo.tierA_span_le64, mo.tierA_walks), mo.ws_keys,
-             static_cast<double>(mo.ws_bytes) / (1024.0 * 1024.0));
+             static_cast<double>(mo.ws_bytes) / (1024.0 * 1024.0), texel_ro_walks_,
+             texel_ro_regions_);
+    texel_ro_walks_ = 0;
+    texel_ro_regions_ = 0;
     LOG_INFO(Render_Skipcache,
              "[SkipCache] PEEKBASE calls={} dirty={} mwalks={} mregions={} mclean={} per300f",
              memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty,
@@ -352,6 +355,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                             liverpool->SendCommand<false>(
                                 [this, device_addr, size, is_write, job = std::move(job)] {
                                     FinishFaultDownload(*job, device_addr, size, is_write);
+                                    // The timed-out path bumped the generation
+                                    // when it returned, before this deferred
+                                    // finish marked the pages CPU-dirty; a
+                                    // generation-keyed memo recorded in between
+                                    // would hit after the mark.
+                                    VideoCore::Skipcache::Framework::Instance().BumpMemGen();
                                 });
                         });
                     return;
@@ -1527,6 +1536,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         EmitBufferUpload(buffer, src_buffer, copies);
     }
     if (is_texel_buffer && !is_written) {
+        // Sizing input for a texel-bind memo: these formatted read-only binds
+        // are excluded from sync_noop and walk their whole span every bind.
+        ++texel_ro_walks_;
+        texel_ro_regions_ += ((device_addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS) -
+                             (device_addr >> TRACKER_HIGHER_PAGE_BITS) + 1;
         return SynchronizeBufferFromImage(buffer, device_addr, size);
     }
     if (mirror_mode_ && memo_eligible) {

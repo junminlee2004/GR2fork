@@ -458,6 +458,8 @@ private:
     u64 upload_ro_bytes_{};
     u64 upload_w_calls_{};
     u64 upload_w_bytes_{};
+    u64 texel_ro_walks_{};
+    u64 texel_ro_regions_{};
     u64 dmasync_calls_{};
     u64 dmasync_buffers_{};
     u64 dmasync_bytes_{};
