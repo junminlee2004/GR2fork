@@ -213,6 +213,20 @@ public:
      * between the GPU thread and the guest fault handler are otherwise the
      * dominant cost of every buffer bind.
      */
+    /// Whole-region CPU-clean test with no range math: the seqlock read of the
+    /// summary word alone. Only the multi-region upload walk uses it, on
+    /// regions it covers completely; a false answer merely hands the region
+    /// to the full check.
+    [[nodiscard]] bool PeekFullRegionClean() const noexcept {
+        const u32 before = seq.load(std::memory_order_acquire);
+        if (before & 1u) {
+            return false;
+        }
+        const u16 summary = cpu_summary_;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return seq.load(std::memory_order_relaxed) == before && summary == 0;
+    }
+
     template <Type type>
     [[nodiscard]] bool PeekRegionModified(u64 offset, u64 size) noexcept {
         if constexpr (type == Type::CPU) {

@@ -32,6 +32,9 @@ public:
     // Upload-walk peek baseline; GPU-command-thread confined like the walk.
     u64 peek_fastpath_calls{};
     u64 peek_fastpath_dirty{};
+    u64 multi_walks{};
+    u64 multi_regions{};
+    u64 multi_clean_regions{};
 
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
@@ -346,7 +349,37 @@ public:
             std::size_t page_index = first_page;
             u64 page_offset = query_cpu_range & TRACKER_HIGHER_PAGE_MASK;
             bool scattered = true;
+            ++multi_walks;
+            u64 clean_regions = 0;
+            u64 walked_regions = 0;
             while (remaining_size > 0) {
+                if (!is_written && page_offset == 0) {
+                    // Register-only scan over the whole regions ahead: the
+                    // general body below costs ~44 instructions with ten
+                    // stack accesses per region, and ~93% of a read-only
+                    // multi-region walk's regions are clean middle regions.
+                    // Trip count and cursor stay in locals and fold into the
+                    // walk state once, so the loop carries nothing through
+                    // memory. A null slot or a dirty region hands the walk
+                    // back to the general body at that region.
+                    const std::size_t full = remaining_size >> TRACKER_HIGHER_PAGE_BITS;
+                    std::size_t clean = 0;
+                    while (clean < full) {
+                        RegionManager* const ahead = top_tier[page_index + clean];
+                        if (ahead == nullptr || !ahead->PeekFullRegionClean()) {
+                            break;
+                        }
+                        ++clean;
+                    }
+                    if (clean != 0) {
+                        page_index += clean;
+                        remaining_size -= clean << TRACKER_HIGHER_PAGE_BITS;
+                        clean_regions += clean;
+                        scattered = false;
+                        continue;
+                    }
+                }
+                ++walked_regions;
                 const std::size_t copy_amount{
                     std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
                 RegionManager* manager =
@@ -401,6 +434,8 @@ public:
                 manager->template ForEachModifiedRange<Type::CPU, true>(
                     manager->GetCpuAddr() + offset, size, func);
             }
+            multi_regions += walked_regions + clean_regions;
+            multi_clean_regions += clean_regions;
         }
         on_upload();
         if (!is_written) {
