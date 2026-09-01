@@ -734,6 +734,7 @@ void Rasterizer::OnSubmit() {
                          interval_flushes_);
                 interval_flushes_ = 0;
             }
+            pipeline_cache.DumpKeyReuseStats();
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",

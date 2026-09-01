@@ -503,6 +503,10 @@ struct GPUSettings {
     // buffer holding at most this many draws instead of the whole recorded
     // body. Values below 64 are raised to 64 (each flush costs a submit).
     Setting<u32> flush_draw_interval{0};
+    // Reuse the previous graphics pipeline key while the register stamp
+    // repeats: only the stage resolve reruns. Needs runtime_info_stamp_gate
+    // and dynamic vertex input; otherwise the lookup runs unchanged.
+    Setting<bool> pipeline_key_stamp_reuse{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -570,6 +574,8 @@ struct GPUSettings {
             make_override<GPUSettings>("stream_copy_upload_drain",
                                        &GPUSettings::stream_copy_upload_drain),
             make_override<GPUSettings>("flush_draw_interval", &GPUSettings::flush_draw_interval),
+            make_override<GPUSettings>("pipeline_key_stamp_reuse",
+                                       &GPUSettings::pipeline_key_stamp_reuse),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -589,7 +595,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
     stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
-    occlude_all, stream_copy_upload_drain, flush_draw_interval)
+    occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -866,6 +872,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, OccludeAll, occlude_all)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyUploadDrain, stream_copy_upload_drain)
     SETTING_FORWARD(m_gpu, FlushDrawInterval, flush_draw_interval)
+    SETTING_FORWARD_BOOL(m_gpu, PipelineKeyStampReuse, pipeline_key_stamp_reuse)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

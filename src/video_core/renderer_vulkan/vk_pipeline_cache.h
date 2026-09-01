@@ -180,9 +180,13 @@ public:
         return profile;
     }
 
+    /// Per-window telemetry for the stamp-keyed key reuse; silent when it is off.
+    void DumpKeyReuseStats();
+
 private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
+    bool ReuseGraphicsKey(u64 pipe_gen);
     bool RefreshComputeKey();
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
@@ -224,6 +228,16 @@ private:
     GraphicsPipelineKey last_graphics_key{};
     const GraphicsPipeline* last_graphics_pipeline{};
     u64 last_graphics_pipe_gen{};
+    // Stamp-keyed key reuse: the register stamp the last successful key was
+    // built at. While it repeats, every register-derived field of that key
+    // still holds and only the stage resolve reruns (ReuseGraphicsKey).
+    u64 last_key_stamp{};
+    bool key_stamp_reuse{};
+    bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
+    u64 key_reuse_hits{};
+    u64 key_reuse_rebuilds{}; // stamp repeated, the stage resolve changed the key
+    u64 key_reuse_stamp_misses{};
+    u64 key_reuse_mismatches{};
     // Cached value of the spec_mru_perm_probe setting, read once at construction.
     bool spec_mru_perm_probe{};
     // Stamp gate for BuildRuntimeInfo: while the graphics register stamp and

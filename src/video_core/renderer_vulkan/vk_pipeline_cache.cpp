@@ -486,6 +486,18 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // skipcache mode would leave it frozen, so the gate latches the BOOT
     // stamp state, never Framework::Active().
     ri_stamp_gate = EmulatorSettings.IsRuntimeInfoStampGate() && liverpool->IsGfxStampActive();
+    // The reuse copies the previous key back before the stage resolve, so the
+    // vertex-format arm (which appends per attribute) must be dynamic, and the
+    // Fragment runtime-info slot must be stamp-gated (see ReuseGraphicsKey).
+    if (EmulatorSettings.IsPipelineKeyStampReuse()) {
+        key_stamp_reuse = ri_stamp_gate && instance.IsVertexInputDynamicState();
+        key_reuse_validate =
+            Skipcache::Framework::Instance().ActiveMode() == Skipcache::Mode::ValidateOnly;
+        if (!key_stamp_reuse) {
+            LOG_WARNING(Render_Vulkan, "pipeline key stamp reuse needs runtime_info_stamp_gate "
+                                       "and dynamic vertex input; the lookup runs unchanged");
+        }
+    }
     // Latched before WarmUp so deserialized permutations get signatures computed.
     spec_fp_cache = EmulatorSettings.IsSpecFpCache();
     WarmUp();
@@ -499,15 +511,22 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+    // pipe_gen invalidates the cached pair when ReplaceShader erases entries.
+    const u64 pipe_gen =
+        Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
+    if (key_stamp_reuse && ReuseGraphicsKey(pipe_gen)) {
+        return last_graphics_pipeline;
+    }
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
     // A repeated key returns the previous pipeline without hashing or probing the
-    // map. pipe_gen invalidates the cached pair when ReplaceShader erases entries.
-    const u64 pipe_gen =
-        Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
+    // map. The stamp moves here too: registers the key does not read (viewport,
+    // scissor) restamp every draw, and the reuse keys on the stamp this key
+    // was last built at, not on the one that first stored it.
     if (last_graphics_pipeline && pipe_gen == last_graphics_pipe_gen &&
         graphics_key == last_graphics_key) {
+        last_key_stamp = liverpool->GetGfxStateStamp();
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -540,7 +559,53 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
     last_graphics_pipe_gen = pipe_gen;
+    last_key_stamp = liverpool->GetGfxStateStamp();
     return last_graphics_pipeline;
+}
+
+// The stamp covers every register the key reads (context, SH and uconfig), so
+// while it repeats the register-derived fields of the previous key still hold:
+// the stage resolve reruns on top of a copy of that key, and a key that comes
+// out identical is the previous pipeline. The resolve can still change the key
+// (a sharp rewritten in guest memory reaches another permutation), which falls
+// back to the full refresh. The Fragment runtime-info slot must be stamp
+// current: its rebuild reads the key's color buffers, which pass two of the
+// full refresh has already masked, so a rebuild from the copied key would
+// fingerprint a different runtime info than the one the stored spec carries.
+bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
+    const u64 stamp = liverpool->GetGfxStateStamp();
+    const auto& fs_slot = ri_stamp[static_cast<u32>(LogicalStage::Fragment)];
+    if (!last_graphics_pipeline || pipe_gen != last_graphics_pipe_gen || stamp != last_key_stamp ||
+        !fs_slot.valid || fs_slot.stamp != stamp) {
+        ++key_reuse_stamp_misses;
+        return false;
+    }
+    std::memcpy(&graphics_key, &last_graphics_key, sizeof(graphics_key));
+    if (!RefreshGraphicsStages() || !(graphics_key == last_graphics_key)) {
+        ++key_reuse_rebuilds;
+        return false;
+    }
+    ++key_reuse_hits;
+    if (!key_reuse_validate) {
+        return true;
+    }
+    if (RefreshGraphicsKey() && graphics_key == last_graphics_key) {
+        return true;
+    }
+    ++key_reuse_mismatches;
+    LOG_ERROR(Render_Vulkan, "stamp-reused graphics key differs from a full refresh at stamp {}",
+              stamp);
+    return false;
+}
+
+void PipelineCache::DumpKeyReuseStats() {
+    if (!key_stamp_reuse) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] KEYREUSE hits={} rebuilds={} misses={} mismatches={} per300f",
+             key_reuse_hits, key_reuse_rebuilds, key_reuse_stamp_misses, key_reuse_mismatches);
+    key_reuse_hits = key_reuse_rebuilds = key_reuse_stamp_misses = key_reuse_mismatches = 0;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
