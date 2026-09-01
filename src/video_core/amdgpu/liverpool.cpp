@@ -142,6 +142,7 @@ Liverpool::Liverpool() {
     // plain memcpy with zero compares.
     gfx_stamp.active =
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    occlude_all_ = EmulatorSettings.IsOccludeAll();
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -804,7 +805,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                     for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                         *results = pixel_counter | OcclusionCounterValidMask;
                     }
-                    pixel_counter += OcclusionCounterStep;
+                    if (!occlude_all_) {
+                        pixel_counter += OcclusionCounterStep;
+                    }
                 }
             }
             break;

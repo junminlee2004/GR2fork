@@ -244,6 +244,9 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    // Frozen counter = every query pair differences to zero samples passed:
+    // the title's own visibility logic then culls those draws before issue.
+    bool occlude_all_{};
 
     struct ConstantEngine {
         void Reset() {
