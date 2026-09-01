@@ -296,20 +296,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-void Liverpool::SetContextRegPacket(const PM4Header* header, u32 count) {
-    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-    const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-    const auto* payload = reinterpret_cast<const u32*>(header + 2);
-
-    gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-
-    // In the case of HW, render target memory has alignment as color block operates on
-    // tiles. There is no information of actual resource extents stored in CB context
-    // regs, so any deduction of it from slices/pitch will lead to a larger surface
-    // created. The same applies to the depth targets. Fortunately, the guest always
-    // sends a trailing NOP packet right after the context regs setup, so we can use the
-    // heuristic below and extract the hint to determine actual resource dims.
-
+void Liverpool::SetContextRegExtentTail(u32 reg_addr, const PM4Header* header, const u32* payload) {
     switch (reg_addr) {
     case ContextRegs::CbColor0Base:
     case ContextRegs::CbColor1Base:
@@ -378,23 +365,69 @@ void Liverpool::SetContextRegPacket(const PM4Header* header, u32 count) {
     }
 }
 
-void Liverpool::SetShRegPacket(const PM4Header* header, u32 count) {
+SHAD_FORCE_INLINE void Liverpool::SetContextRegHot(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+    const auto* payload = reinterpret_cast<const u32*>(header + 2);
+
+    gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+
+    // In the case of HW, render target memory has alignment as color block operates on
+    // tiles. There is no information of actual resource extents stored in CB context
+    // regs, so any deduction of it from slices/pitch will lead to a larger surface
+    // created. The same applies to the depth targets. Fortunately, the guest always
+    // sends a trailing NOP packet right after the context regs setup, so we can use the
+    // heuristic below and extract the hint to determine actual resource dims. The
+    // per-register bodies carry asserts, so they live in the outlined tail; the switch
+    // itself stays here and costs nothing on the default path.
+    switch (reg_addr) {
+    case ContextRegs::CbColor0Base:
+    case ContextRegs::CbColor1Base:
+    case ContextRegs::CbColor2Base:
+    case ContextRegs::CbColor3Base:
+    case ContextRegs::CbColor4Base:
+    case ContextRegs::CbColor5Base:
+    case ContextRegs::CbColor6Base:
+    case ContextRegs::CbColor7Base:
+    case ContextRegs::CbColor0Cmask:
+    case ContextRegs::CbColor1Cmask:
+    case ContextRegs::CbColor2Cmask:
+    case ContextRegs::CbColor3Cmask:
+    case ContextRegs::CbColor4Cmask:
+    case ContextRegs::CbColor5Cmask:
+    case ContextRegs::CbColor6Cmask:
+    case ContextRegs::CbColor7Cmask:
+    case ContextRegs::DbZInfo:
+        SetContextRegExtentTail(reg_addr, header, payload);
+        break;
+    default:
+        break;
+    }
+}
+
+SHAD_NO_INLINE void Liverpool::SetShRegCompute(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (count - 1) * sizeof(u32);
+    ASSERT(set_size <= sizeof(ComputeProgram));
+    auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
+                 (set_data->reg_offset - 0x200);
+    std::memcpy(addr, header + 2, set_size);
+}
+
+SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count) {
     const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
     const auto set_size = (count - 1) * sizeof(u32);
 
     if (set_data->reg_offset >= 0x200 &&
         set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-        ASSERT(set_size <= sizeof(ComputeProgram));
-        auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
-                     (set_data->reg_offset - 0x200);
-        std::memcpy(addr, header + 2, set_size);
+        SetShRegCompute(header, count);
+        return;
+    }
+    const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+    if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+        StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
     } else {
-        const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
-        if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
-            StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
-        } else {
-            gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
-        }
+        gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
     }
 }
 
@@ -428,12 +461,12 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         // routing is bit-identical to the switch arms below.
         const u32 hdr_masked = header->raw & 0xC000FF00u;
         if (hdr_masked == 0xC0007600u) { // SetShReg
-            SetShRegPacket(header, count);
+            SetShRegHot(header, count);
             dcb = NextPacket(dcb, count + 1);
             continue;
         }
         if (hdr_masked == 0xC0006900u) { // SetContextReg
-            SetContextRegPacket(header, count);
+            SetContextRegHot(header, count);
             dcb = NextPacket(dcb, count + 1);
             continue;
         }
@@ -498,11 +531,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::SetContextReg: {
-            SetContextRegPacket(header, count);
+            SetContextRegHot(header, count);
             break;
         }
         case PM4ItOpcode::SetShReg: {
-            SetShRegPacket(header, count);
+            SetShRegHot(header, count);
             break;
         }
         case PM4ItOpcode::SetUconfigReg: {

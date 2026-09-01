@@ -16,8 +16,10 @@ void assert_fail_impl();
 
 #ifdef _MSC_VER
 #define SHAD_NO_INLINE __declspec(noinline)
+#define SHAD_FORCE_INLINE __forceinline
 #else
 #define SHAD_NO_INLINE __attribute__((noinline))
+#define SHAD_FORCE_INLINE inline __attribute__((always_inline))
 #endif
 
 #define ASSERT(_a_)                                                                                \

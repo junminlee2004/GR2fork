@@ -212,9 +212,14 @@ private:
     SHAD_NO_INLINE std::span<const u32> RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                            uintptr_t base_addr);
     // The two hottest packet arms, shared by the pre-dispatch fast path and
-    // their switch cases so the routes cannot drift.
-    void SetContextRegPacket(const union PM4Header* header, u32 count);
-    void SetShRegPacket(const union PM4Header* header, u32 count);
+    // their switch cases so the routes cannot drift. The hot bodies inline
+    // into the caller (the call frame their assert machinery forced was
+    // 33-51% of the outlined symbols); the assert-carrying tails stay cold.
+    SHAD_FORCE_INLINE void SetContextRegHot(const union PM4Header* header, u32 count);
+    SHAD_NO_INLINE void SetContextRegExtentTail(u32 reg_addr, const union PM4Header* header,
+                                                const u32* payload);
+    SHAD_FORCE_INLINE void SetShRegHot(const union PM4Header* header, u32 count);
+    SHAD_NO_INLINE void SetShRegCompute(const union PM4Header* header, u32 count);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
