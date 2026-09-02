@@ -510,6 +510,10 @@ struct GPUSettings {
     // Reuse the binary-info search result for a stage while its code pointer
     // and the hash stored inside the binary repeat.
     Setting<bool> shader_params_memo{false};
+    // Specialization fingerprint over the sharp bits the specialization
+    // reads: 1 keys the tier on it and carries the resolved module in the
+    // MRU, 2 adds a per-stage slot answered by a memcmp. Needs spec_fp_cache.
+    Setting<u32> spec_fp_canonical{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -580,6 +584,7 @@ struct GPUSettings {
             make_override<GPUSettings>("pipeline_key_stamp_reuse",
                                        &GPUSettings::pipeline_key_stamp_reuse),
             make_override<GPUSettings>("shader_params_memo", &GPUSettings::shader_params_memo),
+            make_override<GPUSettings>("spec_fp_canonical", &GPUSettings::spec_fp_canonical),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -600,7 +605,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
     stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
     occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
-    shader_params_memo)
+    shader_params_memo, spec_fp_canonical)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -879,6 +884,7 @@ public:
     SETTING_FORWARD(m_gpu, FlushDrawInterval, flush_draw_interval)
     SETTING_FORWARD_BOOL(m_gpu, PipelineKeyStampReuse, pipeline_key_stamp_reuse)
     SETTING_FORWARD_BOOL(m_gpu, ShaderParamsMemo, shader_params_memo)
+    SETTING_FORWARD(m_gpu, SpecFpCanonical, spec_fp_canonical)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

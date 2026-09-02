@@ -108,6 +108,8 @@ struct StageSpecialization {
 
     // Refills every member as a fresh construction would while retaining vector capacity,
     // so a persistent scratch object avoids per-call construction and destruction cost.
+    // The pipeline cache's canonical fingerprint masks each sharp down to the fields read
+    // here; a new field read below needs its bit in that mask.
     void Rebuild(const Info& info_, const RuntimeInfo& runtime_info_, const Profile& profile_,
                  Backend::Bindings start_) {
         info = &info_;

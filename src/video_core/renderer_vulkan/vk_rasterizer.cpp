@@ -724,6 +724,7 @@ void Rasterizer::OnSubmit() {
             }
             pipeline_cache.DumpKeyReuseStats();
             pipeline_cache.DumpProgramIdentityStats();
+            pipeline_cache.DumpSpecFpStats();
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,

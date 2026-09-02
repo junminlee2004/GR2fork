@@ -80,6 +80,10 @@ struct Program {
     // bound; modules are append-only, ReplaceShader swaps in place).
     u64 mru_fp{};
     u32 mru_perm_idx{};
+    // The MRU permutation's module, valid while mru_pipe_gen matches the
+    // lookup's pipe_gen (ReplaceShader swaps modules in place and bumps it).
+    vk::ShaderModule mru_module{};
+    u64 mru_pipe_gen{};
     // Bit i set = modules[i].spec.fetch_shader_data is engaged. Read by
     // FetchShaderRef::operator bool so the per-stage probe stops striding into
     // the 1520-byte Module array for one engaged byte. ASSIGNED, never OR-ed:
@@ -184,6 +188,8 @@ public:
     void DumpKeyReuseStats();
     /// Per-window telemetry for the program identity memo; silent while nothing ran.
     void DumpProgramIdentityStats();
+    /// Per-window telemetry for the canonical specialization key; silent when it is off.
+    void DumpSpecFpStats();
 
 private:
     bool RefreshGraphicsKey();
@@ -280,6 +286,30 @@ private:
     u64 params_misses{};
     template <typename Pgm>
     Shader::ShaderParams ResolveParams(Shader::LogicalStage l_stage, const Pgm& pgm);
+    // Canonical specialization key: the sharp bytes the specialization reads,
+    // masked, plus the runtime-info hash, the start bindings and the fetch
+    // shader address. Value 2 keeps the last key per stage so a repeat is a
+    // memcmp; the slot names one permutation of one program under one pipe_gen.
+    struct GatherSlot {
+        const Program* program{};
+        u64 pipe_gen{};
+        u64 perm_hash{};
+        vk::ShaderModule module{};
+        u32 perm_idx{};
+        u32 len{};
+        alignas(16) std::array<u8, 4096> buf{};
+    };
+    std::array<GatherSlot, MaxShaderStages> gather_slots{};
+    u64 lookup_pipe_gen_{}; // pipe_gen of the current pipeline lookup
+    u8 spec_fp_canonical{};
+    bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared
+    u64 specfp_slot_hits{};
+    u64 specfp_mru_hits{};
+    u64 specfp_table_hits{};
+    u64 specfp_rebuilds{};
+    u64 specfp_validate_misses{};
+    void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
+                         const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.

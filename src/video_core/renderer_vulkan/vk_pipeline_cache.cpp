@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <ranges>
@@ -89,6 +90,153 @@ u64 RuntimeInfoProxyHash(const Shader::RuntimeInfo& ri) noexcept {
     const u64 h_active =
         XXH3_64bits(reinterpret_cast<const u8*>(&ri) + header, std::min(active, union_extent));
     return h_header ^ (h_active * 0x9E3779B97F4A7C15ull);
+}
+
+// Sharp bit masks for the canonical key, derived from the fields
+// StageSpecialization::Rebuild reads by setting them on a zeroed sharp.
+struct SpecSharpMasks {
+    std::array<u64, 2> buffer;
+    std::array<u64, 2> attrib;
+    std::array<u64, 2> image;
+    u64 fmask;
+    u64 sampler;
+};
+
+const SpecSharpMasks& GetSpecSharpMasks() noexcept {
+    static const SpecSharpMasks masks = [] {
+        // Not const: a constant here would be diagnosed as a truncating store.
+        u64 ones = ~u64{0};
+        SpecSharpMasks m{};
+        AmdGpu::Buffer b{};
+        b.stride = ones;
+        b.swizzle_enable = ones;
+        b.dst_sel_x = ones;
+        b.dst_sel_y = ones;
+        b.dst_sel_z = ones;
+        b.dst_sel_w = ones;
+        b.num_format = ones;
+        b.data_format = ones;
+        b.element_size = ones;
+        b.index_stride = ones;
+        m.buffer = std::bit_cast<std::array<u64, 2>>(b);
+        AmdGpu::Buffer a{};
+        a.dst_sel_x = ones;
+        a.dst_sel_y = ones;
+        a.dst_sel_z = ones;
+        a.dst_sel_w = ones;
+        a.num_format = ones;
+        a.data_format = ones;
+        m.attrib = std::bit_cast<std::array<u64, 2>>(a);
+        AmdGpu::Image i{};
+        i.data_format = ones;
+        i.num_format = ones;
+        i.dst_sel_x = ones;
+        i.dst_sel_y = ones;
+        i.dst_sel_z = ones;
+        i.dst_sel_w = ones;
+        i.base_level = ones;
+        i.last_level = ones;
+        i.type = ones;
+        const auto iw = std::bit_cast<std::array<u64, 4>>(i);
+        m.image = {iw[0], iw[1]};
+        AmdGpu::Image f{};
+        f.width = ones;
+        f.height = ones;
+        m.fmask = std::bit_cast<std::array<u64, 4>>(f)[1];
+        AmdGpu::Sampler smp{};
+        smp.force_unnormalized.Assign(1);
+        smp.force_degamma.Assign(1);
+        m.sampler = smp.raw0;
+        return m;
+    }();
+    return masks;
+}
+
+// Worst case: bindings + ri hash + 40 buffers + 64 images + 8 fmasks + 16 samplers
+// + fetch address + 32 attributes, each list followed by its validity word.
+constexpr size_t SpecKeyMaxBytes = 12 + 8 + 40 * 16 + 64 * 16 + 8 * 8 + 16 * 8 + 5 * 8 + 8 + 32 * 8;
+static_assert(SpecKeyMaxBytes <= 4096);
+static_assert(Shader::NUM_BUFFERS <= 64 && Shader::NUM_IMAGES <= 64 && Shader::NUM_FMASKS <= 64 &&
+              Shader::NUM_SAMPLERS <= 64);
+
+// Packs the canonical key; an invalid sharp contributes only its cleared
+// validity bit, as the specialization skips it. The vertex attribute layout
+// comes from a stored permutation's fetch data; returns 0 while none carries
+// it, which sends the call to the full resolve.
+size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
+                     const Shader::Backend::Bindings& start, u8* buf) noexcept {
+    const auto& m = GetSpecSharpMasks();
+    size_t len = 0;
+    const auto put = [&](const void* p, size_t n) noexcept {
+        std::memcpy(buf + len, p, n);
+        len += n;
+    };
+    put(&start, sizeof(start));
+    put(&ri_fp_hash, sizeof(ri_fp_hash));
+    u64 valid = 0;
+    u32 n = 0;
+    for (const auto& d : info.buffers) {
+        const AmdGpu::Buffer s = d.GetSharp(info);
+        const u64 keep = s.num_records != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        auto w = std::bit_cast<std::array<u64, 2>>(s);
+        w[0] &= m.buffer[0] & keep;
+        w[1] &= m.buffer[1] & keep;
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    valid = 0;
+    n = 0;
+    for (const auto& d : info.images) {
+        const AmdGpu::Image s = d.GetSharp(info);
+        const u64 keep = s.base_address != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const auto iw = std::bit_cast<std::array<u64, 4>>(s);
+        const std::array<u64, 2> w{iw[0] & m.image[0] & keep, iw[1] & m.image[1] & keep};
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    valid = 0;
+    n = 0;
+    for (const auto& d : info.fmasks) {
+        const AmdGpu::Image s = d.GetSharp(info);
+        const u64 keep = s.base_address != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const u64 w = std::bit_cast<std::array<u64, 4>>(s)[1] & m.fmask & keep;
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    valid = 0;
+    n = 0;
+    for (const auto& d : info.samplers) {
+        const AmdGpu::Sampler s = d.GetSharp(info);
+        const u64 keep = (s.raw0 | s.raw1) != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const u64 w = s.raw0 & m.sampler & keep;
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    if (info.stage == Shader::Stage::Vertex && info.has_fetch_shader) {
+        if (program.fetch_mask == 0) {
+            return 0;
+        }
+        const auto& fetch =
+            program.modules[std::countr_zero(program.fetch_mask)].spec.fetch_shader_data;
+        u64 fetch_addr = 0;
+        std::memcpy(&fetch_addr, &info.user_data[info.fetch_shader_sgpr_base], sizeof(fetch_addr));
+        put(&fetch_addr, sizeof(fetch_addr));
+        valid = 0;
+        n = 0;
+        for (const auto& a : fetch->attributes) {
+            const AmdGpu::Buffer s = a.GetSharp(info);
+            const u64 keep = s.num_records != 0 ? ~u64{0} : 0;
+            valid |= (keep & 1) << n++;
+            const u64 w = std::bit_cast<std::array<u64, 2>>(s)[1] & m.attrib[1] & keep;
+            put(&w, sizeof(w));
+        }
+        put(&valid, sizeof(valid));
+    }
+    return len;
 }
 
 u64 ComputeSpecProxyFp(const Shader::Info& info,
@@ -501,6 +649,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // Latched before WarmUp so deserialized permutations get signatures computed.
     spec_fp_cache = EmulatorSettings.IsSpecFpCache();
     shader_params_memo = EmulatorSettings.IsShaderParamsMemo();
+    if (const u32 canonical = EmulatorSettings.GetSpecFpCanonical(); canonical != 0) {
+        if (canonical > 2) {
+            LOG_WARNING(Render_Vulkan,
+                        "spec_fp_canonical {} is out of range; the tier runs unchanged", canonical);
+        } else if (!spec_fp_cache) {
+            LOG_WARNING(Render_Vulkan, "canonical specialization fingerprint needs spec_fp_cache; "
+                                       "the tier runs unchanged");
+        } else {
+            spec_fp_canonical = static_cast<u8>(canonical);
+            spec_fp_validate =
+                Skipcache::Framework::Instance().ActiveMode() == Skipcache::Mode::ValidateOnly;
+        }
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -515,6 +676,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     // pipe_gen invalidates the cached pair when ReplaceShader erases entries.
     const u64 pipe_gen =
         Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
+    lookup_pipe_gen_ = pipe_gen;
     if (key_stamp_reuse && ReuseGraphicsKey(pipe_gen)) {
         return last_graphics_pipeline;
     }
@@ -599,6 +761,37 @@ bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
     return false;
 }
 
+// A stored spec whose info points elsewhere came from the serialized cache;
+// its compare is not meaningful, so only live-info permutations are checked.
+void PipelineCache::ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
+                                    const Shader::RuntimeInfo& runtime_info,
+                                    Shader::Backend::Bindings start) {
+    const auto& stored = program.modules[hit_idx].spec;
+    if (stored.info != &program.info) {
+        return;
+    }
+    spec_scratch.Rebuild(info, runtime_info, profile, start);
+    if (!(stored == spec_scratch)) {
+        ++specfp_validate_misses;
+        LOG_ERROR(Render_Vulkan,
+                  "canonical fingerprint hit on permutation {} of {:#x} differs from the rebuilt "
+                  "specialization",
+                  hit_idx, info.pgm_hash);
+    }
+}
+
+void PipelineCache::DumpSpecFpStats() {
+    if (spec_fp_canonical == 0) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] SPECFP slot={} mru={} table={} rebuild={} vmiss={} per300f",
+             specfp_slot_hits, specfp_mru_hits, specfp_table_hits, specfp_rebuilds,
+             specfp_validate_misses);
+    specfp_slot_hits = specfp_mru_hits = specfp_table_hits = specfp_rebuilds =
+        specfp_validate_misses = 0;
+}
+
 void PipelineCache::DumpProgramIdentityStats() {
     if (pgmid_map_hits == 0 && pgmid_map_probes == 0) {
         return;
@@ -620,6 +813,8 @@ void PipelineCache::DumpKeyReuseStats() {
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    lookup_pipe_gen_ =
+        Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -1005,6 +1200,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     u64 spec_fp = 0;
     const bool spec_fp_eligible = spec_fp_cache && l_stage != LogicalStage::TessellationControl &&
                                   l_stage != LogicalStage::TessellationEval;
+    alignas(16) u8 key_buf[4096];
+    size_t key_len = 0;
     if (spec_fp_eligible && !program->modules.empty()) {
         // Hash the persistent member, not the local copy: the member's padding bytes are stable
         // across calls, so the raw-byte hash repeats; a padding mismatch could only
@@ -1018,37 +1215,82 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             ri_slot.ri_fp_hash = ri_fp_hash;
             ri_slot.hash_valid = ri_slot.valid;
         }
-        spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data, ri_fp_hash,
-                                     binding);
+        auto& slot = gather_slots[static_cast<u32>(l_stage)];
+        if (spec_fp_canonical != 0) {
+            key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_buf);
+            if (key_len != 0 && spec_fp_canonical == 2 && slot.program == program &&
+                slot.len == key_len && slot.pipe_gen == lookup_pipe_gen_ &&
+                std::memcmp(slot.buf.data(), key_buf, key_len) == 0) {
+                ++specfp_slot_hits;
+                if (spec_fp_validate) {
+                    ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
+                }
+                info.AddBindings(binding);
+                return std::make_tuple(&program->info, slot.module,
+                                       FetchShaderRef{program, slot.perm_idx}, slot.perm_hash);
+            }
+            if (key_len != 0) {
+                spec_fp = XXH3_64bits(key_buf, key_len);
+                spec_fp = spec_fp ? spec_fp : 1;
+            }
+        } else {
+            spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data,
+                                         ri_fp_hash, binding);
+        }
+        // A resolved hit: the MRU carries the module so the strided Module
+        // load is skipped on repeats, and value 2 records the key.
+        const auto resolved = [&](size_t hit_idx, vk::ShaderModule module) {
+            const u64 hit_hash = HashCombine(params.hash, hit_idx);
+            if (spec_fp_canonical != 0) {
+                program->mru_module = module;
+                program->mru_pipe_gen = lookup_pipe_gen_;
+                if (spec_fp_canonical == 2) {
+                    slot.program = program;
+                    slot.pipe_gen = lookup_pipe_gen_;
+                    slot.perm_hash = hit_hash;
+                    slot.module = module;
+                    slot.perm_idx = static_cast<u32>(hit_idx);
+                    slot.len = static_cast<u32>(key_len);
+                    std::memcpy(slot.buf.data(), key_buf, key_len);
+                }
+                if (spec_fp_validate) {
+                    ValidateSpecHit(*program, static_cast<u32>(hit_idx), info, runtime_info,
+                                    binding);
+                }
+            }
+            info.AddBindings(binding);
+            program->last_hit_perm = static_cast<u32>(hit_idx);
+            return std::make_tuple(&program->info, module,
+                                   FetchShaderRef{program, static_cast<u32>(hit_idx)}, hit_hash);
+        };
         // MRU front: consecutive draws overwhelmingly repeat the fingerprint,
         // and this compare reads a line the probe already has hot.
-        if (program->mru_fp == spec_fp && program->mru_perm_idx < program->modules.size())
-            [[likely]] {
+        if (spec_fp != 0 && program->mru_fp == spec_fp &&
+            program->mru_perm_idx < program->modules.size()) [[likely]] {
             const size_t hit_idx = program->mru_perm_idx;
-            const u64 hit_hash = HashCombine(params.hash, hit_idx);
-            info.AddBindings(binding);
-            program->last_hit_perm = static_cast<u32>(hit_idx);
-            return std::make_tuple(&program->info, program->modules[hit_idx].module,
-                                   FetchShaderRef{program, static_cast<u32>(hit_idx)}, hit_hash);
+            ++specfp_mru_hits;
+            const vk::ShaderModule module =
+                spec_fp_canonical != 0 && program->mru_pipe_gen == lookup_pipe_gen_
+                    ? program->mru_module
+                    : program->modules[hit_idx].module;
+            return resolved(hit_idx, module);
         }
-        if (!program->spec_fp_lru) {
-            program->spec_fp_lru = std::make_unique<
-                std::array<Program::SpecFpCacheEntry, Program::kSpecFpCacheSize>>();
-        }
-        const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
-        const auto& fe = (*program->spec_fp_lru)[fp_slot];
-        if (fe.valid && fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
-            const size_t hit_idx = fe.perm_idx;
-            const u64 hit_hash = HashCombine(params.hash, hit_idx);
-            info.AddBindings(binding);
-            program->mru_fp = spec_fp;
-            program->mru_perm_idx = fe.perm_idx;
-            program->last_hit_perm = static_cast<u32>(hit_idx);
-            return std::make_tuple(&program->info, program->modules[hit_idx].module,
-                                   FetchShaderRef{program, static_cast<u32>(hit_idx)}, hit_hash);
+        if (spec_fp != 0) {
+            if (!program->spec_fp_lru) {
+                program->spec_fp_lru = std::make_unique<
+                    std::array<Program::SpecFpCacheEntry, Program::kSpecFpCacheSize>>();
+            }
+            const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
+            const auto& fe = (*program->spec_fp_lru)[fp_slot];
+            if (fe.valid && fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
+                const size_t hit_idx = fe.perm_idx;
+                ++specfp_table_hits;
+                program->mru_fp = spec_fp;
+                program->mru_perm_idx = fe.perm_idx;
+                return resolved(hit_idx, program->modules[hit_idx].module);
+            }
         }
     }
-
     auto& spec = spec_scratch;
     spec.Rebuild(info, runtime_info, profile, binding);
 #ifdef _DEBUG
@@ -1126,6 +1368,21 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             };
             program->mru_fp = spec_fp;
             program->mru_perm_idx = static_cast<u32>(perm_idx);
+            if (spec_fp_canonical != 0) {
+                ++specfp_rebuilds;
+                program->mru_module = module;
+                program->mru_pipe_gen = lookup_pipe_gen_;
+                if (spec_fp_canonical == 2) {
+                    auto& slot = gather_slots[static_cast<u32>(l_stage)];
+                    slot.program = program;
+                    slot.pipe_gen = lookup_pipe_gen_;
+                    slot.perm_hash = perm_hash;
+                    slot.module = module;
+                    slot.perm_idx = static_cast<u32>(perm_idx);
+                    slot.len = static_cast<u32>(key_len);
+                    std::memcpy(slot.buf.data(), key_buf, key_len);
+                }
+            }
         }
         program->last_hit_perm = static_cast<u32>(perm_idx);
         return std::make_tuple(&program->info, module,
