@@ -517,6 +517,12 @@ struct GPUSettings {
     // Hands a texture binding the view handle its FINDIMG memo hit recorded,
     // keyed on the image backing; the view record scan runs only on a miss.
     Setting<bool> texture_view_memo{false};
+    // Skip the sampler map mutex: GetSampler and the sampler GC both run on the
+    // GPU thread only, so the lock pair per sampler bind is dead synchronization.
+    Setting<bool> sampler_memo_lockfree{false};
+    // Compare and store descriptor writes into the delta slot in one walk
+    // instead of serializing to a scratch buffer and comparing afterwards.
+    Setting<bool> desc_delta_inplace{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -589,6 +595,9 @@ struct GPUSettings {
             make_override<GPUSettings>("shader_params_memo", &GPUSettings::shader_params_memo),
             make_override<GPUSettings>("spec_fp_canonical", &GPUSettings::spec_fp_canonical),
             make_override<GPUSettings>("texture_view_memo", &GPUSettings::texture_view_memo),
+            make_override<GPUSettings>("sampler_memo_lockfree",
+                                       &GPUSettings::sampler_memo_lockfree),
+            make_override<GPUSettings>("desc_delta_inplace", &GPUSettings::desc_delta_inplace),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -609,7 +618,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
     stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
     occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
-    shader_params_memo, spec_fp_canonical, texture_view_memo)
+    shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
+    desc_delta_inplace)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -890,6 +900,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ShaderParamsMemo, shader_params_memo)
     SETTING_FORWARD(m_gpu, SpecFpCanonical, spec_fp_canonical)
     SETTING_FORWARD_BOOL(m_gpu, TextureViewMemo, texture_view_memo)
+    SETTING_FORWARD_BOOL(m_gpu, SamplerMemoLockfree, sampler_memo_lockfree)
+    SETTING_FORWARD_BOOL(m_gpu, DescDeltaInplace, desc_delta_inplace)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
