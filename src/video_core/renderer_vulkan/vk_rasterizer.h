@@ -171,6 +171,9 @@ private:
     VideoCore::Skipcache::CacheCounters findimg_last_{};
     void MaybeIntervalFlush();
     bool elide_findbuffer_{};
+    bool bind_prefetch_{};
+    u64 bindpf_img_{};
+    u64 bindpf_backing_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms
 
     // BindingSkip LEARNING probe state (observation snapshot, not a cache).

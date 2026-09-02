@@ -59,6 +59,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
+    bind_prefetch_ = EmulatorSettings.IsBindLinePrefetch();
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -765,6 +766,11 @@ void Rasterizer::OnSubmit() {
                     findimg_last_ = fc;
                 }
             }
+            if (bindpf_img_) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] BINDPF img={} backing={} per300f",
+                         bindpf_img_, bindpf_backing_);
+                bindpf_img_ = bindpf_backing_ = 0;
+            }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,
@@ -1310,6 +1316,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image->binding.force_general |= image_desc.is_written;
             }
             image->binding.is_bound = 1u;
+            if (bind_prefetch_) {
+                // Pass two reads these lines first: props for a texture
+                // binding's layout choice, the backing pointer for the view
+                // memo compare, and the backing's state line for the barrier
+                // probe. A storage binding never reads props there. After a
+                // stencil redirect the memo backing belongs to the pre-redirect
+                // image; its line is warmed for nothing.
+                if (!image_desc.is_written) {
+                    __builtin_prefetch(&image->info.props, 0, 3);
+                }
+                __builtin_prefetch(&image->backing, 0, 3);
+                ++bindpf_img_;
+                if (desc.memo_backing) {
+                    __builtin_prefetch(&desc.memo_backing->state, 0, 3);
+                    ++bindpf_backing_;
+                }
+            }
         }
 
         image_descriptor_array_sizes.push_back(num_bindings);

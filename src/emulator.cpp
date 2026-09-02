@@ -505,6 +505,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU textureViewMemo: {}", EmulatorSettings.IsTextureViewMemo());
     LOG_INFO(Config, "GPU samplerMemoLockfree: {}", EmulatorSettings.IsSamplerMemoLockfree());
     LOG_INFO(Config, "GPU descDeltaInplace: {}", EmulatorSettings.IsDescDeltaInplace());
+    LOG_INFO(Config, "GPU bindLinePrefetch: {}", EmulatorSettings.IsBindLinePrefetch());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

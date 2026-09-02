@@ -523,6 +523,10 @@ struct GPUSettings {
     // Compare and store descriptor writes into the delta slot in one walk
     // instead of serializing to a scratch buffer and comparing afterwards.
     Setting<bool> desc_delta_inplace{false};
+    // Prefetch, during the first texture binding pass, the three image lines
+    // the second pass reads first (props, backing pointer, backing state).
+    // Read once at boot.
+    Setting<bool> bind_line_prefetch{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -598,6 +602,7 @@ struct GPUSettings {
             make_override<GPUSettings>("sampler_memo_lockfree",
                                        &GPUSettings::sampler_memo_lockfree),
             make_override<GPUSettings>("desc_delta_inplace", &GPUSettings::desc_delta_inplace),
+            make_override<GPUSettings>("bind_line_prefetch", &GPUSettings::bind_line_prefetch),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -619,7 +624,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
     occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
     shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
-    desc_delta_inplace)
+    desc_delta_inplace, bind_line_prefetch)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -902,6 +907,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, TextureViewMemo, texture_view_memo)
     SETTING_FORWARD_BOOL(m_gpu, SamplerMemoLockfree, sampler_memo_lockfree)
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaInplace, desc_delta_inplace)
+    SETTING_FORWARD_BOOL(m_gpu, BindLinePrefetch, bind_line_prefetch)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
