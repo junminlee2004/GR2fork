@@ -690,6 +690,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (last_graphics_pipeline && pipe_gen == last_graphics_pipe_gen &&
         graphics_key == last_graphics_key) {
         last_key_stamp = liverpool->GetGfxStateStamp();
+        key_is_last = true;
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -723,6 +724,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     last_graphics_pipeline = it->second.get();
     last_graphics_pipe_gen = pipe_gen;
     last_key_stamp = liverpool->GetGfxStateStamp();
+    key_is_last = true;
     return last_graphics_pipeline;
 }
 
@@ -743,8 +745,17 @@ bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
         ++key_reuse_stamp_misses;
         return false;
     }
-    std::memcpy(&graphics_key, &last_graphics_key, sizeof(graphics_key));
-    if (!RefreshGraphicsStages() || !(graphics_key == last_graphics_key)) {
+    if (!key_is_last) {
+        std::memcpy(&graphics_key, &last_graphics_key, sizeof(graphics_key));
+        key_is_last = true;
+    }
+    // The stage resolve writes only the stage hashes, the MRT mask and the
+    // attachment count (the vertex formats are dynamic here), so those three
+    // are the whole compare.
+    if (!RefreshGraphicsStages() || graphics_key.stage_hashes != last_graphics_key.stage_hashes ||
+        graphics_key.mrt_mask != last_graphics_key.mrt_mask ||
+        graphics_key.num_color_attachments != last_graphics_key.num_color_attachments) {
+        key_is_last = false;
         ++key_reuse_rebuilds;
         return false;
     }
@@ -753,6 +764,7 @@ bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
         return true;
     }
     if (RefreshGraphicsKey() && graphics_key == last_graphics_key) {
+        key_is_last = true;
         return true;
     }
     ++key_reuse_mismatches;
@@ -840,6 +852,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
+    key_is_last = false;
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
 

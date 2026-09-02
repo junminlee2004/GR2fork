@@ -258,6 +258,7 @@ private:
     // built at. While it repeats, every register-derived field of that key
     // still holds and only the stage resolve reruns (ReuseGraphicsKey).
     u64 last_key_stamp{};
+    bool key_is_last{}; // graphics_key is byte-equal to last_graphics_key
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};
