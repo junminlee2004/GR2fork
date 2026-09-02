@@ -723,6 +723,7 @@ void Rasterizer::OnSubmit() {
                 interval_flushes_ = 0;
             }
             pipeline_cache.DumpKeyReuseStats();
+            pipeline_cache.DumpProgramIdentityStats();
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,

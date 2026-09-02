@@ -598,6 +598,15 @@ bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
     return false;
 }
 
+void PipelineCache::DumpProgramIdentityStats() {
+    if (pgmid_map_hits == 0 && pgmid_map_probes == 0) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache, "[SkipCache] PGMID map_hits={} map_probes={} per300f",
+             pgmid_map_hits, pgmid_map_probes);
+    pgmid_map_hits = pgmid_map_probes = 0;
+}
+
 void PipelineCache::DumpKeyReuseStats() {
     if (!key_stamp_reuse) {
         return;
@@ -923,26 +932,36 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         ri_slot.hash_valid = false;
     }
     const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
-    auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
-    if (new_program) {
-        it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
-        auto& program = it_pgm.value();
-        auto start = binding;
-        auto ri_compile = runtime_info;
-        const auto module = CompileModule(program->info, ri_compile, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, ri_compile, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+    auto& id = stage_identity[static_cast<u32>(l_stage)];
+    Program* program = id.program && id.program_hash == params.hash ? id.program : nullptr;
+    if (program) {
+        ++pgmid_map_hits;
+    } else {
+        ++pgmid_map_probes;
+        auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
+        if (new_program) {
+            it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
+            auto& created = it_pgm.value();
+            auto start = binding;
+            auto ri_compile = runtime_info;
+            const auto module = CompileModule(created->info, ri_compile, params.code, 0, binding);
+            auto spec = Shader::StageSpecialization(created->info, ri_compile, profile, start);
+            const auto perm_hash = HashCombine(params.hash, 0);
 
-        if (spec_fp_cache) {
-            spec.ComputeSig();
+            if (spec_fp_cache) {
+                spec.ComputeSig();
+            }
+            RegisterShaderMeta(created->info, spec.fetch_shader_data, spec, perm_hash, 0);
+            created->AddPermut(module, std::move(spec));
+            id.program = created.get();
+            id.program_hash = params.hash;
+            return std::make_tuple(&created->info, module, FetchShaderRef{created.get(), 0u},
+                                   perm_hash);
         }
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, FetchShaderRef{program.get(), 0u},
-                               perm_hash);
+        program = it_pgm.value().get();
+        id.program = program;
+        id.program_hash = params.hash;
     }
-
-    auto& program = it_pgm.value();
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
@@ -980,8 +999,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             info.AddBindings(binding);
             program->last_hit_perm = static_cast<u32>(hit_idx);
             return std::make_tuple(&program->info, program->modules[hit_idx].module,
-                                   FetchShaderRef{program.get(), static_cast<u32>(hit_idx)},
-                                   hit_hash);
+                                   FetchShaderRef{program, static_cast<u32>(hit_idx)}, hit_hash);
         }
         if (!program->spec_fp_lru) {
             program->spec_fp_lru = std::make_unique<
@@ -997,8 +1015,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             program->mru_perm_idx = fe.perm_idx;
             program->last_hit_perm = static_cast<u32>(hit_idx);
             return std::make_tuple(&program->info, program->modules[hit_idx].module,
-                                   FetchShaderRef{program.get(), static_cast<u32>(hit_idx)},
-                                   hit_hash);
+                                   FetchShaderRef{program, static_cast<u32>(hit_idx)}, hit_hash);
         }
     }
 
@@ -1082,8 +1099,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         }
         program->last_hit_perm = static_cast<u32>(perm_idx);
         return std::make_tuple(&program->info, module,
-                               FetchShaderRef{program.get(), static_cast<u32>(perm_idx)},
-                               perm_hash);
+                               FetchShaderRef{program, static_cast<u32>(perm_idx)}, perm_hash);
     }
 
     auto it = program->modules.end();
@@ -1113,7 +1129,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     }
     program->last_hit_perm = static_cast<u32>(perm_idx);
     return std::make_tuple(&program->info, module,
-                           FetchShaderRef{program.get(), static_cast<u32>(perm_idx)}, perm_hash);
+                           FetchShaderRef{program, static_cast<u32>(perm_idx)}, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

@@ -182,6 +182,8 @@ public:
 
     /// Per-window telemetry for the stamp-keyed key reuse; silent when it is off.
     void DumpKeyReuseStats();
+    /// Per-window telemetry for the program identity memo; silent while nothing ran.
+    void DumpProgramIdentityStats();
 
 private:
     bool RefreshGraphicsKey();
@@ -255,6 +257,17 @@ private:
     };
     std::array<RuntimeInfoStamp, MaxShaderStages> ri_stamp{};
     bool ri_stamp_gate{};
+    // Per logical stage: the last resolved program. Programs are added to
+    // program_cache and never removed or re-seated (unique_ptr values survive
+    // rehash), so a remembered (hash, Program*) pair is exactly what
+    // try_emplace returns.
+    struct StageIdentity {
+        Program* program{};
+        u64 program_hash{};
+    };
+    std::array<StageIdentity, MaxShaderStages> stage_identity{};
+    u64 pgmid_map_hits{};
+    u64 pgmid_map_probes{};
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
