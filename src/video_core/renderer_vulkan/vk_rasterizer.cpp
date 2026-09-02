@@ -735,6 +735,12 @@ void Rasterizer::OnSubmit() {
                 interval_flushes_ = 0;
             }
             pipeline_cache.DumpKeyReuseStats();
+            const auto ss = texture_cache.DrainSamplerStats();
+            if (ss.calls) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] SAMPLER calls={} slow={} touches={} map={} per300f", ss.calls,
+                         ss.slow, ss.touches, ss.map);
+            }
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",

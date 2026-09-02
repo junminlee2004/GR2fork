@@ -428,17 +428,36 @@ private:
                                          const ImageIds& image_ids, int& out_view_mip,
                                          int& out_view_slice);
 
+    // 2-way set-associative, one 64-byte line per set; validity is a non-null
+    // handle. GarbageCollectSamplers clears the whole memo whenever it erases,
+    // so a live entry's handle, lru_id and map entry are live.
     struct SamplerMemoEntry {
         std::array<u64, 2> key{};
         vk::Sampler handle{};
-        u64 lru_id{};
-        u64 sampler_gen{};
-        u64 touch_tick{};
-        bool valid{};
+        u32 lru_id{};
+        u32 touch_tick{};
     };
-    std::array<SamplerMemoEntry, 256> sampler_memo_{};
-    u64 sampler_gen_{1};
+    static_assert(sizeof(SamplerMemoEntry) == 32);
+    static constexpr size_t SamplerMemoSets = 256; // 16 KB, L1-resident
+    alignas(64) std::array<SamplerMemoEntry, SamplerMemoSets * 2> sampler_memo_{};
+    u64 sampler_calls_{};
+    u64 sampler_slow_{};
+    u64 sampler_touches_{};
 
+public:
+    struct SamplerStats {
+        u64 calls;
+        u64 slow;
+        u64 touches;
+        u64 map;
+    };
+    SamplerStats DrainSamplerStats() {
+        const SamplerStats out{sampler_calls_, sampler_slow_, sampler_touches_, samplers.size()};
+        sampler_calls_ = sampler_slow_ = sampler_touches_ = 0;
+        return out;
+    }
+
+private:
     struct FindImageMemoEntry {
         std::array<u64, 4> tsharp_raw{};
         u64 image_uid{};
@@ -492,7 +511,6 @@ private:
     bool image_fast_state;
     PageTable page_table;
     std::mutex mutex;
-    std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;
