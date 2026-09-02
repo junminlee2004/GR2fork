@@ -785,10 +785,10 @@ void PipelineCache::DumpSpecFpStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] SPECFP slot={} mru={} table={} rebuild={} vmiss={} per300f",
-             specfp_slot_hits, specfp_mru_hits, specfp_table_hits, specfp_rebuilds,
-             specfp_validate_misses);
-    specfp_slot_hits = specfp_mru_hits = specfp_table_hits = specfp_rebuilds =
+             "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} per300f",
+             specfp_slot_hits, specfp_mru_hits, specfp_mru2_hits, specfp_table_hits,
+             specfp_rebuilds, specfp_validate_misses);
+    specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
         specfp_validate_misses = 0;
 }
 
@@ -1275,6 +1275,16 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     : program->modules[hit_idx].module;
             return resolved(hit_idx, module);
         }
+        if (spec_fp != 0 && spec_fp_canonical != 0 && program->mru2_fp == spec_fp &&
+            program->mru2_perm_idx < program->modules.size()) {
+            program->SwapMru();
+            const size_t hit_idx = program->mru_perm_idx;
+            ++specfp_mru2_hits;
+            const vk::ShaderModule module = program->mru_pipe_gen == lookup_pipe_gen_
+                                                ? program->mru_module
+                                                : program->modules[hit_idx].module;
+            return resolved(hit_idx, module);
+        }
         if (spec_fp != 0) {
             if (!program->spec_fp_lru) {
                 program->spec_fp_lru = std::make_unique<
@@ -1285,6 +1295,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             if (fe.valid && fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
                 const size_t hit_idx = fe.perm_idx;
                 ++specfp_table_hits;
+                if (spec_fp_canonical != 0) {
+                    program->DemoteMru();
+                }
                 program->mru_fp = spec_fp;
                 program->mru_perm_idx = fe.perm_idx;
                 return resolved(hit_idx, program->modules[hit_idx].module);
@@ -1366,6 +1379,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 .perm_idx = static_cast<u32>(perm_idx),
                 .valid = true,
             };
+            if (spec_fp_canonical != 0) {
+                program->DemoteMru();
+            }
             program->mru_fp = spec_fp;
             program->mru_perm_idx = static_cast<u32>(perm_idx);
             if (spec_fp_canonical != 0) {

@@ -84,6 +84,24 @@ struct Program {
     // lookup's pipe_gen (ReplaceShader swaps modules in place and bumps it).
     vk::ShaderModule mru_module{};
     u64 mru_pipe_gen{};
+    // Second entry under the canonical key: two specializations alternating
+    // draw by draw both stay line-hot instead of probing the fingerprint table.
+    u64 mru2_fp{};
+    u32 mru2_perm_idx{};
+    vk::ShaderModule mru2_module{};
+    u64 mru2_pipe_gen{};
+    void DemoteMru() {
+        mru2_fp = mru_fp;
+        mru2_perm_idx = mru_perm_idx;
+        mru2_module = mru_module;
+        mru2_pipe_gen = mru_pipe_gen;
+    }
+    void SwapMru() {
+        std::swap(mru_fp, mru2_fp);
+        std::swap(mru_perm_idx, mru2_perm_idx);
+        std::swap(mru_module, mru2_module);
+        std::swap(mru_pipe_gen, mru2_pipe_gen);
+    }
     // Bit i set = modules[i].spec.fetch_shader_data is engaged. Read by
     // FetchShaderRef::operator bool so the per-stage probe stops striding into
     // the 1520-byte Module array for one engaged byte. ASSIGNED, never OR-ed:
@@ -305,6 +323,7 @@ private:
     bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
+    u64 specfp_mru2_hits{};
     u64 specfp_table_hits{};
     u64 specfp_rebuilds{};
     u64 specfp_validate_misses{};
