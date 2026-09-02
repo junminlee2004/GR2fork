@@ -1149,31 +1149,23 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     auto& sc = Framework::Instance();
     constexpr auto kCache = CacheId::Sampler;
     static_assert(sizeof(AmdGpu::Sampler) == 16);
-    ++sampler_calls_;
     const auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
-    // Every S# field reaches the set index: the filters, max_lod, border color
-    // and clamp modes all sit above the low bits of either word.
-    const u64 mix = (raw[0] ^ (raw[1] * 0x9E3779B97F4A7C15ULL)) * 0xC2B2AE3D27D4EB4FULL;
-    SamplerMemoEntry* const set = &sampler_memo_[(mix >> 56) * 2];
-    SamplerMemoEntry* e = nullptr;
-    if (set[0].handle && set[0].key == raw) {
-        e = &set[0];
-    } else if (set[1].handle && set[1].key == raw) {
-        e = &set[1];
-    }
+    const size_t slot = ((raw[0] >> 5) ^ (raw[0] >> 33) ^ raw[1]) & 255;
+    SamplerMemoEntry& e = sampler_memo_[slot];
     const bool fast_active = sc.ActiveMode() == Mode::Adaptive || sc.ActiveMode() == Mode::Forced;
-    // The samplers erase happens only in GarbageCollectSamplers, and both
-    // GetSampler and the GC run on the GPU thread only. The same fact makes
-    // the map, LRU and memo lock-free.
-    if (fast_active && e) {
-        // An equal touch tick makes the LRU touch a no-op, so the hit reduces
-        // to returning the memoized handle.
-        if (e->touch_tick != static_cast<u32>(gc_tick)) {
-            sampler_lru_cache.Touch(e->lru_id, gc_tick);
-            e->touch_tick = static_cast<u32>(gc_tick);
-            ++sampler_touches_;
+    // Gen equality proves the map entry, lru_id and handle are live: the
+    // samplers erase and the gen bump happen only in GarbageCollectSamplers,
+    // and both GetSampler and the GC run on the GPU thread only.
+    if (fast_active && e.valid && e.key == raw && e.sampler_gen == sampler_gen_) {
+        // An equal touch tick makes the LRU touch a no-op, so the slow path
+        // reduces to returning the memoized handle.
+        if (e.touch_tick == gc_tick) {
+            return e.handle;
         }
-        return e->handle;
+        std::scoped_lock lock{samplers_mutex};
+        sampler_lru_cache.Touch(e.lru_id, gc_tick);
+        e.touch_tick = gc_tick;
+        return e.handle;
     }
     const bool probing = sc.Active() && sc.ShouldProbe(kCache);
     bool would_hit = false;
@@ -1184,14 +1176,17 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         ++ctr.eligible;
         timed = sc.SampleTimer(kCache);
         t0 = timed ? sc.Now() : 0;
-        // The memo mirrors the map key exactly (the raw S# bytes).
-        if (e) {
+        // The memo mirrors the map key exactly (the raw S# bytes); the
+        // generation certifies no sampler was garbage collected since populate.
+        if (!e.valid) {
+            ++ctr.miss_cold;
+        } else if (e.key != raw) {
+            ++ctr.miss_key;
+        } else if (e.sampler_gen != sampler_gen_) {
+            ++ctr.miss_gen[LaneTex];
+        } else {
             would_hit = true;
             ++ctr.hits;
-        } else if (!set[0].handle && !set[1].handle) {
-            ++ctr.miss_cold;
-        } else {
-            ++ctr.miss_key;
         }
         if (timed) {
             ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
@@ -1200,15 +1195,15 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         if (would_hit && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
             // Consumed hit still touches the LRU: never starve the GC the
             // cache depends on.
-            sampler_lru_cache.Touch(e->lru_id, gc_tick);
-            e->touch_tick = static_cast<u32>(gc_tick);
-            return e->handle;
+            std::scoped_lock lock{samplers_mutex};
+            sampler_lru_cache.Touch(e.lru_id, gc_tick);
+            return e.handle;
         }
     }
     const u64 m0 = timed && !would_hit ? sc.Now() : 0;
-    ++sampler_slow_;
     const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
 
+    std::scoped_lock lock{samplers_mutex};
     const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
     if (new_sampler) {
         samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
@@ -1224,33 +1219,24 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     if (probing) {
         auto& sc2 = Framework::Instance();
         if (would_hit && sc2.GetState(kCache) != State::Learning) {
-            if (e->handle == handle) {
+            if (e.handle == handle) {
                 sc2.RecordVerifyClean(kCache);
             } else {
                 sc2.RecordDivergence(kCache, "sampler handle mismatch");
-                e->handle = vk::Sampler{};
+                e.valid = false;
             }
         }
     }
     if (!would_hit && (probing || fast_active)) {
-        // The touch tick is stamped right after Insert/Touch at gc_tick, so an
-        // equal stamp implies the LRU item tick equals gc_tick. Ticks tie
-        // within a submit, so the eviction falls back to way 0.
-        SamplerMemoEntry* victim = e;
-        if (!victim) {
-            if (!set[0].handle) {
-                victim = &set[0];
-            } else if (!set[1].handle) {
-                victim = &set[1];
-            } else {
-                victim = set[0].touch_tick <= set[1].touch_tick ? &set[0] : &set[1];
-            }
-        }
-        *victim = SamplerMemoEntry{
+        // The touch tick is stamped right after the locked Insert/Touch at
+        // gc_tick, so an equal stamp implies the LRU item tick equals gc_tick.
+        e = SamplerMemoEntry{
             .key = raw,
             .handle = handle,
-            .lru_id = static_cast<u32>(it->second.lru_id),
-            .touch_tick = static_cast<u32>(gc_tick),
+            .lru_id = it->second.lru_id,
+            .sampler_gen = sampler_gen_,
+            .touch_tick = gc_tick,
+            .valid = true,
         };
         if (probing) {
             sc.NotifyPopulated(kCache);
@@ -1490,9 +1476,9 @@ void TextureCache::GarbageCollectSamplers() {
     if (total_used_samplers < trigger_gc_samplers) {
         return;
     }
+    std::scoped_lock lock{samplers_mutex};
     bool pressured = false;
     bool aggresive = false;
-    bool erased = false;
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
 
@@ -1511,7 +1497,7 @@ void TextureCache::GarbageCollectSamplers() {
         const size_t lru_id = samplers.at(hash).lru_id;
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);
-        erased = true;
+        ++sampler_gen_;
         return false;
     };
 
@@ -1523,9 +1509,6 @@ void TextureCache::GarbageCollectSamplers() {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
-    }
-    if (erased) {
-        sampler_memo_.fill({});
     }
 }
 
