@@ -239,6 +239,28 @@ size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp
     return len;
 }
 
+// Copies src over dst and returns the OR of every differing word, so a slot
+// compare and its refill are one pass. len is a multiple of 4.
+u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src, size_t len) noexcept {
+    u64 diff = 0;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        u64 a, b;
+        std::memcpy(&a, src + i, 8);
+        std::memcpy(&b, dst + i, 8);
+        diff |= a ^ b;
+        std::memcpy(dst + i, &a, 8);
+    }
+    if (i < len) {
+        u32 a, b;
+        std::memcpy(&a, src + i, 4);
+        std::memcpy(&b, dst + i, 4);
+        diff |= a ^ b;
+        std::memcpy(dst + i, &a, 4);
+    }
+    return diff;
+}
+
 u64 ComputeSpecProxyFp(const Shader::Info& info,
                        const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
                        u64 ri_bytes_hash, const Shader::Backend::Bindings& start) noexcept {
@@ -662,6 +684,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                 Skipcache::Framework::Instance().ActiveMode() == Skipcache::Mode::ValidateOnly;
         }
     }
+    if (EmulatorSettings.IsSpecFpSlotInplace()) {
+        if (spec_fp_canonical != 2) {
+            LOG_WARNING(Render_Vulkan, "in-place specialization slot needs spec_fp_canonical 2; "
+                                       "the slot compare runs unchanged");
+        } else {
+            spec_fp_slot_inplace = true;
+        }
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -800,11 +830,12 @@ void PipelineCache::DumpSpecFpStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} per300f",
+             "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} inplace_kb={} "
+             "rihash={} per300f",
              specfp_slot_hits, specfp_mru_hits, specfp_mru2_hits, specfp_table_hits,
-             specfp_rebuilds, specfp_validate_misses);
+             specfp_rebuilds, specfp_validate_misses, specfp_inplace_bytes >> 10, specfp_ri_rehash);
     specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
-        specfp_validate_misses = 0;
+        specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = 0;
 }
 
 void PipelineCache::DumpProgramIdentityStats() {
@@ -1231,22 +1262,37 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             ri_fp_hash = ri_slot.ri_fp_hash;
         } else {
             ri_fp_hash = RuntimeInfoProxyHash(ri_member);
+            ++specfp_ri_rehash;
             ri_slot.ri_fp_hash = ri_fp_hash;
             ri_slot.hash_valid = ri_slot.valid;
         }
         auto& slot = gather_slots[static_cast<u32>(l_stage)];
         if (spec_fp_canonical != 0) {
             key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_buf);
-            if (key_len != 0 && spec_fp_canonical == 2 && slot.program == program &&
-                slot.len == key_len && slot.pipe_gen == lookup_pipe_gen_ &&
-                std::memcmp(slot.buf.data(), key_buf, key_len) == 0) {
-                ++specfp_slot_hits;
-                if (spec_fp_validate) {
-                    ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
+            if (key_len != 0 && spec_fp_canonical == 2) {
+                const bool same = slot.program == program && slot.len == key_len &&
+                                  slot.pipe_gen == lookup_pipe_gen_;
+                bool hit;
+                if (spec_fp_slot_inplace) {
+                    // The fold rewrites the slot; a miss leaves a key no slot
+                    // field describes until the resolve fills them.
+                    hit = same && FoldKeyIntoSlot(slot.buf.data(), key_buf, key_len) == 0;
+                    if (!hit) {
+                        slot.program = nullptr;
+                    }
+                    specfp_inplace_bytes += key_len;
+                } else {
+                    hit = same && std::memcmp(slot.buf.data(), key_buf, key_len) == 0;
                 }
-                info.AddBindings(binding);
-                return std::make_tuple(&program->info, slot.module,
-                                       FetchShaderRef{program, slot.perm_idx}, slot.perm_hash);
+                if (hit) {
+                    ++specfp_slot_hits;
+                    if (spec_fp_validate) {
+                        ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
+                    }
+                    info.AddBindings(binding);
+                    return std::make_tuple(&program->info, slot.module,
+                                           FetchShaderRef{program, slot.perm_idx}, slot.perm_hash);
+                }
             }
             if (key_len != 0) {
                 spec_fp = XXH3_64bits(key_buf, key_len);
@@ -1270,7 +1316,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     slot.module = module;
                     slot.perm_idx = static_cast<u32>(hit_idx);
                     slot.len = static_cast<u32>(key_len);
-                    std::memcpy(slot.buf.data(), key_buf, key_len);
+                    if (!spec_fp_slot_inplace) {
+                        std::memcpy(slot.buf.data(), key_buf, key_len);
+                    }
                 }
                 if (spec_fp_validate) {
                     ValidateSpecHit(*program, static_cast<u32>(hit_idx), info, runtime_info,
@@ -1415,7 +1463,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     slot.module = module;
                     slot.perm_idx = static_cast<u32>(perm_idx);
                     slot.len = static_cast<u32>(key_len);
-                    std::memcpy(slot.buf.data(), key_buf, key_len);
+                    if (!spec_fp_slot_inplace) {
+                        std::memcpy(slot.buf.data(), key_buf, key_len);
+                    }
                 }
             }
         }

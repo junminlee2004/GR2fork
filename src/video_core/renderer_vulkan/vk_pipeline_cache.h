@@ -330,12 +330,15 @@ private:
     void* pre_compile_user_{};
     u8 spec_fp_canonical{};
     bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared
+    bool spec_fp_slot_inplace{};
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
     u64 specfp_mru2_hits{};
     u64 specfp_table_hits{};
     u64 specfp_rebuilds{};
     u64 specfp_validate_misses{};
+    u64 specfp_inplace_bytes{};
+    u64 specfp_ri_rehash{};
     void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
                          const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
