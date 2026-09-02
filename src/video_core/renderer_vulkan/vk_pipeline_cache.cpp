@@ -692,6 +692,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             spec_fp_slot_inplace = true;
         }
     }
+    if (EmulatorSettings.IsSpecFpFront()) {
+        if (spec_fp_canonical == 0) {
+            LOG_WARNING(Render_Vulkan, "specialization fingerprint front needs spec_fp_canonical; "
+                                       "the tier runs unchanged");
+        } else {
+            spec_fp_front = true;
+        }
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -831,11 +839,12 @@ void PipelineCache::DumpSpecFpStats() {
     }
     LOG_INFO(Render_Skipcache,
              "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} inplace_kb={} "
-             "rihash={} per300f",
+             "rihash={} front={} per300f",
              specfp_slot_hits, specfp_mru_hits, specfp_mru2_hits, specfp_table_hits,
-             specfp_rebuilds, specfp_validate_misses, specfp_inplace_bytes >> 10, specfp_ri_rehash);
+             specfp_rebuilds, specfp_validate_misses, specfp_inplace_bytes >> 10, specfp_ri_rehash,
+             specfp_front_hits);
     specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
-        specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = 0;
+        specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = specfp_front_hits = 0;
 }
 
 void PipelineCache::DumpProgramIdentityStats() {
@@ -1342,8 +1351,27 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                     : program->modules[hit_idx].module;
             return resolved(hit_idx, module);
         }
-        if (spec_fp != 0 && spec_fp_canonical != 0 && program->mru2_fp == spec_fp &&
-            program->mru2_perm_idx < program->modules.size()) {
+        if (spec_fp != 0 && spec_fp_front) {
+            auto& fr = program->front;
+            if (fr.pipe_gen == lookup_pipe_gen_) {
+                u32 mask = 0;
+                for (u32 i = 0; i < Program::kSpecFpFront; ++i) {
+                    mask |= static_cast<u32>(fr.fp[i] == spec_fp) << i;
+                }
+                if (mask != 0) {
+                    const u32 i = std::countr_zero(mask);
+                    const size_t hit_idx = fr.perm_idx[i];
+                    if (hit_idx < program->modules.size()) {
+                        ++specfp_front_hits;
+                        program->mru_fp = spec_fp;
+                        program->mru_perm_idx = static_cast<u32>(hit_idx);
+                        return resolved(hit_idx, fr.module[i]);
+                    }
+                }
+            }
+        }
+        if (spec_fp != 0 && !spec_fp_front && spec_fp_canonical != 0 &&
+            program->mru2_fp == spec_fp && program->mru2_perm_idx < program->modules.size()) {
             program->SwapMru();
             const size_t hit_idx = program->mru_perm_idx;
             ++specfp_mru2_hits;
@@ -1362,7 +1390,10 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             if (fe.valid && fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
                 const size_t hit_idx = fe.perm_idx;
                 ++specfp_table_hits;
-                if (spec_fp_canonical != 0) {
+                if (spec_fp_front) {
+                    program->FrontInsert(spec_fp, fe.perm_idx, program->modules[hit_idx].module,
+                                         lookup_pipe_gen_);
+                } else if (spec_fp_canonical != 0) {
                     program->DemoteMru();
                 }
                 program->mru_fp = spec_fp;
@@ -1446,7 +1477,9 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                 .perm_idx = static_cast<u32>(perm_idx),
                 .valid = true,
             };
-            if (spec_fp_canonical != 0) {
+            if (spec_fp_front) {
+                program->FrontInsert(spec_fp, static_cast<u32>(perm_idx), module, lookup_pipe_gen_);
+            } else if (spec_fp_canonical != 0) {
                 program->DemoteMru();
             }
             program->mru_fp = spec_fp;
