@@ -1283,9 +1283,11 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                                   slot.pipe_gen == lookup_pipe_gen_;
                 bool hit;
                 if (spec_fp_slot_inplace) {
-                    // The fold rewrites the slot; a miss leaves a key no slot
-                    // field describes until the resolve fills them.
-                    hit = same && FoldKeyIntoSlot(slot.buf.data(), key_buf, key_len) == 0;
+                    // The fold rewrites the slot on every resolve, so the key
+                    // the fill below records is the key the slot holds; a miss
+                    // leaves a key no slot field describes until then.
+                    const u64 diff = FoldKeyIntoSlot(slot.buf.data(), key_buf, key_len);
+                    hit = same && diff == 0;
                     if (!hit) {
                         slot.program = nullptr;
                     }
