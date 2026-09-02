@@ -545,6 +545,10 @@ struct GPUSettings {
     // Compare the gathered specialization key against its per-stage slot and
     // store it in one pass. Needs spec_fp_canonical 2.
     Setting<bool> spec_fp_slot_inplace{false};
+    // A 16-entry associative front over each program's fingerprint table, for
+    // programs that cycle through more specializations per frame than the MRU
+    // pair holds. Needs spec_fp_canonical.
+    Setting<bool> spec_fp_front{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -629,6 +633,7 @@ struct GPUSettings {
                                        &GPUSettings::stream_copy_resolved_epoch),
             make_override<GPUSettings>("written_range_fast", &GPUSettings::written_range_fast),
             make_override<GPUSettings>("spec_fp_slot_inplace", &GPUSettings::spec_fp_slot_inplace),
+            make_override<GPUSettings>("spec_fp_front", &GPUSettings::spec_fp_front),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -651,7 +656,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
     shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
     desc_delta_inplace, bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree,
-    stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace)
+    stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -940,6 +945,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyResolvedEpoch, stream_copy_resolved_epoch)
     SETTING_FORWARD(m_gpu, WrittenRangeFast, written_range_fast)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpSlotInplace, spec_fp_slot_inplace)
+    SETTING_FORWARD_BOOL(m_gpu, SpecFpFront, spec_fp_front)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

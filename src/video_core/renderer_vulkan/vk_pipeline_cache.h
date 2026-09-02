@@ -110,6 +110,30 @@ struct Program {
     u64 fetch_mask{};
     static constexpr size_t kSpecFpCacheSize = 4096;
     std::unique_ptr<std::array<SpecFpCacheEntry, kSpecFpCacheSize>> spec_fp_lru{};
+    // Associative front over the fingerprint table: a program that cycles
+    // through more specializations per frame than the MRU pair holds keeps
+    // them here with the module carried, so a hit touches neither the 64 KB
+    // table nor the 1520-byte-strided Module. fp 0 marks an empty entry; the
+    // modules are valid while pipe_gen matches the lookup's, as for mru_module.
+    static constexpr u32 kSpecFpFront = 16;
+    struct alignas(64) SpecFpFront {
+        std::array<u64, kSpecFpFront> fp{};
+        std::array<vk::ShaderModule, kSpecFpFront> module{};
+        std::array<u32, kSpecFpFront> perm_idx{};
+        u64 pipe_gen{};
+        u32 next{};
+    };
+    SpecFpFront front{};
+    void FrontInsert(u64 fp, u32 idx, vk::ShaderModule module, u64 gen) {
+        if (front.pipe_gen != gen) {
+            front = {};
+            front.pipe_gen = gen;
+        }
+        front.fp[front.next] = fp;
+        front.module[front.next] = module;
+        front.perm_idx[front.next] = idx;
+        front.next = (front.next + 1) % kSpecFpFront;
+    }
 
     Program() = default;
     Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
@@ -331,6 +355,7 @@ private:
     u8 spec_fp_canonical{};
     bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared
     bool spec_fp_slot_inplace{};
+    bool spec_fp_front{};
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
     u64 specfp_mru2_hits{};
@@ -339,6 +364,7 @@ private:
     u64 specfp_validate_misses{};
     u64 specfp_inplace_bytes{};
     u64 specfp_ri_rehash{};
+    u64 specfp_front_hits{};
     void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
                          const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
