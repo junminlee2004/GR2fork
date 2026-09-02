@@ -166,6 +166,9 @@ private:
     u32 draws_since_flush_{};
     u64 flush_tick_{};
     u64 interval_flushes_{};
+    // Snapshot of the framework's FindImage counters at the last report; the
+    // per-window line prints the deltas (Forced mode never resets them).
+    VideoCore::Skipcache::CacheCounters findimg_last_{};
     void MaybeIntervalFlush();
     bool elide_findbuffer_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms

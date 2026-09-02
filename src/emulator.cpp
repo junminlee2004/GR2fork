@@ -509,6 +509,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
     LOG_INFO(Config, "GPU guestCopyLockBatch: {}", EmulatorSettings.IsGuestCopyLockBatch());
+    LOG_INFO(Config, "GPU readbackOffloadMode: {}", EmulatorSettings.GetReadbackOffloadMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());

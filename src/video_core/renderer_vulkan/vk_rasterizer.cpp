@@ -743,6 +743,28 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] VIEWMEMO hits={} slow={} writebacks={} per300f", vm.hits,
                          vm.slow, vm.writebacks);
             }
+            if (skipcache.ActiveMode() == Skipcache::Mode::Forced) {
+                const auto& fc = skipcache.Counters(Skipcache::CacheId::FindImage);
+                if (fc.eligible != findimg_last_.eligible) {
+                    const auto d = [&](u64 Skipcache::CacheCounters::* f) {
+                        return fc.*f - findimg_last_.*f;
+                    };
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] FINDIMG probes={} hits={} cold={} key={} gen={} view={} "
+                             "veto={} vfy={}/{}/{} per300f",
+                             d(&Skipcache::CacheCounters::eligible),
+                             d(&Skipcache::CacheCounters::hits),
+                             d(&Skipcache::CacheCounters::miss_cold),
+                             d(&Skipcache::CacheCounters::miss_key),
+                             fc.miss_gen[Skipcache::LaneTex] -
+                                 findimg_last_.miss_gen[Skipcache::LaneTex],
+                             fc.veto[1] - findimg_last_.veto[1], fc.veto[0] - findimg_last_.veto[0],
+                             d(&Skipcache::CacheCounters::verify_clean),
+                             d(&Skipcache::CacheCounters::verify_diverged),
+                             d(&Skipcache::CacheCounters::verify_aborted));
+                    findimg_last_ = fc;
+                }
+            }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,
