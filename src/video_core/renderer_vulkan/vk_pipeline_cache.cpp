@@ -500,6 +500,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     }
     // Latched before WarmUp so deserialized permutations get signatures computed.
     spec_fp_cache = EmulatorSettings.IsSpecFpCache();
+    shader_params_memo = EmulatorSettings.IsShaderParamsMemo();
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -602,9 +603,10 @@ void PipelineCache::DumpProgramIdentityStats() {
     if (pgmid_map_hits == 0 && pgmid_map_probes == 0) {
         return;
     }
-    LOG_INFO(Render_Skipcache, "[SkipCache] PGMID map_hits={} map_probes={} per300f",
-             pgmid_map_hits, pgmid_map_probes);
-    pgmid_map_hits = pgmid_map_probes = 0;
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] PGMID map_hits={} map_probes={} params_hits={} params_misses={} per300f",
+             pgmid_map_hits, pgmid_map_probes, params_hits, params_misses);
+    pgmid_map_hits = pgmid_map_probes = params_hits = params_misses = 0;
 }
 
 void PipelineCache::DumpKeyReuseStats() {
@@ -741,6 +743,34 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
+// Every record here is followed by GetProgram inserting that hash, so a memo
+// hit never feeds a compile path's params.code. A null compute address takes
+// the search, which fails the same way as before.
+template <typename Pgm>
+Shader::ShaderParams PipelineCache::ResolveParams(LogicalStage l_stage, const Pgm& pgm) {
+    if (!shader_params_memo) {
+        return AmdGpu::GetParams(pgm);
+    }
+    auto& id = stage_identity[static_cast<u32>(l_stage)];
+    const u32* const code = pgm.template Address<u32*>();
+    if (code && id.code == code) {
+        // memcpy: on the linear-scan branch the BinaryInfo is only 4-byte aligned.
+        u64 hash;
+        std::memcpy(&hash, id.hash_ptr, sizeof(hash));
+        if (hash == id.hash) {
+            ++params_hits;
+            return {.user_data = pgm.user_data, .code = std::span{code, id.len_dw}, .hash = hash};
+        }
+    }
+    ++params_misses;
+    const auto& bininfo = AmdGpu::SearchBinaryInfo(code);
+    id.code = code;
+    id.hash_ptr = &bininfo.shader_hash;
+    id.hash = bininfo.shader_hash;
+    id.len_dw = bininfo.length / sizeof(u32);
+    return {.user_data = pgm.user_data, .code = std::span{code, id.len_dw}, .hash = id.hash};
+}
+
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -763,7 +793,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = ResolveParams(stage_out, *pgm);
         FetchShaderRef fetch_ref{};
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_ref,
                  key.stage_hashes[stage_out_idx]) =
@@ -870,7 +900,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = ResolveParams(LogicalStage::Compute, cs_pgm);
     // Compute stages carry no fetch shader; the reference is discarded.
     FetchShaderRef fetch_ref{};
     std::tie(infos[0], modules[0], fetch_ref, compute_key.value) =
