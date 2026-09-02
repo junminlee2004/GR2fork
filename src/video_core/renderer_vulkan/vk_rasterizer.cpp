@@ -741,6 +741,11 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] SAMPLER calls={} slow={} touches={} map={} per300f", ss.calls,
                          ss.slow, ss.touches, ss.map);
             }
+            const auto dd = skipcache.DrainDescDeltaStats();
+            if (dd.probes) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] DESCDELTA probes={} hits={} per300f",
+                         dd.probes, dd.hits);
+            }
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
