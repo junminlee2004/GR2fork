@@ -147,37 +147,30 @@ public:
         bool ok;
     };
 
+    /// Spans past this many bytes get no epoch sum; callers key on their
+    /// coarse generation instead.
+    static constexpr u64 MAX_EPOCH_SUM_SPAN = u64{64} << RegionManager::EPOCH_WORD_BITS;
+
     /// Word-epoch sum alone, for consumers that key memos on it. ok is false
     /// when part of the range has no region, when any covered word is
     /// poisoned, or when the span exceeds 64 words; callers then fall back to
-    /// their coarse generation key.
-    EpochSum256 Sum256ForRange(VAddr cpu_addr, u64 size) noexcept {
-        constexpr u64 max_span = u64{64} << RegionManager::EPOCH_WORD_BITS;
-        EpochSum256 out{0, true};
-        if (size == 0 || size > max_span) {
-            out.ok = false;
-            return out;
+    /// their coarse generation key. Nearly every caller is a sub-16KB bind
+    /// inside one epoch word; only word-straddling, empty and oversize ranges
+    /// take the general walk.
+    SHAD_FORCE_INLINE EpochSum256 Sum256ForRange(VAddr cpu_addr, u64 size) noexcept {
+        if (size != 0 && ((cpu_addr ^ (cpu_addr + size - 1)) >> RegionManager::EPOCH_WORD_BITS) ==
+                             0) [[likely]] {
+            RegionManager* const manager = LookupRegion(cpu_addr >> TRACKER_HIGHER_PAGE_BITS);
+            if (manager == nullptr) {
+                return {0, false};
+            }
+            const size_t w =
+                (cpu_addr & TRACKER_HIGHER_PAGE_MASK) >> RegionManager::EPOCH_WORD_BITS;
+            const u32 poison = manager->poison_words.load(std::memory_order_acquire);
+            return {manager->word_epochs[w].load(std::memory_order_acquire),
+                    ((poison >> w) & 1u) == 0};
         }
-        u64 covered = 0;
-        IteratePages<false>(
-            cpu_addr, size,
-            [&out, &covered](RegionManager* manager, u64 offset, size_t range_size) {
-                covered += range_size;
-                const size_t w0 = std::min<u64>(offset >> RegionManager::EPOCH_WORD_BITS,
-                                                RegionManager::NUM_EPOCH_WORDS - 1);
-                const size_t w1 =
-                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_WORD_BITS,
-                                  RegionManager::NUM_EPOCH_WORDS - 1);
-                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
-                for (size_t w = w0; w <= w1; ++w) {
-                    out.sum += manager->word_epochs[w].load(std::memory_order_acquire);
-                    if ((poison >> w) & 1u) {
-                        out.ok = false;
-                    }
-                }
-            });
-        out.ok = out.ok && covered == size;
-        return out;
+        return Sum256ForRangeSlow(cpu_addr, size);
     }
 
     struct EpochSums {
@@ -485,6 +478,34 @@ public:
     }
 
 private:
+    SHAD_NO_INLINE EpochSum256 Sum256ForRangeSlow(VAddr cpu_addr, u64 size) noexcept {
+        EpochSum256 out{0, true};
+        if (size == 0 || size > MAX_EPOCH_SUM_SPAN) {
+            out.ok = false;
+            return out;
+        }
+        u64 covered = 0;
+        IteratePages<false>(
+            cpu_addr, size,
+            [&out, &covered](RegionManager* manager, u64 offset, size_t range_size) {
+                covered += range_size;
+                const size_t w0 = std::min<u64>(offset >> RegionManager::EPOCH_WORD_BITS,
+                                                RegionManager::NUM_EPOCH_WORDS - 1);
+                const size_t w1 =
+                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_WORD_BITS,
+                                  RegionManager::NUM_EPOCH_WORDS - 1);
+                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
+                for (size_t w = w0; w <= w1; ++w) {
+                    out.sum += manager->word_epochs[w].load(std::memory_order_acquire);
+                    if ((poison >> w) & 1u) {
+                        out.ok = false;
+                    }
+                }
+            });
+        out.ok = out.ok && covered == size;
+        return out;
+    }
+
     /**
      * Resolve a region index to its manager.
      *
