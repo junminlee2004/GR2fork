@@ -134,13 +134,15 @@ public:
     struct StreamCopyStats {
         u64 hits;
         u64 probes;
+        u64 fast;
+        u64 idxfast;
     };
 
     /// Snapshot and reset the stream copy cache counters (for periodic logs).
     StreamCopyStats DrainStreamCopyStats() {
-        const StreamCopyStats stats{stream_copy_hits_, stream_copy_probes_};
-        stream_copy_hits_ = 0;
-        stream_copy_probes_ = 0;
+        const StreamCopyStats stats{stream_copy_hits_, stream_copy_probes_, stream_copy_fast_,
+                                    index_bind_fast_};
+        stream_copy_hits_ = stream_copy_probes_ = stream_copy_fast_ = index_bind_fast_ = 0;
         return stats;
     }
 
@@ -354,6 +356,7 @@ private:
     u32 index_bind_type_{};
     u64 index_bind_tick_{};
     u64 index_bind_mem_key_{};
+    RegionManager* index_bind_region_{}; // certifies the mem key without the walk
     u64 index_bind_clean_gpu_gen_{};
     bool index_bind_valid_{};
     StreamBuffer staging_buffer;
@@ -389,6 +392,8 @@ private:
     // thread, so plain counters suffice.
     u64 stream_copy_hits_{};
     u64 stream_copy_probes_{};
+    u64 stream_copy_fast_{};
+    u64 index_bind_fast_{};
 
 public:
     /// Emits and resets the phase-1 stream mirror telemetry. Logs nothing when
@@ -452,6 +457,7 @@ private:
     MirrorSinkCounters mirror_sink_;
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
+    bool stream_copy_resolved_epoch_{};
     bool batch_copy_lock_{};
     bool upload_drain_{};
     u64 upload_ro_calls_{};

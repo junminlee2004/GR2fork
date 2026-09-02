@@ -180,6 +180,43 @@ public:
         return out;
     }
 
+    /// Twin of Sum256ForRange that also names the region when one covers the
+    /// whole range; the resolved memo probe reads that region directly.
+    EpochSum256 Sum256ForRangeResolved(VAddr cpu_addr, u64 size, RegionManager*& region) noexcept {
+        constexpr u64 max_span = u64{64} << RegionManager::EPOCH_WORD_BITS;
+        EpochSum256 out{0, true};
+        region = nullptr;
+        if (size == 0 || size > max_span) {
+            out.ok = false;
+            return out;
+        }
+        u64 covered = 0;
+        u32 regions = 0;
+        IteratePages<false>(
+            cpu_addr, size, [&](RegionManager* manager, u64 offset, size_t range_size) {
+                covered += range_size;
+                ++regions;
+                region = manager;
+                const size_t w0 = std::min<u64>(offset >> RegionManager::EPOCH_WORD_BITS,
+                                                RegionManager::NUM_EPOCH_WORDS - 1);
+                const size_t w1 =
+                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_WORD_BITS,
+                                  RegionManager::NUM_EPOCH_WORDS - 1);
+                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
+                for (size_t w = w0; w <= w1; ++w) {
+                    out.sum += manager->word_epochs[w].load(std::memory_order_acquire);
+                    if ((poison >> w) & 1u) {
+                        out.ok = false;
+                    }
+                }
+            });
+        out.ok = out.ok && covered == size;
+        if (regions != 1 || !out.ok) {
+            region = nullptr;
+        }
+        return out;
+    }
+
     struct EpochSums {
         u64 sum256;
         u64 sum64;

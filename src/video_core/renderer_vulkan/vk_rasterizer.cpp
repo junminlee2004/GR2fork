@@ -770,8 +770,9 @@ void Rasterizer::OnSubmit() {
             }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] STREAMCOPY hits={} probes={} per300f",
-                         sc.hits, sc.probes);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] STREAMCOPY hits={} probes={} fast={} idxfast={} per300f",
+                         sc.hits, sc.probes, sc.fast, sc.idxfast);
             }
             if (flush_draw_interval_ != 0) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",

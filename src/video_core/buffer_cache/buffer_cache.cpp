@@ -48,6 +48,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
+    stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
@@ -930,15 +931,39 @@ void BufferCache::BindIndexBuffer(
         const u64 tick = scheduler.CurrentTick();
         u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
         bool mem_key_ok = true;
-        if (mirror_mode_) {
-            const auto sum = memory_tracker->Sum256ForRange(index_address, index_buffer_size);
-            mem_key = sum.sum;
-            mem_key_ok = sum.ok;
+        RegionManager* region = nullptr;
+        const bool resolved = mirror_mode_ && stream_copy_resolved_epoch_;
+        const bool tag_hit = index_bind_valid_ && index_bind_addr_ == index_address &&
+                             index_bind_size_ == index_buffer_size &&
+                             index_bind_type_ == static_cast<u32>(index_type) &&
+                             index_bind_tick_ == tick;
+        bool certified = false;
+        if (resolved) {
+            // The tag compare comes first; the certificate then comes from the
+            // memo's own region when the recording walk named one.
+            if (tag_hit && index_bind_region_ != nullptr) {
+                u64 sum = 0;
+                certified = index_bind_region_->EpochSumResolved(
+                                index_address & TRACKER_HIGHER_PAGE_MASK, index_buffer_size, sum) &&
+                            sum == index_bind_mem_key_;
+                index_bind_fast_ += certified;
+            }
+            if (!certified) {
+                const auto sum = memory_tracker->Sum256ForRangeResolved(index_address,
+                                                                        index_buffer_size, region);
+                mem_key = sum.sum;
+                mem_key_ok = sum.ok;
+                certified = tag_hit && mem_key_ok && index_bind_mem_key_ == mem_key;
+            }
+        } else {
+            if (mirror_mode_) {
+                const auto sum = memory_tracker->Sum256ForRange(index_address, index_buffer_size);
+                mem_key = sum.sum;
+                mem_key_ok = sum.ok;
+            }
+            certified = tag_hit && mem_key_ok && index_bind_mem_key_ == mem_key;
         }
-        if (mem_key_ok && index_bind_valid_ && index_bind_addr_ == index_address &&
-            index_bind_size_ == index_buffer_size &&
-            index_bind_type_ == static_cast<u32>(index_type) && index_bind_tick_ == tick &&
-            index_bind_mem_key_ == mem_key) {
+        if (certified) {
             // Same resolved index range already bound on this command buffer
             // with no intervening CPU write; an unchanged GPU-dirty generation
             // reproves the recorded clean answer without the region walk.
@@ -956,6 +981,7 @@ void BufferCache::BindIndexBuffer(
         index_bind_type_ = static_cast<u32>(index_type);
         index_bind_tick_ = tick;
         index_bind_mem_key_ = mem_key;
+        index_bind_region_ = region;
         index_bind_valid_ = mem_key_ok;
         // A fresh stamp invalidates the standing clean proof.
         index_bind_clean_gpu_gen_ = 0;
@@ -1128,6 +1154,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 // generation churn of unrelated faults.
                 u64 mem_key;
                 u64 gpu_gen;
+                // The region a certifying walk found covering the range, or
+                // null; regions are pooled for the process's life and the
+                // cache outlives no BufferCache in practice.
+                RegionManager* region;
                 u32 offset;
                 u32 size;
             };
@@ -1155,7 +1185,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             const u64 tick = scheduler.CurrentTick();
             u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
             bool mem_key_ok = true;
-            if (mirror_mode_) {
+            RegionManager* region = nullptr;
+            const bool resolved = mirror_mode_ && stream_copy_resolved_epoch_;
+            if (mirror_mode_ && !resolved) {
                 const auto sum = memory_tracker->Sum256ForRange(device_addr, size);
                 mem_key = sum.sum;
                 mem_key_ok = sum.ok;
@@ -1163,7 +1195,33 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 
             ++stream_copy_probes_;
             StreamCopyCacheEntry* hit = nullptr;
-            if (!mem_key_ok) {
+            bool fast = false;
+            if (resolved) {
+                // The tag compare comes first; the certificate then comes from
+                // the entry's own region when the recording walk named one.
+                for (auto& e : set) {
+                    if (e.addr != device_addr || e.size != size || e.tick != tick) {
+                        continue;
+                    }
+                    if (e.region != nullptr) {
+                        u64 sum = 0;
+                        if (e.region->EpochSumResolved(device_addr & TRACKER_HIGHER_PAGE_MASK, size,
+                                                       sum) &&
+                            sum == e.mem_key) {
+                            hit = &e;
+                            fast = true;
+                        }
+                    } else {
+                        const auto sum = memory_tracker->Sum256ForRange(device_addr, size);
+                        if (sum.ok && sum.sum == e.mem_key) {
+                            hit = &e;
+                        }
+                    }
+                    if (hit) {
+                        break;
+                    }
+                }
+            } else if (!mem_key_ok) {
                 // An uncertifiable range neither hits nor records.
             } else if (set[0].addr == device_addr && set[0].size == size && set[0].tick == tick &&
                        set[0].mem_key == mem_key) {
@@ -1176,34 +1234,45 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 cache.lru[set_idx] = static_cast<u8>(hit == &set[0] ? 1u : 0u);
                 if (hit->gpu_gen == gpu_dirty_generation_) {
                     ++stream_copy_hits_;
+                    stream_copy_fast_ += fast;
                     MirrorOracleProbe(device_addr, size, true, false);
                     return {&stream_buffer, hit->offset};
                 }
                 if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
                     hit->gpu_gen = gpu_dirty_generation_;
                     ++stream_copy_hits_;
+                    stream_copy_fast_ += fast;
                     MirrorOracleProbe(device_addr, size, true, false);
                     return {&stream_buffer, hit->offset};
                 }
                 hit->addr = 0; // went GPU-dirty: no longer stream-eligible
                 MirrorOracleProbe(device_addr, size, true, true);
-            } else if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
-                MirrorOracleProbe(device_addr, size, false, false);
-                const u64 offset =
-                    stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
-                if (mem_key_ok) {
-                    const u8 victim = cache.lru[set_idx] & 1u;
-                    set[victim] = StreamCopyCacheEntry{
-                        .addr = device_addr,
-                        .tick = tick,
-                        .mem_key = mem_key,
-                        .gpu_gen = gpu_dirty_generation_,
-                        .offset = static_cast<u32>(offset),
-                        .size = size,
-                    };
-                    cache.lru[set_idx] = static_cast<u8>(victim ^ 1u);
+            } else {
+                if (resolved) {
+                    const auto sum =
+                        memory_tracker->Sum256ForRangeResolved(device_addr, size, region);
+                    mem_key = sum.sum;
+                    mem_key_ok = sum.ok;
                 }
-                return {&stream_buffer, static_cast<u32>(offset)};
+                if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
+                    MirrorOracleProbe(device_addr, size, false, false);
+                    const u64 offset =
+                        stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+                    if (mem_key_ok) {
+                        const u8 victim = cache.lru[set_idx] & 1u;
+                        set[victim] = StreamCopyCacheEntry{
+                            .addr = device_addr,
+                            .tick = tick,
+                            .mem_key = mem_key,
+                            .gpu_gen = gpu_dirty_generation_,
+                            .region = region,
+                            .offset = static_cast<u32>(offset),
+                            .size = size,
+                        };
+                        cache.lru[set_idx] = static_cast<u8>(victim ^ 1u);
+                    }
+                    return {&stream_buffer, static_cast<u32>(offset)};
+                }
             }
             // GPU-modified: fall through to the slot path below.
         } else if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {

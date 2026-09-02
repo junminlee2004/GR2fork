@@ -343,6 +343,22 @@ public:
         }
     }
 
+    /// Single-region form of the tracker's word-epoch sum for a range this
+    /// manager fully covers: same loads, same sum, same poison rule. The
+    /// caller proves size != 0 and coverage by recording the region only from
+    /// a walk that certified the range.
+    [[nodiscard]] bool EpochSumResolved(u64 offset, u64 size, u64& sum) const noexcept {
+        const size_t w0 = offset >> EPOCH_WORD_BITS;
+        const size_t w1 = (offset + size - 1) >> EPOCH_WORD_BITS;
+        const u32 poison = poison_words.load(std::memory_order_acquire);
+        u64 s = 0;
+        for (size_t w = w0; w <= w1; ++w) {
+            s += word_epochs[w].load(std::memory_order_acquire);
+        }
+        sum = s;
+        return ((poison >> w0) & ((2u << (w1 - w0)) - 1u)) == 0;
+    }
+
     void PoisonEpochWords(u64 offset, u64 size) noexcept {
         if (size == 0) {
             return;

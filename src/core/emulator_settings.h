@@ -534,6 +534,10 @@ struct GPUSettings {
     // A consumed image memo hit stamps its access tick without the texture
     // mutex; the LRU touch stays under it and runs once per image per GC tick.
     Setting<bool> findimg_touch_lockfree{false};
+    // Stream-copy and index-bind memo entries remember the tracker region that
+    // covered their range, so a hit re-certifies the word-epoch sum with that
+    // region's own loads instead of the tracker walk.
+    Setting<bool> stream_copy_resolved_epoch{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -614,6 +618,8 @@ struct GPUSettings {
                                        &GPUSettings::guest_copy_hold_segment),
             make_override<GPUSettings>("findimg_touch_lockfree",
                                        &GPUSettings::findimg_touch_lockfree),
+            make_override<GPUSettings>("stream_copy_resolved_epoch",
+                                       &GPUSettings::stream_copy_resolved_epoch),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -635,7 +641,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
     occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
     shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
-    desc_delta_inplace, bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree)
+    desc_delta_inplace, bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree,
+    stream_copy_resolved_epoch)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -921,6 +928,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BindLinePrefetch, bind_line_prefetch)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyHoldSegment, guest_copy_hold_segment)
     SETTING_FORWARD_BOOL(m_gpu, FindimgTouchLockfree, findimg_touch_lockfree)
+    SETTING_FORWARD_BOOL(m_gpu, StreamCopyResolvedEpoch, stream_copy_resolved_epoch)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
