@@ -90,6 +90,13 @@ public:
         bool view_ready{true};
         bool deferred_is_array{};
 
+        // View memo: the handle and backing a consumed FINDIMG hit carried,
+        // and the memo slot FindTexture writes its resolved handle back to.
+        static constexpr u16 NoMemoSlot = 0xFFFF;
+        vk::ImageView memo_view{};
+        const Image::BackingImage* memo_backing{};
+        u16 memo_slot{NoMemoSlot};
+
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc,
                   bool defer_view = false)
@@ -471,9 +478,29 @@ private:
         // Post-rebase view info: a consumed hit hands the binding a complete
         // view without rebuilding it, and a verify compares all of it.
         ImageViewInfo view_info{};
+        // The view handle FindTexture resolved for this entry on the backing
+        // it names; null until a slow pass wrote it back.
+        vk::ImageView view_handle{};
+        const Image::BackingImage* view_backing{};
     };
     std::array<FindImageMemoEntry, 1024> find_image_memo_{};
+    u64 view_memo_hits_{};
+    u64 view_memo_slow_{};
+    u64 view_memo_writebacks_{};
 
+public:
+    struct ViewMemoStats {
+        u64 hits;
+        u64 slow;
+        u64 writebacks;
+    };
+    ViewMemoStats DrainViewMemoStats() {
+        const ViewMemoStats out{view_memo_hits_, view_memo_slow_, view_memo_writebacks_};
+        view_memo_hits_ = view_memo_slow_ = view_memo_writebacks_ = 0;
+        return out;
+    }
+
+private:
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);
         UnregisterImage(image_id);
@@ -509,6 +536,7 @@ private:
     bool readback_linear_images;
     // Latched once at construction; gates the lock-free UpdateImage fast path.
     bool image_fast_state;
+    bool view_memo; // latched once at construction
     PageTable page_table;
     std::mutex mutex;
     std::mutex download_images_mutex;

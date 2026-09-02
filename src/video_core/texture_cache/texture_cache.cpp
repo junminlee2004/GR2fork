@@ -34,7 +34,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
-      image_fast_state{EmulatorSettings.IsImageFastState()} {
+      image_fast_state{EmulatorSettings.IsImageFastState()},
+      view_memo{EmulatorSettings.IsTextureViewMemo()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -527,6 +528,9 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     if (!sc.Active() || !sc.ShouldProbe(kCache)) {
         return FindImage(desc);
     }
+    // Eager-view bindings carry a rewritten range the key does not cover;
+    // they neither consume nor populate.
+    const bool deferred = !desc.view_ready;
     auto& ctr = sc.Counters(kCache);
     ++ctr.eligible;
     const bool timed = sc.SampleTimer(kCache);
@@ -548,6 +552,8 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     } else if (e.tsharp_raw != raw || e.type != static_cast<u8>(desc.type) ||
                e.view_key != view_key) {
         ++ctr.miss_key;
+    } else if (!deferred) {
+        ++ctr.veto[1];
     } else if (e.tex_gen != tex_gen) {
         ++ctr.miss_gen[LaneTex];
     } else {
@@ -583,7 +589,15 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             }
             desc.view_info = e.view_info;
             desc.view_ready = true;
+            if (view_memo) {
+                desc.memo_view = e.view_handle;
+                desc.memo_backing = e.view_backing;
+                desc.memo_slot = static_cast<u16>(slot);
+            }
             return e.image_id;
+        }
+        if (view_memo) {
+            desc.memo_slot = static_cast<u16>(slot);
         }
     }
     // Authoritative path, exactly once; prediction is only compared, never
@@ -607,15 +621,21 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             e.valid = false;
         }
     }
-    if (!would_hit) {
+    if (!would_hit && deferred) {
         // Populate with commit re-check: a structural mutation racing the
-        // build leaves the entry invalid.
+        // build leaves the entry invalid. The previous occupant's handle
+        // never carries over.
         e.valid = false;
         e.tsharp_raw = raw;
         e.type = static_cast<u8>(desc.type);
         e.view_key = view_key;
         e.image_id = real;
         e.view_info = desc.view_info;
+        e.view_handle = vk::ImageView{};
+        e.view_backing = nullptr;
+        if (view_memo) {
+            desc.memo_slot = static_cast<u16>(slot);
+        }
         {
             const Image& image = slot_images[real];
             e.image_uid = image.image_uid;
@@ -814,7 +834,41 @@ vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc)
     } else {
         MaybeUpdateImage(image_id);
     }
-    return image.FindViewHandle(desc.view_info);
+    // The update above can switch the backing, so the memoized handle is
+    // taken only while its backing is the live one. A recorded handle is a
+    // view of that backing for the image's lifetime: views die only in
+    // DeleteImage, which bumps tex_gen, and backing_images only grows.
+    if (desc.memo_view && desc.memo_backing == image.backing) {
+        ++view_memo_hits_;
+        return desc.memo_view;
+    }
+    const vk::ImageView handle = image.FindViewHandle(desc.view_info);
+    if (desc.memo_slot != ImageDesc::NoMemoSlot) {
+        // Write-back under the full key: the binding passes run all probes
+        // before any FindTexture, so the slot may have been repopulated by
+        // another T# in between. tex_gen is left out: a stale-gen entry
+        // getting a handle is dead-written and cleared on the next populate.
+        ++view_memo_slow_;
+        FindImageMemoEntry& e = find_image_memo_[desc.memo_slot];
+        const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
+                            static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
+        const bool same = e.valid && e.image_id == image_id &&
+                          e.type == static_cast<u8>(desc.type) && e.view_key == view_key &&
+                          e.tsharp_raw == std::bit_cast<std::array<u64, 4>>(desc.deferred_tsharp) &&
+                          e.view_info == desc.view_info;
+        if (same) {
+            if (e.view_handle && e.view_backing == image.backing && e.view_handle != handle) {
+                VideoCore::Skipcache::Framework::Instance().RecordDivergence(
+                    VideoCore::Skipcache::CacheId::FindImage, "memoized view handle mismatch");
+                e.valid = false;
+            } else {
+                e.view_handle = handle;
+                e.view_backing = image.backing;
+                ++view_memo_writebacks_;
+            }
+        }
+    }
+    return handle;
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {

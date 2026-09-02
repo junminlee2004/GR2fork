@@ -502,6 +502,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU pipelineKeyStampReuse: {}", EmulatorSettings.IsPipelineKeyStampReuse());
     LOG_INFO(Config, "GPU shaderParamsMemo: {}", EmulatorSettings.IsShaderParamsMemo());
     LOG_INFO(Config, "GPU specFpCanonical: {}", EmulatorSettings.GetSpecFpCanonical());
+    LOG_INFO(Config, "GPU textureViewMemo: {}", EmulatorSettings.IsTextureViewMemo());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

@@ -731,6 +731,12 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] SAMPLER calls={} slow={} touches={} map={} per300f", ss.calls,
                          ss.slow, ss.touches, ss.map);
             }
+            const auto vm = texture_cache.DrainViewMemoStats();
+            if (vm.hits || vm.slow) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] VIEWMEMO hits={} slow={} writebacks={} per300f", vm.hits,
+                         vm.slow, vm.writebacks);
+            }
             const auto dd = skipcache.DrainDescDeltaStats();
             if (dd.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] DESCDELTA probes={} hits={} per300f",
