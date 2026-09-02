@@ -33,13 +33,22 @@ Scheduler::~Scheduler() {
 #endif
 }
 
-void Scheduler::BeginRendering(const RenderState& new_state) {
-    if (is_rendering && render_state == new_state) {
-        return;
+void Scheduler::BeginRendering(const RenderState& new_state, u64 serial) {
+    if (is_rendering) {
+        if (serial != 0 && serial == render_serial_) {
+            return;
+        }
+        if (render_state == new_state) {
+            // The compare just proved the serial's payload equal, so the
+            // open pass adopts it.
+            render_serial_ = serial;
+            return;
+        }
     }
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    render_serial_ = serial;
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {

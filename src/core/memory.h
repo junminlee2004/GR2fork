@@ -256,17 +256,23 @@ public:
     /// only the outermost scope takes ownership.
     class GuestCopyScope {
     public:
-        explicit GuestCopyScope(MemoryManager* mm) : mm_{mm}, owner_{!tls_in_guest_copy_scope} {
+        /// An inactive scope takes nothing and never reads the thread flag.
+        explicit GuestCopyScope(MemoryManager* mm, bool active)
+            : mm_{mm}, owner_{active && !tls_in_guest_copy_scope} {
             if (owner_) {
                 mm_->mutex.lock_shared();
                 tls_in_guest_copy_scope = true;
             }
         }
-        ~GuestCopyScope() {
+        void Release() {
             if (owner_) {
                 tls_in_guest_copy_scope = false;
                 mm_->mutex.unlock_shared();
+                owner_ = false;
             }
+        }
+        ~GuestCopyScope() {
+            Release();
         }
         GuestCopyScope(const GuestCopyScope&) = delete;
         GuestCopyScope& operator=(const GuestCopyScope&) = delete;

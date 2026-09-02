@@ -434,7 +434,9 @@ public:
     void PopPendingOperations();
 
     /// Starts a new rendering scope with provided state.
-    void BeginRendering(const RenderState& new_state);
+    /// A nonzero serial names one immutable render state; a repeated serial
+    /// on an open pass returns without the state compare.
+    void BeginRendering(const RenderState& new_state, u64 serial = 0);
 
     /// Ends current rendering scope.
     void EndRendering();
@@ -531,6 +533,7 @@ private:
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
+    u64 render_serial_{};
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
 };

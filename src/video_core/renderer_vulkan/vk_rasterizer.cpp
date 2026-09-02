@@ -431,17 +431,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    const bool batch_copy_lock = batch_copy_lock_;
-    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
-        copy_scope.emplace(Core::Memory::Instance());
-    }
+    Core::MemoryManager::GuestCopyScope copy_scope{memory, batch_copy_lock_};
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const auto& state = BeginRendering(pipeline);
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
@@ -450,7 +446,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    scheduler.BeginRendering(state, draw_state_serial_);
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -471,7 +467,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     ResetBindings();
     if (flush_draw_interval_ != 0) {
         // The flush submits; it must not run under the guest-copy shared lock.
-        copy_scope.reset();
+        copy_scope.Release();
         MaybeIntervalFlush();
     }
 }
@@ -516,17 +512,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    const bool batch_copy_lock = batch_copy_lock_;
-    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
-        copy_scope.emplace(Core::Memory::Instance());
-    }
+    Core::MemoryManager::GuestCopyScope copy_scope{memory, batch_copy_lock_};
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const auto& state = BeginRendering(pipeline);
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
@@ -555,7 +547,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    scheduler.BeginRendering(state, draw_state_serial_);
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
@@ -608,11 +600,7 @@ void Rasterizer::DispatchDirect() {
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    const bool batch_copy_lock = batch_copy_lock_;
-    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
-        copy_scope.emplace(Core::Memory::Instance());
-    }
+    Core::MemoryManager::GuestCopyScope copy_scope{memory, batch_copy_lock_};
 
     if (!BindResources(pipeline)) {
         return;
@@ -628,7 +616,7 @@ void Rasterizer::DispatchDirect() {
 
     ResetBindings();
     if (flush_draw_interval_ != 0) {
-        copy_scope.reset();
+        copy_scope.Release();
         MaybeIntervalFlush();
     }
 }
@@ -1077,11 +1065,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     // One shared-lock hold covers every guest copy this stage stages
     // (flatbuf, clip planes, stream uploads); see GuestCopyScope.
-    const bool batch_copy_lock = batch_copy_lock_;
-    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
-        copy_scope.emplace(Core::Memory::Instance());
-    }
+    Core::MemoryManager::GuestCopyScope copy_scope{memory, batch_copy_lock_};
     buffer_bindings.clear();
 
     const bool elide_findbuffer = elide_findbuffer_;
@@ -1521,18 +1505,21 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
     return true;
 }
 
-RenderState Rasterizer::BrReplay(const GraphicsPipeline* pipeline) {
-    // Consumed hit: replay the clear-free snapshot. SetBackingSamples is
-    // cheap and idempotent; re-running it preserves the slow path's every-draw
-    // re-assertion.
+const RenderState& Rasterizer::BrReplay(const GraphicsPipeline* pipeline) {
+    // Consumed hit: replay the clear-free snapshot. The backing sample mirror
+    // keeps the slow path's every-draw re-assertion without the call.
     const auto& key = pipeline->GetGraphicsKey();
     for (u32 cb = 0; cb < br_cache_.cb_count; ++cb) {
         const auto& g = br_cache_.cb_guard[cb];
         if (g.image_id) {
-            texture_cache.GetImage(g.image_id).SetBackingSamples(key.color_samples[cb]);
+            auto& image = texture_cache.GetImage(g.image_id);
+            if (image.backing_num_samples != key.color_samples[cb]) {
+                image.SetBackingSamples(key.color_samples[cb]);
+            }
         }
     }
     attachment_feedback_loop = br_cache_.attachment_feedback_loop;
+    draw_state_serial_ = br_cache_.state_serial;
     return br_cache_.state;
 }
 
@@ -1647,6 +1634,7 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     }
     br_cache_.pipeline = pipeline;
     br_cache_.state = fresh;
+    br_cache_.state_serial = ++br_state_serial_;
     br_cache_.attachment_feedback_loop = attachment_feedback_loop;
     {
         const auto& gens = sc.Gens();
@@ -1665,7 +1653,7 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     sc.NotifyPopulated(VideoCore::Skipcache::CacheId::BeginRendering);
 }
 
-RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     using VideoCore::Skipcache::CacheId;
     using VideoCore::Skipcache::DrawToken;
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
@@ -1697,9 +1685,11 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const u64 br_miss_t0 = br_timed_miss ? skipcache.Now() : 0;
 
     attachment_feedback_loop = false;
+    draw_state_serial_ = 0;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
-    RenderState state{};
+    RenderState& state = fresh_state_;
+    state = RenderState{};
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -1716,7 +1706,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             image = &texture_cache.GetImage(image_id);
         }
         texture_cache.MaybeUpdateImage(image_id);
-        image->SetBackingSamples(key.color_samples[cb]);
+        if (image->backing_num_samples != key.color_samples[cb]) {
+            image->SetBackingSamples(key.color_samples[cb]);
+        }
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
@@ -1830,7 +1822,11 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                 BrVerify(state, br_token);
             }
         } else {
+            const u64 populated = br_state_serial_;
             BrPopulate(state, br_token, pipeline);
+            if (br_state_serial_ != populated) {
+                draw_state_serial_ = br_state_serial_;
+            }
         }
     }
     return state;
