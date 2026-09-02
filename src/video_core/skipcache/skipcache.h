@@ -343,10 +343,25 @@ public:
         u64 layout{};
         u64 foreign_gen{};
         u32 size{};
-        std::array<u8, 16384> blob{};
+        u64 probes{};
+        u64 hits{};
+        alignas(64) std::array<u8, 16384> blob{};
     };
     DescDeltaSlot& DescDeltaState(size_t bind_point_index) {
         return desc_delta_[bind_point_index];
+    }
+    struct DescDeltaStats {
+        u64 probes;
+        u64 hits;
+    };
+    DescDeltaStats DrainDescDeltaStats() {
+        DescDeltaStats out{};
+        for (DescDeltaSlot& slot : desc_delta_) {
+            out.probes += slot.probes;
+            out.hits += slot.hits;
+            slot.probes = slot.hits = 0;
+        }
+        return out;
     }
     std::array<u8, 16384>& DescDeltaScratch() {
         return desc_delta_scratch_;

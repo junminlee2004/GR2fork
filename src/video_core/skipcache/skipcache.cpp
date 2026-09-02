@@ -248,8 +248,8 @@ void Framework::OnSubmit(u32 frame_num, bool guest_paused) {
         return;
     }
     if (mode_ == Mode::Forced) {
-        // Fixed at boot: no windows, no pricing, no transitions, no
-        // telemetry, and no runtime mode changes.
+        // Fixed at boot: no windows, no pricing, no transitions and no
+        // runtime mode changes; per-cache counters still report.
         return;
     }
     if (guest_paused) {
