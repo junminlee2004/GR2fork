@@ -45,30 +45,16 @@ static_assert(sizeof(vk::DescriptorImageInfo) == sizeof(VkDescriptorImageInfo) &
               offsetof(VkDescriptorImageInfo, imageLayout) == 16);
 static_assert(sizeof(vk::BufferView) == 8);
 
-// Walks the write list once, leaving blob equal to the serialized form and
-// reporting whether any byte differed; compares run even when an earlier key
-// field already missed - one loop is cheaper than two. Returns 0 on any
-// unknown descriptor type or overflow: unknowns fail toward the slow path.
-size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::array<u8, 16384>& blob,
-                             bool& changed) {
-    u8* cursor = blob.data();
-    const u8* const limit = blob.data() + blob.size();
-    u64 diff = 0;
-    const auto sync8 = [&](const void* p) {
-        u64 a, b;
-        std::memcpy(&a, p, 8);
-        std::memcpy(&b, cursor, 8);
-        diff |= a ^ b;
-        std::memcpy(cursor, p, 8);
-        cursor += 8;
-    };
-    const auto sync4 = [&](const void* p) {
-        u32 a, b;
-        std::memcpy(&a, p, 4);
-        std::memcpy(&b, cursor, 4);
-        diff |= a ^ b;
-        std::memcpy(cursor, p, 4);
-        cursor += 4;
+// Serialize a descriptor write list into a deterministic byte stream, payload
+// contents included. Returns 0 on any unknown descriptor type or overflow:
+// unknowns fail toward the slow path.
+size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
+                                 std::array<u8, 16384>& out) {
+    u8* cursor = out.data();
+    const u8* const limit = out.data() + out.size();
+    const auto put = [&](const void* p, size_t n) {
+        std::memcpy(cursor, p, n);
+        cursor += n;
     };
     for (const auto& w : writes) {
         const u32 count = w.descriptorCount;
@@ -78,17 +64,13 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
             return 0;
         }
         const VkWriteDescriptorSet& raw = w;
-        sync8(&raw.dstBinding);
-        sync8(&raw.descriptorCount);
+        put(&raw.dstBinding, 16);
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
         case vk::DescriptorType::eStorageBuffer: {
             const auto* const infos = w.pBufferInfo;
             for (u32 i = 0; i < count; ++i) {
-                const VkDescriptorBufferInfo& info = infos[i];
-                sync8(&info.buffer);
-                sync8(&info.offset);
-                sync8(&info.range);
+                put(&infos[i], 24);
             }
             break;
         }
@@ -98,10 +80,7 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
         case vk::DescriptorType::eSampler: {
             const auto* const infos = w.pImageInfo;
             for (u32 i = 0; i < count; ++i) {
-                const VkDescriptorImageInfo& info = infos[i];
-                sync8(&info.sampler);
-                sync8(&info.imageView);
-                sync4(&info.imageLayout);
+                put(&infos[i], 20);
             }
             break;
         }
@@ -109,7 +88,7 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
         case vk::DescriptorType::eStorageTexelBuffer: {
             const auto* const views = w.pTexelBufferView;
             for (u32 i = 0; i < count; ++i) {
-                sync8(&views[i]);
+                put(&views[i], 8);
             }
             break;
         }
@@ -117,8 +96,7 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
             return 0;
         }
     }
-    changed = diff != 0;
-    return static_cast<size_t>(cursor - blob.data());
+    return static_cast<size_t>(cursor - out.data());
 }
 
 } // namespace
@@ -170,8 +148,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             const u64 t0 = timed ? sc.Now() : 0;
             const size_t idx = IsCompute() ? 1 : 0;
             auto& slot = sc.DescDeltaState(idx);
-            bool changed = false;
-            const size_t size = MatchDescriptorWrites(set_writes, slot.blob, changed);
+            auto& scratch = sc.DescDeltaScratch();
+            const size_t size = SerializeDescriptorWrites(set_writes, scratch);
             const u64 tick = scheduler.CurrentTick();
             const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(*pipeline_layout));
             const u64 foreign = sc.ForeignPushGen(idx);
@@ -184,14 +162,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                 ++ctr.miss_gen[Skipcache::LaneTick];
             } else if (slot.layout != layout) {
                 ++ctr.miss_key;
-            } else if (slot.size != size || changed) {
+            } else if (slot.size != size ||
+                       std::memcmp(slot.blob.data(), scratch.data(), size) != 0) {
                 ++ctr.veto[1]; // content changed
             } else {
                 would_hit = true;
                 ++ctr.hits;
             }
-            ++slot.probes;
-            slot.hits += would_hit;
             if (timed) {
                 ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
                 ++ctr.guard_samples;
@@ -212,14 +189,13 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                 }
                 return;
             }
-            // The walk already left the blob in its serialized form; a walk
-            // that bailed leaves it partially rewritten, hence the invalidation.
             if (size != 0) {
                 slot.valid = true;
                 slot.tick = tick;
                 slot.layout = layout;
                 slot.foreign_gen = foreign;
                 slot.size = static_cast<u32>(size);
+                std::memcpy(slot.blob.data(), scratch.data(), size);
                 sc.NotifyPopulated(kCache);
             } else {
                 slot.valid = false;

@@ -343,25 +343,13 @@ public:
         u64 layout{};
         u64 foreign_gen{};
         u32 size{};
-        u64 probes{};
-        u64 hits{};
-        alignas(64) std::array<u8, 16384> blob{};
+        std::array<u8, 16384> blob{};
     };
     DescDeltaSlot& DescDeltaState(size_t bind_point_index) {
         return desc_delta_[bind_point_index];
     }
-    struct DescDeltaStats {
-        u64 probes;
-        u64 hits;
-    };
-    DescDeltaStats DrainDescDeltaStats() {
-        DescDeltaStats out{};
-        for (DescDeltaSlot& slot : desc_delta_) {
-            out.probes += slot.probes;
-            out.hits += slot.hits;
-            slot.probes = slot.hits = 0;
-        }
-        return out;
+    std::array<u8, 16384>& DescDeltaScratch() {
+        return desc_delta_scratch_;
     }
     // Any descriptor push issued OUTSIDE Pipeline::BindResources (fault
     // processing, host passes) overwrites command buffer state behind the
@@ -471,6 +459,7 @@ private:
     std::array<DedupEntry, 256> dedup_{};
     std::array<DescDeltaSlot, 2> desc_delta_{};
     std::array<u64, 2> foreign_push_gen_{};
+    std::array<u8, 16384> desc_delta_scratch_{};
 
     struct {
         InvalidateFn fn;
