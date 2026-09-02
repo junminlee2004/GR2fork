@@ -823,6 +823,11 @@ void Rasterizer::OnSubmit() {
                          bindpf_img_, bindpf_backing_);
                 bindpf_img_ = bindpf_backing_ = 0;
             }
+            const auto ft = texture_cache.DrainFindTouchStats();
+            if (ft.consumed) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] FINDTOUCH consumed={} locks={} per300f",
+                         ft.consumed, ft.locks);
+            }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,

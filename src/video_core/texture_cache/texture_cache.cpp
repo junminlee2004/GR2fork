@@ -36,7 +36,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
       image_fast_state{EmulatorSettings.IsImageFastState()},
       view_memo{EmulatorSettings.IsTextureViewMemo()},
-      sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()} {
+      sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
+      findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -580,7 +581,20 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             // equal gc tick. Other slot_images writers can only grow the
             // ticks, and a grown tick fails the compare and takes the lock.
             const u64 current_tick = scheduler.CurrentTick();
-            if (e.access_tick != current_tick || e.lru_tick != gc_tick) {
+            if (findimg_touch_lockfree) {
+                // The access tick is written and read on the GPU thread only,
+                // so the stamp needs no lock; the LRU list is shared with
+                // UnmapMemory on guest threads, so its touch stays under the
+                // mutex and runs once per image per gc tick.
+                Image& image = slot_images[e.image_id];
+                image.tick_accessed_last = current_tick;
+                if (image.lru_touch_tick != gc_tick) {
+                    std::scoped_lock lock{mutex};
+                    TouchImage(image);
+                    ++findimg_touch_locks_;
+                }
+                ++findimg_consumed_;
+            } else if (e.access_tick != current_tick || e.lru_tick != gc_tick) {
                 std::scoped_lock lock{mutex};
                 Image& image = slot_images[e.image_id];
                 image.tick_accessed_last = current_tick;

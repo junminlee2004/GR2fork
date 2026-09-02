@@ -500,6 +500,15 @@ public:
         u64 slow;
         u64 writebacks;
     };
+    struct FindTouchStats {
+        u64 consumed;
+        u64 locks;
+    };
+    FindTouchStats DrainFindTouchStats() {
+        const FindTouchStats out{findimg_consumed_, findimg_touch_locks_};
+        findimg_consumed_ = findimg_touch_locks_ = 0;
+        return out;
+    }
     ViewMemoStats DrainViewMemoStats() {
         const ViewMemoStats out{view_memo_hits_, view_memo_slow_, view_memo_writebacks_};
         view_memo_hits_ = view_memo_slow_ = view_memo_writebacks_ = 0;
@@ -542,8 +551,11 @@ private:
     bool readback_linear_images;
     // Latched once at construction; gates the lock-free UpdateImage fast path.
     bool image_fast_state;
-    bool view_memo;        // latched once at construction
-    bool sampler_lockfree; // latched once at construction
+    bool view_memo;              // latched once at construction
+    bool sampler_lockfree;       // latched once at construction
+    bool findimg_touch_lockfree; // latched once at construction
+    u64 findimg_consumed_{};
+    u64 findimg_touch_locks_{};
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;
