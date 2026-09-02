@@ -538,6 +538,10 @@ struct GPUSettings {
     // covered their range, so a hit re-certifies the word-epoch sum with that
     // region's own loads instead of the tracker walk.
     Setting<bool> stream_copy_resolved_epoch{false};
+    // Written binds: 1 skips the range-set containment probe when the mark set
+    // a GPU-clean page; 2 adds a memo of ranges proven contained, cleared by
+    // every download subtract. Higher values act as 2.
+    Setting<u32> written_range_fast{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -620,6 +624,7 @@ struct GPUSettings {
                                        &GPUSettings::findimg_touch_lockfree),
             make_override<GPUSettings>("stream_copy_resolved_epoch",
                                        &GPUSettings::stream_copy_resolved_epoch),
+            make_override<GPUSettings>("written_range_fast", &GPUSettings::written_range_fast),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -642,7 +647,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
     shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
     desc_delta_inplace, bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree,
-    stream_copy_resolved_epoch)
+    stream_copy_resolved_epoch, written_range_fast)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -929,6 +934,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyHoldSegment, guest_copy_hold_segment)
     SETTING_FORWARD_BOOL(m_gpu, FindimgTouchLockfree, findimg_touch_lockfree)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyResolvedEpoch, stream_copy_resolved_epoch)
+    SETTING_FORWARD(m_gpu, WrittenRangeFast, written_range_fast)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

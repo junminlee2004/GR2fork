@@ -83,14 +83,15 @@ public:
      * @param size          Size in bytes to mark or unmark as modified
      */
     template <Type type, bool enable>
-    void ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
+    /// Returns whether any bit changed.
+    bool ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
         RENDERER_TRACE;
         const size_t offset = dirty_addr - cpu_addr;
         const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
         const size_t end_page =
             Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
         if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
-            return;
+            return false;
         }
 
         if constexpr (type == Type::GPU && enable) {
@@ -109,11 +110,11 @@ public:
         // count stable for concurrent lock-free readers.
         if constexpr (enable) {
             if (bits.AllInRange(start_page, end_page)) {
-                return;
+                return false;
             }
         } else {
             if (!bits.AnyInRange(start_page, end_page)) {
-                return;
+                return false;
             }
         }
         WriteScope write_scope{*this};
@@ -128,6 +129,7 @@ public:
         } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
             UpdateProtection<enable, true>();
         }
+        return true;
     }
 
     /**

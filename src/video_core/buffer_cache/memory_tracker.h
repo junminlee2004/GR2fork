@@ -321,7 +321,8 @@ public:
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
-    void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
+    /// Returns whether the written marking set any GPU-clean page.
+    bool ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
         // Nearly every bind is a few hundred bytes and lands inside a single
         // 4MB region. Resolving the manager once up front runs both passes on
@@ -352,7 +353,7 @@ public:
                     ++manager->gpu_write_seq;
                 }
                 on_upload();
-                return;
+                return false;
             }
             manager->lock.lock();
             manager->template ForEachModifiedRange<Type::CPU, true>(manager->GetCpuAddr() + offset,
@@ -360,20 +361,21 @@ public:
             if (!is_written) {
                 manager->lock.unlock();
                 on_upload();
-                return;
+                return false;
             }
             // A written bind holds the lock from the upload walk until the
             // GPU marking below, so the marking observes the bits it covers.
             on_upload();
-            manager->template ChangeRegionState<Type::GPU, true>(manager->GetCpuAddr() + offset,
-                                                                 query_size);
+            const bool changed = manager->template ChangeRegionState<Type::GPU, true>(
+                manager->GetCpuAddr() + offset, query_size);
             manager->lock.unlock();
-            return;
+            return changed;
         }
         // A written bind holds each region's lock from the upload walk until
         // the GPU marking below, so a region skipped in the first pass must be
         // skipped in the second. The skip set is recorded rather than
         // recomputed: without the lock held the bits can change in between.
+        bool changed = false;
         u64 skipped = 0;
         u32 index = 0;
         {
@@ -476,7 +478,7 @@ public:
         }
         on_upload();
         if (!is_written) {
-            return;
+            return false;
         }
         {
             // Second pass mirrors the first walk's region sequence exactly; a
@@ -503,11 +505,12 @@ public:
                 if (i < 64 && (skipped & (u64{1} << i)) != 0) {
                     continue; // never locked in the first pass
                 }
-                manager->template ChangeRegionState<Type::GPU, true>(manager->GetCpuAddr() + offset,
-                                                                     size);
+                changed |= manager->template ChangeRegionState<Type::GPU, true>(
+                    manager->GetCpuAddr() + offset, size);
                 manager->lock.unlock();
             }
         }
+        return changed;
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified

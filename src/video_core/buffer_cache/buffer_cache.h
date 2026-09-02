@@ -311,7 +311,7 @@ private:
     void ChangeRegister(BufferId buffer_id);
 
     bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                           bool is_texel_buffer);
+                           bool is_texel_buffer, bool* new_gpu_pages = nullptr);
 
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies, bool is_written,
                             size_t total_size_bytes);
@@ -384,6 +384,45 @@ private:
     // clear-bit pages (veto re-Add in FinishFaultDownload); every consumer of
     // this generation shares that window and is off when skip caches are off.
     u64 gpu_dirty_generation_{1};
+    // Written-bind containment (written_range_fast): mode 1 adds a range whose
+    // mark set a GPU-clean page without probing the set; mode 2 memoizes ranges
+    // proven contained, keyed on a counter every subtract advances.
+    struct WrittenRangeEntry {
+        VAddr addr;
+        u32 size;
+        u32 shrink_gen;
+    };
+    static constexpr size_t WrittenRangeSets = 1024;
+    std::unique_ptr<std::array<std::array<WrittenRangeEntry, 2>, WrittenRangeSets>>
+        written_range_memo_;
+    std::array<u8, WrittenRangeSets> written_range_lru_{};
+    u32 gpu_range_shrink_gen_{1}; // never 0: a zero entry must not match
+    u32 written_range_mode_{};
+    u64 written_binds_{};
+    u64 written_fresh_{};
+    u64 written_hits_{};
+    u64 written_adds_{};
+    u64 written_shrinks_{};
+    void SubtractGpuModifiedRange(VAddr addr, u64 size);
+    bool WrittenRangeCovered(VAddr addr, u32 size) const;
+    void RecordWrittenRange(VAddr addr, u32 size);
+
+public:
+    struct WrittenRangeStats {
+        u64 binds;
+        u64 fresh;
+        u64 hits;
+        u64 adds;
+        u64 shrinks;
+    };
+    WrittenRangeStats DrainWrittenRangeStats() {
+        const WrittenRangeStats out{written_binds_, written_fresh_, written_hits_, written_adds_,
+                                    written_shrinks_};
+        written_binds_ = written_fresh_ = written_hits_ = written_adds_ = written_shrinks_ = 0;
+        return out;
+    }
+
+private:
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
     // Staging pool for offloaded fault readbacks. GPU command thread only.

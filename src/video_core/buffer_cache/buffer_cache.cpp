@@ -49,6 +49,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
+    written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 2);
+    if (written_range_mode_ >= 2) {
+        written_range_memo_ =
+            std::make_unique<std::array<std::array<WrittenRangeEntry, 2>, WrittenRangeSets>>();
+    }
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                           "BDA Page Table Buffer");
@@ -447,7 +452,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
                 total_size_bytes += (new_size + align - 1) & mask;
             };
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            gpu_modified_ranges.Subtract(device_addr_out, range_size);
+            SubtractGpuModifiedRange(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
         // Nothing pending for the window. Unlike the synchronous form, empty
@@ -618,7 +623,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 total_size_bytes += (new_size + align - 1) & mask;
             };
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            gpu_modified_ranges.Subtract(device_addr_out, range_size);
+            SubtractGpuModifiedRange(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
         return;
@@ -1125,6 +1130,48 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
     });
 }
 
+// Set index for the (address, size) keyed range memos.
+static size_t RangeMemoIndex(VAddr addr, u32 size, size_t sets) noexcept {
+    u64 key = static_cast<u64>(addr);
+    key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    return key & (sets - 1);
+}
+
+// Every shrinking access to gpu_modified_ranges goes through here: the
+// covered-range memo certifies containment only while this counter holds.
+void BufferCache::SubtractGpuModifiedRange(VAddr addr, u64 size) {
+    ++written_shrinks_;
+    if (written_range_mode_ >= 2 && ++gpu_range_shrink_gen_ == 0) {
+        written_range_memo_->fill({});
+        gpu_range_shrink_gen_ = 1;
+    }
+    gpu_modified_ranges.Subtract(addr, size);
+}
+
+bool BufferCache::WrittenRangeCovered(VAddr addr, u32 size) const {
+    const auto& set = (*written_range_memo_)[RangeMemoIndex(addr, size, WrittenRangeSets)];
+    for (const WrittenRangeEntry& e : set) {
+        if (e.addr == addr && e.size == size && e.shrink_gen == gpu_range_shrink_gen_) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BufferCache::RecordWrittenRange(VAddr addr, u32 size) {
+    if (written_range_mode_ < 2) {
+        return;
+    }
+    const size_t idx = RangeMemoIndex(addr, size, WrittenRangeSets);
+    auto& set = (*written_range_memo_)[idx];
+    const u8 victim = written_range_lru_[idx] & 1u;
+    set[victim] = WrittenRangeEntry{addr, size, gpu_range_shrink_gen_};
+    written_range_lru_[idx] = static_cast<u8>(victim ^ 1u);
+}
+
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id,
                                                   std::optional<bool> gpu_modified) {
@@ -1177,12 +1224,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 storage = std::make_unique<StreamCopyCache>();
             }
             auto& cache = *storage;
-            u64 key = static_cast<u64>(device_addr);
-            key ^= static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL;
-            key ^= key >> 33;
-            key *= 0xff51afd7ed558ccdULL;
-            key ^= key >> 33;
-            const size_t set_idx = key & (kSets - 1);
+            const size_t set_idx = RangeMemoIndex(device_addr, size, kSets);
             auto& set = cache.sets[set_idx];
             const u64 tick = scheduler.CurrentTick();
             u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
@@ -1288,14 +1330,30 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[buffer_id];
-    SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
+    bool fresh = false;
+    SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, &fresh);
     if (is_written) {
         // Bump the GPU-clean epoch only on new coverage; steady-state
         // re-writes of the same ranges skip both the bump and the no-op
-        // interval merge.
-        if (!gpu_modified_ranges.Contains(device_addr, size)) {
+        // interval merge. A page of the range that was GPU-clean until this
+        // mark has had nothing covering it since its last unmark, so the set
+        // cannot contain the range. The probe stays after the walk: the
+        // upload's guest read can fault into a download that subtracts.
+        ++written_binds_;
+        if (written_range_mode_ != 0 && fresh && size != 0) {
+            ++written_fresh_;
             ++gpu_dirty_generation_;
             gpu_modified_ranges.Add(device_addr, size);
+            RecordWrittenRange(device_addr, size);
+        } else if (written_range_mode_ >= 2 && WrittenRangeCovered(device_addr, size)) {
+            ++written_hits_;
+        } else if (!gpu_modified_ranges.Contains(device_addr, size)) {
+            ++written_adds_;
+            ++gpu_dirty_generation_;
+            gpu_modified_ranges.Add(device_addr, size);
+            RecordWrittenRange(device_addr, size);
+        } else {
+            RecordWrittenRange(device_addr, size);
         }
     }
     return {&buffer, buffer.Offset(device_addr)};
@@ -1556,7 +1614,11 @@ static void PrefetchGuestSource(VAddr device_addr, u64 size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer, bool* new_gpu_pages) {
+    if (new_gpu_pages) {
+        *new_gpu_pages = false;
+    }
+    bool fresh_pages = false;
     // Read-only binds dominate and almost never have anything to upload, but
     // proving it walks every page of the range under the tracker lock. While
     // the host-memory generation is unchanged the guest bytes still equal the
@@ -1595,7 +1657,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
-    memory_tracker->ForEachUploadRange(
+    fresh_pages = memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
             PrefetchGuestSource(device_addr_out, range_size);
@@ -1606,6 +1668,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
 
     if (src_buffer) [[unlikely]] {
         EmitBufferUpload(buffer, src_buffer, copies);
+    }
+    if (new_gpu_pages) {
+        *new_gpu_pages = fresh_pages;
     }
     if (is_texel_buffer && !is_written) {
         // Sizing input for a texel-bind memo: these formatted read-only binds

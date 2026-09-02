@@ -510,6 +510,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU findimgTouchLockfree: {}", EmulatorSettings.IsFindimgTouchLockfree());
     LOG_INFO(Config, "GPU streamCopyResolvedEpoch: {}",
              EmulatorSettings.IsStreamCopyResolvedEpoch());
+    LOG_INFO(Config, "GPU writtenRangeFast: {}", EmulatorSettings.GetWrittenRangeFast());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
