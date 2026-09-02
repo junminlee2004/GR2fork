@@ -768,6 +768,7 @@ void BufferCache::BindVertexBuffers(
             if (vertex_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
                 return;
             }
+            ++vertex_genwalk_;
             if (span_hi <= span_lo || !IsRegionGpuModified(span_lo, span_hi - span_lo)) {
                 vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
                 return;
@@ -970,6 +971,7 @@ void BufferCache::BindIndexBuffer(
             if (index_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
                 return;
             }
+            ++index_genwalk_;
             index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
             if (!*index_gpu_modified) {
                 index_bind_clean_gpu_gen_ = gpu_dirty_generation_;
@@ -1238,6 +1240,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                     MirrorOracleProbe(device_addr, size, true, false);
                     return {&stream_buffer, hit->offset};
                 }
+                stream_genwalk_ += !gpu_modified;
                 if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
                     hit->gpu_gen = gpu_dirty_generation_;
                     ++stream_copy_hits_;

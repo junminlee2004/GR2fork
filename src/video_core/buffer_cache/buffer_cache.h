@@ -136,13 +136,19 @@ public:
         u64 probes;
         u64 fast;
         u64 idxfast;
+        // Memo hits whose clean proof was stale and walked the GPU bits.
+        u64 stream_genwalk;
+        u64 vertex_genwalk;
+        u64 index_genwalk;
     };
 
     /// Snapshot and reset the stream copy cache counters (for periodic logs).
     StreamCopyStats DrainStreamCopyStats() {
         const StreamCopyStats stats{stream_copy_hits_, stream_copy_probes_, stream_copy_fast_,
-                                    index_bind_fast_};
+                                    index_bind_fast_,  stream_genwalk_,     vertex_genwalk_,
+                                    index_genwalk_};
         stream_copy_hits_ = stream_copy_probes_ = stream_copy_fast_ = index_bind_fast_ = 0;
+        stream_genwalk_ = vertex_genwalk_ = index_genwalk_ = 0;
         return stats;
     }
 
@@ -394,6 +400,9 @@ private:
     u64 stream_copy_probes_{};
     u64 stream_copy_fast_{};
     u64 index_bind_fast_{};
+    u64 stream_genwalk_{};
+    u64 vertex_genwalk_{};
+    u64 index_genwalk_{};
 
 public:
     /// Emits and resets the phase-1 stream mirror telemetry. Logs nothing when

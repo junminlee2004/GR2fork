@@ -771,8 +771,10 @@ void Rasterizer::OnSubmit() {
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] STREAMCOPY hits={} probes={} fast={} idxfast={} per300f",
-                         sc.hits, sc.probes, sc.fast, sc.idxfast);
+                         "[SkipCache] STREAMCOPY hits={} probes={} fast={} idxfast={} "
+                         "genwalk={}/{}/{} per300f",
+                         sc.hits, sc.probes, sc.fast, sc.idxfast, sc.stream_genwalk,
+                         sc.vertex_genwalk, sc.index_genwalk);
             }
             if (flush_draw_interval_ != 0) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
