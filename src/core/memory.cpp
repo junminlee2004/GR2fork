@@ -318,7 +318,11 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
-    std::shared_lock lk{mutex};
+    // Inside a guest-copy scope the outer hold keeps the map stable.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope) {
+        lk.lock();
+    }
     // The observer runs before any byte moves, so an epoch consumer that reads
     // its counters after the bytes always sees the advanced value.
     if (const auto observer = g_backing_observer.load(std::memory_order_acquire)) {
@@ -329,8 +333,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
 
     // Pointers, not copies: a VirtualMemoryArea drags a std::map of physical
     // areas and a std::string along, and this runs per guest-visible GPU
-    // write. The shared lock held for the whole function keeps the map (and
-    // therefore these pointers) stable.
+    // write. The shared lock held for the whole function, or the outer
+    // scope's, keeps the map (and therefore these pointers) stable.
     boost::container::small_vector<const VirtualMemoryArea*, 4> vmas_to_write;
     auto current_vma = FindVMA(virtual_addr);
     while (current_vma->second.Overlaps(virtual_addr, size)) {

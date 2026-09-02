@@ -70,6 +70,32 @@ public:
     void Finish();
     void OnSubmit();
 
+    // Scopes a guest-copy hold to one packet run: the caller yields to guest
+    // threads between runs and the submit loop sleeps, so the hold must not
+    // outlive this object.
+    class PacketRunGuard {
+    public:
+        explicit PacketRunGuard(Rasterizer* r) : r_{r} {
+            if (r_) {
+                r_->BeginPacketRun();
+            }
+        }
+        ~PacketRunGuard() {
+            if (r_) {
+                r_->EndPacketRun();
+            }
+        }
+        PacketRunGuard(const PacketRunGuard&) = delete;
+        PacketRunGuard& operator=(const PacketRunGuard&) = delete;
+
+    private:
+        Rasterizer* r_;
+    };
+    void BeginPacketRun();
+    void EndPacketRun();
+    /// The command drain runs fault-download hops inline; none may run under the hold.
+    void DropCopyHoldForCommands();
+
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }
@@ -172,6 +198,25 @@ private:
     void MaybeIntervalFlush();
     bool elide_findbuffer_{};
     bool bind_prefetch_{};
+    // One guest-copy shared hold per packet run (guest_copy_hold_segment).
+    // The hold may cover GPU waits, never a wait on a guest thread; every
+    // path that can block on one drops it first.
+    std::optional<Core::MemoryManager::GuestCopyScope> run_copy_hold_;
+    bool in_packet_run_{};
+    bool segment_copy_hold_{};
+    u64 hold_arms_{};
+    u64 hold_draws_covered_{};
+    u64 hold_drops_run_{};
+    u64 hold_drops_flush_{};
+    u64 hold_drops_wait_{};
+    u64 hold_drops_cmd_{};
+    u64 hold_compiles_{};
+    void ArmCopyHold();
+    void DropCopyHold(u64& counter);
+    static void PreCompileThunk(void* self) {
+        auto* r = static_cast<Rasterizer*>(self);
+        r->DropCopyHold(r->hold_compiles_);
+    }
     u64 bindpf_img_{};
     u64 bindpf_backing_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms

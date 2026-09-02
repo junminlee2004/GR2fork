@@ -150,6 +150,12 @@ public:
         return tile_manager;
     }
 
+    /// Whether a storage image download is queued; read on the GPU thread,
+    /// which is the only writer of the queue.
+    bool HasPendingDownloads() const noexcept {
+        return !download_images.empty();
+    }
+
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 

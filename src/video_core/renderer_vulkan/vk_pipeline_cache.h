@@ -206,6 +206,12 @@ public:
     void DumpKeyReuseStats();
     /// Per-window telemetry for the program identity memo; silent while nothing ran.
     void DumpProgramIdentityStats();
+    /// Runs before every inline pipeline compile; the rasterizer drops its
+    /// guest-copy hold there so a compile never holds the memory map open.
+    void SetPreCompileHook(void (*hook)(void*), void* user) {
+        pre_compile_hook_ = hook;
+        pre_compile_user_ = user;
+    }
     /// Per-window telemetry for the canonical specialization key; silent when it is off.
     void DumpSpecFpStats();
 
@@ -320,6 +326,8 @@ private:
     };
     std::array<GatherSlot, MaxShaderStages> gather_slots{};
     u64 lookup_pipe_gen_{}; // pipe_gen of the current pipeline lookup
+    void (*pre_compile_hook_)(void*){};
+    void* pre_compile_user_{};
     u8 spec_fp_canonical{};
     bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared
     u64 specfp_slot_hits{};

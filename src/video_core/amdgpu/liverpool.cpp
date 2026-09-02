@@ -439,8 +439,12 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
     // can match is registered before that submit is queued, so a segment that
     // starts with none pending cannot be handed one it could have matched.
     const bool dumping_regs = DebugState.DumpingCurrentReg();
+    Vulkan::Rasterizer::PacketRunGuard run{rasterizer};
 
     while (!dcb.empty()) {
+        if (rasterizer && num_commands.load(std::memory_order_relaxed) != 0) {
+            rasterizer->DropCopyHoldForCommands();
+        }
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());

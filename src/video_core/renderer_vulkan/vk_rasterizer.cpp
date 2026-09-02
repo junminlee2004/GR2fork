@@ -60,6 +60,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
     bind_prefetch_ = EmulatorSettings.IsBindLinePrefetch();
+    if (EmulatorSettings.IsGuestCopyHoldSegment()) {
+        segment_copy_hold_ = true;
+        pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
+    }
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -432,9 +436,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
+    if (segment_copy_hold_ && in_packet_run_) {
+        ArmCopyHold();
+    } else if (batch_copy_lock_) {
         copy_scope.emplace(Core::Memory::Instance());
     }
 
@@ -493,9 +498,40 @@ void Rasterizer::MaybeIntervalFlush() {
     if (ds.depth_clear || ds.stencil_clear) {
         return;
     }
+    DropCopyHold(hold_drops_flush_);
     scheduler.Flush();
     draws_since_flush_ = 0;
     ++interval_flushes_;
+}
+
+void Rasterizer::BeginPacketRun() {
+    ASSERT(!in_packet_run_);
+    in_packet_run_ = true;
+}
+
+void Rasterizer::EndPacketRun() {
+    in_packet_run_ = false;
+    DropCopyHold(hold_drops_run_);
+}
+
+void Rasterizer::DropCopyHoldForCommands() {
+    DropCopyHold(hold_drops_cmd_);
+}
+
+void Rasterizer::ArmCopyHold() {
+    if (!run_copy_hold_) {
+        run_copy_hold_.emplace(memory);
+        ++hold_arms_;
+    } else {
+        ++hold_draws_covered_;
+    }
+}
+
+void Rasterizer::DropCopyHold(u64& counter) {
+    if (run_copy_hold_) {
+        run_copy_hold_.reset();
+        ++counter;
+    }
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -517,9 +553,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
+    if (segment_copy_hold_ && in_packet_run_) {
+        ArmCopyHold();
+    } else if (batch_copy_lock_) {
         copy_scope.emplace(Core::Memory::Instance());
     }
 
@@ -609,9 +646,10 @@ void Rasterizer::DispatchDirect() {
     // the per-function scopes inside become TLS-flag no-ops. Placed after the
     // filter and pipeline resolution so filtered draws pay nothing and a
     // pipeline compile never holds the memory map open.
-    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
+    if (segment_copy_hold_ && in_packet_run_) {
+        ArmCopyHold();
+    } else if (batch_copy_lock_) {
         copy_scope.emplace(Core::Memory::Instance());
     }
 
@@ -644,6 +682,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipeline) {
         return;
     }
+    if (segment_copy_hold_ && in_packet_run_) {
+        ArmCopyHold();
+    }
 
     if (!BindResources(pipeline)) {
         return;
@@ -668,6 +709,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 }
 
 u64 Rasterizer::Flush() {
+    DropCopyHold(hold_drops_wait_);
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
@@ -675,6 +717,7 @@ u64 Rasterizer::Flush() {
 }
 
 void Rasterizer::Finish() {
+    DropCopyHold(hold_drops_wait_);
     scheduler.Finish();
 }
 
@@ -734,6 +777,15 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
                          interval_flushes_);
                 interval_flushes_ = 0;
+            }
+            if (segment_copy_hold_) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] COPYHOLD arms={} covered={} drops_run={} drops_flush={} "
+                         "drops_wait={} drops_cmd={} compiles={} per300f",
+                         hold_arms_, hold_draws_covered_, hold_drops_run_, hold_drops_flush_,
+                         hold_drops_wait_, hold_drops_cmd_, hold_compiles_);
+                hold_arms_ = hold_draws_covered_ = hold_drops_run_ = hold_drops_flush_ =
+                    hold_drops_wait_ = hold_drops_cmd_ = hold_compiles_ = 0;
             }
             pipeline_cache.DumpKeyReuseStats();
             pipeline_cache.DumpProgramIdentityStats();
@@ -1113,9 +1165,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     // One shared-lock hold covers every guest copy this stage stages
     // (flatbuf, clip planes, stream uploads); see GuestCopyScope.
-    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
+    if (batch_copy_lock_) {
         copy_scope.emplace(Core::Memory::Instance());
     }
     buffer_bindings.clear();
@@ -2002,6 +2053,9 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::ProcessDownloadImages() {
+    if (texture_cache.HasPendingDownloads()) {
+        DropCopyHold(hold_drops_wait_);
+    }
     texture_cache.ProcessDownloadImages();
 }
 
