@@ -85,8 +85,7 @@ public:
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
-    /// Valid until the next BeginRendering.
-    const RenderState& BeginRendering(const GraphicsPipeline* pipeline);
+    RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -146,13 +145,12 @@ private:
         u64 meta_gen{};
         u64 layout_gen{};
         RenderState state{}; // clear-free by populate refusal
-        u64 state_serial{};  // names this snapshot to the scheduler
         std::array<BrAttachmentGuard, AmdGpu::NUM_COLOR_BUFFERS> cb_guard{};
         BrAttachmentGuard db_guard{};
     };
     bool BrProbe(const VideoCore::Skipcache::DrawToken& token, const GraphicsPipeline* pipeline);
     bool BrGuardAttachment(const BrAttachmentGuard& g, VideoCore::Skipcache::CacheCounters& ctr);
-    const RenderState& BrReplay(const GraphicsPipeline* pipeline);
+    RenderState BrReplay(const GraphicsPipeline* pipeline);
     void BrVerify(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token);
     void BrPopulate(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token,
                     const GraphicsPipeline* pipeline);
@@ -160,13 +158,8 @@ private:
         static_cast<Rasterizer*>(self)->br_cache_.valid = false;
     }
     BeginRenderingCache br_cache_{};
-    // Serials name render states to the scheduler: one per populated
-    // snapshot, zero for a miss-path state nothing else refers to.
-    u64 br_state_serial_{};
-    u64 draw_state_serial_{};
-    RenderState fresh_state_{}; // miss-path state, handed out by reference
-    bool br_readback_gate_{};   // readbackLinearImages snapshot: cache off when set
-    bool batch_copy_lock_{};    // settings snapshot, read at draw rate
+    bool br_readback_gate_{}; // readbackLinearImages snapshot: cache off when set
+    bool batch_copy_lock_{};  // settings snapshot, read at draw rate
     // Interval flush: a readback fence otherwise waits on the whole body
     // recorded since the last submit. Boot-latched; 0 = off.
     u32 flush_draw_interval_{};

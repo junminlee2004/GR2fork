@@ -143,8 +143,6 @@ Liverpool::Liverpool() {
     gfx_stamp.active =
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
     occlude_all_ = EmulatorSettings.IsOccludeAll();
-    host_markers_ = EmulatorSettings.IsVkHostMarkersEnabled();
-    guest_markers_ = EmulatorSettings.IsVkGuestMarkersEnabled();
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -435,8 +433,8 @@ SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count
 
 std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                    uintptr_t base_addr) {
-    const bool host_markers_enabled = rasterizer && host_markers_;
-    const bool guest_markers_enabled = rasterizer && guest_markers_;
+    const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
+    const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
     // Cached only for the length of one run segment: every dump entry a submit
     // can match is registered before that submit is queued, so a segment that
     // starts with none pending cannot be handed one it could have matched.
@@ -1104,7 +1102,7 @@ template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
-    const bool host_markers_enabled = rasterizer && host_markers_;
+    const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
 
     struct IndirectPatch {
         const PM4Header* header;

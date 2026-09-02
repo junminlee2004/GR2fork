@@ -670,7 +670,11 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
-    Core::MemoryManager::GuestCopyScope copy_scope{memory, batch_copy_lock_};
+    const bool batch_copy_lock = batch_copy_lock_;
+    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
+    if (batch_copy_lock) {
+        copy_scope.emplace(Core::Memory::Instance());
+    }
     const auto& regs = liverpool->regs;
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -901,7 +905,11 @@ void BufferCache::BindVertexBuffers(
 
 void BufferCache::BindIndexBuffer(
     u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
-    Core::MemoryManager::GuestCopyScope copy_scope{memory, batch_copy_lock_};
+    const bool batch_copy_lock = batch_copy_lock_;
+    std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
+    if (batch_copy_lock) {
+        copy_scope.emplace(Core::Memory::Instance());
+    }
     const auto& regs = liverpool->regs;
 
     // Figure out index type and size.
