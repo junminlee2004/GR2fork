@@ -513,10 +513,16 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
     Vulkan::Rasterizer::PacketRunGuard run{rasterizer};
 
     while (!dcb.empty()) {
-        if (rasterizer && num_commands.load(std::memory_order_relaxed) != 0) {
-            rasterizer->DropCopyHoldForCommands();
+        // One poll, one load: the drain re-tests the same counter, and the copy
+        // hold is dropped only when there is a command to drop it for. A
+        // command landing after the load is seen on the next packet, so the
+        // drop and the drain always happen together.
+        if (num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            if (rasterizer) {
+                rasterizer->DropCopyHoldForCommands();
+            }
+            DrainCommands();
         }
-        ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         if (header->type != 3) [[unlikely]] {
