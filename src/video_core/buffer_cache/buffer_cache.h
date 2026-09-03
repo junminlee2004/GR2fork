@@ -427,6 +427,16 @@ private:
     bool GpuModifiedRangesContain(VAddr addr, u64 size);
 
 public:
+    struct VertexInputStats {
+        u64 calls;
+        u64 built;
+        u64 binds;
+    };
+    VertexInputStats DrainVertexInputStats() {
+        const VertexInputStats out{vinput_calls_, vinput_built_, vinput_binds_};
+        vinput_calls_ = vinput_built_ = vinput_binds_ = 0;
+        return out;
+    }
     struct WritebackStats {
         u64 loops;
         u64 islands;
@@ -545,6 +555,10 @@ private:
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
+    bool vertex_lazy_desc_{};
+    u64 vinput_calls_{};
+    u64 vinput_built_{};
+    u64 vinput_binds_{};
     u64 writeback_loops_{};
     u64 writeback_islands_{};
     u64 writeback_bytes_{};

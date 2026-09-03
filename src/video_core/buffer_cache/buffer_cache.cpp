@@ -50,6 +50,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
+    vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
     // Latched single-threaded, before any GPU-thread pool operation.
     GpuRangeSetMutex::lockfree = EmulatorSettings.IsGpuRangeSetLockfree();
@@ -713,8 +714,16 @@ void BufferCache::BindVertexBuffers(
     Vulkan::VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     Vulkan::VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
-    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
-                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
+    const bool memo_active = skipcache.Active();
+    // Lazy: the signatures come from the V# words and the Vulkan descriptions
+    // are built only for a setVertexInputEXT emit. Decided per call, since the
+    // framework mode changes at runtime.
+    const bool lazy = vertex_lazy_desc_ && memo_active;
+    if (!lazy) {
+        pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                                 regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    }
 
     struct BufferRange {
         VAddr base_address;
@@ -735,8 +744,6 @@ void BufferCache::BindVertexBuffers(
     // pipeline pointer and the two step rates already key them; only stride
     // and format vary under a fixed pipeline. divisors is empty here because
     // the bindings carry the divisor inline on the 2EXT path.
-    auto& skipcache = VideoCore::Skipcache::Framework::Instance();
-    const bool memo_active = skipcache.Active();
     const auto mix = [](u64& h, u64 v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
     u64 input_sig = 0xcbf29ce484222325ULL;
     u64 bind_sig = 0;
@@ -745,27 +752,40 @@ void BufferCache::BindVertexBuffers(
     // never run and the list is discarded, and the loop cannot be deferred
     // because the key that decides the hit is not complete until it ends. An
     // unbound binding takes {~0, 0} so the span reduction needs no second
-    // predicate. Indexing attributes and bindings in parallel is exact only
-    // because GetVertexInputs pushes to all three vectors once per fetch
-    // shader attribute.
+    // predicate. Both legs produce one span and one sharp per fetch shader
+    // attribute, in attribute order.
     Vulkan::VertexInputs<BufferRange> spans;
     VAddr span_lo = ~VAddr{0};
     VAddr span_hi = 0;
-    for (size_t i = 0; i < guest_buffers.size(); ++i) {
-        const auto& gb = guest_buffers[i];
-        const VAddr base = gb.base_address;
-        const u32 size = gb.GetSize();
+    const auto fold = [&](VAddr base, u32 size, u64 layout) {
         const bool bound = base != 0 && size > 0;
         const VAddr lo = bound ? base : ~VAddr{0};
         const VAddr hi = bound ? base + size : VAddr{0};
         spans.emplace_back(lo, hi);
         if (memo_active) {
-            mix(input_sig, (static_cast<u64>(static_cast<u32>(attributes[i].format)) << 32) |
-                               static_cast<u64>(bindings[i].stride));
+            mix(input_sig, layout);
             mix(bind_sig, static_cast<u64>(base));
             mix(bind_sig, static_cast<u64>(size));
             span_lo = std::min<VAddr>(span_lo, lo);
             span_hi = std::max<VAddr>(span_hi, hi);
+        }
+    };
+    if (lazy) {
+        ++vinput_calls_;
+        if (const auto& fetch = pipeline.GetFetchShader(); fetch && !fetch->attributes.empty()) {
+            const auto& vs_info = pipeline.GetStage(Shader::LogicalStage::Vertex);
+            for (const auto& attrib : fetch->attributes) {
+                const AmdGpu::Buffer sharp = attrib.GetSharp(vs_info);
+                guest_buffers.emplace_back(sharp);
+                fold(sharp.base_address, sharp.GetSize(),
+                     (u64{static_cast<u32>(sharp.GetDataFmt())} << 40) |
+                         (u64{static_cast<u32>(sharp.GetNumberFmt())} << 32) | sharp.GetStride());
+            }
+        }
+    } else {
+        for (size_t i = 0; i < guest_buffers.size(); ++i) {
+            fold(guest_buffers[i].base_address, guest_buffers[i].GetSize(),
+                 (u64{static_cast<u32>(attributes[i].format)} << 32) | u64{bindings[i].stride});
         }
     }
     if (memo_active) {
@@ -823,6 +843,13 @@ void BufferCache::BindVertexBuffers(
         const u64 input_tick = scheduler.CurrentTick();
         if (!memo_active || !vertex_input_valid_ || input_sig != vertex_input_sig_ ||
             vertex_input_tick_ != input_tick) {
+            if (lazy) {
+                ++vinput_built_;
+                pipeline.GetVertexInputs(
+                    attributes, bindings, divisors,
+                    std::span<const AmdGpu::Buffer>{guest_buffers.data(), guest_buffers.size()},
+                    regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+            }
             const auto cmdbuf = scheduler.CommandBuffer();
             cmdbuf.setVertexInputEXT(bindings, attributes);
             vertex_input_sig_ = input_sig;
@@ -831,10 +858,11 @@ void BufferCache::BindVertexBuffers(
         }
     }
 
-    if (bindings.empty()) {
+    if (spans.empty()) {
         // If there are no bindings, there is nothing further to do.
         return;
     }
+    vinput_binds_ += vertex_lazy_desc_;
 
     // Coalesce the bound spans into disjoint ranges. Every entry the span
     // touches collapses into it, which is the whole merge: the interleaved

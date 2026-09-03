@@ -107,6 +107,12 @@ public:
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
                          u32 step_rate_1) const;
+    /// Same, from sharps already read: one per fetch attribute, in attribute order.
+    template <typename Attribute, typename Binding>
+    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                         std::span<const AmdGpu::Buffer> sharps, u32 step_rate_0,
+                         u32 step_rate_1) const;
 
 private:
     void BuildDescSetLayout(bool preloading, std::string_view debug_str);

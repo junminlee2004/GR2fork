@@ -521,6 +521,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU backingWriteMemo: {}", EmulatorSettings.IsBackingWriteMemo());
     LOG_INFO(Config, "GPU imageUpdateDirect: {}", EmulatorSettings.IsImageUpdateDirect());
     LOG_INFO(Config, "GPU descLayoutShare: {}", EmulatorSettings.IsDescLayoutShare());
+    LOG_INFO(Config, "GPU vertexInputLazyDesc: {}", EmulatorSettings.IsVertexInputLazyDesc());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
