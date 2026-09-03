@@ -865,6 +865,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
 void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+    static_assert(MaxVertexBindings >= Vulkan::MaxVertexBufferCount);
     const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
@@ -897,25 +898,18 @@ void BufferCache::BindVertexBuffers(
         }
     };
 
-    // Signatures over the RESOLVED inputs: the vertex input layout feeds
-    // setVertexInputEXT, the full bind signature adds the guest V# contents.
-    // Content-keyed, so the user_data churn that defeats raw-register memos
-    // does not apply. location, binding, inputRate, offset and the divisor
-    // class are all read out of the pipeline's own fetch shader, so the
-    // pipeline pointer and the two step rates already key them; only stride
-    // and format vary under a fixed pipeline. divisors is empty here because
-    // the bindings carry the divisor inline on the 2EXT path.
-    const auto mix = [](u64& h, u64 v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
-    u64 input_sig = 0xcbf29ce484222325ULL;
-    u64 bind_sig = 0;
-    // Decoded once per binding and reused by the signature, the memo span, the
-    // merged range list and the final offsets; on a memo hit those consumers
-    // never run and the list is discarded, and the loop cannot be deferred
-    // because the key that decides the hit is not complete until it ends. An
-    // unbound binding takes {~0, 0} so the span reduction needs no second
-    // predicate. Both legs produce one span and one sharp per fetch shader
-    // attribute, in attribute order.
-    Vulkan::VertexInputs<BufferRange> spans;
+    // The resolved inputs go into a flat record compared element-wise with
+    // the previous call's: the layout words key the vertex input state, base
+    // and size add the guest V# contents. Content-keyed, so the user_data
+    // churn that defeats raw-register memos does not apply. location, binding,
+    // inputRate, offset and the divisor class are all read out of the
+    // pipeline's own fetch shader, so the pipeline pointer and the two step
+    // rates key them; only stride and format vary under a fixed pipeline.
+    // Both legs record one entry per fetch shader attribute, in attribute
+    // order; an unbound attribute reads back as the span {~0, 0}.
+    u32 count = 0;
+    bool layout_same = memo_active;
+    bool bind_same = memo_active;
     VAddr span_lo = ~VAddr{0};
     VAddr span_hi = 0;
     // True while every bound span touches the running union, which is the
@@ -924,15 +918,13 @@ void BufferCache::BindVertexBuffers(
     // bridging span reads false and takes the general merge.
     bool chain_ok = true;
     const auto fold = [&](VAddr base, u32 size, u64 layout) {
+        VertexBindEntry& e = vertex_bind_entries_[count++];
+        layout_same = layout_same & (e.layout == layout);
+        bind_same = bind_same & ((e.base == base) & (e.size == size));
+        e = VertexBindEntry{base, layout, size};
         const bool bound = base != 0 && size > 0;
         const VAddr lo = bound ? base : ~VAddr{0};
         const VAddr hi = bound ? base + size : VAddr{0};
-        spans.emplace_back(lo, hi);
-        if (memo_active) {
-            mix(input_sig, layout);
-            mix(bind_sig, static_cast<u64>(base));
-            mix(bind_sig, static_cast<u64>(size));
-        }
         if (bound) {
             if (span_hi > span_lo && (hi < span_lo || span_hi < lo)) {
                 chain_ok = false;
@@ -961,11 +953,19 @@ void BufferCache::BindVertexBuffers(
                  (u64{static_cast<u32>(attributes[i].format)} << 32) | u64{bindings[i].stride});
         }
     }
+    // The count the hashes only implied closes both records; a bind match
+    // implies a layout match, which keeps the bind memo's early return sound.
+    layout_same &= count == vertex_bind_count_ && &pipeline == vertex_bind_pipeline_ &&
+                   regs.vgt_instance_step_rate_0 == vertex_bind_step0_ &&
+                   regs.vgt_instance_step_rate_1 == vertex_bind_step1_;
+    bind_same &= layout_same;
+    vertex_bind_count_ = count;
+    vertex_bind_pipeline_ = &pipeline;
+    vertex_bind_step0_ = regs.vgt_instance_step_rate_0;
+    vertex_bind_step1_ = regs.vgt_instance_step_rate_1;
     if (memo_active) {
-        mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_0));
-        mix(input_sig, static_cast<u64>(regs.vgt_instance_step_rate_1));
-        mix(input_sig, reinterpret_cast<u64>(&pipeline));
-        mix(bind_sig, input_sig);
+        vinput_layout_ += layout_same;
+        vinput_bind_ += bind_same;
         const u64 tick = scheduler.CurrentTick();
         // The memo keys on the bound span's word-epoch sum under the mirror
         // mode, so faults outside the span no longer invalidate it; the
@@ -981,8 +981,8 @@ void BufferCache::BindVertexBuffers(
                 mem_key_ok = false;
             }
         }
-        if (mem_key_ok && vertex_bind_valid_ && bind_sig == vertex_bind_sig_ &&
-            tick == vertex_bind_tick_ && mem_key == vertex_bind_mem_key_) {
+        if (mem_key_ok && vertex_bind_valid_ && bind_same && tick == vertex_bind_tick_ &&
+            mem_key == vertex_bind_mem_key_) {
             // Identical resolved layout and buffer contents descriptors on the
             // same command buffer with no intervening CPU write. GPU writes do
             // not move the key, so a skip additionally requires that no bound
@@ -999,7 +999,6 @@ void BufferCache::BindVertexBuffers(
                 return;
             }
         }
-        vertex_bind_sig_ = bind_sig;
         vertex_bind_tick_ = tick;
         vertex_bind_mem_key_ = mem_key;
         vertex_bind_valid_ = mem_key_ok;
@@ -1014,7 +1013,7 @@ void BufferCache::BindVertexBuffers(
         // Update current vertex inputs, unless the layout is unchanged on
         // this command buffer.
         const u64 input_tick = scheduler.CurrentTick();
-        if (!memo_active || !vertex_input_valid_ || input_sig != vertex_input_sig_ ||
+        if (!memo_active || !vertex_input_valid_ || !layout_same ||
             vertex_input_tick_ != input_tick) {
             if (lazy) {
                 ++vinput_built_;
@@ -1025,19 +1024,23 @@ void BufferCache::BindVertexBuffers(
             }
             const auto cmdbuf = scheduler.CommandBuffer();
             cmdbuf.setVertexInputEXT(bindings, attributes);
-            vertex_input_sig_ = input_sig;
             vertex_input_tick_ = input_tick;
             vertex_input_valid_ = memo_active;
         }
     }
 
-    if (spans.empty()) {
+    if (count == 0) {
         // If there are no bindings, there is nothing further to do.
         return;
     }
     vinput_binds_ += vertex_lazy_desc_;
 
-    const size_t count = spans.size();
+    const auto span_of = [&](size_t i) {
+        const VertexBindEntry& e = vertex_bind_entries_[i];
+        const bool bound = e.base != 0 && e.size > 0;
+        return std::pair<VAddr, VAddr>{bound ? e.base : ~VAddr{0},
+                                       bound ? e.base + e.size : VAddr{0}};
+    };
     // Raw handles: a vk::Buffer array would zero every slot on entry.
     std::array<VkBuffer, Vulkan::MaxVertexBufferCount> host_buffers;
     std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_offsets;
@@ -1072,9 +1075,10 @@ void BufferCache::BindVertexBuffers(
         }
         const VkBuffer handle = static_cast<VkBuffer>(buffer->Handle());
         for (size_t i = 0; i < count; ++i) {
-            if (spans[i].end_address != 0) {
+            const auto [base, end] = span_of(i);
+            if (end != 0) {
                 host_buffers[i] = handle;
-                host_offsets[i] = offset + spans[i].base_address - span_lo;
+                host_offsets[i] = offset + base - span_lo;
             } else {
                 host_buffers[i] = VK_NULL_HANDLE;
                 host_offsets[i] = 0;
@@ -1092,12 +1096,11 @@ void BufferCache::BindVertexBuffers(
         // by the count.
         std::array<BufferRange, Vulkan::MaxVertexBufferCount> ranges;
         size_t num_ranges = 0;
-        for (const auto& span : spans) {
-            if (span.end_address == 0) {
+        for (size_t s = 0; s < count; ++s) {
+            auto [lo, hi] = span_of(s);
+            if (hi == 0) {
                 continue;
             }
-            VAddr lo = span.base_address;
-            VAddr hi = span.end_address;
             size_t kept = 0;
             for (size_t i = 0; i < num_ranges; ++i) {
                 const BufferRange range = ranges[i];
@@ -1152,8 +1155,8 @@ void BufferCache::BindVertexBuffers(
         }
 
         for (size_t i = 0; i < count; ++i) {
-            const VAddr base = spans[i].base_address;
-            if (spans[i].end_address != 0) {
+            const auto [base, end] = span_of(i);
+            if (end != 0) {
                 const auto host_buffer_info = std::find_if(
                     ranges.begin(), ranges.begin() + num_ranges, [&](const BufferRange& range) {
                         return base >= range.base_address && base < range.end_address;

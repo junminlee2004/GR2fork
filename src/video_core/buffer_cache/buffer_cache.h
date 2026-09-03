@@ -378,8 +378,21 @@ private:
     // generation, or the bound range's word-epoch sum under the mirror mode. The clean-gen fields
     // record the gpu_dirty_generation_ at which the memoized range was last proven not GPU
     // modified; zero means unproven.
-    u64 vertex_bind_sig_{};
-    u64 vertex_input_sig_{};
+    // The record of the last call's resolved inputs, compared element-wise
+    // by the next call: the layout words alone key the vertex input state,
+    // base and size add the guest V# contents. All five fields are written
+    // together on every call.
+    static constexpr u32 MaxVertexBindings = 32;
+    struct VertexBindEntry {
+        VAddr base;
+        u64 layout;
+        u32 size;
+    };
+    std::array<VertexBindEntry, MaxVertexBindings> vertex_bind_entries_{};
+    u32 vertex_bind_count_{};
+    const Vulkan::GraphicsPipeline* vertex_bind_pipeline_{};
+    u32 vertex_bind_step0_{};
+    u32 vertex_bind_step1_{};
     u64 vertex_bind_tick_{};
     u64 vertex_input_tick_{};
     u64 vertex_bind_mem_key_{};
@@ -461,10 +474,14 @@ public:
         u64 built;
         u64 binds;
         u64 chain;
+        u64 layout;
+        u64 bind;
     };
     VertexInputStats DrainVertexInputStats() {
-        const VertexInputStats out{vinput_calls_, vinput_built_, vinput_binds_, vinput_chain_};
-        vinput_calls_ = vinput_built_ = vinput_binds_ = vinput_chain_ = 0;
+        const VertexInputStats out{vinput_calls_, vinput_built_,  vinput_binds_,
+                                   vinput_chain_, vinput_layout_, vinput_bind_};
+        vinput_calls_ = vinput_built_ = vinput_binds_ = vinput_chain_ = vinput_layout_ =
+            vinput_bind_ = 0;
         return out;
     }
     struct WritebackStats {
@@ -639,6 +656,8 @@ private:
     u64 vinput_built_{};
     u64 vinput_binds_{};
     u64 vinput_chain_{};
+    u64 vinput_layout_{};
+    u64 vinput_bind_{};
     u64 writeback_loops_{};
     u64 writeback_islands_{};
     u64 writeback_bytes_{};
