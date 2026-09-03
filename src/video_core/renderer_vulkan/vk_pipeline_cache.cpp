@@ -154,7 +154,7 @@ const SpecSharpMasks& GetSpecSharpMasks() noexcept {
 
 // Worst case: bindings + ri hash + 40 buffers + 64 images + 8 fmasks + 16 samplers
 // + fetch address + 32 attributes, each list followed by its validity word.
-constexpr size_t SpecKeyMaxBytes = 12 + 8 + 40 * 16 + 64 * 16 + 8 * 8 + 16 * 8 + 5 * 8 + 8 + 32 * 8;
+constexpr size_t SpecKeyMaxBytes = 24 + 8 + 40 * 16 + 64 * 16 + 8 * 8 + 16 * 8 + 5 * 8 + 8 + 32 * 8;
 static_assert(SpecKeyMaxBytes <= 4096);
 static_assert(Shader::NUM_BUFFERS <= 64 && Shader::NUM_IMAGES <= 64 && Shader::NUM_FMASKS <= 64 &&
               Shader::NUM_SAMPLERS <= 64);
@@ -164,14 +164,23 @@ static_assert(Shader::NUM_BUFFERS <= 64 && Shader::NUM_IMAGES <= 64 && Shader::N
 // comes from a stored permutation's fetch data; returns 0 while none carries
 // it, which sends the call to the full resolve.
 size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
-                     const Shader::Backend::Bindings& start, u8* buf) noexcept {
+                     const Shader::Backend::Bindings& start, u8* buf, bool aligned) noexcept {
     const auto& m = GetSpecSharpMasks();
     size_t len = 0;
     const auto put = [&](const void* p, size_t n) noexcept {
         std::memcpy(buf + len, p, n);
         len += n;
     };
-    put(&start, sizeof(start));
+    if (aligned) {
+        // Every key word starts on an 8-byte boundary, so the fold's loads
+        // forward from the gather's stores.
+        const u64 w0 = u64{start.unified} | (u64{start.buffer} << 32);
+        const u64 w1 = start.user_data;
+        put(&w0, sizeof(w0));
+        put(&w1, sizeof(w1));
+    } else {
+        put(&start, sizeof(start));
+    }
     put(&ri_fp_hash, sizeof(ri_fp_hash));
     u64 valid = 0;
     u32 n = 0;
@@ -700,6 +709,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             spec_fp_front = true;
         }
     }
+    if (const u32 fast = EmulatorSettings.GetSpecKeyFast(); fast != 0) {
+        if (spec_fp_canonical == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "spec_key_fast needs spec_fp_canonical; the key runs unchanged");
+        } else {
+            spec_key_align = true;
+            slot_prefetch = fast >= 2 && spec_fp_canonical == 2;
+        }
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -839,12 +857,13 @@ void PipelineCache::DumpSpecFpStats() {
     }
     LOG_INFO(Render_Skipcache,
              "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} inplace_kb={} "
-             "rihash={} front={} per300f",
+             "rihash={} front={} pf={} per300f",
              specfp_slot_hits, specfp_mru_hits, specfp_mru2_hits, specfp_table_hits,
              specfp_rebuilds, specfp_validate_misses, specfp_inplace_bytes >> 10, specfp_ri_rehash,
-             specfp_front_hits);
+             specfp_front_hits, specfp_slot_pf);
     specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
-        specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = specfp_front_hits = 0;
+        specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = specfp_front_hits =
+            specfp_slot_pf = 0;
 }
 
 void PipelineCache::DumpProgramIdentityStats() {
@@ -1205,6 +1224,16 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     // reference - and the new-program spec must be built from that SAME
     // mutated copy to keep stored-spec bytes identical to before.
     auto& ri_slot = ri_stamp[static_cast<u32>(l_stage)];
+    if (slot_prefetch && l_stage != LogicalStage::TessellationControl &&
+        l_stage != LogicalStage::TessellationEval) {
+        // Warms the slot lines the fold reads and writes: the header and the
+        // first 256 bytes of the key, issued ahead of the runtime info and
+        // the gather.
+        const auto* p = reinterpret_cast<const char*>(&gather_slots[static_cast<u32>(l_stage)]);
+        for (u32 i = 0; i < 5; ++i) {
+            __builtin_prefetch(p + i * 64, 1, 3);
+        }
+    }
     const bool stampable = ri_stamp_gate && (stage == Stage::Vertex || stage == Stage::Fragment);
     const u64 reg_stamp = stampable ? liverpool->GetGfxStateStamp() : 0;
     if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
@@ -1277,7 +1306,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         }
         auto& slot = gather_slots[static_cast<u32>(l_stage)];
         if (spec_fp_canonical != 0) {
-            key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_buf);
+            key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_buf, spec_key_align);
             if (key_len != 0 && spec_fp_canonical == 2) {
                 const bool same = slot.program == program && slot.len == key_len &&
                                   slot.pipe_gen == lookup_pipe_gen_;
@@ -1292,6 +1321,7 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                         slot.program = nullptr;
                     }
                     specfp_inplace_bytes += key_len;
+                    specfp_slot_pf += slot_prefetch;
                 } else {
                     hit = same && std::memcmp(slot.buf.data(), key_buf, key_len) == 0;
                 }

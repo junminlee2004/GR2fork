@@ -339,14 +339,14 @@ private:
     // masked, plus the runtime-info hash, the start bindings and the fetch
     // shader address. Value 2 keeps the last key per stage so a repeat is a
     // memcmp; the slot names one permutation of one program under one pipe_gen.
-    struct GatherSlot {
+    struct alignas(64) GatherSlot {
         const Program* program{};
         u64 pipe_gen{};
         u64 perm_hash{};
         vk::ShaderModule module{};
         u32 perm_idx{};
         u32 len{};
-        alignas(16) std::array<u8, 4096> buf{};
+        alignas(64) std::array<u8, 4096> buf{};
     };
     std::array<GatherSlot, MaxShaderStages> gather_slots{};
     u64 lookup_pipe_gen_{}; // pipe_gen of the current pipeline lookup
@@ -356,6 +356,8 @@ private:
     bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared
     bool spec_fp_slot_inplace{};
     bool spec_fp_front{};
+    bool spec_key_align{};
+    bool slot_prefetch{};
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
     u64 specfp_mru2_hits{};
@@ -365,6 +367,7 @@ private:
     u64 specfp_inplace_bytes{};
     u64 specfp_ri_rehash{};
     u64 specfp_front_hits{};
+    u64 specfp_slot_pf{};
     void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
                          const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
