@@ -606,7 +606,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes}, layouts{instance} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -718,6 +718,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             slot_prefetch = fast >= 2 && spec_fp_canonical == 2;
         }
     }
+    share_layouts = EmulatorSettings.IsDescLayoutShare();
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -759,8 +760,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             pre_compile_hook_(pre_compile_user_);
         }
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos,
+            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+            graphics_key, *pipeline_cache, infos, runtime_infos,
             fetch_shader_ref ? fetch_shader_ref.Get()
                              : std::optional<Shader::Gcn::FetchShaderData>{},
             modules, sdata, false);
@@ -851,6 +852,14 @@ void PipelineCache::ValidateSpecHit(const Program& program, u32 hit_idx, const S
     }
 }
 
+void PipelineCache::DumpLayoutStats() {
+    if (!share_layouts) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache, "[SkipCache] LAYOUTS shapes={} pipelines={}", layouts.NumLayouts(),
+             graphics_pipelines.size() + compute_pipelines.size());
+}
+
 void PipelineCache::DumpSpecFpStats() {
     if (spec_fp_canonical == 0) {
         return;
@@ -901,9 +910,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         if (pre_compile_hook_) {
             pre_compile_hook_(pre_compile_user_);
         }
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false);
+        it.value() = std::make_unique<ComputePipeline>(
+            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+            *pipeline_cache, compute_key, *infos[0], modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

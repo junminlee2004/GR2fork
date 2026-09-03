@@ -236,6 +236,8 @@ public:
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
     }
+    /// Shared layout count against the pipeline count; silent when sharing is off.
+    void DumpLayoutStats();
     /// Per-window telemetry for the canonical specialization key; silent when it is off.
     void DumpSpecFpStats();
 
@@ -263,6 +265,8 @@ private:
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
+    PipelineLayoutCache layouts; // destroyed after every pipeline
+    bool share_layouts{};
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};

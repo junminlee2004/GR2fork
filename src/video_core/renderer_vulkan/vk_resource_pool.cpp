@@ -101,6 +101,59 @@ vk::CommandBuffer CommandPool::Commit() {
     return cmd_buffers[index];
 }
 
+PipelineLayoutCache::PipelineLayoutCache(const Instance& instance_) : instance{instance_} {}
+
+PipelineLayoutCache::~PipelineLayoutCache() = default;
+
+PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
+    std::span<const vk::DescriptorSetLayoutBinding> bindings,
+    vk::DescriptorSetLayoutCreateFlags flags, const vk::PushConstantRange& push_constants,
+    std::string_view debug_name) {
+    // The key is the raw shape: flags, the push range and each binding's
+    // index, type, count and stages; equal keys are equal layouts.
+    std::string key;
+    key.reserve(16 + 16 * bindings.size());
+    const auto put = [&](const auto& v) {
+        key.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    put(static_cast<u32>(flags));
+    put(static_cast<u32>(push_constants.stageFlags));
+    put(push_constants.offset);
+    put(push_constants.size);
+    for (const auto& b : bindings) {
+        ASSERT(b.pImmutableSamplers == nullptr);
+        put(b.binding);
+        put(static_cast<u32>(b.descriptorType));
+        put(b.descriptorCount);
+        put(static_cast<u32>(b.stageFlags));
+    }
+    auto [it, inserted] = layouts.try_emplace(std::move(key));
+    if (inserted) {
+        const auto device = instance.GetDevice();
+        const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+            .flags = flags,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        };
+        auto [set_result, set] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
+        ASSERT_MSG(set_result == vk::Result::eSuccess,
+                   "Failed to create shared descriptor set layout: {}", vk::to_string(set_result));
+        const vk::DescriptorSetLayout set_layout = *set;
+        const vk::PipelineLayoutCreateInfo layout_info = {
+            .setLayoutCount = 1U,
+            .pSetLayouts = &set_layout,
+            .pushConstantRangeCount = 1U,
+            .pPushConstantRanges = &push_constants,
+        };
+        auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_info);
+        ASSERT_MSG(layout_result == vk::Result::eSuccess,
+                   "Failed to create shared pipeline layout: {}", vk::to_string(layout_result));
+        SetObjectName(device, *layout, "Shared PipelineLayout {}", debug_name);
+        it.value() = Entry{std::move(set), std::move(layout)};
+    }
+    return {*it->second.set, *it->second.pipeline};
+}
+
 DescriptorHeap::DescriptorHeap(const Instance& instance, MasterSemaphore* master_semaphore_,
                                std::span<const vk::DescriptorPoolSize> pool_sizes_,
                                u32 descriptor_heap_count_)

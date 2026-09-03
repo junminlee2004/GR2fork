@@ -4,6 +4,9 @@
 #pragma once
 
 #include <deque>
+#include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
@@ -62,6 +65,35 @@ private:
     const Instance& instance;
     vk::UniqueCommandPool cmd_pool;
     std::vector<vk::CommandBuffer> cmd_buffers;
+};
+
+// One descriptor set layout and pipeline layout per distinct binding list,
+// shared by every pipeline of that shape. Filled by the pipeline preload
+// before the first draw and by the GPU thread afterwards; no lock, like the
+// pipeline maps.
+class PipelineLayoutCache final {
+public:
+    explicit PipelineLayoutCache(const Instance& instance);
+    ~PipelineLayoutCache();
+
+    struct Layouts {
+        vk::DescriptorSetLayout set;
+        vk::PipelineLayout pipeline;
+    };
+    Layouts Acquire(std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                    vk::DescriptorSetLayoutCreateFlags flags,
+                    const vk::PushConstantRange& push_constants, std::string_view debug_name);
+    size_t NumLayouts() const noexcept {
+        return layouts.size();
+    }
+
+private:
+    struct Entry {
+        vk::UniqueDescriptorSetLayout set;
+        vk::UniquePipelineLayout pipeline;
+    };
+    const Instance& instance;
+    tsl::robin_map<std::string, Entry> layouts;
 };
 
 class DescriptorHeap final {

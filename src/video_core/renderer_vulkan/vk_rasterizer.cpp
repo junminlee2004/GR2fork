@@ -805,6 +805,7 @@ void Rasterizer::OnSubmit() {
             pipeline_cache.DumpKeyReuseStats();
             pipeline_cache.DumpProgramIdentityStats();
             pipeline_cache.DumpSpecFpStats();
+            pipeline_cache.DumpLayoutStats();
             const auto vm = texture_cache.DrainViewMemoStats();
             if (vm.hits || vm.slow) {
                 LOG_INFO(Render_Skipcache,

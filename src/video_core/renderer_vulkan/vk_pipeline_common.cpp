@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 
@@ -178,9 +179,45 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
-                   bool is_compute_ /*= false*/)
+                   PipelineLayoutCache* layouts_, bool is_compute_ /*= false*/)
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
-      is_compute{is_compute_} {}
+      layouts{layouts_}, is_compute{is_compute_} {}
+
+void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                             vk::DescriptorSetLayoutCreateFlags flags,
+                             const vk::PushConstantRange& push_constants,
+                             std::string_view debug_name) {
+    if (layouts) {
+        const auto shared = layouts->Acquire(bindings, flags, push_constants, debug_name);
+        desc_layout = shared.set;
+        pipeline_layout = shared.pipeline;
+        return;
+    }
+    const auto device = instance.GetDevice();
+    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+        .flags = flags,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    };
+    auto [set_result, set] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
+    ASSERT_MSG(set_result == vk::Result::eSuccess, "Failed to create descriptor set layout: {}",
+               vk::to_string(set_result));
+    owned_desc_layout = std::move(set);
+    desc_layout = *owned_desc_layout;
+    const vk::PipelineLayoutCreateInfo layout_info = {
+        .setLayoutCount = 1U,
+        .pSetLayouts = &desc_layout,
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &push_constants,
+    };
+    auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_info);
+    ASSERT_MSG(layout_result == vk::Result::eSuccess, "Failed to create pipeline layout: {}",
+               vk::to_string(layout_result));
+    owned_pipeline_layout = std::move(layout);
+    pipeline_layout = *owned_pipeline_layout;
+    SetObjectName(device, pipeline_layout, "{} PipelineLayout {}",
+                  is_compute ? "Compute" : "Graphics", debug_name);
+}
 
 Pipeline::~Pipeline() = default;
 
@@ -201,7 +238,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -229,7 +266,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             const size_t size = inplace ? MatchDescriptorWrites(set_writes, slot.blob, changed)
                                         : SerializeDescriptorWrites(set_writes, scratch);
             const u64 tick = scheduler.CurrentTick();
-            const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(*pipeline_layout));
+            const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
             const u64 foreign = sc.ForeignPushGen(idx);
             bool would_hit = false;
             if (size == 0) {
@@ -259,7 +296,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             }
             const bool timed_miss = timed && !would_hit;
             const u64 m0 = timed_miss ? sc.Now() : 0;
-            cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
             if (timed_miss) {
                 ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
                 ++ctr.miss_samples;
@@ -287,16 +324,16 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             }
             return;
         }
-        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
         return;
     }
 
-    const auto desc_set = desc_heap.Commit(*desc_layout);
+    const auto desc_set = desc_heap.Commit(desc_layout);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, desc_set, {});
 }
 
 std::string Pipeline::GetDebugString() const {

@@ -164,9 +164,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
+    it.value() = std::make_unique<ComputePipeline>(
+        instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+        *pipeline_cache, compute_key, *infos[0], modules[0], sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -243,8 +243,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     ASSERT(is_new);
 
     it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, std::move(fetch_data), modules, sdata, true);
+        instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile, graphics_key,
+        *pipeline_cache, infos, runtime_infos, std::move(fetch_data), modules, sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);

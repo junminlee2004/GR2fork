@@ -7,6 +7,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
+#include <span>
+#include <string_view>
 #include <boost/container/small_vector.hpp>
 
 namespace Shader {
@@ -24,12 +26,13 @@ static constexpr auto AllGraphicsStageBits =
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+class PipelineLayoutCache;
 
 class Pipeline {
 public:
     Pipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
              const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
-             bool is_compute = false);
+             PipelineLayoutCache* layouts, bool is_compute = false);
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
@@ -37,7 +40,7 @@ public:
     }
 
     vk::PipelineLayout GetLayout() const noexcept {
-        return *pipeline_layout;
+        return pipeline_layout;
     }
 
     auto GetStages() const {
@@ -65,14 +68,21 @@ public:
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+    /// Takes the pipeline's layouts from the shared cache, or creates owned ones.
+    void AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                       vk::DescriptorSetLayoutCreateFlags flags,
+                       const vk::PushConstantRange& push_constants, std::string_view debug_name);
 
     const Instance& instance;
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
     vk::UniquePipeline pipeline;
-    vk::UniquePipelineLayout pipeline_layout;
-    vk::UniqueDescriptorSetLayout desc_layout;
+    PipelineLayoutCache* layouts;
+    vk::PipelineLayout pipeline_layout{};
+    vk::DescriptorSetLayout desc_layout{};
+    vk::UniquePipelineLayout owned_pipeline_layout;
+    vk::UniqueDescriptorSetLayout owned_desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
