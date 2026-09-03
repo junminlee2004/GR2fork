@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <deque>
+#include <limits>
 #include <optional>
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -302,6 +303,8 @@ public:
     // the LAST field of the 528-byte backing, a line nothing else on the draw
     // path touches. Updated wherever backing or its sample count changes.
     u32 backing_num_samples{};
+    // Index of this image's live entry in the texture cache's touch log.
+    u32 lru_log_pos{std::numeric_limits<u32>::max()};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
     u64 lru_id{};

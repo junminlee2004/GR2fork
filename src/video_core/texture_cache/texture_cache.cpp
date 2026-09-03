@@ -47,6 +47,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
+      lru_log{EmulatorSettings.IsTextureLruLog()},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
           64 - std::countr_zero(u64{FindImageMemoEntries / std::max<u32>(memo_ways, 1u)}))} {
@@ -500,7 +501,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                     cache_image.binding.needs_rebind = 1u;
                     Skipcache::Framework::Instance().BumpTexGen();
                     if (merged_image_id) {
-                        GetImage(merged_image_id).binding.is_target = 1u;
+                        Image& merged = slot_images[merged_image_id];
+                        TouchImage(merged, merged_image_id);
+                        merged.binding.is_target = 1u;
                     }
 
                     FreeImage(cache_image_id);
@@ -644,7 +647,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 image.tick_accessed_last = current_tick;
                 if (image.lru_touch_tick != gc_tick) {
                     std::scoped_lock lock{mutex};
-                    TouchImage(image);
+                    TouchImage(image, e.image_id);
                     ++findimg_touch_locks_;
                 }
                 ++findimg_consumed_;
@@ -652,7 +655,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 std::scoped_lock lock{mutex};
                 Image& image = slot_images[e.image_id];
                 image.tick_accessed_last = current_tick;
-                TouchImage(image);
+                TouchImage(image, e.image_id);
                 e.access_tick = current_tick;
                 e.lru_tick = gc_tick;
             }
@@ -771,7 +774,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             if (match && slot_images[match].info.resources >= info.resources) {
                 Image& image = slot_images[match];
                 image.tick_accessed_last = scheduler.CurrentTick();
-                TouchImage(image);
+                TouchImage(image, match);
                 return match;
             }
         }
@@ -817,7 +820,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
-    TouchImage(image);
+    TouchImage(image, image_id);
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
@@ -1004,6 +1007,9 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                                  }
                              });
         if (!stencil_id) {
+            // The insert and the registration write structures other threads
+            // read under the mutex.
+            std::scoped_lock lock{mutex};
             ImageInfo info{};
             info.guest_address = desc.Info().stencil_addr;
             info.guest_size = desc.Info().stencil_size;
@@ -1013,7 +1019,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
             RegisterImage(stencil_id);
         }
         Image& stencil_image = slot_images[stencil_id];
-        TouchImage(stencil_image);
+        TouchImageUnlocked(stencil_image, stencil_id);
         stencil_image.AssociateDepth(image_id, image.image_uid);
     }
 
@@ -1032,7 +1038,7 @@ void TextureCache::UpdateImage(ImageId image_id) {
         std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
-        TouchImage(image);
+        TouchImage(image, image_id);
         RefreshImage(image);
         return;
     }
@@ -1066,7 +1072,7 @@ void TextureCache::UpdateImage(ImageId image_id) {
     }
     update_full_ += image_update_direct;
     TrackImage(image_id);
-    TouchImage(image);
+    TouchImage(image, image_id);
     RefreshImage(image);
     image.tick_accessed_last = now_tick;
     if (False(image.flags & ImageFlagBits::Dirty) && tracked_ok()) {
@@ -1386,7 +1392,13 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
-    image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    if (lru_log) {
+        image.lru_touch_tick = gc_tick;
+        image.lru_log_pos = static_cast<u32>(lru_log_.size());
+        lru_log_.push_back({image_id, gc_tick});
+    } else {
+        image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    }
     ASSERT_MSG(image.info.guest_size <= std::numeric_limits<u32>::max(),
                "guest_size does not fit the packed page ref");
     ForEachPage(image.info.guest_address, image.info.guest_size,
@@ -1403,7 +1415,12 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
-    lru_cache.Free(image.lru_id);
+    if (lru_log) {
+        lru_log_[image.lru_log_pos].id = ImageId{};
+        ++lru_dead_;
+    } else {
+        lru_cache.Free(image.lru_id);
+    }
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
@@ -1597,12 +1614,12 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    ForEachLruBelow(gc_tick - ticks_to_destroy, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        ForEachLruBelow(gc_tick - ticks_to_destroy, clean_up);
     }
 }
 
@@ -1659,6 +1676,21 @@ void TextureCache::RunGarbageCollector() {
         ++gc_tick;
     };
 
+    if (lru_log) {
+        // Compaction drops the tombstones and renumbers every live image;
+        // the threshold keeps its cost to once per tens of frames.
+        const u64 live = lru_log_.size() - lru_head_ - lru_dead_;
+        if (lru_dead_ > 16 * live + 16384) {
+            std::scoped_lock lock{mutex};
+            std::erase_if(lru_log_, [](const LruLogEntry& e) { return !e.id; });
+            for (size_t i = 0; i < lru_log_.size(); ++i) {
+                slot_images[lru_log_[i].id].lru_log_pos = static_cast<u32>(i);
+            }
+            lru_head_ = 0;
+            lru_dead_ = 0;
+            ++lru_log_compactions_;
+        }
+    }
     GarbageCollectImages();
     GarbageCollectSamplers();
 }
@@ -1688,9 +1720,37 @@ void TextureCache::MemoTouch(u32 ways, size_t set_index, u32 way) {
     order = out;
 }
 
-void TextureCache::TouchImageSlow(const Image& image) {
+void TextureCache::TouchImageSlow(Image& image, ImageId id) {
+    if (!lru_log) {
+        image.lru_touch_tick = gc_tick;
+        lru_cache.Touch(image.lru_id, gc_tick);
+        return;
+    }
+    // A same-tick repeat keeps its position; reached only with the skip
+    // cache inactive, the inline mirror answers it otherwise.
+    if (image.lru_touch_tick == gc_tick) {
+        return;
+    }
+    DEBUG_ASSERT_MSG(image.lru_log_pos != std::numeric_limits<u32>::max(),
+                     "Touch of an unregistered image");
     image.lru_touch_tick = gc_tick;
-    lru_cache.Touch(image.lru_id, gc_tick);
+    lru_log_[image.lru_log_pos].id = ImageId{}; // by index: no reference across the push
+    ++lru_dead_;
+    image.lru_log_pos = static_cast<u32>(lru_log_.size());
+    lru_log_.push_back({id, gc_tick});
+    ++lru_log_pushes_;
+}
+
+// The buffer cache's image reads never run under the texture mutex: the
+// texel path enters from a bind, and RefreshImage's buffer call is not a
+// texel read. A texel refresh under this mutex would deadlock here.
+SHAD_NO_INLINE void TextureCache::TouchImageSlowUnlocked(Image& image, ImageId id) {
+    if (!lru_log) {
+        TouchImageSlow(image, id);
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    TouchImageSlow(image, id);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

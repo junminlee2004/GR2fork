@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <queue>
@@ -222,7 +223,7 @@ public:
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
-        TouchImage(image);
+        TouchImageUnlocked(image, id);
         return image;
     }
 
@@ -322,6 +323,43 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+
+    /// Walks images oldest-first up to the tick, from the list or the touch
+    /// log; the callback may free the current image and may stop the walk by
+    /// returning true. Tombstones are skipped, the leading run is dropped.
+    template <typename Func>
+    void ForEachLruBelow(u64 tick, Func&& func) {
+        if (!lru_log) {
+            lru_cache.ForEachItemBelow(tick, func);
+            return;
+        }
+        while (lru_head_ < lru_log_.size() && !lru_log_[lru_head_].id) {
+            ++lru_head_;
+            --lru_dead_;
+        }
+        for (size_t i = lru_head_; i < lru_log_.size(); ++i) {
+            const LruLogEntry e = lru_log_[i]; // func may tombstone, never pushes
+            if (static_cast<s64>(tick) - static_cast<s64>(e.tick) < 0) {
+                return;
+            }
+            ++lru_log_walked_;
+            if (!e.id) {
+                ++lru_log_skipped_;
+                continue;
+            }
+            const size_t size_before = lru_log_.size();
+            if constexpr (std::is_same_v<std::invoke_result_t<Func, ImageId>, bool>) {
+                const bool stop = func(e.id);
+                DEBUG_ASSERT(lru_log_.size() == size_before);
+                if (stop) {
+                    return;
+                }
+            } else {
+                func(e.id);
+                DEBUG_ASSERT(lru_log_.size() == size_before);
+            }
+        }
+    }
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -429,14 +467,24 @@ private:
     /// Touch the image in the LRU cache.
     /// Touch is idempotent within one gc tick; the inline mirror compare
     /// spares the call (one per binding per draw) entirely on repeats.
-    void TouchImage(const Image& image) {
+    void TouchImage(Image& image, ImageId id) {
         if (image.lru_touch_tick == gc_tick &&
             VideoCore::Skipcache::Framework::Instance().Active()) {
             return;
         }
-        TouchImageSlow(image);
+        TouchImageSlow(image, id);
     }
-    void TouchImageSlow(const Image& image);
+    void TouchImageSlow(Image& image, ImageId id);
+    /// Touch from a caller that does not hold the cache mutex; the touch log
+    /// takes it, the list runs unlocked as it always has.
+    void TouchImageUnlocked(Image& image, ImageId id) {
+        if (image.lru_touch_tick == gc_tick &&
+            VideoCore::Skipcache::Framework::Instance().Active()) {
+            return;
+        }
+        TouchImageSlowUnlocked(image, id);
+    }
+    SHAD_NO_INLINE void TouchImageSlowUnlocked(Image& image, ImageId id);
 
     /// Overlap resolution, validation, and creation for FindImage when no
     /// accepted perfect match exists. Requires the cache mutex to be held.
@@ -562,6 +610,20 @@ public:
         findimg_consumed_ = findimg_touch_locks_ = 0;
         return out;
     }
+    struct LruLogStats {
+        u64 pushes;
+        u64 walked;
+        u64 skipped;
+        u64 compactions;
+        u64 size;
+        u64 dead;
+    };
+    LruLogStats DrainLruLogStats() {
+        const LruLogStats out{lru_log_pushes_,      lru_log_walked_, lru_log_skipped_,
+                              lru_log_compactions_, lru_log_.size(), lru_dead_};
+        lru_log_pushes_ = lru_log_walked_ = lru_log_skipped_ = lru_log_compactions_ = 0;
+        return out;
+    }
     ViewMemoStats DrainViewMemoStats() {
         const ViewMemoStats out{view_memo_hits_, view_memo_slow_, view_memo_writebacks_};
         view_memo_hits_ = view_memo_slow_ = view_memo_writebacks_ = 0;
@@ -600,6 +662,20 @@ private:
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
+    // Touch log: the LRU order as an append-only vector. An image's live entry
+    // is the last one pushed for it; a tombstone (null id) marks the superseded
+    // or freed ones. Entries move only in the compaction.
+    struct LruLogEntry {
+        ImageId id;
+        u64 tick; // never wraps
+    };
+    std::vector<LruLogEntry> lru_log_;
+    size_t lru_head_{}; // every entry before it is a tombstone
+    u64 lru_dead_{};    // tombstones at or after lru_head_
+    u64 lru_log_pushes_{};
+    u64 lru_log_walked_{};
+    u64 lru_log_skipped_{};
+    u64 lru_log_compactions_{};
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     // Latched once at construction; gates the lock-free UpdateImage fast path.
@@ -609,6 +685,7 @@ private:
     bool findimg_touch_lockfree; // latched once at construction
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
+    bool lru_log;                // latched once at construction
     u64 update_fast_{};
     u64 update_relock_{};
     u64 update_full_{};

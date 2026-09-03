@@ -894,6 +894,12 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IMGUPD fast={} relock={} full={} per300f",
                          iu.fast, iu.relock, iu.full);
             }
+            if (const auto ll = texture_cache.DrainLruLogStats(); ll.pushes || ll.walked) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] LRULOG pushes={} walked={} skipped={} compact={} size={} "
+                         "dead={} per300f",
+                         ll.pushes, ll.walked, ll.skipped, ll.compactions, ll.size, ll.dead);
+            }
             if (const auto fw = texture_cache.DrainFindImageWayStats(); fw.ways) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] FINDIMGWAYS ways={} hits={}/{}/{}/{} evict={} per300f",

@@ -609,6 +609,10 @@ struct GPUSettings {
     // uconfig registers its updaters read, and on the pipeline's write masks
     // instead of its identity. Needs dyn_state_memo.
     Setting<bool> dyn_state_stamp{false};
+    // Keeps the image LRU as an append-only touch log with tombstones instead of
+    // a linked list relinked on every first touch per submit; the GC walk skips
+    // tombstones and compacts.
+    Setting<bool> texture_lru_log{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -715,6 +719,7 @@ struct GPUSettings {
             make_override<GPUSettings>("shader_params_memo_entries",
                                        &GPUSettings::shader_params_memo_entries),
             make_override<GPUSettings>("dyn_state_stamp", &GPUSettings::dyn_state_stamp),
+            make_override<GPUSettings>("texture_lru_log", &GPUSettings::texture_lru_log),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -746,7 +751,7 @@ struct GPUSettings {
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1066,6 +1071,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaPartial, desc_delta_partial)
     SETTING_FORWARD(m_gpu, ShaderParamsMemoEntries, shader_params_memo_entries)
     SETTING_FORWARD_BOOL(m_gpu, DynStateStamp, dyn_state_stamp)
+    SETTING_FORWARD_BOOL(m_gpu, TextureLruLog, texture_lru_log)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
