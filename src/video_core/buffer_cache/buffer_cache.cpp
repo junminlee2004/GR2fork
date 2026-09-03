@@ -303,6 +303,11 @@ void BufferCache::EmitMirrorTelemetry() {
     memory_tracker->multi_walks = 0;
     memory_tracker->multi_regions = 0;
     memory_tracker->multi_clean_regions = 0;
+    if (const u64 de = damp_entries_.exchange(0, std::memory_order_relaxed); de != 0) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] DAMP entries={} iters={} stuck={} per300f", de,
+                 damp_iters_.exchange(0, std::memory_order_relaxed),
+                 damp_stuck_.exchange(0, std::memory_order_relaxed));
+    }
     mo = MirrorOracleCounters{};
 }
 
@@ -356,10 +361,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 // instead of returning keeps that thread from re-faulting in a
                 // tight loop and hammering the GPU command thread with empty
                 // download requests while the first one is in flight.
-                for (int spin = 0;
-                     spin < 400 && memory_tracker->IsRegionGpuModified(device_addr, size); ++spin) {
+                damp_entries_.fetch_add(1, std::memory_order_relaxed);
+                int spin = 0;
+                for (; spin < 400 && memory_tracker->IsRegionGpuModified(device_addr, size);
+                     ++spin) {
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
                 }
+                damp_iters_.fetch_add(static_cast<u64>(spin), std::memory_order_relaxed);
+                damp_stuck_.fetch_add(spin == 400, std::memory_order_relaxed);
                 return;
             }
             const u64 t0 = Common::FencedRDTSC();

@@ -687,6 +687,10 @@ private:
     u64 dmasync_buffers_{};
     u64 dmasync_bytes_{};
     u64 dmasync_max_bytes_{};
+    // Refault damping census, written by guest threads on the fault path.
+    alignas(64) std::atomic<u64> damp_entries_{};
+    std::atomic<u64> damp_iters_{};
+    std::atomic<u64> damp_stuck_{};
 };
 
 } // namespace VideoCore
