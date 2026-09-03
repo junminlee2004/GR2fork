@@ -1246,9 +1246,11 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     const u64 mix = (raw[0] ^ (raw[1] * 0x9E3779B97F4A7C15ULL)) * 0xC2B2AE3D27D4EB4FULL;
     SamplerMemoEntry* const set = &sampler_memo_[(mix >> 56) * 2];
     SamplerMemoEntry* e = nullptr;
-    if (set[0].handle && set[0].key == raw) {
+    // Word compares: the array compare spilled both key words to build one
+    // vector test, and a vector load over two scalar stores cannot forward.
+    if (set[0].handle && set[0].key[0] == raw[0] && set[0].key[1] == raw[1]) {
         e = &set[0];
-    } else if (set[1].handle && set[1].key == raw) {
+    } else if (set[1].handle && set[1].key[0] == raw[0] && set[1].key[1] == raw[1]) {
         e = &set[1];
     }
     const bool fast_active = sc.ActiveMode() == Mode::Adaptive || sc.ActiveMode() == Mode::Forced;
