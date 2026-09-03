@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -715,6 +717,7 @@ private:
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
     bool lru_log;                // latched once at construction
+    bool invalidate_filter;      // latched once at construction
     u64 update_fast_{};
     u64 update_relock_{};
     u64 update_full_{};
@@ -785,6 +788,79 @@ private:
     u64 addr_filter_fast_{};
     u64 addr_filter_walk_{};
     alignas(64) std::array<u64, 8> meta_bloom_{};
+
+    // Coverage bitmap of the registered images at 64KiB granules over the
+    // 40-bit guest space, written under the mutex and probed without it by
+    // the fault path. A granule's bit is set before its image reaches the
+    // page table and cleared only once no image is left in it, so a clear
+    // bit proves the locked walk would visit nothing. Always maintained, so
+    // the probe can be audited with the filter off.
+public:
+    struct InvalidateFilterStats {
+        u64 probes;
+        u64 skips;
+        u64 unsound;
+    };
+    InvalidateFilterStats DrainInvalidateFilterStats() noexcept {
+        return {invfilter_probes_.exchange(0, std::memory_order_relaxed),
+                invfilter_skips_.exchange(0, std::memory_order_relaxed),
+                invfilter_unsound_.exchange(0, std::memory_order_relaxed)};
+    }
+
+private:
+    static constexpr u32 CoverGranuleBits = 16;
+    static constexpr size_t CoverWords = size_t{1} << (40 - CoverGranuleBits - 6);
+    bool CoverAny(VAddr addr, size_t size) const noexcept {
+        const u64 first = addr >> CoverGranuleBits;
+        const u64 last = (addr + size - 1) >> CoverGranuleBits;
+        for (u64 g = first; g <= last; ++g) {
+            if ((g >> 6) >= CoverWords) {
+                return true;
+            }
+            if ((invalidate_cover_[g >> 6].load(std::memory_order_acquire) >> (g & 63)) & 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+    void CoverSet(VAddr addr, size_t size) noexcept {
+        const u64 first = addr >> CoverGranuleBits;
+        const u64 last = (addr + size - 1) >> CoverGranuleBits;
+        for (u64 g = first; g <= last && (g >> 6) < CoverWords; ++g) {
+            invalidate_cover_[g >> 6].fetch_or(u64{1} << (g & 63), std::memory_order_release);
+        }
+    }
+    void CoverRecompute(VAddr addr, size_t size) {
+        const u64 first = addr >> CoverGranuleBits;
+        const u64 last = (addr + size - 1) >> CoverGranuleBits;
+        for (u64 g = first; g <= last && (g >> 6) < CoverWords; ++g) {
+            // Straight off the page table: the picked dedup of the image walk
+            // would hide an image an enclosing walk has already visited.
+            const VAddr g_addr = g << CoverGranuleBits;
+            constexpr size_t g_size = size_t{1} << CoverGranuleBits;
+            bool any = false;
+            ForEachPage(g_addr, g_size, [&](u64 page) {
+                const auto it = page_table.find(page);
+                if (it == nullptr) {
+                    return;
+                }
+                for (const PageImageRef& ref : *it) {
+                    if (ref.addr < g_addr + g_size && g_addr < ref.addr + ref.size) {
+                        any = true;
+                        return;
+                    }
+                }
+            });
+            if (!any) {
+                invalidate_cover_[g >> 6].fetch_and(~(u64{1} << (g & 63)),
+                                                    std::memory_order_release);
+            }
+        }
+    }
+    std::unique_ptr<std::atomic<u64>[]> invalidate_cover_;
+    alignas(64) std::atomic<u64> invfilter_probes_{};
+    std::atomic<u64> invfilter_skips_{};
+    std::atomic<u64> invfilter_unsound_{};
 };
 
 } // namespace VideoCore

@@ -965,6 +965,11 @@ void Rasterizer::OnSubmit() {
                          "split={} per300f",
                          dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split);
             }
+            if (const auto inv = texture_cache.DrainInvalidateFilterStats(); inv.probes) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] IMGFAULT probes={} skips={} unsound={} per300f", inv.probes,
+                         inv.skips, inv.unsound);
+            }
             if (const auto pc = skipcache.DrainPushConstStats(); pc.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] PUSHCONST probes={} hits={} per300f",
                          pc.probes, pc.hits);

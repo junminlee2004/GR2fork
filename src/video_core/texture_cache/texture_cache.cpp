@@ -49,10 +49,12 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
       lru_log{EmulatorSettings.IsTextureLruLog()},
+      invalidate_filter{EmulatorSettings.IsTextureInvalidateFilter()},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
           64 - std::countr_zero(u64{FindImageMemoEntries / std::max<u32>(memo_ways, 1u)}))} {
 
+    invalidate_cover_ = std::make_unique<std::atomic<u64>[]>(CoverWords);
     if (EmulatorSettings.IsImageUpdateDirect() && !image_update_direct) {
         LOG_WARNING(Render_Vulkan,
                     "direct image updates need image_fast_state; the dedup probe runs unchanged");
@@ -161,10 +163,23 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+    // The coverage probe runs ahead of the mutex: most guest faults land in
+    // memory no image covers, and the walk they would take visits nothing.
+    // With the filter off the walk still runs and audits the probe.
+    const bool covered = size == 0 || CoverAny(addr, size);
+    invfilter_probes_.fetch_add(1, std::memory_order_relaxed);
+    if (!covered) {
+        invfilter_skips_.fetch_add(1, std::memory_order_relaxed);
+        if (invalidate_filter) {
+            return;
+        }
+    }
     std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    bool visited = false;
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
+        visited = true;
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         if (image.Overlaps(addr, size)) {
@@ -190,6 +205,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             MarkAsMaybeDirty(image_id, image);
         }
     });
+    if (!covered && visited) {
+        invfilter_unsound_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
@@ -1427,6 +1445,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
     }
     ASSERT_MSG(image.info.guest_size <= std::numeric_limits<u32>::max(),
                "guest_size does not fit the packed page ref");
+    // The coverage bit precedes the page table entry, which the unlocked
+    // fault probe relies on.
+    CoverSet(image.info.guest_address, image.info.guest_size);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id, addr = image.info.guest_address,
                  size = static_cast<u32>(image.info.guest_size)](u64 page) {
@@ -1474,6 +1495,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         }
         image_ids.erase(vector_it);
     });
+    CoverRecompute(image.info.guest_address, image.info.guest_size);
     if (const auto it = images_by_addr.find(image.info.guest_address); it != images_by_addr.end()) {
         auto& ids = it.value();
         if (const auto id_it = std::ranges::find(ids, image_id); id_it != ids.end()) {
