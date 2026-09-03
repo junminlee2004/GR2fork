@@ -72,6 +72,15 @@ struct Liverpool {
     u64 GetDynStateStamp() const noexcept {
         return gfx_stamp.dyn_value;
     }
+    struct RegFunnelStats {
+        u64 calls;
+        u64 classified;
+    };
+    RegFunnelStats DrainRegFunnelStats() noexcept {
+        const RegFunnelStats out{gfx_stamp.funnel_calls, gfx_stamp.funnel_classified};
+        gfx_stamp.funnel_calls = gfx_stamp.funnel_classified = 0;
+        return out;
+    }
     bool IsGfxStampActive() const noexcept {
         return gfx_stamp.active;
     }

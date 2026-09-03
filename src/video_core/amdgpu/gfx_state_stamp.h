@@ -38,8 +38,13 @@ struct GfxStateStamp {
     const u64* dyn_mask{};
     u32 dyn_mask_base{};
     u32 dyn_mask_words{};
+    // Funnel census, counted only while active: covered writes and the
+    // classifications the pending flag did not already answer.
+    u64 funnel_calls{};
+    u64 funnel_classified{};
 
-    // True when any word of the block [word, word + n) is in the dyn mask.
+    // True when any word of the block [word, word + n) is in the dyn mask,
+    // tested a mask word at a time.
     bool Touches(u32 word, u32 n) const noexcept {
         if (n == 0 || word < dyn_mask_base) {
             return false;
@@ -48,12 +53,24 @@ struct GfxStateStamp {
         if (first >= dyn_mask_words) {
             return false;
         }
-        for (u32 w = first, end = std::min(first + n, dyn_mask_words); w < end; ++w) {
-            if ((dyn_mask[w >> 6] >> (w & 63)) & 1) {
+        const u32 end = std::min(first + n, dyn_mask_words);
+        const u32 last = end - 1;
+        const u32 c0 = first >> 6;
+        const u32 c1 = last >> 6;
+        const u64 lo_mask = ~u64{0} << (first & 63);
+        const u64 hi_mask = ~u64{0} >> (63 - (last & 63));
+        if (c0 == c1) {
+            return (dyn_mask[c0] & lo_mask & hi_mask) != 0;
+        }
+        if ((dyn_mask[c0] & lo_mask) != 0) {
+            return true;
+        }
+        for (u32 c = c0 + 1; c < c1; ++c) {
+            if (dyn_mask[c] != 0) {
                 return true;
             }
         }
-        return false;
+        return (dyn_mask[c1] & hi_mask) != 0;
     }
 
     // Change-detected copy: compare before copy, mark pending on change.
@@ -64,10 +81,16 @@ struct GfxStateStamp {
             std::memcpy(dst, src, bytes);
             return;
         }
+        ++funnel_calls;
         if (FusedCompareStore(dst, src, bytes)) {
             pending = true;
-            if (classify && Touches(word, static_cast<u32>(bytes / sizeof(u32)))) {
-                pending_dyn = true;
+            // The lane flag only rises between draws, so once it is set the
+            // remaining writes of the interval need no classification.
+            if (classify && !pending_dyn) {
+                ++funnel_classified;
+                if (Touches(word, static_cast<u32>(bytes / sizeof(u32)))) {
+                    pending_dyn = true;
+                }
             }
         }
     }

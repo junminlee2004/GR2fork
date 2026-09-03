@@ -903,6 +903,10 @@ void Rasterizer::OnSubmit() {
                 gfx_stamp_last_ = gfx_stamp;
                 dyn_stamp_last_ = dyn_stamp;
             }
+            if (const auto rf = liverpool->DrainRegFunnelStats(); rf.calls) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] REGFUNNEL calls={} classified={} per300f",
+                         rf.calls, rf.classified);
+            }
             if (bindpf_img_) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] BINDPF img={} backing={} per300f",
                          bindpf_img_, bindpf_backing_);
