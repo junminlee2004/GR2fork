@@ -644,6 +644,12 @@ struct GPUSettings {
     // Worker threads of the stream copy lane. 0 keeps the measured default of
     // two; 1 to 4 set the count directly.
     Setting<u32> stream_copy_lane_threads{0};
+    // Widens a buffer upload to the dirty pages around it, so one protection
+    // call re-arms a chunk of this many bytes instead of one per bind. The
+    // widening stays inside the bound buffer and stops at the first page that
+    // is clean or holds pending GPU writes. Rounded down to a power of two,
+    // capped at 65536; 0 disables it.
+    Setting<u32> upload_arm_chunk_bytes{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -761,6 +767,8 @@ struct GPUSettings {
             make_override<GPUSettings>("stream_copy_idle_us", &GPUSettings::stream_copy_idle_us),
             make_override<GPUSettings>("stream_copy_lane_threads",
                                        &GPUSettings::stream_copy_lane_threads),
+            make_override<GPUSettings>("upload_arm_chunk_bytes",
+                                       &GPUSettings::upload_arm_chunk_bytes),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -792,7 +800,7 @@ struct GPUSettings {
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1121,6 +1129,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, PushConstDedup, push_const_dedup)
     SETTING_FORWARD(m_gpu, StreamCopyIdleUs, stream_copy_idle_us)
     SETTING_FORWARD(m_gpu, StreamCopyLaneThreads, stream_copy_lane_threads)
+    SETTING_FORWARD(m_gpu, UploadArmChunkBytes, upload_arm_chunk_bytes)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

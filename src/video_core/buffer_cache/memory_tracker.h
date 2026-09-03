@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <deque>
 #include <utility>
 
@@ -72,6 +73,18 @@ public:
     u64 multi_walks{};
     u64 multi_regions{};
     u64 multi_clean_regions{};
+    // Upload arm chunking census: clearing walks on the single-region path,
+    // the walks the chunk widened and the extra pages those uploaded.
+    u64 arm_chunk_walks{};
+    u64 arm_chunk_widened{};
+    u64 arm_chunk_pages{};
+    // Chunk granule in pages, a power of two; 0 leaves uploads unwidened.
+    const u32 arm_chunk_pages_per{ArmChunkPages()};
+
+    static u32 ArmChunkPages() noexcept {
+        const u32 bytes = std::min<u32>(EmulatorSettings.GetUploadArmChunkBytes(), 65536u);
+        return bytes < 2 * TRACKER_BYTES_PER_PAGE ? 0u : std::bit_floor(bytes) >> TRACKER_PAGE_BITS;
+    }
 
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
@@ -412,8 +425,10 @@ public:
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     /// Returns whether the written marking set any GPU-clean page.
+    /// window_size > 0 names the bound buffer, inside which the single-region
+    /// walk may widen its upload to the surrounding dirty pages.
     bool ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
-                            auto&& on_upload) {
+                            auto&& on_upload, VAddr window_addr = 0, u64 window_size = 0) {
         // A written bind holds region locks across its upload, which can flush
         // the scheduler; a drain from that flush would take a lock this thread
         // already holds, so it is left to the next drain site.
@@ -462,8 +477,38 @@ public:
                 return false;
             }
             manager->lock.lock();
-            manager->template ForEachModifiedRange<Type::CPU, true>(manager->GetCpuAddr() + offset,
-                                                                    query_size, func);
+            if (arm_chunk_pages_per != 0 && window_size != 0) {
+                // The chunk is the granule around the query, clamped to the
+                // buffer and the region; the widening then takes only the
+                // dirty pages adjacent to the query inside it, so the one
+                // protection call covers them all and their binds find them
+                // clean. The peek above and the GPU marking below keep the
+                // original range.
+                ++arm_chunk_walks;
+                const VAddr region_base = manager->GetCpuAddr();
+                const VAddr region_end = region_base + TRACKER_HIGHER_PAGE_SIZE;
+                const VAddr win_lo = std::max(window_addr, region_base);
+                const VAddr win_hi = std::min(window_addr + window_size, region_end);
+                const size_t start_page = offset >> TRACKER_PAGE_BITS;
+                const size_t end_page =
+                    (offset + query_size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
+                const size_t mask = arm_chunk_pages_per - 1;
+                const size_t lo_limit = std::max<size_t>(
+                    start_page & ~mask,
+                    (win_lo - region_base + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS);
+                const size_t hi_limit = std::min<size_t>(
+                    (end_page + mask) & ~mask, (win_hi - region_base) >> TRACKER_PAGE_BITS);
+                auto [lo, hi] = manager->WidenCpuDirty(start_page, end_page, lo_limit, hi_limit);
+                if (lo != start_page || hi != end_page) {
+                    ++arm_chunk_widened;
+                    arm_chunk_pages += (hi - lo) - (end_page - start_page);
+                }
+                manager->template ForEachModifiedRange<Type::CPU, true>(
+                    region_base + (lo << TRACKER_PAGE_BITS), (hi - lo) << TRACKER_PAGE_BITS, func);
+            } else {
+                manager->template ForEachModifiedRange<Type::CPU, true>(
+                    manager->GetCpuAddr() + offset, query_size, func);
+            }
             if (!is_written) {
                 manager->lock.unlock();
                 on_upload();

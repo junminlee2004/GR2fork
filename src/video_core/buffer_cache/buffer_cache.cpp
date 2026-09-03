@@ -303,6 +303,14 @@ void BufferCache::EmitMirrorTelemetry() {
     memory_tracker->multi_walks = 0;
     memory_tracker->multi_regions = 0;
     memory_tracker->multi_clean_regions = 0;
+    if (memory_tracker->arm_chunk_walks != 0) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] ARMCHUNK walks={} widened={} pages={} per300f",
+                 memory_tracker->arm_chunk_walks, memory_tracker->arm_chunk_widened,
+                 memory_tracker->arm_chunk_pages);
+        memory_tracker->arm_chunk_walks = 0;
+        memory_tracker->arm_chunk_widened = 0;
+        memory_tracker->arm_chunk_pages = 0;
+    }
     if (const u64 de = damp_entries_.exchange(0, std::memory_order_relaxed); de != 0) {
         LOG_INFO(Render_Skipcache, "[SkipCache] DAMP entries={} iters={} stuck={} per300f", de,
                  damp_iters_.exchange(0, std::memory_order_relaxed),
@@ -2040,7 +2048,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             copies.emplace_back(total_size_bytes, device_addr_out - buffer_start, range_size);
             total_size_bytes += range_size;
         },
-        [&] { src_buffer = UploadCopies(buffer, copies, is_written, total_size_bytes); });
+        [&] { src_buffer = UploadCopies(buffer, copies, is_written, total_size_bytes); },
+        buffer_start, buffer.SizeBytes());
 
     if (src_buffer) [[unlikely]] {
         EmitBufferUpload(buffer, src_buffer, copies);

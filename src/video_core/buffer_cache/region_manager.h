@@ -186,6 +186,20 @@ public:
         }
     }
 
+    /// Widens a page interval outward to [lo_limit, hi_limit) over pages that
+    /// are CPU dirty and hold no pending GPU write, stopping at the first that
+    /// is not. Caller holds the lock.
+    std::pair<size_t, size_t> WidenCpuDirty(size_t start_page, size_t end_page, size_t lo_limit,
+                                            size_t hi_limit) const noexcept {
+        while (start_page > lo_limit && cpu.Get(start_page - 1) && !gpu.Get(start_page - 1)) {
+            --start_page;
+        }
+        while (end_page < hi_limit && cpu.Get(end_page) && !gpu.Get(end_page)) {
+            ++end_page;
+        }
+        return {start_page, end_page};
+    }
+
     /**
      * Returns true when a region has been modified
      *
