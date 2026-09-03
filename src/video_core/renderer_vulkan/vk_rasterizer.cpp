@@ -769,6 +769,11 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} per300f",
                          off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns));
             }
+            if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,
+                         wb.islands, wb.bytes >> 10);
+            }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
                 LOG_INFO(Render_Skipcache,

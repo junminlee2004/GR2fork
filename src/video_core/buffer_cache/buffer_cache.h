@@ -427,6 +427,16 @@ private:
     bool GpuModifiedRangesContain(VAddr addr, u64 size);
 
 public:
+    struct WritebackStats {
+        u64 loops;
+        u64 islands;
+        u64 bytes;
+    };
+    WritebackStats DrainWritebackStats() {
+        const WritebackStats out{writeback_loops_, writeback_islands_, writeback_bytes_};
+        writeback_loops_ = writeback_islands_ = writeback_bytes_ = 0;
+        return out;
+    }
     struct WrittenRangeStats {
         u64 binds;
         u64 fresh;
@@ -531,6 +541,10 @@ private:
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
+    bool writeback_hold_{};
+    u64 writeback_loops_{};
+    u64 writeback_islands_{};
+    u64 writeback_bytes_{};
     bool batch_copy_lock_{};
     bool upload_drain_{};
     u64 upload_ro_calls_{};

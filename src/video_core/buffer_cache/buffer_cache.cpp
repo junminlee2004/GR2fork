@@ -49,6 +49,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
+    writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
     if (written_range_mode_ >= 3) {
         pending_batch_.reserve(PendingLaneCapacity);
@@ -507,6 +508,14 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
     auto* memory = Core::Memory::Instance();
     const u8* download = job.staging->mapped_data.data();
+    // One shared hold keeps the map stable for every island's backing write;
+    // the loop waits on nothing, so a guest mapping call is delayed by at most
+    // the loop.
+    std::optional<Core::MemoryManager::GuestCopyScope> hold;
+    if (writeback_hold_) {
+        hold.emplace(memory);
+        ++writeback_loops_;
+    }
 
     // Every copy gets its own verdict. This runs on the GPU command thread, so
     // between the sequence test and the bit clear nothing can interleave; and
@@ -539,6 +548,8 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     for (const auto& copy : job.copies) {
         const VAddr copy_device_addr = job.buffer_base + copy.srcOffset;
         if (memory_tracker->GpuWriteSeqMatches(copy_device_addr, copy.size, job.snapshots)) {
+            ++writeback_islands_;
+            writeback_bytes_ += copy.size;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + copy.dstOffset,
                                     copy.size);
             // The ordering guard makes an out-of-order copy flush and restart
@@ -567,6 +578,7 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         }
     }
     flush_pending_unmark();
+    hold.reset();
     job.fully_cleared = !vetoed_any;
     if (vetoed_any) {
         offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
@@ -659,12 +671,20 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
+        std::optional<Core::MemoryManager::GuestCopyScope> hold;
+        if (writeback_hold_) {
+            hold.emplace(memory);
+            ++writeback_loops_;
+        }
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
+            ++writeback_islands_;
+            writeback_bytes_ += copy.size;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
         }
+        hold.reset();
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
     };
     if constexpr (async) {

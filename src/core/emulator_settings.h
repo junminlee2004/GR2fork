@@ -566,6 +566,9 @@ struct GPUSettings {
     // The GPU-modified range set gets its own node pool whose mutex is skipped:
     // every operation on that set runs on the GPU command thread.
     Setting<bool> gpu_range_set_lockfree{false};
+    // Hold the guest-copy shared lock once per readback write-back loop instead
+    // of once per island.
+    Setting<bool> readback_writeback_hold{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -656,6 +659,8 @@ struct GPUSettings {
             make_override<GPUSettings>("spec_key_fast", &GPUSettings::spec_key_fast),
             make_override<GPUSettings>("gpu_range_set_lockfree",
                                        &GPUSettings::gpu_range_set_lockfree),
+            make_override<GPUSettings>("readback_writeback_hold",
+                                       &GPUSettings::readback_writeback_hold),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -679,7 +684,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
     desc_delta_inplace, bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree,
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front,
-    findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree)
+    findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree,
+    readback_writeback_hold)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -973,6 +979,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BindNoopMemo, bind_noop_memo)
     SETTING_FORWARD(m_gpu, SpecKeyFast, spec_key_fast)
     SETTING_FORWARD_BOOL(m_gpu, GpuRangeSetLockfree, gpu_range_set_lockfree)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackHold, readback_writeback_hold)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
