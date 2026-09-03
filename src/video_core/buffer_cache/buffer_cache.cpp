@@ -51,6 +51,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
+    // Latched single-threaded, before any GPU-thread pool operation.
+    GpuRangeSetMutex::lockfree = EmulatorSettings.IsGpuRangeSetLockfree();
     if (written_range_mode_ >= 3) {
         pending_batch_.reserve(PendingLaneCapacity);
     }

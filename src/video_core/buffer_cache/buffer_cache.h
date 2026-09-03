@@ -377,7 +377,7 @@ private:
     u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
-    RangeSet gpu_modified_ranges;
+    GpuRangeSet gpu_modified_ranges;
     // Bumped only on clean->dirty coverage transitions; an entry stamped with
     // the current value is proven GPU-clean without walking the range set.
     // Overlapping in-flight fault downloads can leave the range set covering
@@ -447,13 +447,16 @@ public:
         u64 folded;
         u64 full;
         u64 direct;
+        u64 lockskips;
     };
     WrittenRangeStats DrainWrittenRangeStats() {
-        const WrittenRangeStats out{written_binds_,  written_fresh_,   written_hits_,
-                                    written_adds_,   written_shrinks_, pending_folds_,
-                                    pending_folded_, pending_full_,    pending_direct_};
+        const WrittenRangeStats out{written_binds_,         written_fresh_,   written_hits_,
+                                    written_adds_,          written_shrinks_, pending_folds_,
+                                    pending_folded_,        pending_full_,    pending_direct_,
+                                    GpuRangeSetMutex::skips};
         written_binds_ = written_fresh_ = written_hits_ = written_adds_ = written_shrinks_ = 0;
         pending_folds_ = pending_folded_ = pending_full_ = pending_direct_ = 0;
+        GpuRangeSetMutex::skips = 0;
         return out;
     }
 
