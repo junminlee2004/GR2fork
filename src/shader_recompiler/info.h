@@ -165,6 +165,12 @@ struct Info : InfoPersistent {
         return *reinterpret_cast<const T*>(flat_ud + sharp_idx);
     }
 
+    /// The sharp in place, for readers that never modify it.
+    template <typename T>
+    inline const T& ReadUdSharpRef(u32 sharp_idx) const noexcept {
+        return *reinterpret_cast<const T*>(flat_ud + sharp_idx);
+    }
+
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;

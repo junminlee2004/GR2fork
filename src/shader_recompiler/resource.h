@@ -97,6 +97,31 @@ struct ImageResource {
         return image;
     }
 
+    // Bind sites that only read the T# take this form: the by-value read
+    // forces a 32-byte stack copy whose 8-byte reloads cannot forward. scratch
+    // carries the value only on the r128 arm and for the null fixups, which
+    // build the same Null objects the by-value form builds.
+    const AmdGpu::Image& GetSharpRef(const auto& info, AmdGpu::Image& scratch) const noexcept {
+        if (is_r128) [[unlikely]] {
+            scratch = GetSharp(info);
+            return scratch;
+        }
+        const auto& raw = info.template ReadUdSharpRef<AmdGpu::Image>(sharp_idx);
+        if (!raw.Valid()) [[unlikely]] {
+            scratch = AmdGpu::Image::Null(is_depth);
+            return scratch;
+        }
+        if (is_depth) [[unlikely]] {
+            const auto data_fmt = raw.GetDataFmt();
+            if (data_fmt != AmdGpu::DataFormat::Format16 &&
+                data_fmt != AmdGpu::DataFormat::Format32) [[unlikely]] {
+                scratch = AmdGpu::Image::Null(true);
+                return scratch;
+            }
+        }
+        return raw;
+    }
+
     // Bind sites already holding the decoded T# take this form: the other one
     // re-reads 32 bytes of user data per image per draw to reach the same count.
     u32 NumBindings(const AmdGpu::Image& tsharp) const {

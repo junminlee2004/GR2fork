@@ -1412,8 +1412,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // This is currently always 1 for anything other than mip fallback arrays.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
+    AmdGpu::Image tsharp_scratch{};
     for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(stage);
+        const AmdGpu::Image& tsharp = image_desc.GetSharpRef(stage, tsharp_scratch);
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
@@ -1453,8 +1454,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // only fallback-free bindings defer the view build to a memo miss.
             auto& [image_id, desc] = image_bindings.emplace_back(
                 std::piecewise_construct, std::tuple{},
-                std::tuple{tsharp, image_desc,
-                           mip_fallback_mode == Shader::MipStorageFallbackMode::None});
+                std::tuple<const AmdGpu::Image&, const Shader::ImageResource&, bool>{
+                    tsharp, image_desc, mip_fallback_mode == Shader::MipStorageFallbackMode::None});
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
@@ -1597,10 +1598,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // and appending to image_infos.
     const u32 first_sampler_info = static_cast<u32>(image_infos.size());
     const u32 first_sampler_binding = binding.unified;
+    AmdGpu::Image aniso_scratch{};
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (sampler.disable_aniso) {
-            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
+            const AmdGpu::Image& tsharp =
+                stage.images[sampler.associated_image].GetSharpRef(stage, aniso_scratch);
             if (tsharp.base_level == 0 && tsharp.last_level == 0) {
                 ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
