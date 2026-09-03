@@ -136,31 +136,45 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
         cursor += 4;
         return x;
     };
-    const auto note = [&]([[maybe_unused]] u64 d) {
+    // The verdict counters live in locals: they share the slot with the blob
+    // the cursor stores into, so a slot-resident counter is reloaded after
+    // every store, and the reload of a pair a vector store just wrote does not
+    // forward. Every exit writes them back, so a bail leaves the slot as before.
+    [[maybe_unused]] u8* const verdicts = kMap ? slot.changed.data() : nullptr;
+    [[maybe_unused]] u32 n = 0;
+    [[maybe_unused]] u32 n_changed = 0;
+    [[maybe_unused]] u64 hdr_diff = 0;
+    const auto write_back = [&] {
         if constexpr (kMap) {
-            slot.changed[slot.desc_count++] = d != 0;
-            slot.desc_changed += d != 0;
+            slot.desc_count = n;
+            slot.desc_changed = n_changed;
+            slot.header_changed = hdr_diff != 0;
         }
     };
-    if constexpr (kMap) {
-        slot.desc_count = 0;
-        slot.desc_changed = 0;
-        slot.header_changed = false;
-    }
+    const auto note = [&]([[maybe_unused]] u64 d) {
+        if constexpr (kMap) {
+            const u32 c = d != 0;
+            verdicts[n++] = static_cast<u8>(c);
+            n_changed += c;
+        }
+    };
     for (const auto& w : writes) {
         const u32 count = w.descriptorCount;
         if (static_cast<size_t>(limit - cursor) < 16 + size_t{count} * 24) {
+            write_back();
             return 0;
         }
         if constexpr (kMap) {
-            if (slot.desc_count + count > slot.changed.size()) {
+            // Reached only past the size check above, so the u32 sum cannot wrap.
+            if (n + count > slot.changed.size()) {
+                write_back();
                 return 0;
             }
         }
         const VkWriteDescriptorSet& raw = w;
         [[maybe_unused]] const u64 header = sync8(&raw.dstBinding) | sync8(&raw.descriptorCount);
         if constexpr (kMap) {
-            slot.header_changed |= header != 0;
+            hdr_diff |= header;
         }
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
@@ -192,9 +206,11 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
             break;
         }
         default:
+            write_back();
             return 0;
         }
     }
+    write_back();
     changed = diff != 0;
     return static_cast<size_t>(cursor - blob.data());
 }
