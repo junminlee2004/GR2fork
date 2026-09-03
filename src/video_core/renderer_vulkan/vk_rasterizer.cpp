@@ -74,6 +74,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     dyn_memo_enabled_ =
         EmulatorSettings.IsDynStateMemo() &&
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    dyn_class_stamp_ = dyn_memo_enabled_ && EmulatorSettings.IsDynStateStamp();
     // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
@@ -848,6 +849,28 @@ void Rasterizer::OnSubmit() {
                              d(&Skipcache::CacheCounters::verify_aborted));
                     findimg_last_ = fc;
                 }
+            }
+            if (const auto& dc = skipcache.Counters(Skipcache::CacheId::DynState);
+                dc.eligible != dynstate_last_.eligible) {
+                const auto d = [&](u64 Skipcache::CacheCounters::* f) {
+                    return dc.*f - dynstate_last_.*f;
+                };
+                const u64 gfx_stamp = liverpool->GetGfxStateStamp();
+                const u64 dyn_stamp = liverpool->GetDynStateStamp();
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] DYNSTATE probes={} hits={} reg={} key={} gen={} stamp={} "
+                         "dyn={} per300f",
+                         d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
+                         dc.miss_gen[Skipcache::LaneReg] -
+                             dynstate_last_.miss_gen[Skipcache::LaneReg],
+                         d(&Skipcache::CacheCounters::miss_key),
+                         dc.miss_gen[Skipcache::LaneTick] + dc.miss_gen[Skipcache::LanePipe] -
+                             dynstate_last_.miss_gen[Skipcache::LaneTick] -
+                             dynstate_last_.miss_gen[Skipcache::LanePipe],
+                         gfx_stamp - gfx_stamp_last_, dyn_stamp - dyn_stamp_last_);
+                dynstate_last_ = dc;
+                gfx_stamp_last_ = gfx_stamp;
+                dyn_stamp_last_ = dyn_stamp;
             }
             if (bindpf_img_) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] BINDPF img={} backing={} per300f",
@@ -2241,7 +2264,9 @@ bool Rasterizer::DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 r
         ++ctr.miss_gen[LaneReg];
         return false;
     }
-    if (m.flags != flags || m.pipeline != pipeline) {
+    if (m.flags != flags ||
+        (dyn_class_stamp_ ? m.write_masks != pipeline->GetGraphicsKey().write_masks
+                          : m.pipeline != pipeline)) {
         ++ctr.miss_key;
         return false;
     }
@@ -2274,7 +2299,8 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         ++ctr.eligible;
         const bool timed = skipcache->SampleTimer(CacheId::DynState);
         const u64 t0 = timed ? skipcache->Now() : 0;
-        dyn_stamp = liverpool->GetGfxStateStamp();
+        dyn_stamp =
+            dyn_class_stamp_ ? liverpool->GetDynStateStamp() : liverpool->GetGfxStateStamp();
         // Read live, never from a draw-entry token: the binds that run before
         // this can flush the command buffer and re-arm every dirty bit.
         dyn_gen = dynamic_state.InvalidateGen();
@@ -2321,7 +2347,8 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         }
         // The body writes no register and bumps neither generation, so all
         // three lanes still hold their probe-time values.
-        dyn_memo_ = {dyn_stamp, dyn_gen, dyn_pipe_gen, pipeline, flags};
+        dyn_memo_ = {dyn_stamp, dyn_gen, dyn_pipe_gen,
+                     pipeline,  flags,   pipeline->GetGraphicsKey().write_masks};
         skipcache->NotifyPopulated(CacheId::DynState);
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -135,6 +136,60 @@ static void StoreRegBlock(void* dst, const void* src, size_t bytes) {
     }
 }
 
+namespace {
+
+// The register blocks the dynamic-state updaters in vk_rasterizer.cpp read;
+// that file is the source of truth for this table. Every block is a context
+// or uconfig register, so shader and config writes never move the dyn lane.
+struct DynRegBlock {
+    u32 word;
+    u32 count;
+};
+#define DYN_REG_BLOCK(member)                                                                      \
+    DynRegBlock {                                                                                  \
+        static_cast<u32>(offsetof(Regs, member) / sizeof(u32)),                                    \
+            static_cast<u32>(sizeof(Regs::member) / sizeof(u32))                                   \
+    }
+constexpr std::array kDynRegBlocks = {
+    DYN_REG_BLOCK(window_scissor),
+    DYN_REG_BLOCK(screen_scissor),
+    DYN_REG_BLOCK(generic_scissor),
+    DYN_REG_BLOCK(window_offset),
+    DYN_REG_BLOCK(polygon_control),
+    DYN_REG_BLOCK(viewport_control),
+    DYN_REG_BLOCK(viewports),
+    DYN_REG_BLOCK(viewport_depths),
+    DYN_REG_BLOCK(viewport_scissors),
+    DYN_REG_BLOCK(clipper_control),
+    DYN_REG_BLOCK(mode_control),
+    DYN_REG_BLOCK(depth_buffer),
+    DYN_REG_BLOCK(depth_control),
+    DYN_REG_BLOCK(depth_render_control),
+    DYN_REG_BLOCK(depth_bounds_min),
+    DYN_REG_BLOCK(depth_bounds_max),
+    DYN_REG_BLOCK(poly_offset),
+    DYN_REG_BLOCK(stencil_control),
+    DYN_REG_BLOCK(stencil_ref_front),
+    DYN_REG_BLOCK(stencil_ref_back),
+    DYN_REG_BLOCK(enable_primitive_restart),
+    DYN_REG_BLOCK(primitive_restart_index),
+    DYN_REG_BLOCK(primitive_type),
+    DYN_REG_BLOCK(line_control),
+    DYN_REG_BLOCK(blend_constants),
+};
+#undef DYN_REG_BLOCK
+consteval bool DynRegBlocksInRange() {
+    for (const auto& block : kDynRegBlocks) {
+        if (block.word < Regs::ContextRegWordOffset || block.word + block.count > Regs::NumRegs) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(DynRegBlocksInRange());
+
+} // namespace
+
 Liverpool::Liverpool() {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // Stamp dormancy is decided before the process thread can observe work;
@@ -142,6 +197,16 @@ Liverpool::Liverpool() {
     // plain memcpy with zero compares.
     gfx_stamp.active =
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    for (const auto& block : kDynRegBlocks) {
+        for (u32 w = block.word - Regs::ContextRegWordOffset, end = w + block.count; w < end; ++w) {
+            dyn_reg_mask_[w >> 6] |= u64{1} << (w & 63);
+        }
+    }
+    gfx_stamp.dyn_mask = dyn_reg_mask_.data();
+    gfx_stamp.dyn_mask_base = Regs::ContextRegWordOffset;
+    gfx_stamp.dyn_mask_words = static_cast<u32>(dyn_reg_mask_.size() * 64);
+    gfx_stamp.classify =
+        gfx_stamp.active && EmulatorSettings.IsDynStateStamp() && EmulatorSettings.IsDynStateMemo();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -370,7 +435,7 @@ SHAD_FORCE_INLINE void Liverpool::SetContextRegHot(const PM4Header* header, u32 
     const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
     const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-    gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+    gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32), reg_addr);
 
     // In the case of HW, render target memory has alignment as color block operates on
     // tiles. There is no information of actual resource extents stored in CB context
@@ -427,7 +492,7 @@ SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count
     if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
         StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
     } else {
-        gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size);
+        gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size, word);
     }
 }
 
@@ -538,7 +603,8 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
             const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
             const auto* payload = reinterpret_cast<const u32*>(header + 2);
-            gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+            gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32),
+                                reg_addr);
             break;
         }
         case PM4ItOpcode::SetContextReg: {
@@ -552,7 +618,8 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::SetUconfigReg: {
             const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
             gfx_stamp.WriteRegs(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                                header + 2, (count - 1) * sizeof(u32));
+                                header + 2, (count - 1) * sizeof(u32),
+                                Regs::UconfigRegWordOffset + set_data->reg_offset);
             break;
         }
         case PM4ItOpcode::SetPredication: {
@@ -1251,7 +1318,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
                     StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
                 } else {
-                    gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size);
+                    gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size, word);
                 }
             }
             break;

@@ -62,9 +62,15 @@ struct Liverpool {
 
     Regs regs{};
     GfxStateStamp gfx_stamp{};
+    // One bit per context and uconfig register word the dynamic-state
+    // updaters read; the stamp's dyn lane classifies writes against it.
+    std::array<u64, (Regs::NumRegs - Regs::ContextRegWordOffset) / 64> dyn_reg_mask_{};
 
     u64 GetGfxStateStamp() const noexcept {
         return gfx_stamp.value;
+    }
+    u64 GetDynStateStamp() const noexcept {
+        return gfx_stamp.dyn_value;
     }
     bool IsGfxStampActive() const noexcept {
         return gfx_stamp.active;

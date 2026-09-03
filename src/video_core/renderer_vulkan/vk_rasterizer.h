@@ -195,6 +195,9 @@ private:
     // Snapshot of the framework's FindImage counters at the last report; the
     // per-window line prints the deltas (Forced mode never resets them).
     VideoCore::Skipcache::CacheCounters findimg_last_{};
+    VideoCore::Skipcache::CacheCounters dynstate_last_{};
+    u64 dyn_stamp_last_{};
+    u64 gfx_stamp_last_{};
     void MaybeIntervalFlush();
     bool elide_findbuffer_{};
     bool bind_prefetch_{};
@@ -274,11 +277,15 @@ private:
         u64 pipe_gen{};
         const GraphicsPipeline* pipeline{}; // compared, never dereferenced
         u32 flags{}; // 0 invalid; bit0 valid, bit1 feedback loop, bit2 indexed
+        // The only pipeline field the updaters read; the stamp-lane keying
+        // compares it instead of the pipeline identity.
+        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
     };
     bool DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 reg_stamp, u64 dyn_gen,
                       u64 pipe_gen);
     DynStateMemo dyn_memo_{};
     bool dyn_memo_enabled_{};
+    bool dyn_class_stamp_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);

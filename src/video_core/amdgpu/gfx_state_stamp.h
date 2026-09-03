@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include "common/types.h"
 
@@ -20,20 +21,55 @@ namespace AmdGpu {
 //
 // Dormant (active == false) the funnel degrades to a plain memcpy - zero
 // compares, zero bumps - so a disabled framework costs nothing here.
+//
+// Two lanes: value moves on any covered change; dyn_value moves only when a
+// changed block touches a word of dyn_mask, the read set of the dynamic-state
+// updaters in vk_rasterizer.cpp. Every bump site feeds both lanes; config
+// register writes and the draw-packet words carry no mask and move neither.
+// The mask is only as complete as that read set: an updater that starts
+// reading a new register extends the block table in liverpool.cpp.
 struct GfxStateStamp {
     u64 value{1};
+    u64 dyn_value{1};
     bool pending{};
+    bool pending_dyn{};
     bool active{};
+    bool classify{};
+    const u64* dyn_mask{};
+    u32 dyn_mask_base{};
+    u32 dyn_mask_words{};
+
+    // True when any word of the block [word, word + n) is in the dyn mask.
+    bool Touches(u32 word, u32 n) const noexcept {
+        if (n == 0 || word < dyn_mask_base) {
+            return false;
+        }
+        const u32 first = word - dyn_mask_base;
+        if (first >= dyn_mask_words) {
+            return false;
+        }
+        for (u32 w = first, end = std::min(first + n, dyn_mask_words); w < end; ++w) {
+            if ((dyn_mask[w >> 6] >> (w & 63)) & 1) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // Change-detected copy: compare before copy, mark pending on change.
     // Deferred bump - the parser coalesces all reg writes between draws into
     // at most one bump, flushed at each draw/dispatch handler.
-    void WriteRegs(void* dst, const void* src, size_t bytes) {
+    void WriteRegs(void* dst, const void* src, size_t bytes, u32 word) {
         if (!active) {
             std::memcpy(dst, src, bytes);
             return;
         }
-        pending |= FusedCompareStore(dst, src, bytes);
+        if (FusedCompareStore(dst, src, bytes)) {
+            pending = true;
+            if (classify && Touches(word, static_cast<u32>(bytes / sizeof(u32)))) {
+                pending_dyn = true;
+            }
+        }
     }
 
     /// One fused compare-and-store pass for the small register blocks this
@@ -74,13 +110,16 @@ struct GfxStateStamp {
 
     // Immediate change-detected write for the async-compute queue's writes
     // into the shared gfx range: the ACB has no draw boundary to defer to.
-    void WriteRegsImmediate(void* dst, const void* src, size_t bytes) {
+    void WriteRegsImmediate(void* dst, const void* src, size_t bytes, u32 word) {
         if (!active) {
             std::memcpy(dst, src, bytes);
             return;
         }
         if (FusedCompareStore(dst, src, bytes)) {
             ++value;
+            if (classify && Touches(word, static_cast<u32>(bytes / sizeof(u32)))) {
+                ++dyn_value;
+            }
         }
     }
 
@@ -88,6 +127,7 @@ struct GfxStateStamp {
     void MarkDirty() {
         if (active) {
             pending = true;
+            pending_dyn = true;
         }
     }
 
@@ -98,6 +138,10 @@ struct GfxStateStamp {
         if (pending) {
             ++value;
             pending = false;
+            if (pending_dyn) {
+                ++dyn_value;
+                pending_dyn = false;
+            }
         }
     }
 };
