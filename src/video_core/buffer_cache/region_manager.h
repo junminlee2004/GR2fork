@@ -195,7 +195,7 @@ public:
         // scanning the bit words. A set summary bit only proves the word is
         // worth scanning, so stale-set bits fall through to the exact answer.
         if constexpr (type == Type::CPU) {
-            if ((cpu_summary_ & SummaryMask(start_page, end_page)) == 0) {
+            if ((Summary() & SummaryMask(start_page, end_page)) == 0) {
                 return false;
             }
         }
@@ -220,13 +220,7 @@ public:
     /// regions it covers completely; a false answer merely hands the region
     /// to the full check.
     [[nodiscard]] bool PeekFullRegionClean() const noexcept {
-        const u32 before = seq.load(std::memory_order_acquire);
-        if (before & 1u) {
-            return false;
-        }
-        const u16 summary = cpu_summary_;
-        std::atomic_thread_fence(std::memory_order_acquire);
-        return seq.load(std::memory_order_relaxed) == before && summary == 0;
+        return (state.load(std::memory_order_acquire) & CLEAN_MASK) == 0;
     }
 
     template <Type type>
@@ -244,14 +238,9 @@ public:
             if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
                 return false;
             }
-            const u32 before = seq.load(std::memory_order_acquire);
-            if (!(before & 1u)) {
-                const u16 summary = cpu_summary_;
-                std::atomic_thread_fence(std::memory_order_acquire);
-                if (seq.load(std::memory_order_relaxed) == before &&
-                    (summary & SummaryMask(start_page, end_page)) == 0) {
-                    return false;
-                }
+            const u64 w = state.load(std::memory_order_acquire);
+            if ((w & (SEQ_ONE | SummaryMask(start_page, end_page))) == 0) {
+                return false;
             }
         }
         return PeekRegionModifiedSlow<type>(offset, size);
@@ -260,13 +249,13 @@ public:
     template <Type type>
     [[nodiscard]] SHAD_NO_INLINE bool PeekRegionModifiedSlow(u64 offset, u64 size) noexcept {
         for (u32 attempt = 0; attempt < 4; ++attempt) {
-            const u32 before = seq.load(std::memory_order_acquire);
-            if (before & 1u) {
+            const u64 before = state.load(std::memory_order_acquire);
+            if (before & SEQ_ONE) {
                 continue; // writer in flight
             }
             const bool result = IsRegionModified<type>(offset, size);
             std::atomic_thread_fence(std::memory_order_acquire);
-            if (seq.load(std::memory_order_relaxed) == before) {
+            if (state.load(std::memory_order_relaxed) == before) {
                 return result;
             }
         }
@@ -284,13 +273,13 @@ public:
             return false;
         }
         for (u32 attempt = 0; attempt < 4; ++attempt) {
-            const u32 before = seq.load(std::memory_order_acquire);
-            if (before & 1u) {
+            const u64 before = state.load(std::memory_order_acquire);
+            if (before & SEQ_ONE) {
                 continue;
             }
             const bool result = GetRegionBits<type>().AllInRange(start_page, end_page);
             std::atomic_thread_fence(std::memory_order_acquire);
-            if (seq.load(std::memory_order_relaxed) == before) {
+            if (state.load(std::memory_order_relaxed) == before) {
                 return result;
             }
         }
@@ -301,19 +290,24 @@ public:
     /// Scope guard marking a mutation of the tracked bits for readers.
     struct WriteScope {
         explicit WriteScope(RegionManager& m) : mgr{m} {
-            mgr.seq.fetch_add(1, std::memory_order_acq_rel);
+            mgr.state.fetch_add(SEQ_ONE, std::memory_order_acq_rel);
         }
         ~WriteScope() {
-            mgr.seq.fetch_add(1, std::memory_order_release);
+            mgr.state.fetch_add(SEQ_ONE, std::memory_order_release);
         }
         RegionManager& mgr;
     };
 
-    std::atomic<u32> seq{0};
-    // Kept adjacent to seq: the lock-free peek fast path reads exactly this
-    // pair, and the old layout put them eleven cache lines apart. Public for
-    // layout reasons only - written solely under WriteScope.
-    u16 cpu_summary_{0xFFFF}; // cpu.Fill() in the ctor => fully set
+    // The CPU dirty summary (low 16 bits) and the write sequence (bits 16 and
+    // up) share one word: a single load is a consistent snapshot of both, and
+    // an even sequence in it proves no writer was inside its scope then.
+    static constexpr u64 SUMMARY_BITS = 0xFFFF;
+    static constexpr u64 SEQ_ONE = u64{1} << 16;
+    static constexpr u64 CLEAN_MASK = SUMMARY_BITS | SEQ_ONE; // no dirty word, even sequence
+    std::atomic<u64> state{SUMMARY_BITS};                     // cpu.Fill() in the ctor => fully set
+    [[nodiscard]] u16 Summary() const noexcept {
+        return static_cast<u16>(state.load(std::memory_order_relaxed));
+    }
     // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
     u64 gpu_write_seq{0};
     LockType lock;
@@ -391,16 +385,23 @@ public:
         return static_cast<u16>(((2u << w1) - (1u << w0)) & 0xFFFFu);
     }
 
+    // Runs inside a WriteScope; the xor keeps the update atomic against the
+    // scope's own increments on the shared word.
     void RefreshCpuSummary(size_t start_page, size_t end_page) noexcept {
         const size_t w0 = start_page / PAGES_PER_SUMMARY_BIT;
         const size_t w1 = (end_page - 1) / PAGES_PER_SUMMARY_BIT;
+        const u16 old = Summary();
+        u16 summary = old;
         for (size_t w = w0; w <= w1; ++w) {
             const size_t p0 = w * PAGES_PER_SUMMARY_BIT;
             if (cpu.AnyInRange(p0, p0 + PAGES_PER_SUMMARY_BIT)) {
-                cpu_summary_ |= static_cast<u16>(1u << w);
+                summary |= static_cast<u16>(1u << w);
             } else {
-                cpu_summary_ &= static_cast<u16>(~(1u << w));
+                summary &= static_cast<u16>(~(1u << w));
             }
+        }
+        if (const u64 delta = old ^ summary; delta != 0) {
+            state.fetch_xor(delta, std::memory_order_relaxed);
         }
     }
 
