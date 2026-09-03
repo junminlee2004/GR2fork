@@ -225,8 +225,9 @@ struct PageManager::Impl {
 #endif
 
     template <bool track, bool is_read>
-    void UpdatePageWatchers(VAddr addr, u64 size) {
+    u32 UpdatePageWatchers(VAddr addr, u64 size) {
         RENDERER_TRACE;
+        u32 calls = 0;
 
         size_t page = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
@@ -246,6 +247,7 @@ struct PageManager::Impl {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
                 Protect(range_begin << PM_PAGE_BITS, range_bytes, perms);
+                ++calls;
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -289,11 +291,13 @@ struct PageManager::Impl {
 
         // Add pending (un)protect action
         release_pending();
+        return calls;
     }
 
     template <bool track, bool is_read>
-    void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) {
+    u32 UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) {
         RENDERER_TRACE;
+        u32 calls = 0;
         auto start_range = mask.FirstRange();
         auto end_range = mask.LastRange();
 
@@ -317,6 +321,7 @@ struct PageManager::Impl {
                 RENDERER_TRACE;
                 // Perform pending (un)protect action
                 Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                ++calls;
                 range_bytes = 0;
                 potential_range_bytes = 0;
             }
@@ -359,6 +364,7 @@ struct PageManager::Impl {
 
         // Add pending (un)protect action
         release_pending();
+        return calls;
     }
 
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
@@ -389,19 +395,19 @@ void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
 }
 
 template <bool track, bool is_read>
-void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const {
-    impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
+u32 PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const {
+    return impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
 }
 
 template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;
 template void PageManager::UpdatePageWatchers<false>(VAddr addr, u64 size) const;
-template void PageManager::UpdatePageWatchersForRegion<true, true>(VAddr base_addr,
+template u32 PageManager::UpdatePageWatchersForRegion<true, true>(VAddr base_addr,
+                                                                  RegionBits& mask) const;
+template u32 PageManager::UpdatePageWatchersForRegion<true, false>(VAddr base_addr,
                                                                    RegionBits& mask) const;
-template void PageManager::UpdatePageWatchersForRegion<true, false>(VAddr base_addr,
+template u32 PageManager::UpdatePageWatchersForRegion<false, true>(VAddr base_addr,
+                                                                   RegionBits& mask) const;
+template u32 PageManager::UpdatePageWatchersForRegion<false, false>(VAddr base_addr,
                                                                     RegionBits& mask) const;
-template void PageManager::UpdatePageWatchersForRegion<false, true>(VAddr base_addr,
-                                                                    RegionBits& mask) const;
-template void PageManager::UpdatePageWatchersForRegion<false, false>(VAddr base_addr,
-                                                                     RegionBits& mask) const;
 
 } // namespace VideoCore

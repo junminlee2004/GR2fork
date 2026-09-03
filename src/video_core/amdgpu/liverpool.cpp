@@ -266,6 +266,9 @@ void Liverpool::Process(std::stop_token stoken) {
             task.resume();
 
             if (task.done()) {
+                if (rasterizer) {
+                    rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Idle);
+                }
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -291,6 +294,9 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
+        if (rasterizer) {
+            rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Idle);
+        }
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -926,6 +932,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::EventWriteEos: {
             const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
             if (rasterizer) {
+                rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
                 rasterizer->ProcessDownloadImages();
             }
             event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
@@ -947,6 +954,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::EventWriteEop: {
             const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
             if (rasterizer) {
+                rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
                 rasterizer->ProcessDownloadImages();
             }
             event_eop->SignalFence(
@@ -1017,7 +1025,10 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         // The only graphics opcodes whose handling can suspend the parser. They
-        // are returned unconsumed; the coroutine owns them.
+        // are returned unconsumed; the coroutine owns them, and the packet-run
+        // guard has already armed this run's marks. A GPU command thread read
+        // of guest memory that is neither bit-guarded nor behind one of those
+        // points sees pre-execution bytes for at most one run.
         case PM4ItOpcode::MemSemaphore:
         case PM4ItOpcode::Rewind:
         case PM4ItOpcode::WaitRegMem:
@@ -1061,6 +1072,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
             if (cond_exec->command.Value() != 0) {
                 LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
+            }
+            if (rasterizer) {
+                rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Wait);
             }
             const auto skip = *cond_exec->Address() == false;
             if (skip) {
@@ -1298,6 +1312,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Wait);
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -1398,6 +1413,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                if (rasterizer) {
+                    rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Wait);
+                }
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -1408,6 +1426,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (rasterizer) {
+                rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Wait);
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
@@ -1416,6 +1437,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
+                // The compute queue has no packet-run guard, so its dispatch
+                // marks reach a drain here, at its waits and at every submit.
+                rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
                 rasterizer->ProcessDownloadImages();
             }
             release_mem->SignalFence(

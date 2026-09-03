@@ -109,6 +109,8 @@ public:
         // from them cannot change either. Skipping it also leaves the sequence
         // count stable for concurrent lock-free readers.
         if constexpr (enable) {
+            // Every set page is armed or already listed for the next drain, so
+            // a range that is entirely set needs no arm of its own.
             if (bits.AllInRange(start_page, end_page)) {
                 return false;
             }
@@ -125,9 +127,18 @@ public:
         }
         if constexpr (type == Type::CPU) {
             RefreshCpuSummary(start_page, end_page);
-            UpdateProtection<!enable, false>();
+            UpdateProtection<!enable>();
         } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
-            UpdateProtection<enable, true>();
+            if constexpr (enable) {
+                if (defer_read_arm_) {
+                    read_arm_pending_ = true;
+                } else {
+                    u32 pages = 0;
+                    ArmReadWatchers(pages);
+                }
+            } else {
+                ReleaseReadWatchers();
+            }
         }
         return true;
     }
@@ -164,9 +175,9 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 RefreshCpuSummary(start_page, end_page);
-                UpdateProtection<true, false>();
+                UpdateProtection<true>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+                ReleaseReadWatchers();
             }
         }
 
@@ -287,6 +298,36 @@ public:
         return GetRegionBits<type>().AllInRange(start_page, end_page);
     }
 
+    /// Arms the read watcher of every GPU-dirty page that still lacks one and
+    /// returns the protection calls issued. A page with gpu and readable both
+    /// set awaits its arm; the arm and release masks are disjoint, so a
+    /// release never touches a pending page and the arm of a page unmarked
+    /// before its drain is simply never issued. readable is cleared under this
+    /// lock before the watcher update, because the read watcher count is one
+    /// bit and arming an armed page would wrap it.
+    u32 ArmReadWatchers(u32& pages) {
+        read_arm_pending_ = false;
+        RegionBits mask = gpu & readable;
+        if (mask.None()) {
+            return 0;
+        }
+        readable &= ~mask;
+        for (const auto& [start, end] : mask) {
+            pages += static_cast<u32>(end - start);
+        }
+        return tracker->UpdatePageWatchersForRegion<true, true>(cpu_addr, mask);
+    }
+
+    /// Releases the read watcher of every page that is no longer GPU dirty.
+    void ReleaseReadWatchers() {
+        RegionBits mask = ~gpu & ~readable;
+        if (mask.None()) {
+            return;
+        }
+        readable |= mask;
+        tracker->UpdatePageWatchersForRegion<false, true>(cpu_addr, mask);
+    }
+
     /// Scope guard marking a mutation of the tracked bits for readers.
     struct WriteScope {
         explicit WriteScope(RegionManager& m) : mgr{m} {
@@ -309,8 +350,15 @@ public:
         return static_cast<u16>(state.load(std::memory_order_relaxed));
     }
     // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
+    // GPU bits are set only there; an unmap clears them from a guest thread
+    // under the lock, which leaves this count untouched.
     u64 gpu_write_seq{0};
     LockType lock;
+    // Copied from the tracker when the region is handed out.
+    bool defer_read_arm_{false};
+    // A mark that recorded its bits and left the arm to the next drain. Read
+    // and written under the lock on GPU-command-thread paths only.
+    bool read_arm_pending_{false};
 
     // Word epochs advance whenever guest bytes in a span may change outside
     // the write watchers' sight: write protection loss, guest protection
@@ -420,19 +468,15 @@ private:
      *
      * @tparam track True when the tracker should start tracking the new pages
      */
-    template <bool track, bool is_read>
+    template <bool track>
     void UpdateProtection() {
         RENDERER_TRACE;
-        RegionBits mask = is_read ? (~gpu ^ readable) : (cpu ^ writeable);
+        RegionBits mask = cpu ^ writeable;
         if (mask.None()) {
             return;
         }
-        if constexpr (is_read) {
-            readable = ~gpu;
-        } else {
-            writeable = cpu;
-        }
-        tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
+        writeable = cpu;
+        tracker->UpdatePageWatchersForRegion<track, false>(cpu_addr, mask);
     }
 
     PageManager* tracker;

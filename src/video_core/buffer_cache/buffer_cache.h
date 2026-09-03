@@ -39,6 +39,9 @@ using BufferId = Common::SlotId;
 class TextureCache;
 class PageManager;
 
+/// Where a pending read-watcher arm was drained, for telemetry only.
+enum class ReadArmSite : u8 { Run, Submit, Fence, Wait, Idle, Count };
+
 class BufferCache {
 public:
     static constexpr u32 CACHING_PAGEBITS = 14;
@@ -473,6 +476,30 @@ public:
         writeback_loops_ = writeback_islands_ = writeback_bytes_ = 0;
         return out;
     }
+    /// Arms every read watcher left pending since the last drain.
+    void DrainPendingReadArms(ReadArmSite site) {
+        const auto d = memory_tracker->ArmPendingReadWatchers();
+        ++rarm_drains_[static_cast<size_t>(site)];
+        rarm_regions_ += d.regions;
+        rarm_pages_ += d.pages;
+        rarm_calls_ += d.calls;
+    }
+    /// Clears the GPU bits of a range the guest is unmapping.
+    void DropPendingReadArms(VAddr addr, u64 size) {
+        memory_tracker->DropPendingReadArms(addr, size);
+    }
+    struct ReadArmStats {
+        std::array<u64, static_cast<size_t>(ReadArmSite::Count)> drains;
+        u64 regions;
+        u64 pages;
+        u64 calls;
+    };
+    ReadArmStats DrainReadArmStats() {
+        const ReadArmStats out{rarm_drains_, rarm_regions_, rarm_pages_, rarm_calls_};
+        rarm_drains_ = {};
+        rarm_regions_ = rarm_pages_ = rarm_calls_ = 0;
+        return out;
+    }
     struct WriteBackOffloadStats {
         u64 guest;
         u64 prio;
@@ -618,6 +645,10 @@ private:
     u64 wboff_gpucomm_{};
     u64 wboff_excluded_{};
     u64 wboff_copy_ns_{};
+    std::array<u64, static_cast<size_t>(ReadArmSite::Count)> rarm_drains_{};
+    u64 rarm_regions_{};
+    u64 rarm_pages_{};
+    u64 rarm_calls_{};
     bool batch_copy_lock_{};
     bool upload_drain_{};
     u64 upload_ro_calls_{};

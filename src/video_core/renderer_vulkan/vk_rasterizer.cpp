@@ -65,6 +65,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
+    deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
+    if (deferred_read_arm_) {
+        scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
+    }
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -516,6 +520,8 @@ void Rasterizer::BeginPacketRun() {
 
 void Rasterizer::EndPacketRun() {
     in_packet_run_ = false;
+    // The arms run under the guest-copy hold, where the per-bind arms ran.
+    DrainPendingReadArms(VideoCore::ReadArmSite::Run);
     DropCopyHold(hold_drops_run_);
 }
 
@@ -922,6 +928,14 @@ void Rasterizer::OnSubmit() {
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
                          us.ro_calls, us.ro_bytes >> 20, us.w_calls, us.w_bytes >> 20);
+            }
+            if (const auto ra = buffer_cache.DrainReadArmStats();
+                ra.drains[0] + ra.drains[1] + ra.drains[2] + ra.drains[3] + ra.drains[4] != 0) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] RARM run={} submit={} fence={} wait={} idle={} regions={} "
+                         "pages={} calls={} per300f",
+                         ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
+                         ra.regions, ra.pages, ra.calls);
             }
             if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f",
@@ -2251,6 +2265,11 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
+    if (deferred_read_arm_) {
+        // Runs before the range leaves the map, so no later drain protects
+        // memory the guest has given back.
+        buffer_cache.DropPendingReadArms(addr, size);
+    }
     texture_cache.UnmapMemory(addr, size);
     page_manager.OnGpuUnmap(addr, size);
     {

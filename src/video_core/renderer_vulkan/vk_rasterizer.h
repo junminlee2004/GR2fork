@@ -91,6 +91,15 @@ public:
     private:
         Rasterizer* r_;
     };
+    /// Arms every read watcher a written bind left pending. GPU command thread.
+    void DrainPendingReadArms(VideoCore::ReadArmSite site) {
+        if (deferred_read_arm_) {
+            buffer_cache.DrainPendingReadArms(site);
+        }
+    }
+    static void PreSubmitThunk(void* self) {
+        static_cast<Rasterizer*>(self)->DrainPendingReadArms(VideoCore::ReadArmSite::Submit);
+    }
     void BeginPacketRun();
     void EndPacketRun();
     /// The command drain runs fault-download hops inline; none may run under the hold.
@@ -286,6 +295,7 @@ private:
     DynStateMemo dyn_memo_{};
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
+    bool deferred_read_arm_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);

@@ -69,6 +69,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
+    memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 

@@ -498,6 +498,14 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    using SubmitHook = void (*)(void*);
+    /// Runs on the submitting thread before the queue submit; the rasterizer
+    /// arms its pending read watchers there.
+    void SetSubmitHook(SubmitHook hook, void* user) {
+        submit_hook_ = hook;
+        submit_hook_user_ = user;
+    }
+
     static std::mutex submit_mutex;
 
 private:
@@ -508,6 +516,8 @@ private:
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
+    SubmitHook submit_hook_{};
+    void* submit_hook_user_{};
     const Instance& instance;
     std::array<WaitStat, static_cast<size_t>(WaitSite::Count)> wait_stats_{};
     MasterSemaphore master_semaphore;

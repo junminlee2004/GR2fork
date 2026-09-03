@@ -31,6 +31,40 @@ public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
+    /// Latched once before any region exists; new regions inherit it.
+    void SetDeferReadArm(bool value) {
+        defer_read_arm_ = value;
+    }
+
+    struct ReadArmDrain {
+        u32 regions;
+        u32 pages;
+        u32 calls;
+    };
+
+    /// Arms the read watchers every mark since the last drain left pending.
+    /// GPU command thread only. A walk that holds region locks across its
+    /// upload defers the drain to the next site rather than deadlocking.
+    ReadArmDrain ArmPendingReadWatchers() {
+        ReadArmDrain out{};
+        if (upload_walk_depth_ != 0) {
+            return out;
+        }
+        for (RegionManager* manager : pending_read_arms_) {
+            std::scoped_lock lk{manager->lock};
+            out.calls += manager->ArmReadWatchers(out.pages);
+            ++out.regions;
+        }
+        pending_read_arms_.clear();
+        return out;
+    }
+
+    /// Clears the GPU bits of a range that is about to be unmapped, so no
+    /// later drain protects memory the guest has given back.
+    void DropPendingReadArms(VAddr addr, u64 size) {
+        UnmarkRegionAsGpuModified(addr, size);
+    }
+
     // Upload-walk peek baseline; GPU-command-thread confined like the walk.
     u64 peek_fastpath_calls{};
     u64 peek_fastpath_dirty{};
@@ -324,6 +358,22 @@ public:
     /// Returns whether the written marking set any GPU-clean page.
     bool ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
+        // A written bind holds region locks across its upload, which can flush
+        // the scheduler; a drain from that flush would take a lock this thread
+        // already holds, so it is left to the next drain site.
+        struct WalkDepth {
+            u32* depth;
+            explicit WalkDepth(u32* d) : depth{d} {
+                if (depth) {
+                    ++*depth;
+                }
+            }
+            ~WalkDepth() {
+                if (depth) {
+                    --*depth;
+                }
+            }
+        } walk_depth{is_written ? &upload_walk_depth_ : nullptr};
         // Nearly every bind is a few hundred bytes and lands inside a single
         // 4MB region. Resolving the manager once up front runs both passes on
         // it directly, without the second memo probe and the per-region
@@ -366,8 +416,12 @@ public:
             // A written bind holds the lock from the upload walk until the
             // GPU marking below, so the marking observes the bits it covers.
             on_upload();
+            const bool was_pending = manager->read_arm_pending_;
             const bool changed = manager->template ChangeRegionState<Type::GPU, true>(
                 manager->GetCpuAddr() + offset, query_size);
+            if (manager->read_arm_pending_ && !was_pending) {
+                pending_read_arms_.push_back(manager);
+            }
             manager->lock.unlock();
             return changed;
         }
@@ -505,8 +559,12 @@ public:
                 if (i < 64 && (skipped & (u64{1} << i)) != 0) {
                     continue; // never locked in the first pass
                 }
+                const bool was_pending = manager->read_arm_pending_;
                 changed |= manager->template ChangeRegionState<Type::GPU, true>(
                     manager->GetCpuAddr() + offset, size);
+                if (manager->read_arm_pending_ && !was_pending) {
+                    pending_read_arms_.push_back(manager);
+                }
                 manager->lock.unlock();
             }
         }
@@ -657,6 +715,7 @@ private:
         // Each manager tracks a 4_MB virtual address space.
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
+        new_manager->defer_read_arm_ = defer_read_arm_;
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
         // Returned directly: re-probing the lookup memo twenty instructions
@@ -665,6 +724,11 @@ private:
         return new_manager;
     }
 
+    bool defer_read_arm_{};
+    // Regions whose marks await their arm, and the depth of the walk that must
+    // not be drained into. GPU-command-thread confined, like gpu_write_seq.
+    boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
+    u32 upload_walk_depth_{};
     PageManager* tracker;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
