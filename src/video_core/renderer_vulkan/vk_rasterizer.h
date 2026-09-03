@@ -283,6 +283,7 @@ private:
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
     std::array<vk::Pipeline, 2> last_bound_pipeline_{};
+    std::array<u64, 2> last_bound_pipeline_gen_{};
     u64 last_bound_tick_{};
     u64 filter_true_stamp_{};
 

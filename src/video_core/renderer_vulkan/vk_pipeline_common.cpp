@@ -334,6 +334,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
     cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, desc_set, {});
+    // The heap set replaces this bind point's set 0 behind the delta cache;
+    // the bump makes its next probe miss.
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(
+        bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0);
 }
 
 std::string Pipeline::GetDebugString() const {

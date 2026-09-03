@@ -375,6 +375,14 @@ public:
     u64 ForeignPushGen(size_t bind_point_index) const {
         return foreign_push_gen_[bind_point_index];
     }
+    // A pipeline bound outside the dedup path on the scheduler command buffer;
+    // the dedup treats a moved value as an unknown bound handle.
+    void BumpForeignPipelineGen(size_t bind_point_index) {
+        ++foreign_pipeline_gen_[bind_point_index];
+    }
+    u64 ForeignPipelineGen(size_t bind_point_index) const {
+        return foreign_pipeline_gen_[bind_point_index];
+    }
 
     // ---- UpdateImageDedup storage (framework-owned: its consumer is the
     // texture cache, which has no rasterizer pointer). 256-slot direct-mapped;
@@ -474,6 +482,7 @@ private:
     std::array<DedupEntry, 256> dedup_{};
     std::array<DescDeltaSlot, 2> desc_delta_{};
     std::array<u64, 2> foreign_push_gen_{};
+    std::array<u64, 2> foreign_pipeline_gen_{};
     std::array<u8, 16384> desc_delta_scratch_{};
 
     struct {

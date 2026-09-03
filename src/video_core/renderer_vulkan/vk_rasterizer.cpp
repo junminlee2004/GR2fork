@@ -113,7 +113,9 @@ void Rasterizer::BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline han
         scheduler.CommandBuffer().bindPipeline(point, handle);
         return;
     }
-    if (tick == last_bound_tick_ && last_bound_pipeline_[idx] == handle) {
+    const u64 fgen = Skipcache::Framework::Instance().ForeignPipelineGen(idx);
+    if (tick == last_bound_tick_ && last_bound_pipeline_[idx] == handle &&
+        last_bound_pipeline_gen_[idx] == fgen) {
         return; // same handle already bound on this command buffer
     }
     if (tick != last_bound_tick_) {
@@ -121,6 +123,7 @@ void Rasterizer::BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline han
         last_bound_tick_ = tick;
     }
     last_bound_pipeline_[idx] = handle;
+    last_bound_pipeline_gen_[idx] = fgen;
     scheduler.CommandBuffer().bindPipeline(point, handle);
 }
 

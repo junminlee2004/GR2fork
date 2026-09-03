@@ -238,6 +238,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     };
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+    // A pipeline bound outside the dedup path; the bump makes the dedup
+    // treat its last bound handle as unknown.
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(0);
 
     const std::array viewports = {
         vk::Viewport{
