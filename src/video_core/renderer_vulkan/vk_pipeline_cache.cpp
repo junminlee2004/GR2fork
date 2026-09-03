@@ -682,7 +682,7 @@ bool PipelineCache::MemoRuntimeInfo(Stage stage, LogicalStage l_stage, RuntimeIn
         slot.hash_valid = e.hash_valid;
         ++rimemo_hits;
         if (ri_memo_validate) {
-            Shader::RuntimeInfo memoized;
+            Shader::RuntimeInfo memoized{};
             std::memcpy(&memoized, &runtime_infos[l], sizeof(memoized));
             BuildRuntimeInfo(stage, l_stage);
             if (RuntimeInfoProxyHash(memoized) != RuntimeInfoProxyHash(runtime_infos[l])) {
