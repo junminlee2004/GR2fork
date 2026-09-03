@@ -173,6 +173,9 @@ public:
         u64 w_calls;
         u64 w_bytes;
     };
+    MemoryTracker::FastPathDrain DrainTrackerFastStats() {
+        return memory_tracker->DrainFastPathStats();
+    }
     struct TexelNoopStats {
         u64 hits;
         u64 probes;

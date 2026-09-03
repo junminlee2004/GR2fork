@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <utility>
 
@@ -82,6 +83,17 @@ public:
 
     /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        RegionManager* region;
+        if (TrySingleRegion(query_cpu_addr, query_size, region)) [[likely]] {
+            RENDERER_TRACE;
+            fast_stats_.gpu_fast.fetch_add(1, std::memory_order_relaxed);
+            if (region == nullptr) {
+                return false;
+            }
+            return region->template PeekRegionModified<Type::GPU>(
+                query_cpu_addr & TRACKER_HIGHER_PAGE_MASK, query_size);
+        }
+        fast_stats_.gpu_walk.fetch_add(1, std::memory_order_relaxed);
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
                 return manager->template PeekRegionModified<Type::GPU>(offset, size);
@@ -186,8 +198,51 @@ public:
     /// Word-epoch sum alone, for consumers that key memos on it. ok is false
     /// when part of the range has no region, when any covered word is
     /// poisoned, or when the span exceeds 64 words; callers then fall back to
-    /// their coarse generation key.
+    /// their coarse generation key. Nearly every bind lies inside one region,
+    /// so that case is answered here and the general walk is the exception.
     EpochSum256 Sum256ForRange(VAddr cpu_addr, u64 size) noexcept {
+        RegionManager* region;
+        if (size <= MAX_EPOCH_SUM_SPAN && TrySingleRegion(cpu_addr, size, region)) [[likely]] {
+            RENDERER_TRACE;
+            ++fast_stats_.sum_fast;
+            if (region == nullptr) {
+                ++fast_stats_.single_null;
+                return {0, false};
+            }
+            EpochSum256 out{0, false};
+            out.ok = region->EpochSumResolved(cpu_addr & TRACKER_HIGHER_PAGE_MASK, size, out.sum);
+            return out;
+        }
+        ++fast_stats_.sum_walk;
+        return Sum256ForRangeSlow(cpu_addr, size);
+    }
+
+    /// Twin of Sum256ForRange that also names the region when one covers the
+    /// whole range; the resolved memo probe reads that region directly.
+    EpochSum256 Sum256ForRangeResolved(VAddr cpu_addr, u64 size, RegionManager*& region) noexcept {
+        region = nullptr;
+        RegionManager* single;
+        if (size <= MAX_EPOCH_SUM_SPAN && TrySingleRegion(cpu_addr, size, single)) [[likely]] {
+            RENDERER_TRACE;
+            ++fast_stats_.sum_fast;
+            if (single == nullptr) {
+                ++fast_stats_.single_null;
+                return {0, false};
+            }
+            EpochSum256 out{0, false};
+            out.ok = single->EpochSumResolved(cpu_addr & TRACKER_HIGHER_PAGE_MASK, size, out.sum);
+            region = out.ok ? single : nullptr;
+            return out;
+        }
+        ++fast_stats_.sum_walk;
+        return Sum256ForRangeResolvedSlow(cpu_addr, size, region);
+    }
+
+    /// The general walk of Sum256ForRange. ok is false
+    /// when part of the range has no region, when any covered word is
+    /// poisoned, or when the span exceeds 64 words; callers then fall back to
+    /// their coarse generation key.
+    SHAD_NO_INLINE EpochSum256 Sum256ForRangeSlow(VAddr cpu_addr, u64 size) noexcept {
         EpochSum256 out{0, true};
         if (size == 0 || size > MAX_EPOCH_SUM_SPAN) {
             out.ok = false;
@@ -217,7 +272,8 @@ public:
 
     /// Twin of Sum256ForRange that also names the region when one covers the
     /// whole range; the resolved memo probe reads that region directly.
-    EpochSum256 Sum256ForRangeResolved(VAddr cpu_addr, u64 size, RegionManager*& region) noexcept {
+    SHAD_NO_INLINE EpochSum256 Sum256ForRangeResolvedSlow(VAddr cpu_addr, u64 size,
+                                                          RegionManager*& region) noexcept {
         EpochSum256 out{0, true};
         region = nullptr;
         if (size == 0 || size > MAX_EPOCH_SUM_SPAN) {
@@ -632,6 +688,18 @@ private:
         }
     }
 
+    /// True when [addr, addr + size) lies inside one 4 MB tracker region;
+    /// region is that region, or null when it does not exist yet. size == 0
+    /// falls through: the addr + size - 1 form underflows for an empty range.
+    [[nodiscard]] bool TrySingleRegion(VAddr addr, u64 size, RegionManager*& region) noexcept {
+        const std::size_t page_index = addr >> TRACKER_HIGHER_PAGE_BITS;
+        if (size == 0 || ((addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS) != page_index) {
+            return false;
+        }
+        region = LookupRegion(page_index);
+        return true;
+    }
+
     [[nodiscard]] RegionManager* LookupRegion(std::size_t page_index) noexcept {
         static thread_local constinit LookupMemo memo{};
         if (memo.owner != this) [[unlikely]] {
@@ -729,6 +797,35 @@ private:
     // not be drained into. GPU-command-thread confined, like gpu_write_seq.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
     u32 upload_walk_depth_{};
+    // Probe telemetry on a line of its own: the gpu pair is bumped from guest
+    // fault handlers as well as the GPU command thread.
+    struct alignas(64) FastPathStats {
+        u64 sum_fast{};
+        u64 sum_walk{};
+        u64 single_null{};
+        std::atomic<u64> gpu_fast{};
+        std::atomic<u64> gpu_walk{};
+    };
+    FastPathStats fast_stats_;
+
+public:
+    struct FastPathDrain {
+        u64 sum_fast;
+        u64 sum_walk;
+        u64 gpu_fast;
+        u64 gpu_walk;
+        u64 single_null;
+    };
+    FastPathDrain DrainFastPathStats() {
+        const FastPathDrain out{fast_stats_.sum_fast, fast_stats_.sum_walk,
+                                fast_stats_.gpu_fast.exchange(0, std::memory_order_relaxed),
+                                fast_stats_.gpu_walk.exchange(0, std::memory_order_relaxed),
+                                fast_stats_.single_null};
+        fast_stats_.sum_fast = fast_stats_.sum_walk = fast_stats_.single_null = 0;
+        return out;
+    }
+
+private:
     PageManager* tracker;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;

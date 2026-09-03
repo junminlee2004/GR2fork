@@ -941,6 +941,12 @@ void Rasterizer::OnSubmit() {
                          ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
                          ra.regions, ra.pages, ra.calls);
             }
+            if (const auto tf = buffer_cache.DrainTrackerFastStats();
+                tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] TRKFAST sum1={} sumwalk={} gpu1={} gpuwalk={} nul={} per300f",
+                         tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null);
+            }
             if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f",
                          tn.hits, tn.probes);
