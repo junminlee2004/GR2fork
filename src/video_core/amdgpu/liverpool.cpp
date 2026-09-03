@@ -208,6 +208,7 @@ Liverpool::Liverpool() {
     gfx_stamp.classify =
         gfx_stamp.active && EmulatorSettings.IsDynStateStamp() && EmulatorSettings.IsDynStateMemo();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
+    reg_run_ = EmulatorSettings.IsParserRegRun();
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -522,6 +523,48 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 rasterizer->DropCopyHoldForCommands();
             }
             DrainCommands();
+        }
+
+        if (reg_run_) {
+            // The packets that cannot suspend: register writes take their hot
+            // handlers, type-2 padding and empty NOPs advance, and the run
+            // ends at anything else, which the dispatch below then handles.
+            // A queued command ends the run through the poll above, so no
+            // packet executes with a command waiting and the hold armed.
+            u32 run = 0;
+            bool command_break = false;
+            while (!dcb.empty()) {
+                if (num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+                    command_break = true;
+                    break;
+                }
+                const auto* h = reinterpret_cast<const PM4Header*>(dcb.data());
+                const u32 raw = h->raw;
+                const u32 masked = raw & 0xC000FF00u;
+                const bool is_pad = (raw >> 30) == 2;
+                // An empty NOP is a no-op in the dispatch too: its arm returns
+                // before the payload is read and the exit advances two words.
+                const bool is_nop0 = (raw & 0xFFFFFF00u) == 0xC0001000u;
+                const u32 words = is_pad ? 0 : h->type3.NumWords();
+                if (words + 1 > dcb.size()) {
+                    break;
+                }
+                if (masked == 0xC0007600u) {
+                    SetShRegHot(h, words);
+                } else if (masked == 0xC0006900u) {
+                    SetContextRegHot(h, words);
+                } else if (!is_pad && !is_nop0) {
+                    break;
+                }
+                dcb = dcb.subspan(words + 1);
+                ++run;
+            }
+            run_stats.run_packets += run;
+            run_stats.runs += run != 0;
+            if (command_break || dcb.empty()) {
+                continue;
+            }
+            ++run_stats.outer_packets;
         }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());

@@ -762,11 +762,14 @@ void Rasterizer::OnSubmit() {
         if (frame - last_packet_frame >= 300) {
             last_packet_frame = frame;
             auto& pk = liverpool->packet_stats;
+            auto& rs = liverpool->run_stats;
             LOG_INFO(Render,
-                     "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} per300f",
+                     "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} run={} runs={} "
+                     "outer={} per300f",
                      pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
-                     pk.set_predication);
+                     pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets);
             pk = {};
+            rs = {};
         }
     }
     auto& skipcache = Skipcache::Framework::Instance();

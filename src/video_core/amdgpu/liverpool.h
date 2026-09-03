@@ -168,7 +168,8 @@ public:
      * occlusion path at all - shadPS4 answers every occlusion query with a
      * large "visible" count and ignores SET_PREDICATION, so a title that
      * culls from query results would be submitting draws it means to skip.
-     * GPU-parser-thread confined, like the counters above.
+     * GPU-parser-thread confined, like the counters above. The register run
+     * census lives in RunStats and describes this fork's parser, not the title.
      */
     struct PacketStats {
         u64 draws;            // graphics draws submitted by the guest
@@ -262,6 +263,7 @@ private:
     // Frozen counter = every query pair differences to zero samples passed:
     // the title's own visibility logic then culls those draws before issue.
     bool occlude_all_{};
+    bool reg_run_{};
 
     struct ConstantEngine {
         void Reset() {
@@ -286,6 +288,16 @@ private:
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
+
+public:
+    // Register run census, behind parser_reg_run. Declared after num_commands
+    // so the poll word keeps its line. GPU-parser-thread confined.
+    struct RunStats {
+        u64 run_packets;   // packets consumed by the run loop
+        u64 runs;          // run loop entries that consumed at least one
+        u64 outer_packets; // packets that reached the full dispatch
+    };
+    RunStats run_stats{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;

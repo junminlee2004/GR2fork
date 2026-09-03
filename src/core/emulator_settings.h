@@ -628,6 +628,10 @@ struct GPUSettings {
     // folding the compare into the gather's stores. Needs spec_fp_canonical 2,
     // spec_fp_slot_inplace and spec_key_fast.
     Setting<bool> spec_key_fused{false};
+    // Runs consecutive register writes, padding and empty NOPs in a tight loop
+    // inside the graphics packet parser, so a run of them takes one branch
+    // pair instead of a trip through the far packet dispatch each.
+    Setting<bool> parser_reg_run{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -740,6 +744,7 @@ struct GPUSettings {
             make_override<GPUSettings>("static_color_write_mask",
                                        &GPUSettings::static_color_write_mask),
             make_override<GPUSettings>("spec_key_fused", &GPUSettings::spec_key_fused),
+            make_override<GPUSettings>("parser_reg_run", &GPUSettings::parser_reg_run),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -771,7 +776,7 @@ struct GPUSettings {
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1096,6 +1101,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DeferredReadArm, deferred_read_arm)
     SETTING_FORWARD_BOOL(m_gpu, StaticColorWriteMask, static_color_write_mask)
     SETTING_FORWARD_BOOL(m_gpu, SpecKeyFused, spec_key_fused)
+    SETTING_FORWARD_BOOL(m_gpu, ParserRegRun, parser_reg_run)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
