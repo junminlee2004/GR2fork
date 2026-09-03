@@ -884,8 +884,10 @@ void Rasterizer::OnSubmit() {
             }
             const auto dd = skipcache.DrainDescDeltaStats();
             if (dd.probes) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] DESCDELTA probes={} hits={} per300f",
-                         dd.probes, dd.hits);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] DESCDELTA probes={} hits={} partial={} descs={} pushed={} "
+                         "split={} per300f",
+                         dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split);
             }
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {

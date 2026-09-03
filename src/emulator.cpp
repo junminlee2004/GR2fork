@@ -526,6 +526,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbackWritebackOffload: {}",
              EmulatorSettings.IsReadbackWritebackOffload());
     LOG_INFO(Config, "GPU keyReuseHashDiff: {}", EmulatorSettings.IsKeyReuseHashDiff());
+    LOG_INFO(Config, "GPU descDeltaPartial: {}", EmulatorSettings.IsDescDeltaPartial());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

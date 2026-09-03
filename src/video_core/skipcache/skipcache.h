@@ -345,7 +345,17 @@ public:
         u32 size{};
         u64 probes{};
         u64 hits{};
+        // Per-descriptor verdicts of the last mapped walk, valid up to
+        // desc_count; a partial push sends only the changed ones.
+        u32 desc_count{};
+        u32 desc_changed{};
+        bool header_changed{};
+        u64 partial{};
+        u64 descs{};
+        u64 pushed{};
+        u64 split{};
         alignas(64) std::array<u8, 16384> blob{};
+        std::array<u8, 1024> changed{};
     };
     DescDeltaSlot& DescDeltaState(size_t bind_point_index) {
         return desc_delta_[bind_point_index];
@@ -353,13 +363,21 @@ public:
     struct DescDeltaStats {
         u64 probes;
         u64 hits;
+        u64 partial;
+        u64 descs;
+        u64 pushed;
+        u64 split;
     };
     DescDeltaStats DrainDescDeltaStats() {
         DescDeltaStats out{};
         for (DescDeltaSlot& slot : desc_delta_) {
             out.probes += slot.probes;
             out.hits += slot.hits;
-            slot.probes = slot.hits = 0;
+            out.partial += slot.partial;
+            out.descs += slot.descs;
+            out.pushed += slot.pushed;
+            out.split += slot.split;
+            slot.probes = slot.hits = slot.partial = slot.descs = slot.pushed = slot.split = 0;
         }
         return out;
     }
@@ -407,6 +425,11 @@ public:
     void DedupInvalidateAll() {
         for (auto& e : dedup_) {
             e.valid = false;
+        }
+        // The unlisted descriptors of a partial push are whatever the driver
+        // holds, so the slot dies with the command buffer state.
+        for (auto& s : desc_delta_) {
+            s.valid = false;
         }
     }
 

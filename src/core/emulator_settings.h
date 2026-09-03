@@ -596,6 +596,10 @@ struct GPUSettings {
     // the resolve rewrites instead of re-reading the hash array it just stored.
     // Needs pipeline_key_stamp_reuse.
     Setting<bool> key_reuse_hash_diff{false};
+    // Pushes only the descriptors whose bytes differ from the last push on the
+    // same command buffer and layout; the rest stay as the driver holds them.
+    // Needs desc_delta_inplace.
+    Setting<bool> desc_delta_partial{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -698,6 +702,7 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_writeback_offload",
                                        &GPUSettings::readback_writeback_offload),
             make_override<GPUSettings>("key_reuse_hash_diff", &GPUSettings::key_reuse_hash_diff),
+            make_override<GPUSettings>("desc_delta_partial", &GPUSettings::desc_delta_partial),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -708,23 +713,43 @@ struct GPUSettings {
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
-    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
-    adaptive_skipcaches_mode, stream_buffer_size_mb, readback_batching_enabled,
-    readback_offload_mode, stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders,
-    patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
-    fsr_enabled, rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode,
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, fault_widen_bytes,
-    stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, runtime_info_stamp_gate,
-    occlude_all, stream_copy_upload_drain, flush_draw_interval, pipeline_key_stamp_reuse,
-    shader_params_memo, spec_fp_canonical, texture_view_memo, sampler_memo_lockfree,
-    desc_delta_inplace, bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree,
-    stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front,
-    findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree,
-    readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share,
-    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload,
-    key_reuse_hash_diff)
+// nlohmann's field macros take at most 63 names, so the GPU settings are
+// serialized in two groups; new settings go at the end of the second.
+// clang-format off
+#define GPU_SETTINGS_JSON_FIELDS_A \
+    window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
+    copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload_mode, \
+    stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
+    vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
+    rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, \
+    fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
+    runtime_info_stamp_gate, occlude_all, stream_copy_upload_drain, flush_draw_interval, \
+    pipeline_key_stamp_reuse, shader_params_memo
+#define GPU_SETTINGS_JSON_FIELDS_B \
+    spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
+    bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, \
+    stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front, \
+    findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
+    readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
+    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
+    key_reuse_hash_diff, desc_delta_partial
+// clang-format on
+template <
+    typename BasicJsonType,
+    nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
+void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_A))
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_B))
+}
+template <
+    typename BasicJsonType,
+    nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
+void from_json(const BasicJsonType& nlohmann_json_j, GPUSettings& nlohmann_json_t) {
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_A))
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_B))
+}
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -1026,6 +1051,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoInputMemo, runtime_info_input_memo)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackOffload, readback_writeback_offload)
     SETTING_FORWARD_BOOL(m_gpu, KeyReuseHashDiff, key_reuse_hash_diff)
+    SETTING_FORWARD_BOOL(m_gpu, DescDeltaPartial, desc_delta_partial)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

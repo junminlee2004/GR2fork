@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include <boost/container/static_vector.hpp>
+#include "common/assert.h"
+#include "common/logging/log.h"
 
 #include "core/emulator_settings.h"
 #include "shader_recompiler/resource.h"
@@ -105,44 +107,68 @@ size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
 // reporting whether any byte differed; compares run even when an earlier key
 // field already missed - one loop is cheaper than two. Same chunking and
 // bail rules as SerializeDescriptorWrites.
-size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::array<u8, 16384>& blob,
-                             bool& changed) {
+// The mapped form also records a per-descriptor verdict in the slot, which a
+// partial push consumes; the unmapped form is the plain walk.
+template <bool kMap>
+size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
+                             Skipcache::Framework::DescDeltaSlot& slot, bool& changed) {
+    auto& blob = slot.blob;
     u8* cursor = blob.data();
     const u8* const limit = blob.data() + blob.size();
     u64 diff = 0;
-    const auto sync8 = [&](const void* p) {
+    const auto sync8 = [&](const void* p) -> u64 {
         u64 a, b;
         std::memcpy(&a, p, 8);
         std::memcpy(&b, cursor, 8);
-        diff |= a ^ b;
+        const u64 x = a ^ b;
+        diff |= x;
         std::memcpy(cursor, p, 8);
         cursor += 8;
+        return x;
     };
-    const auto sync4 = [&](const void* p) {
+    const auto sync4 = [&](const void* p) -> u64 {
         u32 a, b;
         std::memcpy(&a, p, 4);
         std::memcpy(&b, cursor, 4);
-        diff |= a ^ b;
+        const u64 x = a ^ b;
+        diff |= x;
         std::memcpy(cursor, p, 4);
         cursor += 4;
+        return x;
     };
+    const auto note = [&]([[maybe_unused]] u64 d) {
+        if constexpr (kMap) {
+            slot.changed[slot.desc_count++] = d != 0;
+            slot.desc_changed += d != 0;
+        }
+    };
+    if constexpr (kMap) {
+        slot.desc_count = 0;
+        slot.desc_changed = 0;
+        slot.header_changed = false;
+    }
     for (const auto& w : writes) {
         const u32 count = w.descriptorCount;
         if (static_cast<size_t>(limit - cursor) < 16 + size_t{count} * 24) {
             return 0;
         }
+        if constexpr (kMap) {
+            if (slot.desc_count + count > slot.changed.size()) {
+                return 0;
+            }
+        }
         const VkWriteDescriptorSet& raw = w;
-        sync8(&raw.dstBinding);
-        sync8(&raw.descriptorCount);
+        [[maybe_unused]] const u64 header = sync8(&raw.dstBinding) | sync8(&raw.descriptorCount);
+        if constexpr (kMap) {
+            slot.header_changed |= header != 0;
+        }
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
         case vk::DescriptorType::eStorageBuffer: {
             const auto* const infos = w.pBufferInfo;
             for (u32 i = 0; i < count; ++i) {
                 const VkDescriptorBufferInfo& info = infos[i];
-                sync8(&info.buffer);
-                sync8(&info.offset);
-                sync8(&info.range);
+                note(sync8(&info.buffer) | sync8(&info.offset) | sync8(&info.range));
             }
             break;
         }
@@ -153,9 +179,7 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
             const auto* const infos = w.pImageInfo;
             for (u32 i = 0; i < count; ++i) {
                 const VkDescriptorImageInfo& info = infos[i];
-                sync8(&info.sampler);
-                sync8(&info.imageView);
-                sync4(&info.imageLayout);
+                note(sync8(&info.sampler) | sync8(&info.imageView) | sync4(&info.imageLayout));
             }
             break;
         }
@@ -163,7 +187,7 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
         case vk::DescriptorType::eStorageTexelBuffer: {
             const auto* const views = w.pTexelBufferView;
             for (u32 i = 0; i < count; ++i) {
-                sync8(&views[i]);
+                note(sync8(&views[i]));
             }
             break;
         }
@@ -174,6 +198,66 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes, std::arra
     changed = diff != 0;
     return static_cast<size_t>(cursor - blob.data());
 }
+
+// Compacts the write list to the descriptors the mapped walk saw change.
+// Buffer and sampler writes span consecutive count-1 bindings, so each
+// maximal run of changed descriptors becomes one write on its own binding;
+// image writes are one binding with an array, so they go whole or not at all.
+// The layouts come from the graphics and compute pipeline builders.
+size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
+                               const Skipcache::Framework::DescDeltaSlot& map,
+                               Pipeline::DescriptorWrites& out) {
+    out.clear();
+    u32 k = 0;
+    for (const auto& w : in) {
+        const u32 count = w.descriptorCount;
+        ASSERT(k + count <= map.desc_count);
+        switch (w.descriptorType) {
+        case vk::DescriptorType::eUniformBuffer:
+        case vk::DescriptorType::eStorageBuffer:
+        case vk::DescriptorType::eSampler: {
+            u32 i = 0;
+            while (i < count) {
+                if (!map.changed[k + i]) {
+                    ++i;
+                    continue;
+                }
+                u32 j = i + 1;
+                while (j < count && map.changed[k + j]) {
+                    ++j;
+                }
+                vk::WriteDescriptorSet run = w;
+                run.dstBinding = w.dstBinding + i;
+                run.dstArrayElement = 0;
+                run.descriptorCount = j - i;
+                if (w.descriptorType == vk::DescriptorType::eSampler) {
+                    run.pImageInfo = w.pImageInfo + i;
+                } else {
+                    run.pBufferInfo = w.pBufferInfo + i;
+                }
+                out.push_back(run);
+                i = j;
+            }
+            break;
+        }
+        default: {
+            bool any = false;
+            for (u32 i = 0; i < count; ++i) {
+                any |= map.changed[k + i] != 0;
+            }
+            if (any) {
+                out.push_back(w);
+            }
+            break;
+        }
+        }
+        k += count;
+    }
+    return out.size();
+}
+
+// GPU command thread only, like the delta slots.
+Pipeline::DescriptorWrites partial_scratch;
 
 } // namespace
 
@@ -262,13 +346,25 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             auto& slot = sc.DescDeltaState(idx);
             auto& scratch = sc.DescDeltaScratch();
             static const bool inplace = EmulatorSettings.IsDescDeltaInplace();
+            static const bool partial_enabled = [] {
+                const bool partial = EmulatorSettings.IsDescDeltaPartial();
+                if (partial && !EmulatorSettings.IsDescDeltaInplace()) {
+                    LOG_WARNING(Render_Vulkan, "partial descriptor pushes need desc_delta_inplace; "
+                                               "every content miss pushes the whole set");
+                }
+                return partial;
+            }();
             bool changed = false;
-            const size_t size = inplace ? MatchDescriptorWrites(set_writes, slot.blob, changed)
-                                        : SerializeDescriptorWrites(set_writes, scratch);
+            const size_t size =
+                inplace
+                    ? (partial_enabled ? MatchDescriptorWrites<true>(set_writes, slot, changed)
+                                       : MatchDescriptorWrites<false>(set_writes, slot, changed))
+                    : SerializeDescriptorWrites(set_writes, scratch);
             const u64 tick = scheduler.CurrentTick();
             const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
             const u64 foreign = sc.ForeignPushGen(idx);
             bool would_hit = false;
+            bool partial_ok = false;
             if (size == 0) {
                 ++ctr.veto[0]; // unknown type or overflow: fail closed
             } else if (!slot.valid) {
@@ -281,6 +377,16 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                        (inplace ? changed
                                 : std::memcmp(slot.blob.data(), scratch.data(), size) != 0)) {
                 ++ctr.veto[1]; // content changed
+                // Same command buffer, foreign gen and layout: the driver's
+                // set still holds the last push, so only the changed
+                // descriptors need to go. Near-total changes push whole.
+                partial_ok = inplace && partial_enabled && size == slot.size &&
+                             !slot.header_changed && slot.desc_changed * 4 <= slot.desc_count * 3;
+                if (partial_ok) {
+                    ++slot.partial;
+                    slot.descs += slot.desc_count;
+                    slot.pushed += slot.desc_changed;
+                }
             } else {
                 would_hit = true;
                 ++ctr.hits;
@@ -296,7 +402,20 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             }
             const bool timed_miss = timed && !would_hit;
             const u64 m0 = timed_miss ? sc.Now() : 0;
-            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+            if (partial_ok && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+                // Each extra write costs the driver's per-write prologue, so a
+                // compaction that saves fewer descriptors than it adds writes
+                // is sent whole.
+                const size_t runs = CompactDescriptorWrites(set_writes, slot, partial_scratch);
+                if (runs <= set_writes.size() + (slot.desc_count - slot.desc_changed) / 2) {
+                    cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, partial_scratch);
+                } else {
+                    ++slot.split;
+                    cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+                }
+            } else {
+                cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+            }
             if (timed_miss) {
                 ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
                 ++ctr.miss_samples;
