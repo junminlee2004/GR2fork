@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <limits>
 
 #include <xxhash.h>
@@ -562,6 +563,13 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     const u64 t0 = timed ? sc.Now() : 0;
     const u64 tex_gen = sc.Gens().tex_gen.load(std::memory_order_acquire);
     const auto raw = std::bit_cast<std::array<u64, 4>>(tsharp);
+    // The index words are read straight from the T#: a narrow reload of the
+    // 32-byte copy above would wait on the store queue.
+    const std::byte* const tp = reinterpret_cast<const std::byte*>(&tsharp);
+    u64 w0;
+    u64 w1;
+    std::memcpy(&w0, tp, 8);
+    std::memcpy(&w1, tp + 8, 8);
     const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
                         static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
     const u8 type = static_cast<u8>(desc.type);
@@ -569,14 +577,18 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     u32 ways;
     size_t set_index = 0;
     if (memo_ways == 0) {
-        set = &find_image_memo_[((raw[0] >> 8) ^ (raw[0] >> 40) ^ raw[1] ^ view_key) & 1023];
+        set = &find_image_memo_[((w0 >> 8) ^ (w0 >> 40) ^ w1 ^ view_key) & 1023];
         ways = 1;
     } else {
         // Every T# word reaches the set index through its own odd multiplier;
         // the top bits are taken because a product's low bits see only the low
         // input bits.
-        const u64 mix = (raw[0] ^ view_key) * 0x9E3779B97F4A7C15ULL +
-                        raw[1] * 0xC2B2AE3D27D4EB4FULL + (raw[2] ^ raw[3]) * 0x165667B19E3779F9ULL;
+        u64 w2;
+        u64 w3;
+        std::memcpy(&w2, tp + 16, 8);
+        std::memcpy(&w3, tp + 24, 8);
+        const u64 mix = (w0 ^ view_key) * 0x9E3779B97F4A7C15ULL + w1 * 0xC2B2AE3D27D4EB4FULL +
+                        (w2 ^ w3) * 0x165667B19E3779F9ULL;
         set_index = mix >> memo_set_shift;
         set = &find_image_memo_[set_index * memo_ways];
         ways = memo_ways;
