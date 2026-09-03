@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -19,15 +20,39 @@ using RangeSetsAllocator =
     boost::fast_pool_allocator<T, boost::default_user_allocator_new_delete,
                                boost::details::pool::default_mutex, 1024, 2048>;
 
-struct RangeSet {
-    using IntervalSet =
-        boost::icl::interval_set<VAddr, std::less,
-                                 ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, VAddr, std::less),
-                                 RangeSetsAllocator>;
+// Node-pool mutex of the GPU-modified range set: every operation on that set
+// runs on the GPU command thread, so the lock is skipped once the setting
+// latches; the skip count feeds the WRANGE line.
+struct GpuRangeSetMutex {
+    static inline bool lockfree = false;
+    static inline u64 skips = 0;
+    void lock() {
+        if (lockfree) {
+            ++skips;
+            return;
+        }
+        mutex.lock();
+    }
+    void unlock() {
+        if (!lockfree) {
+            mutex.unlock();
+        }
+    }
+    std::mutex mutex;
+};
+
+template <class T>
+using GpuRangeSetAllocator = boost::fast_pool_allocator<T, boost::default_user_allocator_new_delete,
+                                                        GpuRangeSetMutex, 1024, 2048>;
+
+template <template <class> class Alloc>
+struct BasicRangeSet {
+    using IntervalSet = boost::icl::interval_set<
+        VAddr, std::less, ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, VAddr, std::less), Alloc>;
     using IntervalType = typename IntervalSet::interval_type;
 
-    explicit RangeSet() = default;
-    ~RangeSet() = default;
+    explicit BasicRangeSet() = default;
+    ~BasicRangeSet() = default;
 
     void Add(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
@@ -124,6 +149,9 @@ struct RangeSet {
 
     IntervalSet m_ranges_set;
 };
+
+using RangeSet = BasicRangeSet<RangeSetsAllocator>;
+using GpuRangeSet = BasicRangeSet<GpuRangeSetAllocator>;
 
 template <typename T>
 class RangeMap {

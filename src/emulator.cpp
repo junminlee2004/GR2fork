@@ -516,6 +516,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU findimgMemoWays: {}", EmulatorSettings.GetFindimgMemoWays());
     LOG_INFO(Config, "GPU bindNoopMemo: {}", EmulatorSettings.IsBindNoopMemo());
     LOG_INFO(Config, "GPU specKeyFast: {}", EmulatorSettings.GetSpecKeyFast());
+    LOG_INFO(Config, "GPU gpuRangeSetLockfree: {}", EmulatorSettings.IsGpuRangeSetLockfree());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
