@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include <xxhash.h>
 
@@ -103,10 +104,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     tsc_hz_ = Common::EstimateRDTSCFrequency();
     // Mode, not a worker count: 0 disables the lane, 1 is the unsafe fast
     // path (titles that never unmap mid-play), 2 and above the hardened one.
-    // Both modes run two workers, the measured knee.
+    // Both modes run two workers, the measured knee, unless the thread
+    // setting says otherwise.
     const u32 lane_mode = EmulatorSettings.GetStreamCopyWorkers();
     if (lane_mode != 0) {
-        VideoCore::StreamCopyLane::Instance().Init(2, lane_mode >= 2);
+        const u32 lane_threads = EmulatorSettings.GetStreamCopyLaneThreads();
+        const u32 workers = lane_threads == 0 ? 2u : std::min(lane_threads, 4u);
+        const u64 idle_ticks = EmulatorSettings.GetStreamCopyIdleUs() * tsc_hz_ / 1000000u;
+        VideoCore::StreamCopyLane::Instance().Init(
+            workers, lane_mode >= 2,
+            static_cast<u32>(std::min<u64>(idle_ticks, std::numeric_limits<u32>::max())));
         Core::MemoryManager::RegisterUnmapDrain(
             [](void*) { VideoCore::StreamCopyLane::Instance().DrainRemote(); }, nullptr);
     }
@@ -1003,9 +1010,9 @@ void Rasterizer::OnSubmit() {
                 const auto ls = lane.DrainStats();
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] LANE jobs={} MiB={} unres={} full={} barriers={} "
-                         "wait_ms={} per300f",
+                         "wait_ms={} mwaits={} woke={} per300f",
                          ls.jobs, ls.bytes >> 20, ls.inline_unresolved, ls.inline_full, ls.barriers,
-                         ls.barrier_wait_ns / 1000000);
+                         ls.barrier_wait_ns / 1000000, ls.mwaits, ls.mwait_wakes);
             }
             buffer_cache.EmitMirrorTelemetry();
         }

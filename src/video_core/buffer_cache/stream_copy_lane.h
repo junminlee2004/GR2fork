@@ -31,7 +31,10 @@ class StreamCopyLane {
 public:
     static StreamCopyLane& Instance();
 
-    void Init(u32 num_workers, bool hardened);
+    /// idle_ticks > 0 parks an idle worker in a timed MWAITX on the publish
+    /// word for that many TSC ticks per round instead of the pause spin.
+    /// Honoured only when the CPU reports MWAITX.
+    void Init(u32 num_workers, bool hardened, u32 idle_ticks = 0);
 
     /// Safe mode: foreign-producer refusal, atomic barrier targets and the
     /// resolver push windows. Unsafe mode is byte-for-byte the original hot
@@ -65,6 +68,8 @@ public:
         u64 inline_full;
         u64 barriers;
         u64 barrier_wait_ns;
+        u64 mwaits;      // timed monitor waits entered by idle workers
+        u64 mwait_wakes; // of those, ended by a publish rather than the timer
     };
     /// GPU command thread: returns and resets the counters.
     Stats DrainStats();
@@ -92,6 +97,7 @@ private:
     std::atomic<u32> num_workers_{0};
     std::atomic<bool> stop_{false};
     bool hardened_{true};
+    u32 idle_ticks_{0};
 
     // Producer-owned (GPU command thread); plain because single-writer. The
     // alignas(64) on published_ keeps the worker-touched atomics off this line.
@@ -110,6 +116,9 @@ private:
     alignas(64) std::atomic<u64> copies_done_{};
     // Read by the producer on every Push; copies_done_ is a per-job RMW.
     alignas(64) std::atomic<u32> sleepers_{};
+    // Worker census of the timed waits, on a line of their own.
+    alignas(64) std::atomic<u64> mwaits_{};
+    std::atomic<u64> mwait_wakes_{};
 };
 
 } // namespace VideoCore

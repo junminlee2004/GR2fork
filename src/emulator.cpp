@@ -537,6 +537,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU specKeyFused: {}", EmulatorSettings.IsSpecKeyFused());
     LOG_INFO(Config, "GPU parserRegRun: {}", EmulatorSettings.IsParserRegRun());
     LOG_INFO(Config, "GPU pushConstDedup: {}", EmulatorSettings.IsPushConstDedup());
+    LOG_INFO(Config, "GPU streamCopyIdleUs: {}", EmulatorSettings.GetStreamCopyIdleUs());
+    LOG_INFO(Config, "GPU streamCopyLaneThreads: {}", EmulatorSettings.GetStreamCopyLaneThreads());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

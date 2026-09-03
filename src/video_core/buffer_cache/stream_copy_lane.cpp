@@ -4,21 +4,56 @@
 #include <chrono>
 #include <cstring>
 #include <emmintrin.h>
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
+#define SHAD_COPY_LANE_MWAITX 1
+#endif
 #include "common/thread.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
 
 namespace VideoCore {
+
+namespace {
+
+bool CpuHasMwaitx() {
+#ifdef SHAD_COPY_LANE_MWAITX
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid(0x80000001u, &eax, &ebx, &ecx, &edx) == 0) {
+        return false;
+    }
+    return (ecx & (1u << 29)) != 0;
+#else
+    return false;
+#endif
+}
+
+// Timed wait on one line: the core parks until the line is written or the
+// TSC timer runs out, whichever comes first. The hint keeps the core in C0
+// so a wake costs no state exit.
+void MonitorWait(const void* line, u32 ticks) {
+#ifdef SHAD_COPY_LANE_MWAITX
+    asm volatile("monitorx" : : "a"(line), "c"(0u), "d"(0u) : "memory");
+    asm volatile("mwaitx" : : "a"(0xF0u), "b"(ticks), "c"(0x2u) : "memory");
+#else
+    (void)line;
+    (void)ticks;
+    _mm_pause();
+#endif
+}
+
+} // namespace
 
 StreamCopyLane& StreamCopyLane::Instance() {
     static StreamCopyLane lane;
     return lane;
 }
 
-void StreamCopyLane::Init(u32 num_workers, bool hardened) {
+void StreamCopyLane::Init(u32 num_workers, bool hardened, u32 idle_ticks) {
     if (num_workers == 0 || !threads_.empty()) {
         return;
     }
     hardened_ = hardened;
+    idle_ticks_ = CpuHasMwaitx() ? idle_ticks : 0;
     slots_ = std::make_unique<Slot[]>(kRingSlots);
     for (size_t i = 0; i < kRingSlots; ++i) {
         slots_[i].seq.store(i, std::memory_order_relaxed);
@@ -107,6 +142,7 @@ bool StreamCopyLane::TryDrainOne() {
 void StreamCopyLane::WorkerLoop() {
     Common::SetCurrentThreadName("shadPS4:CopyLane");
     u32 idle_rounds = 0;
+    const u32 idle_ticks = idle_ticks_;
     while (true) {
         if (TryDrainOne()) {
             idle_rounds = 0;
@@ -116,6 +152,21 @@ void StreamCopyLane::WorkerLoop() {
             return;
         }
         if (++idle_rounds < 512) {
+            if (idle_ticks != 0) {
+                // Arm the monitor, then re-check the cursor: a publish that
+                // landed between the drain attempt and the arm is seen here
+                // and skips the wait, so the wait never misses it.
+                const u64 seen = published_.load(std::memory_order_acquire);
+                if (seen != dequeue_pos_.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                MonitorWait(&published_, idle_ticks);
+                mwaits_.fetch_add(1, std::memory_order_relaxed);
+                if (published_.load(std::memory_order_acquire) != seen) {
+                    mwait_wakes_.fetch_add(1, std::memory_order_relaxed);
+                }
+                continue;
+            }
             for (int i = 0; i < 64; ++i) {
                 _mm_pause();
             }
@@ -175,6 +226,8 @@ StreamCopyLane::Stats StreamCopyLane::DrainStats() {
         .inline_full = inline_full_,
         .barriers = barriers_,
         .barrier_wait_ns = barrier_wait_ns_,
+        .mwaits = mwaits_.exchange(0, std::memory_order_relaxed),
+        .mwait_wakes = mwait_wakes_.exchange(0, std::memory_order_relaxed),
     };
     jobs_ = 0;
     bytes_ = 0;
