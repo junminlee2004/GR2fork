@@ -796,6 +796,12 @@ void Rasterizer::OnSubmit() {
                 hold_arms_ = hold_draws_covered_ = hold_drops_run_ = hold_drops_flush_ =
                     hold_drops_wait_ = hold_drops_cmd_ = hold_compiles_ = 0;
             }
+            if (const auto bw = Core::MemoryManager::DrainBackingWriteStats(); bw.calls) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] BACKWRITE calls={} hits={} hitKiB={} missKiB={} multi={} "
+                         "per300f",
+                         bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
+            }
             pipeline_cache.DumpKeyReuseStats();
             pipeline_cache.DumpProgramIdentityStats();
             pipeline_cache.DumpSpecFpStats();

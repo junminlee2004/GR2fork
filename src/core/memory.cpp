@@ -32,6 +32,7 @@ MemoryManager::MemoryManager() {
         LOG_INFO(Kernel_Vmm, "{:#x} - {:#x}", region.lower(), region.upper());
     }
     RefreshVmaBounds();
+    backing_write_memo_ = EmulatorSettings.IsBackingWriteMemo();
 
     // Pre-initialize direct backing
     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
@@ -205,6 +206,25 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+// One resolved physical chunk of a backed area: guest [base, end) maps to
+// backing while the map generation still equals generation.
+struct BackingChunkMemo {
+    u64 generation;
+    VAddr base;
+    VAddr end;
+    u8* backing;
+};
+struct BackingWriteMemo {
+    std::array<BackingChunkMemo, 4> entries{};
+    size_t next{};
+    u64 calls{};
+    u64 hits{};
+    u64 hit_bytes{};
+    u64 miss_bytes{};
+    u64 multi{};
+};
+static constinit thread_local BackingWriteMemo tls_backing_write_memo{};
+
 static std::atomic<BackingWriteObserver> g_backing_observer{nullptr};
 static std::atomic<void*> g_backing_observer_user{nullptr};
 
@@ -328,6 +348,24 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     if (const auto observer = g_backing_observer.load(std::memory_order_acquire)) {
         observer(g_backing_observer_user.load(std::memory_order_acquire), virtual_addr, size);
     }
+    if (backing_write_memo_) {
+        // Backing writes land in the same few chunks - fence labels repeat and
+        // readback islands ascend through one buffer - so the resolved chunk is
+        // remembered per thread and revalidated by the map generation under
+        // the shared lock, as CopySparseMemory's area memo is.
+        auto& memo = tls_backing_write_memo;
+        ++memo.calls;
+        for (const auto& e : memo.entries) {
+            if (e.generation == vma_generation && virtual_addr >= e.base &&
+                virtual_addr + size <= e.end) {
+                ++memo.hits;
+                memo.hit_bytes += size;
+                std::memcpy(e.backing + (virtual_addr - e.base), data, size);
+                return true;
+            }
+        }
+        memo.miss_bytes += size;
+    }
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
@@ -349,6 +387,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
         return false;
     }
 
+    const u64 total = size;
     for (const VirtualMemoryArea* vma_ptr : vmas_to_write) {
         const VirtualMemoryArea& vma = *vma_ptr;
         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
@@ -361,12 +400,34 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
+            if (backing_write_memo_ && size == total) {
+                // Recorded only when the whole write sits inside this chunk:
+                // a write starting in a hole of a sparse map wraps its size.
+                const VAddr chunk_base = vma.base + phys_handle->first;
+                const VAddr chunk_end = chunk_base + phys_handle->second.size;
+                auto& memo = tls_backing_write_memo;
+                if (virtual_addr >= chunk_base && virtual_addr + total <= chunk_end) {
+                    memo.entries[memo.next] =
+                        BackingChunkMemo{vma_generation, chunk_base, chunk_end,
+                                         impl.BackingBase() + phys_handle->second.base};
+                    memo.next = (memo.next + 1) % memo.entries.size();
+                } else {
+                    ++memo.multi;
+                }
+            }
             memcpy(backing, data, copy_size);
             size -= copy_size;
         }
     }
 
     return true;
+}
+
+MemoryManager::BackingWriteStats MemoryManager::DrainBackingWriteStats() {
+    auto& memo = tls_backing_write_memo;
+    const BackingWriteStats out{memo.calls, memo.hits, memo.hit_bytes, memo.miss_bytes, memo.multi};
+    memo.calls = memo.hits = memo.hit_bytes = memo.miss_bytes = memo.multi = 0;
+    return out;
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {

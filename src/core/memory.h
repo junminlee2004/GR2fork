@@ -301,6 +301,15 @@ public:
     static void EndBackingPush();
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
+    struct BackingWriteStats {
+        u64 calls;
+        u64 hits;
+        u64 hit_bytes;
+        u64 miss_bytes;
+        u64 multi;
+    };
+    /// Returns and resets the calling thread's backing write memo counters.
+    static BackingWriteStats DrainBackingWriteStats();
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -403,6 +412,7 @@ private:
     /// Incremented on every structural change to vma_map. Readers holding the
     /// shared lock may cache lookups against it; see CopySparseMemory.
     u64 vma_generation{1};
+    bool backing_write_memo_{};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};
