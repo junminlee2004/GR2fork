@@ -603,6 +603,113 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     return info;
 }
 
+// The words each memoized arm of BuildRuntimeInfo reads: the program settings
+// first so a program switch fails at word 0, the color buffers and the
+// interpolant table last. Every other arm reads guest memory or code.
+u32 PipelineCache::SnapshotRuntimeInputs(Stage stage, u32* out) const {
+    const auto& regs = liverpool->regs;
+    u32 n = 0;
+    const auto put = [&](const auto& v) {
+        static_assert(sizeof(v) % sizeof(u32) == 0);
+        std::memcpy(out + n, &v, sizeof(v));
+        n += sizeof(v) / sizeof(u32);
+    };
+    switch (stage) {
+    case Stage::Vertex:
+        put(regs.vs_program.settings);
+        put(regs.clipper_control);
+        put(regs.vgt_instance_step_rate_0);
+        put(regs.vgt_instance_step_rate_1);
+        put(regs.vs_output_control);
+        put(regs.primitive_type);
+        put(regs.tess_config);
+        break;
+    case Stage::Fragment: {
+        put(regs.ps_program.settings);
+        put(regs.ps_input_ena);
+        put(regs.ps_input_addr);
+        const u32 num_interp = regs.num_interp;
+        put(num_interp);
+        put(regs.z_export_format);
+        put(regs.depth_shader_control);
+        put(regs.blend_control[0]);
+        put(regs.clipper_control);
+        put(regs.stage_enable);
+        put(regs.vs_output_control);
+        put(graphics_key.color_buffers);
+        const u32 count = std::min<u32>(num_interp, static_cast<u32>(regs.ps_inputs.size()));
+        std::memcpy(out + n, regs.ps_inputs.data(), count * sizeof(u32));
+        n += count;
+        break;
+    }
+    case Stage::Compute: {
+        const auto& cs = liverpool->GetCsRegs();
+        put(cs.settings);
+        put(cs.num_thread_x);
+        put(cs.num_thread_y);
+        put(cs.num_thread_z);
+        break;
+    }
+    default:
+        break;
+    }
+    ASSERT(n <= kRuntimeInputWords);
+    return n;
+}
+
+bool PipelineCache::MemoRuntimeInfo(Stage stage, LogicalStage l_stage, RuntimeInfoStamp& slot) {
+    std::array<u32, kRuntimeInputWords> words;
+    const u32 n = SnapshotRuntimeInputs(stage, words.data());
+    if (n == 0) {
+        return false;
+    }
+    const u32 l = static_cast<u32>(l_stage);
+    auto& entries = ri_memo[l];
+    RuntimeInputMemo*& last = ri_memo_last[l];
+    for (auto& e : entries) {
+        if (!e.used || e.n_words != n ||
+            std::memcmp(e.words.data(), words.data(), n * sizeof(u32)) != 0) {
+            continue;
+        }
+        if (&e != last) {
+            // The full struct, inactive union tail included: the rebuild's
+            // memset zeroes it, so the copy reproduces the rebuilt bytes.
+            std::memcpy(&runtime_infos[l], &e.ri, sizeof(Shader::RuntimeInfo));
+            last = &e;
+            ++rimemo_restores;
+        }
+        slot.ri_fp_hash = e.ri_fp_hash;
+        slot.hash_valid = e.hash_valid;
+        ++rimemo_hits;
+        if (ri_memo_validate) {
+            Shader::RuntimeInfo memoized;
+            std::memcpy(&memoized, &runtime_infos[l], sizeof(memoized));
+            BuildRuntimeInfo(stage, l_stage);
+            if (RuntimeInfoProxyHash(memoized) != RuntimeInfoProxyHash(runtime_infos[l])) {
+                ++rimemo_vmiss;
+                LOG_ERROR(Render_Vulkan,
+                          "memoized runtime info for stage {} differs from a rebuild",
+                          static_cast<u32>(stage));
+                std::memcpy(&e.ri, &runtime_infos[l], sizeof(Shader::RuntimeInfo));
+                e.hash_valid = false;
+                slot.hash_valid = false;
+            }
+        }
+        return true;
+    }
+    BuildRuntimeInfo(stage, l_stage);
+    RuntimeInputMemo& e = &entries[0] == last ? entries[1] : entries[0];
+    e.n_words = static_cast<u8>(n);
+    std::memcpy(e.words.data(), words.data(), n * sizeof(u32));
+    std::memcpy(&e.ri, &runtime_infos[l], sizeof(Shader::RuntimeInfo));
+    e.used = true;
+    e.hash_valid = false;
+    last = &e;
+    slot.hash_valid = false;
+    ++rimemo_misses;
+    return true;
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -665,6 +772,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // skipcache mode would leave it frozen, so the gate latches the BOOT
     // stamp state, never Framework::Active().
     ri_stamp_gate = EmulatorSettings.IsRuntimeInfoStampGate() && liverpool->IsGfxStampActive();
+    ri_input_memo = EmulatorSettings.IsRuntimeInfoInputMemo();
+    ri_memo_validate = ri_input_memo && Skipcache::Framework::Instance().ActiveMode() ==
+                                            Skipcache::Mode::ValidateOnly;
     // The reuse copies the previous key back before the stage resolve, so the
     // vertex-format arm (which appends per attribute) must be dynamic, and the
     // Fragment runtime-info slot must be stamp-gated (see ReuseGraphicsKey).
@@ -850,6 +960,15 @@ void PipelineCache::ValidateSpecHit(const Program& program, u32 hit_idx, const S
                   "specialization",
                   hit_idx, info.pgm_hash);
     }
+}
+
+void PipelineCache::DumpRuntimeInfoMemoStats() {
+    if (!ri_input_memo) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache, "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} per300f",
+             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss);
+    rimemo_hits = rimemo_misses = rimemo_restores = rimemo_vmiss = 0;
 }
 
 void PipelineCache::DumpLayoutStats() {
@@ -1247,11 +1366,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
     const u64 reg_stamp = stampable ? liverpool->GetGfxStateStamp() : 0;
     if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
         ri_slot.stage != static_cast<u8>(stage)) {
-        BuildRuntimeInfo(stage, l_stage);
+        if (!ri_input_memo || !MemoRuntimeInfo(stage, l_stage, ri_slot)) {
+            BuildRuntimeInfo(stage, l_stage);
+            ri_memo_last[static_cast<u32>(l_stage)] = nullptr;
+            ri_slot.hash_valid = false;
+        }
         ri_slot.stamp = reg_stamp;
         ri_slot.stage = static_cast<u8>(stage);
         ri_slot.valid = stampable;
-        ri_slot.hash_valid = false;
     }
     const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
     auto& id = stage_identity[static_cast<u32>(l_stage)];
@@ -1311,7 +1433,14 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
             ri_fp_hash = RuntimeInfoProxyHash(ri_member);
             ++specfp_ri_rehash;
             ri_slot.ri_fp_hash = ri_fp_hash;
-            ri_slot.hash_valid = ri_slot.valid;
+            // The memo entry the member was restored from keeps the hash with
+            // its bytes, so a later restore brings both back.
+            auto* memo = ri_input_memo ? ri_memo_last[static_cast<u32>(l_stage)] : nullptr;
+            if (memo) {
+                memo->ri_fp_hash = ri_fp_hash;
+                memo->hash_valid = true;
+            }
+            ri_slot.hash_valid = ri_slot.valid || memo != nullptr;
         }
         auto& slot = gather_slots[static_cast<u32>(l_stage)];
         if (spec_fp_canonical != 0) {

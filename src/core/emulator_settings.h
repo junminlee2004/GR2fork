@@ -584,6 +584,10 @@ struct GPUSettings {
     // Derive the vertex-input signatures from the fetch shader's V# words and
     // build the Vulkan descriptions only for a layout change.
     Setting<bool> vertex_input_lazy_desc{false};
+    // Per-stage two-entry memo of the register words the Vertex, Fragment and
+    // Compute runtime-info builds read; an equal snapshot restores the struct
+    // and its fingerprint hash wherever the rebuild runs.
+    Setting<bool> runtime_info_input_memo{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -681,6 +685,8 @@ struct GPUSettings {
             make_override<GPUSettings>("desc_layout_share", &GPUSettings::desc_layout_share),
             make_override<GPUSettings>("vertex_input_lazy_desc",
                                        &GPUSettings::vertex_input_lazy_desc),
+            make_override<GPUSettings>("runtime_info_input_memo",
+                                       &GPUSettings::runtime_info_input_memo),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -706,7 +712,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front,
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree,
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share,
-    vertex_input_lazy_desc)
+    vertex_input_lazy_desc, runtime_info_input_memo)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -1005,6 +1011,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ImageUpdateDirect, image_update_direct)
     SETTING_FORWARD_BOOL(m_gpu, DescLayoutShare, desc_layout_share)
     SETTING_FORWARD_BOOL(m_gpu, VertexInputLazyDesc, vertex_input_lazy_desc)
+    SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoInputMemo, runtime_info_input_memo)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

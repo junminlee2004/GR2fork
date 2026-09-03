@@ -236,6 +236,8 @@ public:
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
     }
+    /// Per-window telemetry for the runtime-info input memo; silent when it is off.
+    void DumpRuntimeInfoMemoStats();
     /// Shared layout count against the pipeline count; silent when sharing is off.
     void DumpLayoutStats();
     /// Per-window telemetry for the canonical specialization key; silent when it is off.
@@ -316,6 +318,30 @@ private:
     };
     std::array<RuntimeInfoStamp, MaxShaderStages> ri_stamp{};
     bool ri_stamp_gate{};
+    // Register words the Vertex, Fragment and Compute runtime-info arms read,
+    // with the struct and fingerprint hash they produced; an equal snapshot
+    // restores both. Two entries per logical stage keep an alternating
+    // program pair resident.
+    static constexpr size_t kRuntimeInputWords = 96;
+    struct RuntimeInputMemo {
+        u64 ri_fp_hash{};
+        std::array<u32, kRuntimeInputWords> words{};
+        u8 n_words{};
+        bool used{};
+        bool hash_valid{};
+        Shader::RuntimeInfo ri{};
+    };
+    std::array<std::array<RuntimeInputMemo, 2>, MaxShaderStages> ri_memo{};
+    // The entry whose bytes runtime_infos[l_stage] holds; null after any other rebuild.
+    std::array<RuntimeInputMemo*, MaxShaderStages> ri_memo_last{};
+    bool ri_input_memo{};
+    bool ri_memo_validate{};
+    u64 rimemo_hits{};
+    u64 rimemo_misses{};
+    u64 rimemo_restores{};
+    u64 rimemo_vmiss{};
+    u32 SnapshotRuntimeInputs(Shader::Stage stage, u32* out) const;
+    bool MemoRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage, RuntimeInfoStamp& slot);
     // Per logical stage: the last resolved program. Programs are added to
     // program_cache and never removed or re-seated (unique_ptr values survive
     // rehash), so a remembered (hash, Program*) pair is exactly what
