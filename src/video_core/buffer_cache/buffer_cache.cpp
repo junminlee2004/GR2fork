@@ -1089,8 +1089,9 @@ void BufferCache::BindVertexBuffers(
     Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
     Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
     Vulkan::VertexInputs<vk::DeviceSize> host_strides;
-    // Sizes and strides feed only the bindVertexBuffers2 fallback; on devices
-    // with vertex-input dynamic state the fills are dead.
+    // Both legs enter the driver at the same entry point; sizes and strides
+    // feed only the path without vertex-input dynamic state, where the null
+    // arrays would leave the driver's stride table untouched.
     const bool needs_sizes_strides = !instance.IsVertexInputDynamicState();
     for (size_t i = 0; i < spans.size(); ++i) {
         const VAddr base = spans[i].base_address;
@@ -1116,7 +1117,10 @@ void BufferCache::BindVertexBuffers(
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+        // Null sizes and strides are whole size and the bound stride; the
+        // direct call skips the runtime's forwarding frame.
+        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(), nullptr,
+                                  nullptr);
     } else {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
