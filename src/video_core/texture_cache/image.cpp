@@ -192,6 +192,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing_num_samples = info.num_samples;
+    backing_epoch = backing->state_epoch;
     backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
     backing->image.Create(image_ci);
 
@@ -278,7 +279,7 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
         last_state.pl_stage |= backing->subres_stage_union;
         subresource_states.clear();
         backing->subres_stage_union = {};
-        ++backing->state_epoch;
+        BumpStateEpoch();
         partially_transited = false;
     }
     // A partial transition into the state the whole image is already in would
@@ -374,7 +375,7 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
-                    ++backing->state_epoch;
+                    BumpStateEpoch();
                     Skipcache::Framework::Instance().BumpLayoutGen();
                 }
             }
@@ -390,7 +391,7 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
             subresource_states.clear();
             backing->subres_divergent = 0;
             backing->subres_stage_union = {};
-            ++backing->state_epoch;
+            BumpStateEpoch();
         }
     } else { // Full resource transition
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
@@ -430,7 +431,7 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
     }
     if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
         last_state.pl_stage != dst_stage) {
-        ++backing->state_epoch;
+        BumpStateEpoch();
     }
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
@@ -980,6 +981,7 @@ void Image::SetBackingSamples(u32 num_samples, bool copy_backing) {
 
     backing = new_backing;
     backing_num_samples = new_backing->num_samples;
+    backing_epoch = backing->state_epoch;
 }
 
 } // namespace VideoCore

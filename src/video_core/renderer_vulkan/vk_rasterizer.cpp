@@ -60,6 +60,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
     bind_prefetch_ = EmulatorSettings.IsBindLinePrefetch();
+    bind_noop_ = texture_cache.BindNoopMemo();
     if (EmulatorSettings.IsGuestCopyHoldSegment()) {
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
@@ -826,6 +827,13 @@ void Rasterizer::OnSubmit() {
                          bindpf_img_, bindpf_backing_);
                 bindpf_img_ = bindpf_backing_ = 0;
             }
+            if (bind_noop_) {
+                const auto bn = texture_cache.DrainBindNoopStats();
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] BINDNOOP hits={} slow={} records={} zero={} per300f",
+                         bindnoop_hits_, bindnoop_slow_, bn.records, bn.zero);
+                bindnoop_hits_ = bindnoop_slow_ = 0;
+            }
             const auto ft = texture_cache.DrainFindTouchStats();
             if (ft.consumed) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] FINDTOUCH consumed={} locks={} per300f",
@@ -1398,7 +1406,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 __builtin_prefetch(&image->backing, 0, 3);
                 ++bindpf_img_;
-                if (desc.memo_backing) {
+                // Under the bind no-op memo the state line is read only on a
+                // memo miss, so it is not warmed.
+                if (!bind_noop_ && desc.memo_backing) {
                     __builtin_prefetch(&desc.memo_backing->state, 0, 3);
                     ++bindpf_backing_;
                 }
@@ -1424,6 +1434,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             auto& image = texture_cache.GetImage(image_id);
             const vk::ImageView image_view = texture_cache.FindTexture(image_id, desc);
+            vk::ImageLayout bound_layout;
 
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
@@ -1440,24 +1451,41 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                        : vk::AccessFlagBits2::eColorAttachmentWrite |
                                              vk::AccessFlagBits2::eColorAttachmentRead),
                               {});
+                bound_layout = image.backing->state.layout;
+            } else if (is_storage) {
+                image.Transit(vk::ImageLayout::eGeneral,
+                              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                              desc.view_info.range);
+                bound_layout = image.backing->state.layout;
             } else {
-                if (is_storage) {
-                    image.Transit(vk::ImageLayout::eGeneral,
-                                  vk::AccessFlagBits2::eShaderRead |
-                                      vk::AccessFlagBits2::eShaderWrite,
-                                  desc.view_info.range);
+                const auto new_layout = image.info.props.is_depth
+                                            ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                            : vk::ImageLayout::eShaderReadOnlyOptimal;
+                // A no-op recorded under the backing's current epoch repeats,
+                // and the layout recorded with it is the one the backing still
+                // holds. The compare is against the live image: a rebind
+                // re-resolve leaves the memo backing on another image.
+                if (bind_noop_ && desc.memo_bind_epoch != 0 &&
+                    desc.memo_bind_epoch == image.backing_epoch &&
+                    desc.memo_backing == image.backing) {
+                    bound_layout = desc.memo_bind_layout;
+                    ++bindnoop_hits_;
                 } else {
-                    const auto new_layout = image.info.props.is_depth
-                                                ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                : vk::ImageLayout::eShaderReadOnlyOptimal;
                     image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead,
                                   desc.view_info.range);
+                    bound_layout = image.backing->state.layout;
+                    if (bind_noop_) {
+                        if (desc.memo_slot != VideoCore::TextureCache::ImageDesc::NoMemoSlot) {
+                            texture_cache.RecordBindNoop(image_id, desc, new_layout);
+                        }
+                        ++bindnoop_slow_;
+                    }
                 }
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, image_view, image.backing->state.layout);
+            image_infos.emplace_back(VK_NULL_HANDLE, image_view, bound_layout);
         }
     }
 

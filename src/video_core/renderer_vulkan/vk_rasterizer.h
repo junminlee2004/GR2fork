@@ -219,6 +219,9 @@ private:
     }
     u64 bindpf_img_{};
     u64 bindpf_backing_{};
+    bool bind_noop_{};
+    u64 bindnoop_hits_{};
+    u64 bindnoop_slow_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms
 
     // BindingSkip LEARNING probe state (observation snapshot, not a cache).

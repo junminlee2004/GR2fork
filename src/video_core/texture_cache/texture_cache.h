@@ -97,6 +97,8 @@ public:
         vk::ImageView memo_view{};
         const Image::BackingImage* memo_backing{};
         u16 memo_slot{NoMemoSlot};
+        u64 memo_bind_epoch{};
+        vk::ImageLayout memo_bind_layout{};
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc,
@@ -491,6 +493,10 @@ private:
         vk::ImageView view_handle{};
         alignas(64) u64 access_tick{};
         u64 lru_tick{};
+        // Backing epoch at which a shader-read transit of this view was a
+        // no-op (0 = none) and the descriptor layout the backing held then.
+        u64 bind_epoch{};
+        vk::ImageLayout bind_layout{};
     };
     static_assert(sizeof(FindImageMemoEntry) == 192);
     static_assert(offsetof(FindImageMemoEntry, view_info) == 64);
@@ -526,6 +532,21 @@ public:
         findimg_evictions_ = 0;
         return out;
     }
+    bool BindNoopMemo() const noexcept {
+        return bind_noop;
+    }
+    struct BindNoopStats {
+        u64 records;
+        u64 zero;
+    };
+    BindNoopStats DrainBindNoopStats() {
+        const BindNoopStats out{bind_noop_records_, bind_noop_zero_};
+        bind_noop_records_ = bind_noop_zero_ = 0;
+        return out;
+    }
+    /// Records, for a binding that just took the slow transit path, whether a
+    /// shader-read transit is a no-op under the backing's current epoch.
+    void RecordBindNoop(ImageId image_id, const ImageDesc& desc, vk::ImageLayout dst_layout);
     FindTouchStats DrainFindTouchStats() {
         const FindTouchStats out{findimg_consumed_, findimg_touch_locks_};
         findimg_consumed_ = findimg_touch_locks_ = 0;
@@ -576,8 +597,13 @@ private:
     bool view_memo;              // latched once at construction
     bool sampler_lockfree;       // latched once at construction
     bool findimg_touch_lockfree; // latched once at construction
-    u32 memo_ways;               // findimg_memo_ways, clamped to 0/1/2/4 at construction
-    u32 memo_set_shift;          // 64 - log2(sets): the mixed T# key's top bits index the set
+    bool bind_noop;              // latched once at construction; needs view_memo
+    u64 bind_noop_records_{};
+    u64 bind_noop_zero_{};
+    bool MemoEntryMatches(const FindImageMemoEntry& e, const ImageDesc& desc,
+                          ImageId image_id) const;
+    u32 memo_ways;      // findimg_memo_ways, clamped to 0/1/2/4 at construction
+    u32 memo_set_shift; // 64 - log2(sets): the mixed T# key's top bits index the set
     std::array<u64, 4> findimg_way_hits_{};
     u64 findimg_evictions_{};
     u64 findimg_consumed_{};

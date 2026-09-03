@@ -139,6 +139,11 @@ struct Image {
     /// state epoch emits nothing. Probing it BEFORE the body's divergent
     /// collapse is sound because every path that makes the collapse
     /// applicable bumps state_epoch, which misses this memo.
+    static constexpr vk::PipelineStageFlags2 kShaderReadStages =
+        vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+    void BumpStateEpoch() {
+        backing_epoch = ++backing->state_epoch;
+    }
     bool BarriersNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                       vk::PipelineStageFlags2 dst_stage,
                       const std::optional<SubresourceRange>& subres_range) const {
@@ -169,8 +174,7 @@ struct Image {
             (dst_mask == vk::AccessFlagBits2::eTransferRead ||
              dst_mask == vk::AccessFlagBits2::eTransferWrite)
                 ? vk::PipelineStageFlagBits2::eTransfer
-                : vk::PipelineStageFlagBits2::eAllGraphics |
-                      vk::PipelineStageFlagBits2::eComputeShader;
+                : kShaderReadStages;
         if (BarriersNoop(dst_layout, dst_mask, dst_pl_stage, range)) {
             return;
         }
@@ -291,6 +295,9 @@ public:
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
+    // Mirror of backing->state_epoch: every bump and backing switch writes it,
+    // so the bind path compares it on this line instead of the backing's.
+    u64 backing_epoch{};
     // Mirror of backing->num_samples: FindView's per-bind sample check read
     // the LAST field of the 528-byte backing, a line nothing else on the draw
     // path touches. Updated wherever backing or its sample count changes.

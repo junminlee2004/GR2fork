@@ -45,10 +45,15 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       view_memo{EmulatorSettings.IsTextureViewMemo()},
       sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
+      bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
           64 - std::countr_zero(u64{FindImageMemoEntries / std::max<u32>(memo_ways, 1u)}))} {
 
+    if (EmulatorSettings.IsBindNoopMemo() && !bind_noop) {
+        LOG_WARNING(Render_Vulkan,
+                    "bind no-op memo needs texture_view_memo; the transit probe runs unchanged");
+    }
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
     pressure_gc_samplers = max_samplers * 7 / 8;
@@ -652,6 +657,10 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 desc.memo_view = e.view_handle;
                 desc.memo_backing = e.view_backing;
                 desc.memo_slot = static_cast<u16>(slot);
+                if (bind_noop) {
+                    desc.memo_bind_epoch = e.bind_epoch;
+                    desc.memo_bind_layout = e.bind_layout;
+                }
             }
             return e.image_id;
         }
@@ -695,6 +704,8 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         e.view_info = desc.view_info;
         e.view_handle = vk::ImageView{};
         e.view_backing = nullptr;
+        e.bind_epoch = 0;
+        e.bind_layout = {};
         if (view_memo) {
             desc.memo_slot = static_cast<u16>(slot);
         }
@@ -917,20 +928,17 @@ vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc)
         // getting a handle is dead-written and cleared on the next populate.
         ++view_memo_slow_;
         FindImageMemoEntry& e = find_image_memo_[desc.memo_slot];
-        const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
-                            static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
-        const bool same = e.valid && e.image_id == image_id &&
-                          e.type == static_cast<u8>(desc.type) && e.view_key == view_key &&
-                          e.tsharp_raw == std::bit_cast<std::array<u64, 4>>(desc.deferred_tsharp) &&
-                          e.view_info == desc.view_info;
-        if (same) {
+        if (MemoEntryMatches(e, desc, image_id)) {
             if (e.view_handle && e.view_backing == image.backing && e.view_handle != handle) {
                 VideoCore::Skipcache::Framework::Instance().RecordDivergence(
                     VideoCore::Skipcache::CacheId::FindImage, "memoized view handle mismatch");
                 e.valid = false;
             } else {
+                // Epochs are per backing and each starts at 1, so a recorded
+                // no-op belongs to the backing recorded with it.
                 e.view_handle = handle;
                 e.view_backing = image.backing;
+                e.bind_epoch = 0;
                 ++view_memo_writebacks_;
             }
         }
@@ -1334,6 +1342,33 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         }
     }
     return handle;
+}
+
+bool TextureCache::MemoEntryMatches(const FindImageMemoEntry& e, const ImageDesc& desc,
+                                    ImageId image_id) const {
+    const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
+                        static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
+    return e.valid && e.image_id == image_id && e.type == static_cast<u8>(desc.type) &&
+           e.view_key == view_key &&
+           e.tsharp_raw == std::bit_cast<std::array<u64, 4>>(desc.deferred_tsharp) &&
+           e.view_info == desc.view_info;
+}
+
+void TextureCache::RecordBindNoop(ImageId image_id, const ImageDesc& desc,
+                                  vk::ImageLayout dst_layout) {
+    FindImageMemoEntry& e = find_image_memo_[desc.memo_slot];
+    const Image& image = slot_images[image_id];
+    if (!MemoEntryMatches(e, desc, image_id) || e.view_backing != image.backing) {
+        return;
+    }
+    // A no-op answered now repeats until the backing's epoch moves; the layout
+    // stored with it is the one the descriptor reads.
+    const bool noop = image.BarriersNoop(dst_layout, vk::AccessFlagBits2::eShaderRead,
+                                         Image::kShaderReadStages, desc.view_info.range);
+    e.bind_epoch = noop ? image.backing->state_epoch : 0;
+    e.bind_layout = image.backing->state.layout;
+    ++bind_noop_records_;
+    bind_noop_zero_ += !noop;
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
