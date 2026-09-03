@@ -45,7 +45,7 @@ class TextureCache {
     // Page-table bucket entry. The guest range is copied in at registration
     // (it is immutable while registered), so overlap filtering reads the
     // bucket's contiguous memory instead of chasing each candidate's cold
-    // 752-byte Image struct - the dominant cost of FindImage was that
+    // 768-byte Image struct - the dominant cost of FindImage was that
     // dependent load missing cache once per candidate.
     struct PageImageRef {
         ImageId id;
@@ -389,7 +389,7 @@ public:
                 const ImageId image_id = ref.id;
                 // Dedup against the dense per-image byte array: one warm
                 // cache line covers hundreds of ids, where the old Picked
-                // flag cost a cold load into the 752-byte Image slot per
+                // flag cost a cold load into the 768-byte Image slot per
                 // duplicate and the local list cost a linear scan. Semantics
                 // match the flag exactly, including across nested walks -
                 // bits set by an outer walk stay set until its trailing
@@ -622,6 +622,18 @@ public:
         update_fast_ = update_relock_ = update_full_ = 0;
         return out;
     }
+    struct AddrFilterStats {
+        u64 calls;
+        u64 cands;
+        u64 fast;
+        u64 walk;
+    };
+    AddrFilterStats DrainAddrFilterStats() {
+        const AddrFilterStats out{addr_filter_calls_, addr_filter_cands_, addr_filter_fast_,
+                                  addr_filter_walk_};
+        addr_filter_calls_ = addr_filter_cands_ = addr_filter_fast_ = addr_filter_walk_ = 0;
+        return out;
+    }
     FindTouchStats DrainFindTouchStats() {
         const FindTouchStats out{findimg_consumed_, findimg_touch_locks_};
         findimg_consumed_ = findimg_touch_locks_ = 0;
@@ -748,6 +760,30 @@ private:
     // Dense dedup bits for ForEachImageInRegion, indexed by ImageId; sized to
     // the slot vector's index capacity at walk start.
     std::vector<u8> image_picked_;
+    // Exact-address filter fields, dense and indexed by ImageId. The filter
+    // read them out of each candidate's Image, where guest_size sits 320 bytes
+    // from the extent and format block, so a candidate cost two cold lines of
+    // a 768-byte slot. Every field is fixed while the image is registered.
+    struct AddrFilter {
+        u32 guest_size;
+        vk::Format pixel_format;
+        u32 type;
+        SubresourceExtent resources;
+        Extent3D size;
+    };
+    static_assert(sizeof(AddrFilter) == 32);
+    // 64-byte storage so no 32-byte record straddles two lines.
+    struct alignas(64) AddrFilterPair {
+        std::array<AddrFilter, 2> records;
+    };
+    std::vector<AddrFilterPair> addr_filter_;
+    AddrFilter& AddrFilterOf(u32 index) {
+        return addr_filter_[index >> 1].records[index & 1];
+    }
+    u64 addr_filter_calls_{};
+    u64 addr_filter_cands_{};
+    u64 addr_filter_fast_{};
+    u64 addr_filter_walk_{};
     alignas(64) std::array<u64, 8> meta_bloom_{};
 };
 

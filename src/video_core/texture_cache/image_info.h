@@ -57,6 +57,8 @@ struct ImageInfo {
     s32 SliceOf(const ImageInfo& info, s32 mip) const;
 
     bool IsCompatible(const ImageInfo& info) const;
+    // Writes guest_size; runs only from the constructors, since the texture
+    // cache mirrors the field into a per-image record while it is registered.
     void UpdateSize();
 
     struct {

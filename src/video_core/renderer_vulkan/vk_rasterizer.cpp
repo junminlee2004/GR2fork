@@ -912,6 +912,11 @@ void Rasterizer::OnSubmit() {
                          bindnoop_hits_, bindnoop_slow_, bn.records, bn.zero);
                 bindnoop_hits_ = bindnoop_slow_ = 0;
             }
+            if (const auto af = texture_cache.DrainAddrFilterStats(); af.calls) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] ADDRFILT calls={} cands={} fast={} walk={} per300f", af.calls,
+                         af.cands, af.fast, af.walk);
+            }
             const auto ft = texture_cache.DrainFindTouchStats();
             if (ft.consumed) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] FINDTOUCH consumed={} locks={} per300f",

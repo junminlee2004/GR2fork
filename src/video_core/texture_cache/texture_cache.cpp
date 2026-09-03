@@ -765,30 +765,42 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // through to the full walk unchanged.
     if (info.guest_size > 0) {
         if (const auto it = images_by_addr.find(info.guest_address); it != images_by_addr.end()) {
+            ++addr_filter_calls_;
+            addr_filter_cands_ += it.value().size();
             ImageId match{};
+            AddrFilter match_rec{};
+            const u32 want_type = static_cast<u32>(info.type);
             for (const ImageId cache_id : it.value()) {
-                const auto& cache_info = slot_images[cache_id].info;
-                if (cache_info.guest_size != info.guest_size) {
+                const AddrFilter rec = AddrFilterOf(cache_id.index);
+                if (rec.guest_size != info.guest_size) {
                     continue;
                 }
-                if (cache_info.size != info.size) {
+                if (rec.size != info.size) {
                     continue;
                 }
-                if (!IsVulkanFormatCompatible(cache_info.pixel_format, info.pixel_format) ||
-                    (cache_info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+                if (!IsVulkanFormatCompatible(rec.pixel_format, info.pixel_format) ||
+                    (rec.type != want_type && info.size != Extent3D{1, 1, 1})) {
                     continue;
                 }
-                if (exact_fmt && info.pixel_format != cache_info.pixel_format) {
+                if (exact_fmt && info.pixel_format != rec.pixel_format) {
                     continue;
                 }
                 match = cache_id;
+                match_rec = rec;
             }
-            if (match && slot_images[match].info.resources >= info.resources) {
+            if (match && match_rec.resources >= info.resources) {
                 Image& image = slot_images[match];
+                DEBUG_ASSERT(image.info.guest_size == match_rec.guest_size &&
+                             image.info.pixel_format == match_rec.pixel_format &&
+                             static_cast<u32>(image.info.type) == match_rec.type &&
+                             image.info.resources == match_rec.resources &&
+                             image.info.size == match_rec.size);
+                ++addr_filter_fast_;
                 image.tick_accessed_last = scheduler.CurrentTick();
                 TouchImage(image, match);
                 return match;
             }
+            ++addr_filter_walk_;
         }
     }
 
@@ -1420,6 +1432,18 @@ void TextureCache::RegisterImage(ImageId image_id) {
                  size = static_cast<u32>(image.info.guest_size)](u64 page) {
                     page_table[page].push_back({image_id, size, addr});
                 });
+    // The record must exist before the id is reachable through the map, which
+    // unlocked readers walk.
+    if (addr_filter_.size() * 2 < slot_images.IndexCapacity()) {
+        addr_filter_.resize((slot_images.IndexCapacity() + 1) / 2);
+    }
+    AddrFilterOf(image_id.index) = AddrFilter{
+        .guest_size = image.info.guest_size,
+        .pixel_format = image.info.pixel_format,
+        .type = static_cast<u32>(image.info.type),
+        .resources = image.info.resources,
+        .size = image.info.size,
+    };
     images_by_addr[image.info.guest_address].push_back(image_id);
     Skipcache::Framework::Instance().BumpTexGen();
 }
