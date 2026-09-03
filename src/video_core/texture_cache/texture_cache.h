@@ -486,6 +486,23 @@ private:
     }
     SHAD_NO_INLINE void TouchImageSlowUnlocked(Image& image, ImageId id);
 
+    // Lock-free tier of UpdateImage: a clean, tracked image touched within the
+    // interval proves the locked pass a no-op. Callers gate on image_fast_state.
+    static constexpr u64 kTouchIntervalTicks = 8192;
+    bool UpdateImageFast(const Image& image, u64 now_tick) {
+        const u64 fast = image.ReadFastState();
+        const bool dirty = (fast & Image::kFastStateDirty) != 0;
+        const bool tracked = (fast & Image::kFastStateTracked) != 0;
+        const u64 last_tick = fast >> Image::kFastStateTouchShift;
+        if (dirty || !tracked || now_tick - last_tick > kTouchIntervalTicks) {
+            return false;
+        }
+        update_fast_ += image_update_direct;
+        return true;
+    }
+    void UpdateImage(Image& image, ImageId image_id);
+    void UpdateImageSlow(ImageId image_id, u64 now_tick);
+
     /// Overlap resolution, validation, and creation for FindImage when no
     /// accepted perfect match exists. Requires the cache mutex to be held.
     SHAD_NO_INLINE ImageId FindImageSlow(ImageDesc& desc, bool exact_fmt, ImageId image_id,

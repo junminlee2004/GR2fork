@@ -915,8 +915,8 @@ vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc)
             download_images.emplace(image_id);
         }
     }
-    if (desc.type == BindingType::Storage) {
-        UpdateImage(image_id);
+    if (desc.type == BindingType::Storage || image_update_direct) {
+        UpdateImage(image, image_id);
     } else {
         MaybeUpdateImage(image_id);
     }
@@ -962,7 +962,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
-    UpdateImage(image_id);
+    UpdateImage(image, image_id);
 
     // Register meta data for this color buffer
     if (desc.Info().meta_info.cmask_addr) {
@@ -986,7 +986,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
-    UpdateImage(image_id);
+    UpdateImage(image, image_id);
 
     // Register meta data for this depth buffer
     if (desc.Info().meta_info.htile_addr) {
@@ -1026,14 +1026,26 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
+// The lock-free tier runs per image binding per draw; every path that dirties
+// or untracks an image marks the fast state, so a clean read proves the locked
+// pass a no-op. The image_fast_state toggle latched at construction gates it.
+void TextureCache::UpdateImage(Image& image, ImageId image_id) {
+    const u64 now_tick = scheduler.CurrentTick();
+    if (!image_fast_state || !UpdateImageFast(image, now_tick)) {
+        UpdateImageSlow(image_id, now_tick);
+    }
+}
+
 void TextureCache::UpdateImage(ImageId image_id) {
-    // Lock-free fast path: this runs per image binding per draw and most calls
-    // find the image clean, tracked and recently touched; the lock alone is a
-    // measurable share of L1 misses on handheld cache hierarchies. Every path
-    // that dirties or (partially) untracks an image marks the fast state, so
-    // a clean read here proves the full pass would be a no-op. Gated on the
-    // image_fast_state toggle latched at construction; when it is off this is
-    // exactly the plain locked pass.
+    const u64 now_tick = scheduler.CurrentTick();
+    if (image_fast_state && slot_images.is_allocated(image_id) &&
+        UpdateImageFast(slot_images[image_id], now_tick)) {
+        return;
+    }
+    UpdateImageSlow(image_id, now_tick);
+}
+
+void TextureCache::UpdateImageSlow(ImageId image_id, u64 now_tick) {
     if (!image_fast_state) {
         std::scoped_lock lock{mutex};
         Image& image = slot_images[image_id];
@@ -1041,18 +1053,6 @@ void TextureCache::UpdateImage(ImageId image_id) {
         TouchImage(image, image_id);
         RefreshImage(image);
         return;
-    }
-    const u64 now_tick = scheduler.CurrentTick();
-    constexpr u64 kTouchIntervalTicks = 8192;
-    if (slot_images.is_allocated(image_id)) {
-        const u64 fast = slot_images[image_id].ReadFastState();
-        const bool dirty = (fast & Image::kFastStateDirty) != 0;
-        const bool tracked = (fast & Image::kFastStateTracked) != 0;
-        const u64 last_tick = fast >> Image::kFastStateTouchShift;
-        if (!dirty && tracked && now_tick - last_tick <= kTouchIntervalTicks) {
-            update_fast_ += image_update_direct;
-            return; // clean, tracked, recently touched: nothing to do
-        }
     }
     // Locked tier: verify under the lock; when the flags are really clean
     // just restamp the fast word, else do the full pass.
