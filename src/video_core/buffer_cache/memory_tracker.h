@@ -488,7 +488,7 @@ public:
                 const VAddr region_base = manager->GetCpuAddr();
                 const VAddr region_end = region_base + TRACKER_HIGHER_PAGE_SIZE;
                 const VAddr win_lo = std::max(window_addr, region_base);
-                const VAddr win_hi = std::min(window_addr + window_size, region_end);
+                const VAddr win_hi = std::min<VAddr>(window_addr + window_size, region_end);
                 const size_t start_page = offset >> TRACKER_PAGE_BITS;
                 const size_t end_page =
                     (offset + query_size + TRACKER_BYTES_PER_PAGE - 1) >> TRACKER_PAGE_BITS;
