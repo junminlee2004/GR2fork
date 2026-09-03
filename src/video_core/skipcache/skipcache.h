@@ -435,6 +435,30 @@ public:
         for (auto& s : desc_delta_) {
             s.valid = false;
         }
+        push_const_.valid = false;
+    }
+
+    struct alignas(64) PushConstSlot {
+        std::array<u64, 16> words;
+        u64 layout;
+        u32 stage_flags;
+        bool valid;
+    };
+    PushConstSlot& PushConstState() {
+        return push_const_;
+    }
+    void CountPushConst(bool hit) {
+        ++push_const_probes_;
+        push_const_hits_ += hit;
+    }
+    struct PushConstStats {
+        u64 probes;
+        u64 hits;
+    };
+    PushConstStats DrainPushConstStats() {
+        const PushConstStats out{push_const_probes_, push_const_hits_};
+        push_const_probes_ = push_const_hits_ = 0;
+        return out;
     }
 
     // Convenience gen bumps (hooks call these; mutate-then-bump discipline is
@@ -508,6 +532,12 @@ private:
     std::array<CacheState, NumCaches> caches_{};
     std::array<DedupEntry, 256> dedup_{};
     std::array<DescDeltaSlot, 2> desc_delta_{};
+    // The last push constant block recorded on the open command buffer.
+    // One slot for both bind points: a push through either layout lands in
+    // the same command buffer storage, so only the latest push is known.
+    PushConstSlot push_const_{};
+    u64 push_const_probes_{};
+    u64 push_const_hits_{};
     std::array<u64, 2> foreign_push_gen_{};
     std::array<u64, 2> foreign_pipeline_gen_{};
     std::array<u8, 16384> desc_delta_scratch_{};

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstring>
@@ -338,7 +339,44 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    static const bool push_const_dedup = EmulatorSettings.IsPushConstDedup();
+    bool push_same = false;
+    if (push_const_dedup) {
+        // A push identical to the last one on this command buffer, through
+        // the same layout, leaves the same bytes in place. The slot is written
+        // either way, so a taken skip stores what the storage already holds.
+        using namespace VideoCore::Skipcache;
+        auto& sc = Framework::Instance();
+        auto& slot = sc.PushConstState();
+        if (sc.Active()) [[likely]] {
+            static_assert(sizeof(push_data) % sizeof(u64) == 0 &&
+                          sizeof(push_data) <= sizeof(slot.words));
+            constexpr size_t kWords = sizeof(push_data) / sizeof(u64);
+            std::array<u64, kWords> words;
+            std::memcpy(words.data(), &push_data, sizeof(push_data));
+            const u64 layout_bits =
+                std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
+            const u32 flag_bits = static_cast<u32>(static_cast<vk::ShaderStageFlags>(stage_flags));
+            u64 diff = 0;
+            for (size_t i = 0; i < kWords; ++i) {
+                diff |= words[i] ^ slot.words[i];
+                slot.words[i] = words[i];
+            }
+            diff |= slot.layout ^ layout_bits;
+            diff |= slot.stage_flags ^ flag_bits;
+            const bool same = slot.valid && diff == 0;
+            slot.layout = layout_bits;
+            slot.stage_flags = flag_bits;
+            slot.valid = true;
+            sc.CountPushConst(same);
+            push_same = same && sc.ActiveMode() != Mode::ValidateOnly;
+        } else {
+            slot.valid = false;
+        }
+    }
+    if (!push_same) {
+        cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    }
 
     // Bind descriptor set.
     if (set_writes.empty()) {

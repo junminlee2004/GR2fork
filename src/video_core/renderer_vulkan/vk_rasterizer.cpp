@@ -958,6 +958,10 @@ void Rasterizer::OnSubmit() {
                          "split={} per300f",
                          dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split);
             }
+            if (const auto pc = skipcache.DrainPushConstStats(); pc.probes) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] PUSHCONST probes={} hits={} per300f",
+                         pc.probes, pc.hits);
+            }
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
