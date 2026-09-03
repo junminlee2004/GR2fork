@@ -795,6 +795,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // Latched before WarmUp so deserialized permutations get signatures computed.
     spec_fp_cache = EmulatorSettings.IsSpecFpCache();
     shader_params_memo = EmulatorSettings.IsShaderParamsMemo();
+    if (const u32 want = EmulatorSettings.GetShaderParamsMemoEntries(); want != 0) {
+        if (!shader_params_memo) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "the binary info table needs shader_params_memo; the search runs unchanged");
+        } else {
+            const u32 n = std::bit_ceil(std::min(want, 4096u));
+            identity_table.resize(n);
+            identity_table_mask = n - 1;
+        }
+    }
     if (const u32 canonical = EmulatorSettings.GetSpecFpCanonical(); canonical != 0) {
         if (canonical > 2) {
             LOG_WARNING(Render_Vulkan,
@@ -1015,9 +1026,12 @@ void PipelineCache::DumpProgramIdentityStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] PGMID map_hits={} map_probes={} params_hits={} params_misses={} per300f",
-             pgmid_map_hits, pgmid_map_probes, params_hits, params_misses);
+             "[SkipCache] PGMID map_hits={} map_probes={} params_hits={} params_misses={} "
+             "table_hits={} table_misses={} pf={} per300f",
+             pgmid_map_hits, pgmid_map_probes, params_hits, params_misses, params_table_hits,
+             params_table_misses, params_prefetches);
     pgmid_map_hits = pgmid_map_probes = params_hits = params_misses = 0;
+    params_table_hits = params_table_misses = params_prefetches = 0;
 }
 
 void PipelineCache::DumpKeyReuseStats() {
@@ -1172,6 +1186,27 @@ Shader::ShaderParams PipelineCache::ResolveParams(LogicalStage l_stage, const Pg
     }
     auto& id = stage_identity[static_cast<u32>(l_stage)];
     const u32* const code = pgm.template Address<u32*>();
+    if (code && id.code != code && !identity_table.empty()) {
+        // The front carries the program the last resolve found for it; keep it
+        // before the front is replaced, then try the table's entry for this
+        // address. A hit is accepted only on the search's own anchors: the
+        // token and the trailer position prove the entry's hash line is the
+        // one the search would read, and the re-read below validates it. A
+        // written-back entry always has hash == program_hash, so a failed
+        // re-read carries a program the resolve of the new hash rejects.
+        if (id.code) {
+            identity_table[IdentitySlot(id.code)].id = id;
+        }
+        const auto& e = identity_table[IdentitySlot(code)].id;
+        if (e.code == code && code[0] == 0xBEEB03FF &&
+            e.hash_ptr ==
+                &std::bit_cast<const AmdGpu::BinaryInfo*>(code + (code[1] + 1) * 2)->shader_hash) {
+            id = e;
+            ++params_table_hits;
+        } else {
+            ++params_table_misses;
+        }
+    }
     if (code && id.code == code) {
         // memcpy: on the linear-scan branch the BinaryInfo is only 4-byte aligned.
         u64 hash;
@@ -1236,6 +1271,23 @@ bool PipelineCache::RefreshGraphicsStages() {
 
     infos.fill(nullptr);
     modules.fill(nullptr);
+
+    if (!identity_table.empty() &&
+        regs.stage_enable.raw == static_cast<u32>(AmdGpu::ShaderStageEnable::VgtStages::Vs)) {
+        // The Vertex lines are demanded after the Fragment resolve: the code
+        // start by the token check or the search, the remembered hash line by
+        // the re-read when the front or the table names this program.
+        if (const u32* code = regs.vs_program.Address<u32*>()) {
+            const auto& vid = stage_identity[static_cast<u32>(LogicalStage::Vertex)];
+            const auto& e = identity_table[IdentitySlot(code)].id;
+            const StageIdentity* known = vid.code == code ? &vid : e.code == code ? &e : nullptr;
+            __builtin_prefetch(code, 0, 3);
+            if (known) {
+                __builtin_prefetch(known->hash_ptr, 0, 3);
+            }
+            ++params_prefetches;
+        }
+    }
 
     bind_stage(Stage::Fragment, LogicalStage::Fragment);
 

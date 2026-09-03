@@ -363,6 +363,22 @@ private:
     };
     std::array<StageIdentity, MaxShaderStages> stage_identity{};
     bool shader_params_memo{};
+    // Direct-mapped table behind stage_identity, indexed by the code address:
+    // a program a stage returns to resolves from it, validated by the search's
+    // own anchors and the hash re-read. Empty unless the entries setting is set.
+    struct alignas(64) IdentityEntry {
+        StageIdentity id;
+    };
+    std::vector<IdentityEntry> identity_table{};
+    u32 identity_table_mask{};
+    u64 params_table_hits{};
+    u64 params_table_misses{};
+    u64 params_prefetches{};
+    u32 IdentitySlot(const u32* code) const noexcept {
+        return static_cast<u32>(
+                   ((reinterpret_cast<uintptr_t>(code) >> 8) * 0x9E3779B97F4A7C15ull) >> 40) &
+               identity_table_mask;
+    }
     u64 pgmid_map_hits{};
     u64 pgmid_map_probes{};
     u64 params_hits{};
