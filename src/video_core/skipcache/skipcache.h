@@ -115,13 +115,17 @@ constexpr const char* StateName(State s) {
 // Lanes that certify classes of external mutation when unchanged. reg_stamp
 // (GPU-thread, lives in the Liverpool parser) joins via the DrawToken.
 struct ValidityGens {
-    std::atomic<u64> mem_gen{1};  // host-guest-memory writes incl. emulator-internal downloads
-    std::atomic<u64> tex_gen{1};  // texture-cache identity/lifecycle
-    std::atomic<u64> pipe_gen{1}; // pipeline object destroyed/replaced
-    u64 img_dirty_gen{1};         // GPU-thread confined: GPU-side image dirtying
-    u64 layout_gen{1};            // GPU-thread confined: any image layout/backing state write
-    u64 meta_gen{1};              // GPU-thread confined: real CMASK/HTILE arm/disarm changes
+    // mem_gen is bumped from guest threads on every fault; tex_gen and
+    // pipe_gen move a few times per frame from either thread; the rest are
+    // GPU-thread stores. The guest-hot counter owns a line of its own.
+    alignas(64) std::atomic<u64> mem_gen{1}; // host-guest-memory writes incl. internal downloads
+    alignas(64) std::atomic<u64> tex_gen{1}; // texture-cache identity/lifecycle
+    std::atomic<u64> pipe_gen{1};            // pipeline object destroyed/replaced
+    u64 img_dirty_gen{1};                    // GPU-thread confined: GPU-side image dirtying
+    u64 layout_gen{1}; // GPU-thread confined: any image layout/backing state write
+    u64 meta_gen{1};   // GPU-thread confined: real CMASK/HTILE arm/disarm changes
 };
+static_assert(sizeof(ValidityGens) == 128);
 
 struct DrawToken {
     u64 reg_stamp;
