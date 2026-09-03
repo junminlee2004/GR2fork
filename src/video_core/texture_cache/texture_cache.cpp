@@ -46,10 +46,15 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
+      image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
           64 - std::countr_zero(u64{FindImageMemoEntries / std::max<u32>(memo_ways, 1u)}))} {
 
+    if (EmulatorSettings.IsImageUpdateDirect() && !image_update_direct) {
+        LOG_WARNING(Render_Vulkan,
+                    "direct image updates need image_fast_state; the dedup probe runs unchanged");
+    }
     if (EmulatorSettings.IsBindNoopMemo() && !bind_noop) {
         LOG_WARNING(Render_Vulkan,
                     "bind no-op memo needs texture_view_memo; the transit probe runs unchanged");
@@ -1039,6 +1044,7 @@ void TextureCache::UpdateImage(ImageId image_id) {
         const bool tracked = (fast & Image::kFastStateTracked) != 0;
         const u64 last_tick = fast >> Image::kFastStateTouchShift;
         if (!dirty && tracked && now_tick - last_tick <= kTouchIntervalTicks) {
+            update_fast_ += image_update_direct;
             return; // clean, tracked, recently touched: nothing to do
         }
     }
@@ -1054,9 +1060,11 @@ void TextureCache::UpdateImage(ImageId image_id) {
     const bool needs_refresh = True(image.flags & ImageFlagBits::Dirty) || !tracked_ok();
     const bool needs_touch = now_tick - image.tick_accessed_last > kTouchIntervalTicks;
     if (!needs_refresh && !needs_touch) {
+        update_relock_ += image_update_direct;
         image.UpdateFastState(now_tick, true);
         return;
     }
+    update_full_ += image_update_direct;
     TrackImage(image_id);
     TouchImage(image);
     RefreshImage(image);
@@ -1070,7 +1078,8 @@ void TextureCache::MaybeUpdateImage(ImageId image_id) {
     using namespace VideoCore::Skipcache;
     auto& sc = Framework::Instance();
     constexpr auto kCache = CacheId::UpdateImageDedup;
-    if (!sc.Active() || !sc.ShouldProbe(kCache)) {
+    // The bool first: ShouldProbe advances the Learning burst counters.
+    if (image_update_direct || !sc.Active() || !sc.ShouldProbe(kCache)) {
         UpdateImage(image_id);
         return;
     }

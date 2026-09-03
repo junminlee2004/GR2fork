@@ -547,6 +547,16 @@ public:
     /// Records, for a binding that just took the slow transit path, whether a
     /// shader-read transit is a no-op under the backing's current epoch.
     void RecordBindNoop(ImageId image_id, const ImageDesc& desc, vk::ImageLayout dst_layout);
+    struct ImageUpdateStats {
+        u64 fast;
+        u64 relock;
+        u64 full;
+    };
+    ImageUpdateStats DrainImageUpdateStats() {
+        const ImageUpdateStats out{update_fast_, update_relock_, update_full_};
+        update_fast_ = update_relock_ = update_full_ = 0;
+        return out;
+    }
     FindTouchStats DrainFindTouchStats() {
         const FindTouchStats out{findimg_consumed_, findimg_touch_locks_};
         findimg_consumed_ = findimg_touch_locks_ = 0;
@@ -598,6 +608,10 @@ private:
     bool sampler_lockfree;       // latched once at construction
     bool findimg_touch_lockfree; // latched once at construction
     bool bind_noop;              // latched once at construction; needs view_memo
+    bool image_update_direct;    // latched once at construction; needs image_fast_state
+    u64 update_fast_{};
+    u64 update_relock_{};
+    u64 update_full_{};
     u64 bind_noop_records_{};
     u64 bind_noop_zero_{};
     bool MemoEntryMatches(const FindImageMemoEntry& e, const ImageDesc& desc,
