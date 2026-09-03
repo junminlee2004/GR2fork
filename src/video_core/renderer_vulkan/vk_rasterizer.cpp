@@ -863,8 +863,10 @@ void Rasterizer::OnSubmit() {
             const auto wr = buffer_cache.DrainWrittenRangeStats();
             if (wr.binds) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WRANGE binds={} fresh={} hits={} adds={} shrinks={} per300f",
-                         wr.binds, wr.fresh, wr.hits, wr.adds, wr.shrinks);
+                         "[SkipCache] WRANGE binds={} fresh={} hits={} adds={} shrinks={} folds={} "
+                         "folded={} full={} direct={} per300f",
+                         wr.binds, wr.fresh, wr.hits, wr.adds, wr.shrinks, wr.folds, wr.folded,
+                         wr.full, wr.direct);
             }
             const auto ds = buffer_cache.DrainDmaSyncStats();
             if (ds.calls) {

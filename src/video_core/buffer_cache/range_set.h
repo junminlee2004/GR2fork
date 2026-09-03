@@ -35,6 +35,18 @@ struct RangeSet {
         m_ranges_set.add(interval);
     }
 
+    using Iterator = typename IntervalSet::iterator;
+    Iterator End() {
+        return m_ranges_set.end();
+    }
+    /// Hinted insert for ascending batches: returns the node holding the
+    /// added interval, which is the hint for the next one.
+    Iterator Add(Iterator hint, VAddr base_address, size_t size) {
+        const VAddr end_address = base_address + size;
+        IntervalType interval{base_address, end_address};
+        return m_ranges_set.add(hint, interval);
+    }
+
     void Subtract(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};

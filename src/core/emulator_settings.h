@@ -540,7 +540,9 @@ struct GPUSettings {
     Setting<bool> stream_copy_resolved_epoch{false};
     // Written binds: 1 skips the range-set containment probe when the mark set
     // a GPU-clean page; 2 adds a memo of ranges proven contained, cleared by
-    // every download subtract. Higher values act as 2.
+    // every download subtract; 3 defers the adds to a per-region pending log
+    // that the next reader of an overlapping range folds in. Higher values act
+    // as 3.
     Setting<u32> written_range_fast{0};
     // Compare the gathered specialization key against its per-stage slot and
     // store it in one pass. Needs spec_fp_canonical 2.

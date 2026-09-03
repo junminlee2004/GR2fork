@@ -49,7 +49,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
-    written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 2);
+    written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
+    if (written_range_mode_ >= 3) {
+        pending_batch_.reserve(PendingLaneCapacity);
+    }
     if (written_range_mode_ >= 2) {
         written_range_memo_ =
             std::make_unique<std::array<std::array<WrittenRangeEntry, 2>, WrittenRangeSets>>();
@@ -435,6 +438,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     // used here: its reclamation tracks GPU ticks only, and the bytes must
     // survive on the host until the faulting thread has consumed them.
     u64 total_size_bytes = 0;
+    FoldPendingRanges(window_start, window_end - window_start);
     memory_tracker->ForEachDownloadRange<false>(
         window_start, window_end - window_start, [&](u64 device_addr_out, u64 range_size) {
             const VAddr buffer_addr = buffer.CpuAddr();
@@ -557,7 +561,7 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         // and the range set stay in lockstep. New dirty coverage expires the
         // GPU-clean epoch, per the protocol at every other Add site.
         if (memory_tracker->IsRegionGpuModified(copy_device_addr, copy.size) &&
-            !gpu_modified_ranges.Contains(copy_device_addr, copy.size)) {
+            !GpuModifiedRangesContain(copy_device_addr, copy.size)) {
             ++gpu_dirty_generation_;
             gpu_modified_ranges.Add(copy_device_addr, copy.size);
         }
@@ -606,6 +610,7 @@ template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
+    FoldPendingRanges(device_addr, size);
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
             const VAddr buffer_addr = buffer.CpuAddr();
@@ -1064,9 +1069,9 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
-        if (!gpu_modified_ranges.Contains(dst, num_bytes)) {
+        if (!GpuModifiedRangesContain(dst, num_bytes)) {
             ++gpu_dirty_generation_;
-            gpu_modified_ranges.Add(dst, num_bytes);
+            AddWrittenRange(dst, num_bytes);
         }
         return buffer;
     }();
@@ -1142,6 +1147,8 @@ static size_t RangeMemoIndex(VAddr addr, u32 size, size_t sets) noexcept {
 
 // Every shrinking access to gpu_modified_ranges goes through here: the
 // covered-range memo certifies containment only while this counter holds.
+// Callers fold the pending lanes over the window before the enumeration that
+// precedes every subtract.
 void BufferCache::SubtractGpuModifiedRange(VAddr addr, u64 size) {
     ++written_shrinks_;
     if (written_range_mode_ >= 2 && ++gpu_range_shrink_gen_ == 0) {
@@ -1149,6 +1156,68 @@ void BufferCache::SubtractGpuModifiedRange(VAddr addr, u64 size) {
         gpu_range_shrink_gen_ = 1;
     }
     gpu_modified_ranges.Subtract(addr, size);
+}
+
+void BufferCache::AddWrittenRange(VAddr addr, u64 size) {
+    // A range crossing a region boundary goes straight to the set: a download
+    // folds only the lanes of its own regions.
+    const bool straddles = ((addr ^ (addr + size - 1)) >> TRACKER_HIGHER_PAGE_BITS) != 0;
+    if (written_range_mode_ < 3 || straddles) {
+        pending_direct_ += written_range_mode_ >= 3;
+        gpu_modified_ranges.Add(addr, size);
+        return;
+    }
+    auto& lane = pending_lanes_[(addr >> TRACKER_HIGHER_PAGE_BITS) & (PendingLanes - 1)];
+    if (!lane.empty() && lane.back().addr == addr && lane.back().size == size) {
+        return;
+    }
+    if (lane.size() == PendingLaneCapacity) {
+        ++pending_full_;
+        FoldLane(lane, 0, ~VAddr{0});
+    }
+    lane.push_back({addr, size});
+}
+
+void BufferCache::FoldLane(std::vector<PendingRange>& lane, VAddr lo, VAddr hi) {
+    const auto rest = std::ranges::partition(
+        lane, [&](const PendingRange& e) { return e.addr < hi && lo < e.addr + e.size; });
+    pending_batch_.assign(lane.begin(), rest.begin());
+    lane.erase(lane.begin(), rest.begin());
+    if (pending_batch_.empty()) {
+        return;
+    }
+    std::ranges::sort(pending_batch_, {},
+                      [](const PendingRange& e) { return std::pair{e.addr, e.size}; });
+    const auto dup =
+        std::ranges::unique(pending_batch_, [](const PendingRange& a, const PendingRange& b) {
+            return a.addr == b.addr && a.size == b.size;
+        });
+    pending_batch_.erase(dup.begin(), dup.end());
+    auto hint = gpu_modified_ranges.End();
+    for (const PendingRange& e : pending_batch_) {
+        hint = gpu_modified_ranges.Add(hint, e.addr, e.size);
+    }
+    ++pending_folds_;
+    pending_folded_ += pending_batch_.size();
+}
+
+void BufferCache::FoldPendingRanges(VAddr addr, u64 size) {
+    if (written_range_mode_ < 3 || size == 0) {
+        return;
+    }
+    const u64 first = addr >> TRACKER_HIGHER_PAGE_BITS;
+    const u64 count =
+        std::min<u64>(((addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS) - first + 1, PendingLanes);
+    for (u64 i = 0; i < count; ++i) {
+        if (auto& lane = pending_lanes_[(first + i) & (PendingLanes - 1)]; !lane.empty()) {
+            FoldLane(lane, addr, addr + size);
+        }
+    }
+}
+
+bool BufferCache::GpuModifiedRangesContain(VAddr addr, u64 size) {
+    FoldPendingRanges(addr, size);
+    return gpu_modified_ranges.Contains(addr, size);
 }
 
 bool BufferCache::WrittenRangeCovered(VAddr addr, u32 size) const {
@@ -1343,10 +1412,17 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         if (written_range_mode_ != 0 && fresh && size != 0) {
             ++written_fresh_;
             ++gpu_dirty_generation_;
-            gpu_modified_ranges.Add(device_addr, size);
+            AddWrittenRange(device_addr, size);
             RecordWrittenRange(device_addr, size);
         } else if (written_range_mode_ >= 2 && WrittenRangeCovered(device_addr, size)) {
             ++written_hits_;
+        } else if (written_range_mode_ >= 3) {
+            if (size != 0) {
+                ++written_adds_;
+                ++gpu_dirty_generation_;
+                AddWrittenRange(device_addr, size);
+                RecordWrittenRange(device_addr, size);
+            }
         } else if (!gpu_modified_ranges.Contains(device_addr, size)) {
             ++written_adds_;
             ++gpu_dirty_generation_;

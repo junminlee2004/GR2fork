@@ -406,6 +406,25 @@ private:
     void SubtractGpuModifiedRange(VAddr addr, u64 size);
     bool WrittenRangeCovered(VAddr addr, u32 size) const;
     void RecordWrittenRange(VAddr addr, u32 size);
+    // Mode 3 appends a written range to the lane of its 4 MB region; a reader
+    // folds the lane entries overlapping its range into the set first, so the
+    // set is exact as the union of tree and lanes.
+    struct PendingRange {
+        VAddr addr;
+        u64 size;
+    };
+    static constexpr size_t PendingLanes = 64;         // region index & 63
+    static constexpr size_t PendingLaneCapacity = 256; // a full lane folds whole
+    std::array<std::vector<PendingRange>, PendingLanes> pending_lanes_;
+    std::vector<PendingRange> pending_batch_; // fold scratch
+    u64 pending_folds_{};
+    u64 pending_folded_{};
+    u64 pending_full_{};
+    u64 pending_direct_{};
+    void AddWrittenRange(VAddr addr, u64 size);
+    void FoldLane(std::vector<PendingRange>& lane, VAddr lo, VAddr hi);
+    void FoldPendingRanges(VAddr addr, u64 size);
+    bool GpuModifiedRangesContain(VAddr addr, u64 size);
 
 public:
     struct WrittenRangeStats {
@@ -414,11 +433,17 @@ public:
         u64 hits;
         u64 adds;
         u64 shrinks;
+        u64 folds;
+        u64 folded;
+        u64 full;
+        u64 direct;
     };
     WrittenRangeStats DrainWrittenRangeStats() {
-        const WrittenRangeStats out{written_binds_, written_fresh_, written_hits_, written_adds_,
-                                    written_shrinks_};
+        const WrittenRangeStats out{written_binds_,  written_fresh_,   written_hits_,
+                                    written_adds_,   written_shrinks_, pending_folds_,
+                                    pending_folded_, pending_full_,    pending_direct_};
         written_binds_ = written_fresh_ = written_hits_ = written_adds_ = written_shrinks_ = 0;
+        pending_folds_ = pending_folded_ = pending_full_ = pending_direct_ = 0;
         return out;
     }
 
