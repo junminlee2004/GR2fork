@@ -212,9 +212,14 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
-    using Result = std::tuple<const Shader::Info*, vk::ShaderModule, FetchShaderRef, u64>;
-    Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
-                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+    /// Resolves the stage's program and publishes its info and module into
+    /// infos[out_slot] and modules[out_slot] (read by the pipeline lookups) and,
+    /// for graphics stages, the fetch shader reference (read by the vertex
+    /// format walk and the graphics pipeline constructor). Returns the
+    /// permutation hash. Compute publishes into slot 0.
+    [[nodiscard]] u64 GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                 const Shader::ShaderParams& params,
+                                 Shader::Backend::Bindings& binding, u32 out_slot);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
