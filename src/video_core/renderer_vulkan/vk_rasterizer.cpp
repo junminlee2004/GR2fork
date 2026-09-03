@@ -831,6 +831,11 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] FINDTOUCH consumed={} locks={} per300f",
                          ft.consumed, ft.locks);
             }
+            if (const auto fw = texture_cache.DrainFindImageWayStats(); fw.ways) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] FINDIMGWAYS ways={} hits={}/{}/{}/{} evict={} per300f",
+                         fw.ways, fw.hits[0], fw.hits[1], fw.hits[2], fw.hits[3], fw.evictions);
+            }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,

@@ -513,6 +513,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU writtenRangeFast: {}", EmulatorSettings.GetWrittenRangeFast());
     LOG_INFO(Config, "GPU specFpSlotInplace: {}", EmulatorSettings.IsSpecFpSlotInplace());
     LOG_INFO(Config, "GPU specFpFront: {}", EmulatorSettings.IsSpecFpFront());
+    LOG_INFO(Config, "GPU findimgMemoWays: {}", EmulatorSettings.GetFindimgMemoWays());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

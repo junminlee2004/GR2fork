@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 
 #include <xxhash.h>
@@ -27,6 +28,12 @@ namespace VideoCore {
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
+namespace {
+constexpr u32 ClampMemoWays(u32 v) {
+    return v == 0 ? 0 : v >= 4 ? 4 : v >= 2 ? 2 : 1;
+}
+} // namespace
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& tracker_)
@@ -37,7 +44,10 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       image_fast_state{EmulatorSettings.IsImageFastState()},
       view_memo{EmulatorSettings.IsTextureViewMemo()},
       sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
-      findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()} {
+      findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
+      memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
+      memo_set_shift{static_cast<u32>(
+          64 - std::countr_zero(u64{FindImageMemoEntries / std::max<u32>(memo_ways, 1u)}))} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -541,30 +551,61 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     const auto raw = std::bit_cast<std::array<u64, 4>>(tsharp);
     const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
                         static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
-    const size_t slot = ((raw[0] >> 8) ^ (raw[0] >> 40) ^ raw[1] ^ view_key) & 1023;
-    FindImageMemoEntry& e = find_image_memo_[slot];
-
+    const u8 type = static_cast<u8>(desc.type);
+    FindImageMemoEntry* set;
+    u32 ways;
+    size_t set_index = 0;
+    if (memo_ways == 0) {
+        set = &find_image_memo_[((raw[0] >> 8) ^ (raw[0] >> 40) ^ raw[1] ^ view_key) & 1023];
+        ways = 1;
+    } else {
+        // Every T# word reaches the set index through its own odd multiplier;
+        // the top bits are taken because a product's low bits see only the low
+        // input bits.
+        const u64 mix = (raw[0] ^ view_key) * 0x9E3779B97F4A7C15ULL +
+                        raw[1] * 0xC2B2AE3D27D4EB4FULL + (raw[2] ^ raw[3]) * 0x165667B19E3779F9ULL;
+        set_index = mix >> memo_set_shift;
+        set = &find_image_memo_[set_index * memo_ways];
+        ways = memo_ways;
+    }
     // Hit predicate: identical T#, same binding class, texture-cache structure
     // untouched since populate (tex_gen covers register/unregister/delete and
     // both rebind arms, so the slot provably was not reused), and the image
-    // itself still carries the recorded identity.
+    // itself still carries the recorded identity. No two valid ways hold the
+    // same key: a populate happens only after no valid way matched.
+    u32 way = 0;
+    while (way < ways && !(set[way].valid && set[way].tsharp_raw == raw && set[way].type == type &&
+                           set[way].view_key == view_key)) {
+        ++way;
+    }
+    const bool matched = way < ways;
     bool would_hit = false;
-    if (!e.valid) {
-        ++ctr.miss_cold;
-    } else if (e.tsharp_raw != raw || e.type != static_cast<u8>(desc.type) ||
-               e.view_key != view_key) {
-        ++ctr.miss_key;
+    if (!matched) {
+        // No valid way holds the key: a free way makes this a cold miss,
+        // otherwise the least recently used way is the conflict victim.
+        way = MemoVictim(set, ways, set_index);
+        if (set[way].valid) {
+            ++ctr.miss_key;
+        } else {
+            ++ctr.miss_cold;
+        }
     } else if (!deferred) {
         ++ctr.veto[1];
-    } else if (e.tex_gen != tex_gen) {
+    } else if (set[way].tex_gen != tex_gen) {
         ++ctr.miss_gen[LaneTex];
     } else {
-        const Image& image = slot_images[e.image_id];
-        if (image.image_uid != e.image_uid || False(image.flags & ImageFlagBits::Registered)) {
+        const Image& image = slot_images[set[way].image_id];
+        if (image.image_uid != set[way].image_uid ||
+            False(image.flags & ImageFlagBits::Registered)) {
             ++ctr.veto[0];
         } else {
             would_hit = true;
         }
+    }
+    FindImageMemoEntry& e = set[way];
+    const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
+    if (matched && ways > 1) {
+        MemoTouch(ways, set_index, way);
     }
     if (timed) {
         ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
@@ -572,6 +613,9 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     }
     if (would_hit) {
         ++ctr.hits;
+        if (memo_ways != 0) {
+            ++findimg_way_hits_[way];
+        }
         if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
             // Consumed hit: replicate the slow path's residual effects - the
             // LRU touch and the overlap view rebase captured at populate.
@@ -640,6 +684,9 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         // Populate with commit re-check: a structural mutation racing the
         // build leaves the entry invalid. The previous occupant's handle
         // never carries over.
+        if (memo_ways != 0 && !matched && e.valid) {
+            ++findimg_evictions_;
+        }
         e.valid = false;
         e.tsharp_raw = raw;
         e.type = static_cast<u8>(desc.type);
@@ -659,6 +706,11 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         if (sc.Gens().tex_gen.load(std::memory_order_acquire) == tex_gen) {
             e.valid = true;
             sc.NotifyPopulated(kCache);
+        }
+        // Touched on every populate, a failed commit included: the order byte
+        // is a permutation only if every way that was written was ranked.
+        if (ways > 1) {
+            MemoTouch(ways, set_index, way);
         }
     }
     return real;
@@ -1565,6 +1617,31 @@ void TextureCache::RunGarbageCollector() {
 
     GarbageCollectImages();
     GarbageCollectSamplers();
+}
+
+// The order byte lists a set's ways two bits per rank, most recent first; the
+// last rank is the victim once every way is valid.
+u32 TextureCache::MemoVictim(const FindImageMemoEntry* set, u32 ways, size_t set_index) const {
+    for (u32 w = 0; w < ways; ++w) {
+        if (!set[w].valid) {
+            return w;
+        }
+    }
+    return ways == 1 ? 0 : (find_image_memo_order_[set_index] >> (2 * (ways - 1))) & 3;
+}
+
+void TextureCache::MemoTouch(u32 ways, size_t set_index, u32 way) {
+    u8& order = find_image_memo_order_[set_index];
+    u8 out = static_cast<u8>(way);
+    u32 rank = 1;
+    for (u32 r = 0; r < ways; ++r) {
+        const u32 v = (order >> (2 * r)) & 3;
+        if (v != way && rank < ways) {
+            out |= static_cast<u8>(v << (2 * rank));
+            ++rank;
+        }
+    }
+    order = out;
 }
 
 void TextureCache::TouchImageSlow(const Image& image) {

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -471,25 +472,35 @@ public:
     }
 
 private:
-    struct FindImageMemoEntry {
+    // Image memo entry: line 0 holds what a probe and a hit read, line 1 what a
+    // consumed hit copies out, line 2 the stamps of the locked touch path.
+    struct alignas(64) FindImageMemoEntry {
         std::array<u64, 4> tsharp_raw{};
         u64 image_uid{};
         u64 tex_gen{};
+        // The view handle FindTexture resolved for this entry on the backing
+        // it names; null until a slow pass wrote it back.
+        const Image::BackingImage* view_backing{};
+        ImageId image_id{};
         u8 type{};
         u8 view_key{}; // is_depth | is_array << 1: the view build's other inputs
         bool valid{};
-        u64 access_tick{};
-        u64 lru_tick{};
-        ImageId image_id{};
         // Post-rebase view info: a consumed hit hands the binding a complete
         // view without rebuilding it, and a verify compares all of it.
-        ImageViewInfo view_info{};
-        // The view handle FindTexture resolved for this entry on the backing
-        // it names; null until a slow pass wrote it back.
+        alignas(64) ImageViewInfo view_info{};
         vk::ImageView view_handle{};
-        const Image::BackingImage* view_backing{};
+        alignas(64) u64 access_tick{};
+        u64 lru_tick{};
     };
-    std::array<FindImageMemoEntry, 1024> find_image_memo_{};
+    static_assert(sizeof(FindImageMemoEntry) == 192);
+    static_assert(offsetof(FindImageMemoEntry, view_info) == 64);
+    static_assert(offsetof(FindImageMemoEntry, access_tick) == 128);
+    static constexpr size_t FindImageMemoEntries = 2048;
+    std::array<FindImageMemoEntry, FindImageMemoEntries> find_image_memo_{};
+    // One byte per set: the ways two bits per rank, most recently used first.
+    std::array<u8, FindImageMemoEntries> find_image_memo_order_{};
+    u32 MemoVictim(const FindImageMemoEntry* set, u32 ways, size_t set_index) const;
+    void MemoTouch(u32 ways, size_t set_index, u32 way);
     u64 view_memo_hits_{};
     u64 view_memo_slow_{};
     u64 view_memo_writebacks_{};
@@ -504,6 +515,17 @@ public:
         u64 consumed;
         u64 locks;
     };
+    struct FindImageWayStats {
+        u32 ways;
+        std::array<u64, 4> hits;
+        u64 evictions;
+    };
+    FindImageWayStats DrainFindImageWayStats() {
+        const FindImageWayStats out{memo_ways, findimg_way_hits_, findimg_evictions_};
+        findimg_way_hits_ = {};
+        findimg_evictions_ = 0;
+        return out;
+    }
     FindTouchStats DrainFindTouchStats() {
         const FindTouchStats out{findimg_consumed_, findimg_touch_locks_};
         findimg_consumed_ = findimg_touch_locks_ = 0;
@@ -554,6 +576,10 @@ private:
     bool view_memo;              // latched once at construction
     bool sampler_lockfree;       // latched once at construction
     bool findimg_touch_lockfree; // latched once at construction
+    u32 memo_ways;               // findimg_memo_ways, clamped to 0/1/2/4 at construction
+    u32 memo_set_shift;          // 64 - log2(sets): the mixed T# key's top bits index the set
+    std::array<u64, 4> findimg_way_hits_{};
+    u64 findimg_evictions_{};
     u64 findimg_consumed_{};
     u64 findimg_touch_locks_{};
     PageTable page_table;
