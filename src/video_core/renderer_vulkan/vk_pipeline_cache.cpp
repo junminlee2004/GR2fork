@@ -787,6 +787,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                        "and dynamic vertex input; the lookup runs unchanged");
         }
     }
+    key_reuse_hash_diff = key_stamp_reuse && EmulatorSettings.IsKeyReuseHashDiff();
+    if (EmulatorSettings.IsKeyReuseHashDiff() && !key_reuse_hash_diff) {
+        LOG_WARNING(Render_Vulkan, "the stage hash accumulator needs pipeline_key_stamp_reuse; "
+                                   "the compare runs unchanged");
+    }
     // Latched before WarmUp so deserialized permutations get signatures computed.
     spec_fp_cache = EmulatorSettings.IsSpecFpCache();
     shader_params_memo = EmulatorSettings.IsShaderParamsMemo();
@@ -922,8 +927,19 @@ bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
     // The stage resolve writes only the stage hashes, the MRT mask and the
     // attachment count (the vertex formats are dynamic here), so those three
     // are the whole compare.
-    if (!RefreshGraphicsStages() || graphics_key.stage_hashes != last_graphics_key.stage_hashes ||
-        graphics_key.mrt_mask != last_graphics_key.mrt_mask ||
+    hash_diff_armed = key_reuse_hash_diff;
+    const bool resolved = RefreshGraphicsStages();
+    hash_diff_armed = false;
+    if (!resolved) {
+        key_is_last = false;
+        ++key_reuse_rebuilds;
+        return false;
+    }
+    const bool stages_changed = key_reuse_hash_diff
+                                    ? stage_hash_diff != 0
+                                    : graphics_key.stage_hashes != last_graphics_key.stage_hashes;
+    key_reuse_diff_decisions += key_reuse_hash_diff;
+    if (stages_changed || graphics_key.mrt_mask != last_graphics_key.mrt_mask ||
         graphics_key.num_color_attachments != last_graphics_key.num_color_attachments) {
         key_is_last = false;
         ++key_reuse_rebuilds;
@@ -1009,9 +1025,11 @@ void PipelineCache::DumpKeyReuseStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] KEYREUSE hits={} rebuilds={} misses={} mismatches={} per300f",
-             key_reuse_hits, key_reuse_rebuilds, key_reuse_stamp_misses, key_reuse_mismatches);
+             "[SkipCache] KEYREUSE hits={} rebuilds={} misses={} mismatches={} hdiff={} per300f",
+             key_reuse_hits, key_reuse_rebuilds, key_reuse_stamp_misses, key_reuse_mismatches,
+             key_reuse_diff_decisions);
     key_reuse_hits = key_reuse_rebuilds = key_reuse_stamp_misses = key_reuse_mismatches = 0;
+    key_reuse_diff_decisions = 0;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -1176,29 +1194,40 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
     fetch_shader_ref = {};
+    if (hash_diff_armed) {
+        stage_hash_diff = 0;
+    }
 
+    // An armed resolve accumulates old ^ new per stage hash it writes, so the
+    // reuse decision never reloads the array right after these stores.
+    const auto store_hash = [&](u32 idx, u64 hash) {
+        if (hash_diff_armed) {
+            stage_hash_diff |= key.stage_hashes[idx] ^ hash;
+        }
+        key.stage_hashes[idx] = hash;
+    };
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
-            key.stage_hashes[stage_out_idx] = 0;
+            store_hash(stage_out_idx, 0);
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto* pgm = regs.ProgramForStage(stage_in_idx);
         if (!pgm || !pgm->Address<u32*>()) {
-            key.stage_hashes[stage_out_idx] = 0;
+            store_hash(stage_out_idx, 0);
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto params = ResolveParams(stage_out, *pgm);
-        FetchShaderRef fetch_ref{};
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_ref,
-                 key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+        auto [info, module, fetch_ref, hash] = GetProgram(stage_in, stage_out, params, binding);
+        infos[stage_out_idx] = info;
+        modules[stage_out_idx] = module;
+        store_hash(stage_out_idx, hash);
         if (fetch_ref) {
             fetch_shader_ref = fetch_ref;
         }

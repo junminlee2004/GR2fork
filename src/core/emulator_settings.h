@@ -592,6 +592,10 @@ struct GPUSettings {
     // fence; the GPU command thread keeps the per-island verdict and the unmark.
     // Islands another job still owns are left out of a new download.
     Setting<bool> readback_writeback_offload{false};
+    // Decides the stamp-keyed key reuse from a running XOR of the stage hashes
+    // the resolve rewrites instead of re-reading the hash array it just stored.
+    // Needs pipeline_key_stamp_reuse.
+    Setting<bool> key_reuse_hash_diff{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -693,6 +697,7 @@ struct GPUSettings {
                                        &GPUSettings::runtime_info_input_memo),
             make_override<GPUSettings>("readback_writeback_offload",
                                        &GPUSettings::readback_writeback_offload),
+            make_override<GPUSettings>("key_reuse_hash_diff", &GPUSettings::key_reuse_hash_diff),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -718,7 +723,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front,
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree,
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share,
-    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload)
+    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload,
+    key_reuse_hash_diff)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -1019,6 +1025,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, VertexInputLazyDesc, vertex_input_lazy_desc)
     SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoInputMemo, runtime_info_input_memo)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackOffload, readback_writeback_offload)
+    SETTING_FORWARD_BOOL(m_gpu, KeyReuseHashDiff, key_reuse_hash_diff)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

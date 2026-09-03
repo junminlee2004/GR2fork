@@ -294,7 +294,11 @@ private:
     // built at. While it repeats, every register-derived field of that key
     // still holds and only the stage resolve reruns (ReuseGraphicsKey).
     u64 last_key_stamp{};
-    bool key_is_last{}; // graphics_key is byte-equal to last_graphics_key
+    bool key_is_last{};     // graphics_key is byte-equal to last_graphics_key
+    u64 stage_hash_diff{};  // OR of (old ^ new) over every stage hash an armed resolve rewrites
+    bool hash_diff_armed{}; // set by the stamp-keyed reuse around its stage resolve
+    bool key_reuse_hash_diff{};
+    u64 key_reuse_diff_decisions{};
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};
