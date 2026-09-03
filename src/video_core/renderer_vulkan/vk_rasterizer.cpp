@@ -777,6 +777,13 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,
                          wb.islands, wb.bytes >> 10);
             }
+            if (const auto wo = buffer_cache.DrainWriteBackOffloadStats();
+                wo.guest + wo.prio + wo.gpucomm) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] WBOFF guest={} prio={} gpucomm={} excluded={} copy_ms={} "
+                         "per300f",
+                         wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
+            }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
                 LOG_INFO(Render_Skipcache,

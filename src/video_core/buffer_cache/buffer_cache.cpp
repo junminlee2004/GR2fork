@@ -5,6 +5,7 @@
 #include <bit>
 #include <chrono>
 #include <optional>
+#include <span>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
@@ -50,6 +51,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
+    writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
     // Latched single-threaded, before any GPU-thread pool operation.
@@ -365,6 +367,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                     scheduler.DeferPriorityOperationAt(
                         deferred->wait_tick,
                         [this, device_addr, size, is_write, job = std::move(deferred)]() mutable {
+                            if (writeback_offload_) {
+                                WriteBackFaultDownload(*job, 1);
+                            }
                             liverpool->SendCommand<false>(
                                 [this, device_addr, size, is_write, job = std::move(job)] {
                                     FinishFaultDownload(*job, device_addr, size, is_write);
@@ -382,6 +387,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
             }
             offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+            if (writeback_offload_) {
+                WriteBackFaultDownload(job, liverpool->OnGpuThread() ? 2 : 0);
+            }
             liverpool->SendCommand<true>(
                 [&] { FinishFaultDownload(job, device_addr, size, is_write); });
             // The faulted range itself may sit outside the vetoed regions, in
@@ -422,6 +430,108 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     });
 }
 
+namespace {
+
+// Emits the sub-intervals of [start, end) that no owned island covers. The
+// islands are sorted and disjoint.
+template <typename Emit>
+void EmitUnownedPieces(VAddr start, VAddr end, std::span<const std::pair<VAddr, u32>> owned,
+                       Emit&& emit) {
+    VAddr cursor = start;
+    for (const auto& [lo, len] : owned) {
+        const VAddr hi = lo + len;
+        if (hi <= cursor) {
+            continue;
+        }
+        if (lo >= end) {
+            break;
+        }
+        if (lo > cursor) {
+            emit(cursor, std::min<VAddr>(lo, end));
+        }
+        cursor = std::max<VAddr>(cursor, hi);
+        if (cursor >= end) {
+            return;
+        }
+    }
+    if (cursor < end) {
+        emit(cursor, end);
+    }
+}
+
+// Page-adjacent write-back islands merged into one pending span and unmarked
+// in a single call, so the page watcher update coalesces the run into one
+// protection change. A merge never crosses a page gap: gap pages may be
+// GPU-dirty outside the download. Islands arrive in ascending address order;
+// an out-of-order island flushes and restarts the span, so the merged range
+// never grows beyond the union of the islands.
+class PendingUnmark {
+public:
+    explicit PendingUnmark(MemoryTracker& tracker_) : tracker{tracker_} {}
+
+    void Add(VAddr addr, u64 size) {
+        const bool adjacent = end != start && addr >= end &&
+                              Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE) <=
+                                  Common::AlignUp(end, TRACKER_BYTES_PER_PAGE);
+        if (!adjacent) {
+            Flush();
+            start = addr;
+        }
+        end = std::max<VAddr>(end, addr + size);
+    }
+
+    void Flush() {
+        if (end != start) {
+            tracker.UnmarkRegionAsGpuModified(start, end - start);
+            start = 0;
+            end = 0;
+        }
+    }
+
+private:
+    MemoryTracker& tracker;
+    VAddr start = 0;
+    VAddr end = 0;
+};
+
+} // namespace
+
+void BufferCache::CollectOwnedIslands(VAddr start, VAddr end, OwnedIslands& out) const {
+    for (const auto& inflight : inflight_downloads_) {
+        if (inflight.hi <= start || inflight.lo >= end) {
+            continue;
+        }
+        for (const auto& island : inflight.islands) {
+            if (island.first < end && island.first + island.second > start) {
+                out.push_back(island);
+            }
+        }
+    }
+    std::ranges::sort(out, {}, &std::pair<VAddr, u32>::first);
+}
+
+void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
+    job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
+    auto* memory = Core::Memory::Instance();
+    const u8* download = job.staging->mapped_data.data();
+    // The hold is per thread; the GPU command thread's own segment hold nests.
+    std::optional<Core::MemoryManager::GuestCopyScope> hold;
+    if (writeback_hold_) {
+        hold.emplace(memory);
+    }
+    const u64 t0 = Common::FencedRDTSC();
+    for (const auto& copy : job.copies) {
+        memory->TryWriteBacking(std::bit_cast<u8*>(job.buffer_base + copy.srcOffset),
+                                download + copy.dstOffset, copy.size);
+        ++job.written_islands;
+        job.written_bytes += copy.size;
+    }
+    job.copy_ns = Common::FencedRDTSC() - t0;
+    hold.reset();
+    job.copier = copier;
+    job.copied = true;
+}
+
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                        bool is_write) {
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
@@ -443,6 +553,13 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     // survive on the host until the faulting thread has consumed them.
     u64 total_size_bytes = 0;
     FoldPendingRanges(window_start, window_end - window_start);
+    // An island another readback still owns keeps its range-set entry and its
+    // GPU bits: the owner's second hop settles it.
+    OwnedIslands owned;
+    if (writeback_offload_) {
+        CollectOwnedIslands(window_start, window_end, owned);
+        wboff_excluded_ += owned.size();
+    }
     memory_tracker->ForEachDownloadRange<false>(
         window_start, window_end - window_start, [&](u64 device_addr_out, u64 range_size) {
             const VAddr buffer_addr = buffer.CpuAddr();
@@ -459,8 +576,18 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
                 constexpr u64 mask = ~(align - 1ULL);
                 total_size_bytes += (new_size + align - 1) & mask;
             };
-            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            SubtractGpuModifiedRange(device_addr_out, range_size);
+            if (owned.empty()) {
+                gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+                SubtractGpuModifiedRange(device_addr_out, range_size);
+                return;
+            }
+            gpu_modified_ranges.ForEachInRange(
+                device_addr_out, range_size, [&](VAddr start, VAddr end) {
+                    EmitUnownedPieces(start, end, owned, [&](VAddr piece_start, VAddr piece_end) {
+                        add_download(piece_start, piece_end);
+                        SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
+                    });
+                });
         });
     if (total_size_bytes == 0) {
         // Nothing pending for the window. Unlike the synchronous form, empty
@@ -503,19 +630,31 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     job.wait_tick = scheduler.CurrentTick();
     scheduler.Flush();
     job.has_download = true;
+    if (writeback_offload_) {
+        job.inflight_id = next_inflight_id_++;
+        InflightDownload entry{job.inflight_id, window_start, window_end, {}};
+        entry.islands.reserve(job.copies.size());
+        for (const auto& copy : job.copies) {
+            entry.islands.emplace_back(job.buffer_base + copy.srcOffset,
+                                       static_cast<u32>(copy.size));
+        }
+        inflight_downloads_.push_back(std::move(entry));
+    }
     offload_jobs_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                       bool is_write) {
-    job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
     auto* memory = Core::Memory::Instance();
     const u8* download = job.staging->mapped_data.data();
+    if (!writeback_offload_) {
+        job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
+    }
     // One shared hold keeps the map stable for every island's backing write;
     // the loop waits on nothing, so a guest mapping call is delayed by at most
     // the loop.
     std::optional<Core::MemoryManager::GuestCopyScope> hold;
-    if (writeback_hold_) {
+    if (writeback_hold_ && !writeback_offload_) {
         hold.emplace(memory);
         ++writeback_loops_;
     }
@@ -525,51 +664,34 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     // because the sequence advances on every recorded GPU write - including
     // rebinds of already-dirty regions - a matching sequence proves any other
     // download of the same range holds byte-identical data, making write-back
-    // order among matching jobs irrelevant. A mismatched copy is written back
-    // by nobody: its bytes may predate the newer write.
+    // order among matching jobs irrelevant. Without the offload a mismatched
+    // copy is written back by nobody: its bytes may predate the newer write.
+    // With it every island's bytes are already in guest memory; a vetoed
+    // island keeps its GPU bits, so under Precise readbacks its pages stay
+    // unreadable and the next fault downloads it again.
     //
-    // Verified copies arrive in ascending address order, so page-adjacent runs
-    // are merged into one pending span and unmarked in a single call: the page
-    // watcher update then coalesces the whole run into one protection change
-    // instead of one per copy. Unmarking never advances the write sequence, so
-    // deferral cannot change any later verdict. A merge never crosses a page
-    // gap - gap pages may be GPU-dirty outside this download - which keeps the
-    // unmarked page set exactly the union of the per-copy page sets. The span
-    // is flushed before any tracker read that could see its pages: the veto
-    // branch below, and the CPU mark at the end (marking with GPU bits still
-    // set would ask for a write-only page, which Protect() rejects).
-    VAddr pending_start = 0;
-    VAddr pending_end = 0;
-    const auto flush_pending_unmark = [&] {
-        if (pending_end != pending_start) {
-            memory_tracker->UnmarkRegionAsGpuModified(pending_start, pending_end - pending_start);
-            pending_start = 0;
-            pending_end = 0;
-        }
-    };
+    // The pending span is flushed before any tracker read that could see its
+    // pages: the veto branch below, and the CPU mark at the end (marking with
+    // GPU bits still set would ask for a write-only page, which Protect()
+    // rejects).
+    PendingUnmark pending{*memory_tracker};
     bool vetoed_any = false;
     for (const auto& copy : job.copies) {
         const VAddr copy_device_addr = job.buffer_base + copy.srcOffset;
         if (memory_tracker->GpuWriteSeqMatches(copy_device_addr, copy.size, job.snapshots)) {
-            ++writeback_islands_;
-            writeback_bytes_ += copy.size;
-            memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + copy.dstOffset,
-                                    copy.size);
-            // The ordering guard makes an out-of-order copy flush and restart
-            // the span instead of moving pending_end backward, so the merged
-            // range can never grow beyond the union of the copies.
-            const bool adjacent = pending_end != pending_start && copy_device_addr >= pending_end &&
-                                  Common::AlignDown(copy_device_addr, TRACKER_BYTES_PER_PAGE) <=
-                                      Common::AlignUp(pending_end, TRACKER_BYTES_PER_PAGE);
-            if (!adjacent) {
-                flush_pending_unmark();
-                pending_start = copy_device_addr;
+            if (writeback_offload_) {
+                ASSERT(job.copied);
+            } else {
+                ++writeback_islands_;
+                writeback_bytes_ += copy.size;
+                memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
+                                        download + copy.dstOffset, copy.size);
             }
-            pending_end = std::max<VAddr>(pending_end, copy_device_addr + copy.size);
+            pending.Add(copy_device_addr, copy.size);
             continue;
         }
         vetoed_any = true;
-        flush_pending_unmark();
+        pending.Flush();
         // The newer write's own bind restored the range set for its span; put
         // back only what is still marked and uncovered, so the tracker bits
         // and the range set stay in lockstep. New dirty coverage expires the
@@ -580,11 +702,20 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
             gpu_modified_ranges.Add(copy_device_addr, copy.size);
         }
     }
-    flush_pending_unmark();
+    pending.Flush();
     hold.reset();
     job.fully_cleared = !vetoed_any;
     if (vetoed_any) {
         offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (writeback_offload_) {
+        ++writeback_loops_;
+        writeback_islands_ += job.written_islands;
+        writeback_bytes_ += job.written_bytes;
+        wboff_copy_ns_ += job.copy_ns;
+        ++(job.copier == 0 ? wboff_guest_ : job.copier == 1 ? wboff_prio_ : wboff_gpucomm_);
+        std::erase_if(inflight_downloads_,
+                      [&](const InflightDownload& d) { return d.id == job.inflight_id; });
     }
     // Same write-only-protection hazard as the empty path in Prepare: the mark
     // is only legal once the faulted range's GPU bits are clear. When a veto
@@ -626,6 +757,13 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     FoldPendingRanges(device_addr, size);
+    // Islands an offloaded readback still owns stay with their owner's second
+    // hop; the unmark below then covers only the islands downloaded here.
+    OwnedIslands owned;
+    if (writeback_offload_) {
+        CollectOwnedIslands(device_addr, device_addr + size, owned);
+        wboff_excluded_ += owned.size();
+    }
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
             const VAddr buffer_addr = buffer.CpuAddr();
@@ -642,8 +780,18 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 constexpr u64 mask = ~(align - 1ULL);
                 total_size_bytes += (new_size + align - 1) & mask;
             };
-            gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            SubtractGpuModifiedRange(device_addr_out, range_size);
+            if (owned.empty()) {
+                gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
+                SubtractGpuModifiedRange(device_addr_out, range_size);
+                return;
+            }
+            gpu_modified_ranges.ForEachInRange(
+                device_addr_out, range_size, [&](VAddr start, VAddr end) {
+                    EmitUnownedPieces(start, end, owned, [&](VAddr piece_start, VAddr piece_end) {
+                        add_download(piece_start, piece_end);
+                        SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
+                    });
+                });
         });
     if (total_size_bytes == 0) {
         return;
@@ -688,7 +836,15 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                                     copy.size);
         }
         hold.reset();
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        if (owned.empty()) {
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+            return;
+        }
+        PendingUnmark pending{*memory_tracker};
+        for (const auto& copy : copies) {
+            pending.Add(buffer.CpuAddr() + copy.srcOffset, copy.size);
+        }
+        pending.Flush();
     };
     if constexpr (async) {
         scheduler.DeferOperation(write_data);

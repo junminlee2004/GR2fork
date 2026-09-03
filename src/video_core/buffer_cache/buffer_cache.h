@@ -266,8 +266,10 @@ private:
     /**
      * One offloaded fault readback in flight. Filled on the GPU command thread
      * (PrepareFaultDownload), the semaphore wait happens on the faulting guest
-     * thread, and the writeback runs on the GPU command thread again
-     * (FinishFaultDownload). The SendCommand handshake orders every cross-
+     * thread, and the verdict and unmark run on the GPU command thread again
+     * (FinishFaultDownload). The write-back runs there too, or - behind
+     * readback_writeback_offload - on the thread that waited out the fence,
+     * before the second hop. The SendCommand handshake orders every cross-
      * thread access, so no field needs synchronization of its own.
      */
     struct FaultDownloadJob {
@@ -278,6 +280,12 @@ private:
         VAddr window_start = 0; // range whose tracker bits the writeback clears
         u64 window_size = 0;
         u64 wait_tick = 0;
+        u64 inflight_id = 0;     // registry entry owning the copied islands
+        u64 written_islands = 0; // filled by the offloaded write-back
+        u64 written_bytes = 0;
+        u64 copy_ns = 0;
+        u8 copier = 0; // 0 guest thread, 1 priority thread, 2 GPU command thread
+        bool copied = false;
         bool has_download = false;
         bool fully_cleared = false; // FinishFaultDownload verdict
     };
@@ -289,6 +297,15 @@ private:
     /// Writes the downloaded bytes back to guest memory and clears tracker
     /// bits for regions with no newer GPU writes. GPU command thread only.
     void FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size, bool is_write);
+
+    /// Copies every downloaded island into guest memory through the backing
+    /// view. Any thread; the caller has waited out job.wait_tick.
+    void WriteBackFaultDownload(FaultDownloadJob& job, u8 copier);
+
+    using OwnedIslands = boost::container::small_vector<std::pair<VAddr, u32>, 16>;
+    /// Islands of in-flight readbacks that overlap [start, end), sorted by
+    /// address. GPU command thread only.
+    void CollectOwnedIslands(VAddr start, VAddr end, OwnedIslands& out) const;
 
     /// Takes a staging buffer of at least the given size from the fault pool.
     /// GPU command thread only.
@@ -447,6 +464,19 @@ public:
         writeback_loops_ = writeback_islands_ = writeback_bytes_ = 0;
         return out;
     }
+    struct WriteBackOffloadStats {
+        u64 guest;
+        u64 prio;
+        u64 gpucomm;
+        u64 excluded;
+        u64 copy_ns;
+    };
+    WriteBackOffloadStats DrainWriteBackOffloadStats() {
+        const WriteBackOffloadStats out{wboff_guest_, wboff_prio_, wboff_gpucomm_, wboff_excluded_,
+                                        wboff_copy_ns_};
+        wboff_guest_ = wboff_prio_ = wboff_gpucomm_ = wboff_excluded_ = wboff_copy_ns_ = 0;
+        return out;
+    }
     struct WrittenRangeStats {
         u64 binds;
         u64 fresh;
@@ -475,6 +505,16 @@ private:
     PageTable page_table;
     // Staging pool for offloaded fault readbacks. GPU command thread only.
     std::vector<std::unique_ptr<Buffer>> fault_staging_pool_;
+    // Islands owned by in-flight readbacks; a later download skips them. GPU
+    // command thread only.
+    struct InflightDownload {
+        u64 id;
+        VAddr lo;
+        VAddr hi;
+        std::vector<std::pair<VAddr, u32>> islands;
+    };
+    std::vector<InflightDownload> inflight_downloads_;
+    u64 next_inflight_id_{1};
     // Offload counters; wait_ns is written by faulting guest threads.
     std::atomic<u64> offload_jobs_{};
     std::atomic<u64> offload_vetoes_{};
@@ -555,6 +595,7 @@ private:
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
+    bool writeback_offload_{};
     bool vertex_lazy_desc_{};
     u64 vinput_calls_{};
     u64 vinput_built_{};
@@ -562,6 +603,11 @@ private:
     u64 writeback_loops_{};
     u64 writeback_islands_{};
     u64 writeback_bytes_{};
+    u64 wboff_guest_{};
+    u64 wboff_prio_{};
+    u64 wboff_gpucomm_{};
+    u64 wboff_excluded_{};
+    u64 wboff_copy_ns_{};
     bool batch_copy_lock_{};
     bool upload_drain_{};
     u64 upload_ro_calls_{};
