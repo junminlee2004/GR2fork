@@ -800,8 +800,9 @@ void Rasterizer::OnSubmit() {
                          sc.vertex_genwalk, sc.index_genwalk);
             }
             if (const auto vi = buffer_cache.DrainVertexInputStats(); vi.calls) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] VINPUT calls={} built={} binds={} per300f",
-                         vi.calls, vi.built, vi.binds);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] VINPUT calls={} built={} binds={} chain={} per300f", vi.calls,
+                         vi.built, vi.binds, vi.chain);
             }
             if (flush_draw_interval_ != 0) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",

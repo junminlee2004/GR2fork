@@ -460,10 +460,11 @@ public:
         u64 calls;
         u64 built;
         u64 binds;
+        u64 chain;
     };
     VertexInputStats DrainVertexInputStats() {
-        const VertexInputStats out{vinput_calls_, vinput_built_, vinput_binds_};
-        vinput_calls_ = vinput_built_ = vinput_binds_ = 0;
+        const VertexInputStats out{vinput_calls_, vinput_built_, vinput_binds_, vinput_chain_};
+        vinput_calls_ = vinput_built_ = vinput_binds_ = vinput_chain_ = 0;
         return out;
     }
     struct WritebackStats {
@@ -637,6 +638,7 @@ private:
     u64 vinput_calls_{};
     u64 vinput_built_{};
     u64 vinput_binds_{};
+    u64 vinput_chain_{};
     u64 writeback_loops_{};
     u64 writeback_islands_{};
     u64 writeback_bytes_{};

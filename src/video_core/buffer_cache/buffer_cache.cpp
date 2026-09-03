@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <optional>
@@ -26,6 +27,8 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace VideoCore {
+
+static_assert(sizeof(vk::Buffer) == sizeof(VkBuffer));
 
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
@@ -865,7 +868,7 @@ void BufferCache::BindVertexBuffers(
     const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
-        copy_scope.emplace(Core::Memory::Instance());
+        copy_scope.emplace(memory);
     }
     const auto& regs = liverpool->regs;
     Vulkan::VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
@@ -915,6 +918,11 @@ void BufferCache::BindVertexBuffers(
     Vulkan::VertexInputs<BufferRange> spans;
     VAddr span_lo = ~VAddr{0};
     VAddr span_hi = 0;
+    // True while every bound span touches the running union, which is the
+    // merge's own disjointness test: the bound spans then merge into the one
+    // range [span_lo, span_hi). A union that only closes through a later
+    // bridging span reads false and takes the general merge.
+    bool chain_ok = true;
     const auto fold = [&](VAddr base, u32 size, u64 layout) {
         const bool bound = base != 0 && size > 0;
         const VAddr lo = bound ? base : ~VAddr{0};
@@ -924,6 +932,11 @@ void BufferCache::BindVertexBuffers(
             mix(input_sig, layout);
             mix(bind_sig, static_cast<u64>(base));
             mix(bind_sig, static_cast<u64>(size));
+        }
+        if (bound) {
+            if (span_hi > span_lo && (hi < span_lo || span_hi < lo)) {
+                chain_ok = false;
+            }
             span_lo = std::min<VAddr>(span_lo, lo);
             span_hi = std::max<VAddr>(span_hi, hi);
         }
@@ -931,6 +944,8 @@ void BufferCache::BindVertexBuffers(
     if (lazy) {
         ++vinput_calls_;
         if (const auto& fetch = pipeline.GetFetchShader(); fetch && !fetch->attributes.empty()) {
+            ASSERT_MSG(fetch->attributes.size() <= Vulkan::MaxVertexBufferCount,
+                       "fetch shader binds {} attributes", fetch->attributes.size());
             const auto& vs_info = pipeline.GetStage(Shader::LogicalStage::Vertex);
             for (const auto& attrib : fetch->attributes) {
                 const AmdGpu::Buffer sharp = attrib.GetSharp(vs_info);
@@ -1022,52 +1037,27 @@ void BufferCache::BindVertexBuffers(
     }
     vinput_binds_ += vertex_lazy_desc_;
 
-    // Coalesce the bound spans into disjoint ranges. Every entry the span
-    // touches collapses into it, which is the whole merge: the interleaved
-    // attribute layout yields one range, so this costs a compare per binding
-    // where sorting the spans first costs a 32-byte move per binding.
-    Vulkan::VertexInputs<BufferRange> ranges_merged{};
-    for (const auto& span : spans) {
-        if (span.end_address == 0) {
-            continue;
-        }
-        VAddr lo = span.base_address;
-        VAddr hi = span.end_address;
-        size_t kept = 0;
-        for (size_t i = 0; i < ranges_merged.size(); ++i) {
-            const BufferRange range = ranges_merged[i];
-            if (range.end_address < lo || hi < range.base_address) {
-                ranges_merged[kept++] = range;
-                continue;
-            }
-            lo = std::min<VAddr>(lo, range.base_address);
-            hi = std::max<VAddr>(hi, range.end_address);
-        }
-        ranges_merged.resize(kept);
-        ranges_merged.emplace_back(lo, hi);
-    }
-    // Ascending order is what the buffer creation path saw before, and the
-    // merged list is one entry in the common case.
-    if (ranges_merged.size() > 1) {
-        std::ranges::sort(ranges_merged, [](const BufferRange& lhv, const BufferRange& rhv) {
-            return lhv.base_address < rhv.base_address;
-        });
-    }
-
-    // Map buffers for merged ranges
-    bool span_proven_clean = memo_active && vertex_bind_valid_ && ranges_merged.size() == 1;
-    for (auto& range : ranges_merged) {
-        const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        // Resolved once and reused: ObtainBuffer would otherwise walk the same
-        // range, and the barrier decision below would walk it a second time.
-        const bool gpu_modified = IsRegionGpuModified(range.base_address, size);
-        if (size != range.GetSize() || gpu_modified) {
+    const size_t count = spans.size();
+    // Raw handles: a vk::Buffer array would zero every slot on entry.
+    std::array<VkBuffer, Vulkan::MaxVertexBufferCount> host_buffers;
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_offsets;
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_sizes;
+    std::array<vk::DeviceSize, Vulkan::MaxVertexBufferCount> host_strides;
+    // Both legs enter the driver at the same entry point; sizes and strides
+    // feed only the path without vertex-input dynamic state, where the null
+    // arrays would leave the driver's stride table untouched.
+    const bool needs_sizes_strides = !instance.IsVertexInputDynamicState();
+    if (chain_ok && span_hi > span_lo) {
+        // The bound spans merge into one range by construction: one clamp,
+        // one modified check, one buffer, and every offset off the unclamped
+        // base, exactly what the general merge produces for one range.
+        bool span_proven_clean = memo_active && vertex_bind_valid_;
+        const u64 size = memory->ClampRangeSize(span_lo, span_hi - span_lo);
+        const bool gpu_modified = IsRegionGpuModified(span_lo, size);
+        if (size != span_hi - span_lo || gpu_modified) {
             span_proven_clean = false;
         }
-        const auto [buffer, offset] =
-            ObtainBuffer(range.base_address, size, false, false, {}, gpu_modified);
-        range.vk_buffer = buffer->buffer;
-        range.offset = offset;
+        const auto [buffer, offset] = ObtainBuffer(span_lo, size, false, false, {}, gpu_modified);
         if (gpu_modified) {
             if (auto barrier =
                     buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
@@ -1075,55 +1065,123 @@ void BufferCache::BindVertexBuffers(
                 barriers.emplace_back(*barrier);
             }
         }
-    }
-    // A single merged range spans the whole memo span, so one clean unclamped
-    // walk proves it at the current generation. The seed relies on the loop
-    // reading guest memory only inside the walked range: a read outside it
-    // could fault into a veto re-Add that bumps the generation mid-loop.
-    if (span_proven_clean) {
-        vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
-    }
-
-    // Bind vertex buffers
-    Vulkan::VertexInputs<vk::Buffer> host_buffers;
-    Vulkan::VertexInputs<vk::DeviceSize> host_offsets;
-    Vulkan::VertexInputs<vk::DeviceSize> host_sizes;
-    Vulkan::VertexInputs<vk::DeviceSize> host_strides;
-    // Both legs enter the driver at the same entry point; sizes and strides
-    // feed only the path without vertex-input dynamic state, where the null
-    // arrays would leave the driver's stride table untouched.
-    const bool needs_sizes_strides = !instance.IsVertexInputDynamicState();
-    for (size_t i = 0; i < spans.size(); ++i) {
-        const VAddr base = spans[i].base_address;
-        if (spans[i].end_address != 0) {
-            const auto host_buffer_info =
-                std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
-                    return base >= range.base_address && base < range.end_address;
-                });
-            ASSERT(host_buffer_info != ranges_merged.cend());
-            host_buffers.emplace_back(host_buffer_info->vk_buffer);
-            host_offsets.push_back(host_buffer_info->offset + base -
-                                   host_buffer_info->base_address);
-        } else {
-            host_buffers.emplace_back(VK_NULL_HANDLE);
-            host_offsets.push_back(0);
+        // One clean unclamped walk proves the whole memo span at the current
+        // generation; the loop above reads guest memory only inside it.
+        if (span_proven_clean) {
+            vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
         }
-        if (needs_sizes_strides) {
-            host_sizes.push_back(guest_buffers[i].GetSize());
-            host_strides.push_back(guest_buffers[i].GetStride());
+        const VkBuffer handle = static_cast<VkBuffer>(buffer->Handle());
+        for (size_t i = 0; i < count; ++i) {
+            if (spans[i].end_address != 0) {
+                host_buffers[i] = handle;
+                host_offsets[i] = offset + spans[i].base_address - span_lo;
+            } else {
+                host_buffers[i] = VK_NULL_HANDLE;
+                host_offsets[i] = 0;
+            }
+            if (needs_sizes_strides) {
+                host_sizes[i] = guest_buffers[i].GetSize();
+                host_strides[i] = guest_buffers[i].GetStride();
+            }
+        }
+        ++vinput_chain_;
+    } else {
+        // Coalesce the bound spans into disjoint ranges. Every entry the span
+        // touches collapses into it, which is the whole merge. The array's
+        // tail past num_ranges is never initialised, so every walk is bounded
+        // by the count.
+        std::array<BufferRange, Vulkan::MaxVertexBufferCount> ranges;
+        size_t num_ranges = 0;
+        for (const auto& span : spans) {
+            if (span.end_address == 0) {
+                continue;
+            }
+            VAddr lo = span.base_address;
+            VAddr hi = span.end_address;
+            size_t kept = 0;
+            for (size_t i = 0; i < num_ranges; ++i) {
+                const BufferRange range = ranges[i];
+                if (range.end_address < lo || hi < range.base_address) {
+                    ranges[kept++] = range;
+                    continue;
+                }
+                lo = std::min<VAddr>(lo, range.base_address);
+                hi = std::max<VAddr>(hi, range.end_address);
+            }
+            ranges[kept] = BufferRange{lo, hi, {}, 0};
+            num_ranges = kept + 1;
+        }
+        // Ascending order is what the buffer creation path saw before.
+        if (num_ranges > 1) {
+            std::sort(ranges.begin(), ranges.begin() + num_ranges,
+                      [](const BufferRange& lhv, const BufferRange& rhv) {
+                          return lhv.base_address < rhv.base_address;
+                      });
+        }
+
+        // Map buffers for merged ranges
+        bool span_proven_clean = memo_active && vertex_bind_valid_ && num_ranges == 1;
+        for (size_t r = 0; r < num_ranges; ++r) {
+            BufferRange& range = ranges[r];
+            const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+            // Resolved once and reused: ObtainBuffer would otherwise walk the
+            // same range, and the barrier decision below would walk it again.
+            const bool gpu_modified = IsRegionGpuModified(range.base_address, size);
+            if (size != range.GetSize() || gpu_modified) {
+                span_proven_clean = false;
+            }
+            const auto [buffer, offset] =
+                ObtainBuffer(range.base_address, size, false, false, {}, gpu_modified);
+            range.vk_buffer = buffer->buffer;
+            range.offset = offset;
+            if (gpu_modified) {
+                if (auto barrier =
+                        buffer->GetBarrier(vk::AccessFlagBits2::eVertexAttributeRead,
+                                           vk::PipelineStageFlagBits2::eVertexAttributeInput)) {
+                    barriers.emplace_back(*barrier);
+                }
+            }
+        }
+        // A single merged range spans the whole memo span, so one clean
+        // unclamped walk proves it at the current generation. The seed relies
+        // on the loop reading guest memory only inside the walked range: a
+        // read outside it could fault into a veto re-Add that bumps the
+        // generation mid-loop.
+        if (span_proven_clean) {
+            vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            const VAddr base = spans[i].base_address;
+            if (spans[i].end_address != 0) {
+                const auto host_buffer_info = std::find_if(
+                    ranges.begin(), ranges.begin() + num_ranges, [&](const BufferRange& range) {
+                        return base >= range.base_address && base < range.end_address;
+                    });
+                ASSERT(host_buffer_info != ranges.begin() + num_ranges);
+                host_buffers[i] = static_cast<VkBuffer>(host_buffer_info->vk_buffer);
+                host_offsets[i] = host_buffer_info->offset + base - host_buffer_info->base_address;
+            } else {
+                host_buffers[i] = VK_NULL_HANDLE;
+                host_offsets[i] = 0;
+            }
+            if (needs_sizes_strides) {
+                host_sizes[i] = guest_buffers[i].GetSize();
+                host_strides[i] = guest_buffers[i].GetStride();
+            }
         }
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    const auto num_buffers = guest_buffers.size();
+    const auto num_buffers = static_cast<u32>(guest_buffers.size());
+    const auto* const buffers = reinterpret_cast<const vk::Buffer*>(host_buffers.data());
     if (instance.IsVertexInputDynamicState()) {
         // Null sizes and strides are whole size and the bound stride; the
         // direct call skips the runtime's forwarding frame.
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(), nullptr,
-                                  nullptr);
+        cmdbuf.bindVertexBuffers2(0, num_buffers, buffers, host_offsets.data(), nullptr, nullptr);
     } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
-                                  host_sizes.data(), host_strides.data());
+        cmdbuf.bindVertexBuffers2(0, num_buffers, buffers, host_offsets.data(), host_sizes.data(),
+                                  host_strides.data());
     }
 }
 
@@ -1132,7 +1190,7 @@ void BufferCache::BindIndexBuffer(
     const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
-        copy_scope.emplace(Core::Memory::Instance());
+        copy_scope.emplace(memory);
     }
     const auto& regs = liverpool->regs;
 
