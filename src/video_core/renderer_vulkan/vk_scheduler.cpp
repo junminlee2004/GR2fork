@@ -416,8 +416,10 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
     }
     if (dirty_state.color_write_masks) {
         dirty_state.color_write_masks = false;
-        if (instance.IsDynamicColorWriteMaskSupported()) {
+        if (instance.IsDynamicColorWriteMaskEnabled()) {
             cmdbuf.setColorWriteMaskEXT(0, color_write_masks);
+        } else {
+            ++color_write_mask_skips_;
         }
     }
     if (dirty_state.line_width) {

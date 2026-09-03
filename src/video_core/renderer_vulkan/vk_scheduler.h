@@ -358,6 +358,12 @@ struct DynamicState {
         }
     }
 
+    /// Mask changes that no pipeline declares dynamic; a compliance count.
+    u64 DrainColorWriteMaskSkips() {
+        return std::exchange(color_write_mask_skips_, u64{0});
+    }
+    u64 color_write_mask_skips_{};
+
     void SetColorWriteMasks(const ColorWriteMasks& color_write_masks_) {
         if (!std::ranges::equal(color_write_masks, color_write_masks_)) {
             color_write_masks = color_write_masks_;

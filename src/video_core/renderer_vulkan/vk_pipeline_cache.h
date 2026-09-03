@@ -236,6 +236,8 @@ public:
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
     }
+    /// Per-window telemetry for the static color write mask: pipeline counts and skipped emits.
+    void DumpColorMaskStats(u64 emit_skips);
     /// Per-window telemetry for the runtime-info input memo; silent when it is off.
     void DumpRuntimeInfoMemoStats();
     /// Shared layout count against the pipeline count; silent when sharing is off.
@@ -299,6 +301,8 @@ private:
     bool hash_diff_armed{}; // set by the stamp-keyed reuse around its stage resolve
     bool key_reuse_hash_diff{};
     u64 key_reuse_diff_decisions{};
+    u64 nonfull_mask_pipelines{};
+    u64 graphics_lookups{};
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};

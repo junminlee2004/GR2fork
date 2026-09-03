@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -598,6 +599,10 @@ bool Instance::CreateDevice() {
         }
     }
 
+    // A pipeline built under one value and drawn under the other would bind
+    // the wrong mask, so the choice is latched once here.
+    dynamic_color_write_mask_enabled =
+        IsDynamicColorWriteMaskSupported() && !EmulatorSettings.IsStaticColorWriteMask();
     CreateAllocator();
     return true;
 }

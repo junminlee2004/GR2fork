@@ -160,6 +160,12 @@ public:
         return dynamic_state_3 && dynamic_state_3_features.extendedDynamicState3ColorWriteMask;
     }
 
+    /// True when the color write mask is left dynamic rather than baked into
+    /// the pipeline blend state. Latched once for the process lifetime.
+    bool IsDynamicColorWriteMaskEnabled() const {
+        return dynamic_color_write_mask_enabled;
+    }
+
     /// Returns true when VK_EXT_vertex_input_dynamic_state is supported.
     bool IsVertexInputDynamicState() const {
         return vertex_input_dynamic_state;
@@ -497,6 +503,7 @@ private:
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
+    bool dynamic_color_write_mask_enabled{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
     bool list_restart{};

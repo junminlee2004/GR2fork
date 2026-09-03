@@ -856,6 +856,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+    ++graphics_lookups;
     // pipe_gen invalidates the cached pair when ReplaceShader erases entries.
     const u64 pipe_gen =
         Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
@@ -891,6 +892,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
             fetch_shader_ref ? fetch_shader_ref.Get()
                              : std::optional<Shader::Gcn::FetchShaderData>{},
             modules, sdata, false);
+        constexpr auto full_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                                   vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
+            if (graphics_key.write_masks[cb] != full_mask) {
+                ++nonfull_mask_pipelines;
+                break;
+            }
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -987,6 +996,17 @@ void PipelineCache::ValidateSpecHit(const Program& program, u32 hit_idx, const S
                   "specialization",
                   hit_idx, info.pgm_hash);
     }
+}
+
+void PipelineCache::DumpColorMaskStats(u64 emit_skips) {
+    if (graphics_pipelines.empty()) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] CWMASK static={} pipes={} nonfull={} emitskip={} draws={} per300f",
+             instance.IsDynamicColorWriteMaskEnabled() ? 0 : 1, graphics_pipelines.size(),
+             nonfull_mask_pipelines, emit_skips, graphics_lookups);
+    graphics_lookups = 0;
 }
 
 void PipelineCache::DumpRuntimeInfoMemoStats() {

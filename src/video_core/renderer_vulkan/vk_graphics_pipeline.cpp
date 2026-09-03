@@ -133,7 +133,9 @@ GraphicsPipeline::GraphicsPipeline(
         dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
         dynamic_states.push_back(vk::DynamicState::eDepthBounds);
     }
-    if (instance.IsDynamicColorWriteMaskSupported()) {
+    // A dynamic color write mask makes the driver build a pixel shader epilog
+    // per draw. The mask is already a pipeline key field.
+    if (instance.IsDynamicColorWriteMaskEnabled()) {
         dynamic_states.push_back(vk::DynamicState::eColorWriteMaskEXT);
     }
     if (instance.IsVertexInputDynamicState()) {
@@ -304,8 +306,10 @@ GraphicsPipeline::GraphicsPipeline(
             .srcAlphaBlendFactor = src_alpha,
             .dstAlphaBlendFactor = dst_alpha,
             .alphaBlendOp = alpha_blend,
+            // The static leg relies on this loop writing every attachment
+            // below num_color_attachments.
             .colorWriteMask =
-                instance.IsDynamicColorWriteMaskSupported()
+                instance.IsDynamicColorWriteMaskEnabled()
                     ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],

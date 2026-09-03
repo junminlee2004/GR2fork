@@ -823,6 +823,8 @@ void Rasterizer::OnSubmit() {
                          "per300f",
                          bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
             }
+            pipeline_cache.DumpColorMaskStats(
+                scheduler.GetDynamicState().DrainColorWriteMaskSkips());
             pipeline_cache.DumpKeyReuseStats();
             pipeline_cache.DumpProgramIdentityStats();
             pipeline_cache.DumpSpecFpStats();

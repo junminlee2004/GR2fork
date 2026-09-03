@@ -533,6 +533,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU textureLruLog: {}", EmulatorSettings.IsTextureLruLog());
     LOG_INFO(Config, "GPU texelSyncNoop: {}", EmulatorSettings.IsTexelSyncNoop());
     LOG_INFO(Config, "GPU deferredReadArm: {}", EmulatorSettings.IsDeferredReadArm());
+    LOG_INFO(Config, "GPU staticColorWriteMask: {}", EmulatorSettings.IsStaticColorWriteMask());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
