@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/assert.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -150,6 +151,8 @@ private:
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
+    /// The three compute shortcuts, out of the graphics bind path's lines.
+    SHAD_NO_INLINE bool TakeComputeShortcut(const Pipeline* pipeline);
 
 private:
     // =========================================================================
@@ -248,7 +251,7 @@ private:
         std::array<StageSnap, 8> stages{};
         bool valid{};
     };
-    void BindingSkipProbe(const Pipeline* pipeline);
+    SHAD_NO_INLINE void BindingSkipProbeBody(const Pipeline* pipeline);
     BindingSkipProbeState bs_probe_{};
 
     // PrepareRenderState memo: with the CB/DB registers, extent hints and

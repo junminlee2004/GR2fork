@@ -31,6 +31,24 @@ namespace Vulkan {
 
 namespace Skipcache = VideoCore::Skipcache;
 
+// Every log site expands to a logger map lookup, a shared pointer round trip,
+// a thread name query and a format pack; the bind path's cold sites stay out
+// of its lines behind these.
+static SHAD_NO_INLINE void WarnUnalignedBufferBinding(u32 index, u64 pgm_hash) {
+    LOG_WARNING(Render_Vulkan, "Buffer binding {} in shader {:#x} isn't dword aligned", index,
+                pgm_hash);
+}
+
+static SHAD_NO_INLINE void WarnMetadataTextureRead() {
+    LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+}
+
+// The assertion macro's body; it returns, as the macro does.
+static SHAD_NO_INLINE void BindAssertFailed() {
+    LOG_CRITICAL(Debug, "Assertion Failed!");
+    assert_fail_impl();
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -1000,13 +1018,12 @@ enum BsVeto : u8 {
     BsVetoUserData = 4,
 };
 
-void Rasterizer::BindingSkipProbe(const Pipeline* pipeline) {
+// Entered only through the gate at the bind site, which is the probe's own
+// former first statement.
+void Rasterizer::BindingSkipProbeBody(const Pipeline* pipeline) {
     using namespace VideoCore::Skipcache;
     auto& sc = Skipcache::Framework::Instance();
     constexpr auto kBS = CacheId::BindingSkipProbe;
-    if (!sc.Active() || !sc.ShouldProbe(kBS)) {
-        return;
-    }
     auto& ctr = sc.Counters(kBS);
     ++ctr.eligible;
     auto& p = bs_probe_;
@@ -1077,12 +1094,16 @@ void Rasterizer::BindingSkipProbe(const Pipeline* pipeline) {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    if (pipeline->IsCompute() && TakeComputeShortcut(pipeline)) [[unlikely]] {
         return false;
     }
 
-    BindingSkipProbe(pipeline);
+    {
+        auto& sc = Skipcache::Framework::Instance();
+        if (sc.Active() && sc.ShouldProbe(Skipcache::CacheId::BindingSkipProbe)) [[unlikely]] {
+            BindingSkipProbeBody(pipeline);
+        }
+    }
 
     set_write_index = 0;
     set_writes.clear();
@@ -1120,6 +1141,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     return true;
+}
+
+// The shortcuts keep their own compute guards: the gate at the bind site
+// makes them redundant today, and they protect any future direct caller.
+bool Rasterizer::TakeComputeShortcut(const Pipeline* pipeline) {
+    return IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+           IsComputeImageClear(pipeline);
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -1373,9 +1401,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // hardware divide here at binding rate.
             const u32 offset_aligned = static_cast<u32>(offset & ~u64{alignment - 1});
             const u32 adjust = offset - offset_aligned;
-            if (adjust % 4 != 0) {
-                LOG_WARNING(Render_Vulkan, "Buffer binding {} in shader {:#x} isn't dword aligned",
-                            i, stage.pgm_hash);
+            if (adjust % 4 != 0) [[unlikely]] {
+                WarnUnalignedBufferBinding(static_cast<u32>(i), stage.pgm_hash);
             }
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
@@ -1423,8 +1450,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     AmdGpu::Image tsharp_scratch{};
     for (const auto& image_desc : stage.images) {
         const AmdGpu::Image& tsharp = image_desc.GetSharpRef(stage, tsharp_scratch);
-        if (texture_cache.IsMeta(tsharp.Address())) {
-            LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+        if (texture_cache.IsMeta(tsharp.Address())) [[unlikely]] {
+            WarnMetadataTextureRead();
         }
 
         const auto data_fmt = tsharp.GetDataFmt();
@@ -1466,7 +1493,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     tsharp, image_desc, mip_fallback_mode == Shader::MipStorageFallbackMode::None});
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
+                if (num_bindings != 1) [[unlikely]] {
+                    BindAssertFailed();
+                }
                 desc.view_info.range.base.level += image_desc.constant_mip_index;
                 desc.view_info.range.extent.levels = 1;
             } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
