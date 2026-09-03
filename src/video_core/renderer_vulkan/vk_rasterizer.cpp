@@ -923,6 +923,10 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
                          us.ro_calls, us.ro_bytes >> 20, us.w_calls, us.w_bytes >> 20);
             }
+            if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f",
+                         tn.hits, tn.probes);
+            }
             const auto wr = buffer_cache.DrainWrittenRangeStats();
             if (wr.binds) {
                 LOG_INFO(Render_Skipcache,

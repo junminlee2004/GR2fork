@@ -174,21 +174,6 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
-    // Memos of recent read-only upload queries that found nothing to upload.
-    // While the key is unchanged the guest bytes still equal the device-buffer
-    // bytes for a recorded range, so eliding the upload is byte-identical; a
-    // query contained in a recorded range hits, since a clean range has no
-    // dirty subrange. The key is the host-memory generation, or the range's
-    // word-epoch sum under the stream mirror mode, where a clean range keeps
-    // every page write-protected and any write bumps the sum through the
-    // protection grant. Zero size = empty.
-    struct SyncNoop {
-        VAddr addr = 0;
-        u32 size = 0;
-        u64 mem_key = 0;
-    };
-    std::array<SyncNoop, 2> sync_noop{};
-    u32 sync_noop_next = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;
@@ -198,7 +183,26 @@ public:
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
     vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    // Memos of recent read-only upload queries that found nothing to upload.
+    // While the key is unchanged the guest bytes still equal the device-buffer
+    // bytes for a recorded range, so eliding the upload is byte-identical; a
+    // query contained in a recorded range hits, since a clean range has no
+    // dirty subrange. The key is the host-memory generation, or the range's
+    // word-epoch sum under the stream mirror mode, where a clean range keeps
+    // every page write-protected and any write bumps the sum through the
+    // protection grant. Entries wider than the epoch-sum span key on the
+    // generation either way. Zero size = empty.
+    struct SyncNoop {
+        VAddr addr = 0;
+        u32 size = 0;
+        u64 mem_key = 0;
+    };
+    std::array<SyncNoop, 3> sync_noop{};
+    u32 sync_noop_next = 0;
 };
+// The memo array sits last so the fields every bind reads keep the front
+// of the object as entries are added.
+static_assert(offsetof(Buffer, sync_noop) > offsetof(Buffer, stage));
 
 class StreamBuffer : public Buffer {
 public:

@@ -24,6 +24,8 @@ public:
     static constexpr size_t MAX_CPU_PAGE_BITS = 40;
     static constexpr size_t NUM_HIGH_PAGES = 1ULL << (MAX_CPU_PAGE_BITS - TRACKER_HIGHER_PAGE_BITS);
     static constexpr size_t MANAGER_POOL_SIZE = 32;
+    // Widest range Sum256ForRange can key: 64 epoch words.
+    static constexpr u64 MAX_EPOCH_SUM_SPAN = u64{64} << RegionManager::EPOCH_WORD_BITS;
 
 public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
@@ -152,9 +154,8 @@ public:
     /// poisoned, or when the span exceeds 64 words; callers then fall back to
     /// their coarse generation key.
     EpochSum256 Sum256ForRange(VAddr cpu_addr, u64 size) noexcept {
-        constexpr u64 max_span = u64{64} << RegionManager::EPOCH_WORD_BITS;
         EpochSum256 out{0, true};
-        if (size == 0 || size > max_span) {
+        if (size == 0 || size > MAX_EPOCH_SUM_SPAN) {
             out.ok = false;
             return out;
         }
@@ -183,10 +184,9 @@ public:
     /// Twin of Sum256ForRange that also names the region when one covers the
     /// whole range; the resolved memo probe reads that region directly.
     EpochSum256 Sum256ForRangeResolved(VAddr cpu_addr, u64 size, RegionManager*& region) noexcept {
-        constexpr u64 max_span = u64{64} << RegionManager::EPOCH_WORD_BITS;
         EpochSum256 out{0, true};
         region = nullptr;
-        if (size == 0 || size > max_span) {
+        if (size == 0 || size > MAX_EPOCH_SUM_SPAN) {
             out.ok = false;
             return out;
         }

@@ -170,6 +170,15 @@ public:
         u64 w_calls;
         u64 w_bytes;
     };
+    struct TexelNoopStats {
+        u64 hits;
+        u64 probes;
+    };
+    TexelNoopStats DrainTexelNoopStats() {
+        const TexelNoopStats out{texel_noop_hits_, texel_noop_probes_};
+        texel_noop_hits_ = texel_noop_probes_ = 0;
+        return out;
+    }
     UploadCopyStats DrainUploadCopyStats() {
         const UploadCopyStats stats{upload_ro_calls_, upload_ro_bytes_, upload_w_calls_,
                                     upload_w_bytes_};
@@ -596,6 +605,7 @@ private:
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
     bool writeback_offload_{};
+    bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
     u64 vinput_calls_{};
     u64 vinput_built_{};
@@ -615,6 +625,8 @@ private:
     u64 upload_w_calls_{};
     u64 upload_w_bytes_{};
     u64 texel_ro_walks_{};
+    u64 texel_noop_hits_{};
+    u64 texel_noop_probes_{};
     u64 texel_ro_regions_{};
     u64 dmasync_calls_{};
     u64 dmasync_buffers_{};

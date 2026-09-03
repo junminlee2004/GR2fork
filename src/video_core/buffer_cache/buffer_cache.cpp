@@ -52,6 +52,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
+    texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
     // Latched single-threaded, before any GPU-thread pool operation.
@@ -1909,7 +1910,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // clean range hits, since a clean range has no dirty subrange. Written
     // binds are excluded: their walk also marks the range GPU modified.
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
-    const bool memo_eligible = skipcache.Active() && !is_written && !is_texel_buffer;
+    const bool texel_read = is_texel_buffer && !is_written;
+    const bool memo_eligible =
+        skipcache.Active() && !is_written && (!is_texel_buffer || texel_sync_noop_);
+    // A span past the epoch-sum limit has no sum to key on, so it keys on the
+    // generation: every CPU-dirty transition bumps it before the guest bytes
+    // it announces can land.
+    const bool gen_fallback = texel_sync_noop_ && size > MemoryTracker::MAX_EPOCH_SUM_SPAN;
     // Under the mirror mode the memo keys on the recorded range's word-epoch
     // sum instead of the global generation, so unrelated faults elsewhere no
     // longer invalidate it. The sum is validated over the recorded range, not
@@ -1918,20 +1925,32 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     const u64 memo_gen =
         memo_eligible ? skipcache.Gens().mem_gen.load(std::memory_order_acquire) : 0;
     if (memo_eligible) {
+        texel_noop_probes_ += texel_read && gen_fallback;
         for (const auto& noop : buffer.sync_noop) {
             if (noop.size == 0 || device_addr < noop.addr ||
                 device_addr + size > noop.addr + noop.size) {
                 continue;
             }
-            if (epoch_keyed) {
+            bool hit = false;
+            if (epoch_keyed && noop.size <= MemoryTracker::MAX_EPOCH_SUM_SPAN) {
                 const auto sum = memory_tracker->Sum256ForRange(noop.addr, noop.size);
-                if (sum.ok && noop.mem_key == sum.sum) {
-                    ++mirror_oracle_.tierA_hits;
-                    return false;
-                }
-            } else if (noop.mem_key == memo_gen) {
-                return false;
+                hit = sum.ok && noop.mem_key == sum.sum;
+            } else {
+                hit = noop.mem_key == memo_gen;
             }
+            if (!hit) {
+                continue;
+            }
+            if (mirror_mode_ && !texel_read) {
+                ++mirror_oracle_.tierA_hits;
+            }
+            if (texel_read) {
+                // The tiling fill and the image sync run on every formatted
+                // bind, hit or miss.
+                texel_noop_hits_ += gen_fallback;
+                return SynchronizeBufferFromImage(buffer, device_addr, size);
+            }
+            return false;
         }
     }
 
@@ -1954,32 +1973,31 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (new_gpu_pages) {
         *new_gpu_pages = fresh_pages;
     }
-    if (is_texel_buffer && !is_written) {
-        // Sizing input for a texel-bind memo: these formatted read-only binds
-        // are excluded from sync_noop and walk their whole span every bind.
-        ++texel_ro_walks_;
-        texel_ro_regions_ += ((device_addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS) -
-                             (device_addr >> TRACKER_HIGHER_PAGE_BITS) + 1;
-        return SynchronizeBufferFromImage(buffer, device_addr, size);
-    }
-    if (mirror_mode_ && memo_eligible) {
+    if (mirror_mode_ && memo_eligible && !texel_read) {
         ++mirror_oracle_.tierA_elig_walks;
     }
-    if (mirror_mode_ && memo_eligible && !src_buffer) {
+    if (mirror_mode_ && memo_eligible && !src_buffer && !texel_read) {
         ++mirror_oracle_.tierA_walks;
         constexpr u64 word_size = u64{1} << RegionManager::EPOCH_WORD_BITS;
         if (size <= 64 * word_size) {
             ++mirror_oracle_.tierA_span_le64;
         }
     }
-    if (memo_eligible && !src_buffer) {
+    // A hit elides the upload walk; its only consumers on a read-only bind are
+    // the copies and their prefetch (none when the recorded walk found nothing
+    // dirty and no page became dirty since), region creation (done by the
+    // recording walk; regions are never released), and walk telemetry. Small
+    // formatted reads probe but never record: their single-region walk costs
+    // less than the sum a record would take.
+    if (memo_eligible && !src_buffer && (!texel_read || gen_fallback)) {
         // Nothing was uploaded: record the exact walked range so the next
         // query contained in it skips the page walk entirely. Prefer to
-        // replace a same-key entry the new range covers, then a stale entry,
+        // replace an entry the new range covers, then a stale or empty entry,
         // then the round-robin victim.
         u64 record_key = memo_gen;
         bool record_valid = true;
-        if (epoch_keyed) {
+        const bool record_gen_kind = !epoch_keyed || gen_fallback;
+        if (!record_gen_kind) {
             const auto sum = memory_tracker->Sum256ForRange(device_addr, size);
             record_key = sum.sum;
             record_valid = sum.ok;
@@ -1988,7 +2006,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             size_t victim = buffer.sync_noop.size();
             for (size_t i = 0; i < buffer.sync_noop.size(); ++i) {
                 const auto& noop = buffer.sync_noop[i];
-                if (noop.mem_key != record_key || noop.size == 0) {
+                if (noop.size == 0) {
+                    victim = i;
+                    continue;
+                }
+                const bool entry_gen_kind =
+                    !epoch_keyed || noop.size > MemoryTracker::MAX_EPOCH_SUM_SPAN;
+                // A generation-keyed entry whose key moved is provably stale,
+                // whatever kind this record is.
+                if (entry_gen_kind && noop.mem_key != memo_gen) {
+                    victim = i;
+                    continue;
+                }
+                if (entry_gen_kind != record_gen_kind) {
+                    continue;
+                }
+                if (noop.mem_key != record_key) {
                     victim = i;
                     continue;
                 }
@@ -2003,6 +2036,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             buffer.sync_noop[victim] = {.addr = device_addr, .size = size, .mem_key = record_key};
             buffer.sync_noop_next = static_cast<u32>((victim + 1) % buffer.sync_noop.size());
         }
+    }
+    if (texel_read) {
+        // Formatted read-only binds that walked; a hit returns above.
+        ++texel_ro_walks_;
+        texel_ro_regions_ += ((device_addr + size - 1) >> TRACKER_HIGHER_PAGE_BITS) -
+                             (device_addr >> TRACKER_HIGHER_PAGE_BITS) + 1;
+        return SynchronizeBufferFromImage(buffer, device_addr, size);
     }
     return false;
 }
