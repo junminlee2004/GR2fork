@@ -101,38 +101,123 @@ static void CountDraw(Liverpool::PacketStats& stats, const PM4Header* header) {
 // benefit (no cache consumes user_data through the stamp; the binding probe
 // compares the words directly). Writes that only partially overlap a block
 // fall through to the stamped path, which is the conservative direction.
-static bool IsGfxUserDataWrite(const Regs& regs, u32 word_addr, u32 num_words) {
-    const u32* base = regs.reg_array.data();
-    const auto in_ud = [&](const ShaderProgram& prog) {
-        const u32 ud = static_cast<u32>(reinterpret_cast<const u32*>(prog.user_data.data()) - base);
-        return word_addr >= ud && word_addr + num_words <= ud + NUM_USER_DATA;
-    };
-    return in_ud(regs.ps_program) || in_ud(regs.vs_program) || in_ud(regs.gs_program) ||
-           in_ud(regs.es_program) || in_ud(regs.hs_program) || in_ud(regs.ls_program);
+// The six user-data blocks sit at fixed offsets from the SH register base;
+// the table maps a SetShReg offset to the words left in the block it starts
+// in, so the six range compares become one load. A block that starts past the
+// table or counts zero words takes the stamped path: a zero-word write is
+// unobservable either way.
+namespace {
+constexpr u32 UdBlockWord(size_t program_offset) {
+    return static_cast<u32>((program_offset + offsetof(ShaderProgram, user_data)) / sizeof(u32)) -
+           Regs::ShRegWordOffset;
+}
+constexpr std::array<u32, 6> kUdBlockStarts = {
+    UdBlockWord(offsetof(Regs, ps_program)), UdBlockWord(offsetof(Regs, vs_program)),
+    UdBlockWord(offsetof(Regs, gs_program)), UdBlockWord(offsetof(Regs, es_program)),
+    UdBlockWord(offsetof(Regs, hs_program)), UdBlockWord(offsetof(Regs, ls_program)),
+};
+constexpr size_t kUdTableWords = 0x160;
+constexpr std::array<u8, kUdTableWords> kUdWindowRemaining = [] {
+    std::array<u8, kUdTableWords> table{};
+    for (const u32 start : kUdBlockStarts) {
+        for (u32 i = 0; i < NUM_USER_DATA; ++i) {
+            table[start + i] = static_cast<u8>(NUM_USER_DATA - i);
+        }
+    }
+    return table;
+}();
+consteval bool UdTableMatchesRanges() {
+    for (u32 off = 0; off < kUdTableWords + 32; ++off) {
+        for (u32 n = 1; n < 18; ++n) {
+            bool ref = false;
+            for (const u32 start : kUdBlockStarts) {
+                ref |= off >= start && off + n <= start + NUM_USER_DATA;
+            }
+            const bool got = off < kUdTableWords && n <= kUdWindowRemaining[off];
+            if (ref != got) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+static_assert(kUdBlockStarts[0] == 0x0C && kUdBlockStarts[5] + NUM_USER_DATA <= kUdTableWords);
+static_assert(UdTableMatchesRanges());
+} // namespace
+
+SHAD_FORCE_INLINE static bool IsGfxUserDataWrite(u32 reg_offset, u32 num_words) {
+    if (reg_offset >= kUdWindowRemaining.size()) [[unlikely]] {
+        return false;
+    }
+    return num_words != 0 && num_words <= kUdWindowRemaining[reg_offset];
 }
 
 // Only for blocks IsGfxUserDataWrite has already bounded to NUM_USER_DATA
-// words, so every real call lands on a fixed-size arm; the >64 arm carries the
-// malformed packet whose NumWords() masked to 0 and underflowed the size, which
-// faults the same way either way. Every copy must stay a constant size - a
-// length-driven loop is turned back into a memcpy call.
+// words, so every real call lands on a fixed-size arm, tested smallest first
+// since most writes are one or two words. Every copy must stay a constant
+// size - a length-driven loop is turned back into a memcpy call. The final
+// arm is defensive: the table gate never selects it.
+namespace {
+constexpr u32 StoreRegArm(size_t bytes) {
+    if (bytes <= 8) {
+        return bytes >= 4 ? 1 : 0;
+    }
+    if (bytes <= 16) {
+        return 2;
+    }
+    if (bytes <= 32) {
+        return 3;
+    }
+    if (bytes <= 64) {
+        return 4;
+    }
+    return 5;
+}
+constexpr u32 StoreRegArmLadder(size_t bytes) {
+    if (bytes > 64) {
+        return 5;
+    }
+    if (bytes > 32) {
+        return 4;
+    }
+    if (bytes > 16) {
+        return 3;
+    }
+    if (bytes > 8) {
+        return 2;
+    }
+    return bytes >= 4 ? 1 : 0;
+}
+consteval bool StoreRegArmsAgree() {
+    for (size_t b = 0; b <= 80; ++b) {
+        if (StoreRegArm(b) != StoreRegArmLadder(b)) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(StoreRegArmsAgree());
+} // namespace
+
 static void StoreRegBlock(void* dst, const void* src, size_t bytes) {
     auto* d = static_cast<u8*>(dst);
     const auto* s = static_cast<const u8*>(src);
-    if (bytes > 64) [[unlikely]] {
-        std::memcpy(d, s, bytes);
-    } else if (bytes > 32) {
-        std::memcpy(d, s, 32);
-        std::memcpy(d + bytes - 32, s + bytes - 32, 32);
-    } else if (bytes > 16) {
-        std::memcpy(d, s, 16);
-        std::memcpy(d + bytes - 16, s + bytes - 16, 16);
-    } else if (bytes > 8) {
+    if (bytes <= 8) {
+        if (bytes >= 4) {
+            std::memcpy(d, s, 4);
+            std::memcpy(d + bytes - 4, s + bytes - 4, 4);
+        }
+    } else if (bytes <= 16) {
         std::memcpy(d, s, 8);
         std::memcpy(d + bytes - 8, s + bytes - 8, 8);
-    } else if (bytes >= 4) {
-        std::memcpy(d, s, 4);
-        std::memcpy(d + bytes - 4, s + bytes - 4, 4);
+    } else if (bytes <= 32) {
+        std::memcpy(d, s, 16);
+        std::memcpy(d + bytes - 16, s + bytes - 16, 16);
+    } else if (bytes <= 64) {
+        std::memcpy(d, s, 32);
+        std::memcpy(d + bytes - 32, s + bytes - 32, 32);
+    } else [[unlikely]] {
+        std::memcpy(d, s, bytes);
     }
 }
 
@@ -496,7 +581,7 @@ SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count
         return;
     }
     const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
-    if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+    if (IsGfxUserDataWrite(static_cast<u32>(set_data->reg_offset), set_size / sizeof(u32))) {
         StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
     } else {
         gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size, word);
@@ -1379,7 +1464,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 std::memcpy(addr, header + 2, set_size);
             } else {
                 const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
-                if (IsGfxUserDataWrite(regs, word, set_size / sizeof(u32))) {
+                if (IsGfxUserDataWrite(static_cast<u32>(set_data->reg_offset),
+                                       set_size / sizeof(u32))) {
                     StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
                 } else {
                     gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size, word);
