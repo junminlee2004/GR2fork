@@ -417,6 +417,7 @@ private:
     bool spec_fp_front{};
     bool spec_key_align{};
     bool slot_prefetch{};
+    bool spec_key_fused{};
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
     u64 specfp_mru2_hits{};
@@ -427,6 +428,8 @@ private:
     u64 specfp_ri_rehash{};
     u64 specfp_front_hits{};
     u64 specfp_slot_pf{};
+    u64 specfp_fused{};
+    u64 specfp_fused_miss{};
     void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
                          const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so

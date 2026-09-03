@@ -163,12 +163,37 @@ static_assert(Shader::NUM_BUFFERS <= 64 && Shader::NUM_IMAGES <= 64 && Shader::N
 // validity bit, as the specialization skips it. The vertex attribute layout
 // comes from a stored permutation's fetch data; returns 0 while none carries
 // it, which sends the call to the full resolve.
-size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
-                     const Shader::Backend::Bindings& start, u8* buf, bool aligned) noexcept {
+// The fused form writes the key over the compare slot it is compared with
+// and folds the differing-word OR into the same pass; buf is then a heap
+// member, so it is declared free of aliases with the sharps it reads.
+template <bool Fold>
+size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
+                         const Shader::Backend::Bindings& start, u8* __restrict buf, bool aligned,
+                         u64* diff_out) noexcept {
     const auto& m = GetSpecSharpMasks();
     size_t len = 0;
+    [[maybe_unused]] u64 diff = 0;
     const auto put = [&](const void* p, size_t n) noexcept {
-        std::memcpy(buf + len, p, n);
+        if constexpr (Fold) {
+            const u8* src = static_cast<const u8*>(p);
+            size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                u64 a, b;
+                std::memcpy(&a, src + i, 8);
+                std::memcpy(&b, buf + len + i, 8);
+                diff |= a ^ b;
+                std::memcpy(buf + len + i, &a, 8);
+            }
+            if (i < n) {
+                u32 a, b;
+                std::memcpy(&a, src + i, 4);
+                std::memcpy(&b, buf + len + i, 4);
+                diff |= a ^ b;
+                std::memcpy(buf + len + i, &a, 4);
+            }
+        } else {
+            std::memcpy(buf + len, p, n);
+        }
         len += n;
     };
     if (aligned) {
@@ -227,6 +252,9 @@ size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp
     put(&valid, sizeof(valid));
     if (info.stage == Shader::Stage::Vertex && info.has_fetch_shader) {
         if (program.fetch_mask == 0) {
+            if constexpr (Fold) {
+                *diff_out = diff;
+            }
             return 0;
         }
         const auto& fetch =
@@ -245,7 +273,15 @@ size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp
         }
         put(&valid, sizeof(valid));
     }
+    if constexpr (Fold) {
+        *diff_out = diff;
+    }
     return len;
+}
+
+size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
+                     const Shader::Backend::Bindings& start, u8* buf, bool aligned) noexcept {
+    return GatherSpecKeyImpl<false>(info, program, ri_fp_hash, start, buf, aligned, nullptr);
 }
 
 // Copies src over dst and returns the OR of every differing word, so a slot
@@ -844,6 +880,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             slot_prefetch = fast >= 2 && spec_fp_canonical == 2;
         }
     }
+    if (EmulatorSettings.IsSpecKeyFused()) {
+        if (spec_fp_canonical != 2 || !spec_fp_slot_inplace || !spec_key_align) {
+            LOG_WARNING(Render_Vulkan, "the fused specialization key needs spec_fp_canonical 2, "
+                                       "spec_fp_slot_inplace and spec_key_fast; the key is built "
+                                       "in two passes");
+        } else {
+            spec_key_fused = true;
+        }
+    }
     share_layouts = EmulatorSettings.IsDescLayoutShare();
     WarmUp();
 
@@ -1032,13 +1077,13 @@ void PipelineCache::DumpSpecFpStats() {
     }
     LOG_INFO(Render_Skipcache,
              "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} inplace_kb={} "
-             "rihash={} front={} pf={} per300f",
+             "rihash={} front={} pf={} fused={} fusedmiss={} per300f",
              specfp_slot_hits, specfp_mru_hits, specfp_mru2_hits, specfp_table_hits,
              specfp_rebuilds, specfp_validate_misses, specfp_inplace_bytes >> 10, specfp_ri_rehash,
-             specfp_front_hits, specfp_slot_pf);
+             specfp_front_hits, specfp_slot_pf, specfp_fused, specfp_fused_miss);
     specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
         specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = specfp_front_hits =
-            specfp_slot_pf = 0;
+            specfp_slot_pf = specfp_fused = specfp_fused_miss = 0;
 }
 
 void PipelineCache::DumpProgramIdentityStats() {
@@ -1551,7 +1596,60 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
             ri_slot.hash_valid = ri_slot.valid || memo != nullptr;
         }
         auto& slot = gather_slots[static_cast<u32>(l_stage)];
-        if (spec_fp_canonical != 0) {
+        if (spec_fp_canonical != 0 && spec_key_fused) {
+            // Whenever slot.program is set, slot.buf holds that program's key;
+            // the gather writes the slot before the header fields describe it,
+            // and nothing inside this window resolves the same stage again.
+            const bool pre_same = slot.program == program && slot.pipe_gen == lookup_pipe_gen_;
+            u64 diff = 0;
+            if (spec_fp_validate) {
+                // The tripwire keeps the bytes the gather replaces, so the
+                // accumulator is checked against them and not against the
+                // sharps, which guest threads rewrite concurrently.
+                std::memcpy(key_buf, slot.buf.data(), slot.buf.size());
+            }
+            key_len = GatherSpecKeyImpl<true>(info, *program, ri_fp_hash, binding, slot.buf.data(),
+                                              true, &diff);
+            ++specfp_fused;
+            if (key_len == 0) {
+                // A partial key sits in the slot and no field describes it.
+                slot.program = nullptr;
+            } else {
+                if (spec_fp_validate) {
+                    u64 ref = 0;
+                    size_t i = 0;
+                    for (; i + 8 <= key_len; i += 8) {
+                        u64 a, b;
+                        std::memcpy(&a, key_buf + i, 8);
+                        std::memcpy(&b, slot.buf.data() + i, 8);
+                        ref |= a ^ b;
+                    }
+                    if (i < key_len) {
+                        u32 a, b;
+                        std::memcpy(&a, key_buf + i, 4);
+                        std::memcpy(&b, slot.buf.data() + i, 4);
+                        ref |= a ^ b;
+                    }
+                    if (ref != diff) {
+                        ++specfp_fused_miss;
+                    }
+                }
+                specfp_inplace_bytes += key_len;
+                specfp_slot_pf += slot_prefetch;
+                if (pre_same && slot.len == key_len && diff == 0) {
+                    ++specfp_slot_hits;
+                    if (spec_fp_validate) {
+                        ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
+                    }
+                    info.AddBindings(binding);
+                    return publish(&program->info, slot.module, program, slot.perm_idx,
+                                   slot.perm_hash);
+                }
+                slot.program = nullptr;
+                spec_fp = XXH3_64bits(slot.buf.data(), key_len);
+                spec_fp = spec_fp ? spec_fp : 1;
+            }
+        } else if (spec_fp_canonical != 0) {
             key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_buf, spec_key_align);
             if (key_len != 0 && spec_fp_canonical == 2) {
                 const bool same = slot.program == program && slot.len == key_len &&
