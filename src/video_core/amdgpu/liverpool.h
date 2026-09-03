@@ -307,6 +307,8 @@ public:
         u64 outer_packets; // packets that reached the full dispatch
     };
     RunStats run_stats{};
+
+private:
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
