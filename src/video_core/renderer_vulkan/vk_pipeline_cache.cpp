@@ -155,7 +155,7 @@ const SpecSharpMasks& GetSpecSharpMasks() noexcept {
 // Worst case: bindings + ri hash + 40 buffers + 64 images + 8 fmasks + 16 samplers
 // + fetch address + 32 attributes, each list followed by its validity word.
 constexpr size_t SpecKeyMaxBytes = 24 + 8 + 40 * 16 + 64 * 16 + 8 * 8 + 16 * 8 + 5 * 8 + 8 + 32 * 8;
-static_assert(SpecKeyMaxBytes <= 4096);
+static_assert(SpecKeyMaxBytes <= 4096, "the key scratch member must hold a whole key");
 static_assert(Shader::NUM_BUFFERS <= 64 && Shader::NUM_IMAGES <= 64 && Shader::NUM_FMASKS <= 64 &&
               Shader::NUM_SAMPLERS <= 64);
 
@@ -279,14 +279,16 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
     return len;
 }
 
-size_t GatherSpecKey(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
-                     const Shader::Backend::Bindings& start, u8* buf, bool aligned) noexcept {
+SHAD_NO_INLINE size_t GatherSpecKey(const Shader::Info& info, const Program& program,
+                                    u64 ri_fp_hash, const Shader::Backend::Bindings& start, u8* buf,
+                                    bool aligned) noexcept {
     return GatherSpecKeyImpl<false>(info, program, ri_fp_hash, start, buf, aligned, nullptr);
 }
 
 // Copies src over dst and returns the OR of every differing word, so a slot
 // compare and its refill are one pass. len is a multiple of 4.
-u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src, size_t len) noexcept {
+SHAD_NO_INLINE u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src,
+                                   size_t len) noexcept {
     u64 diff = 0;
     size_t i = 0;
     for (; i + 8 <= len; i += 8) {
@@ -306,9 +308,10 @@ u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src, size_t len) no
     return diff;
 }
 
-u64 ComputeSpecProxyFp(const Shader::Info& info,
-                       const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
-                       u64 ri_bytes_hash, const Shader::Backend::Bindings& start) noexcept {
+SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
+                                      const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
+                                      u64 ri_bytes_hash,
+                                      const Shader::Backend::Bindings& start) noexcept {
     u64 h = 0x84222325cbf29ce4ULL;
     const auto mix = [&](u64 v) noexcept { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
     // Batched gather: one XXH3 over every sharp instead of one call per sharp.
@@ -1572,7 +1575,6 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
     u64 spec_fp = 0;
     const bool spec_fp_eligible = spec_fp_cache && l_stage != LogicalStage::TessellationControl &&
                                   l_stage != LogicalStage::TessellationEval;
-    alignas(16) u8 key_buf[4096];
     size_t key_len = 0;
     if (spec_fp_eligible && !program->modules.empty()) {
         // Hash the persistent member, not the local copy: the member's padding bytes are stable
@@ -1606,7 +1608,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                 // The tripwire keeps the bytes the gather replaces, so the
                 // accumulator is checked against them and not against the
                 // sharps, which guest threads rewrite concurrently.
-                std::memcpy(key_buf, slot.buf.data(), slot.buf.size());
+                std::memcpy(key_scratch.data(), slot.buf.data(), slot.buf.size());
             }
             key_len = GatherSpecKeyImpl<true>(info, *program, ri_fp_hash, binding, slot.buf.data(),
                                               true, &diff);
@@ -1620,13 +1622,13 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                     size_t i = 0;
                     for (; i + 8 <= key_len; i += 8) {
                         u64 a, b;
-                        std::memcpy(&a, key_buf + i, 8);
+                        std::memcpy(&a, key_scratch.data() + i, 8);
                         std::memcpy(&b, slot.buf.data() + i, 8);
                         ref |= a ^ b;
                     }
                     if (i < key_len) {
                         u32 a, b;
-                        std::memcpy(&a, key_buf + i, 4);
+                        std::memcpy(&a, key_scratch.data() + i, 4);
                         std::memcpy(&b, slot.buf.data() + i, 4);
                         ref |= a ^ b;
                     }
@@ -1650,7 +1652,8 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                 spec_fp = spec_fp ? spec_fp : 1;
             }
         } else if (spec_fp_canonical != 0) {
-            key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_buf, spec_key_align);
+            key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_scratch.data(),
+                                    spec_key_align);
             if (key_len != 0 && spec_fp_canonical == 2) {
                 const bool same = slot.program == program && slot.len == key_len &&
                                   slot.pipe_gen == lookup_pipe_gen_;
@@ -1659,7 +1662,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                     // The fold rewrites the slot on every resolve, so the key
                     // the fill below records is the key the slot holds; a miss
                     // leaves a key no slot field describes until then.
-                    const u64 diff = FoldKeyIntoSlot(slot.buf.data(), key_buf, key_len);
+                    const u64 diff = FoldKeyIntoSlot(slot.buf.data(), key_scratch.data(), key_len);
                     hit = same && diff == 0;
                     if (!hit) {
                         slot.program = nullptr;
@@ -1667,7 +1670,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                     specfp_inplace_bytes += key_len;
                     specfp_slot_pf += slot_prefetch;
                 } else {
-                    hit = same && std::memcmp(slot.buf.data(), key_buf, key_len) == 0;
+                    hit = same && std::memcmp(slot.buf.data(), key_scratch.data(), key_len) == 0;
                 }
                 if (hit) {
                     ++specfp_slot_hits;
@@ -1680,7 +1683,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                 }
             }
             if (key_len != 0) {
-                spec_fp = XXH3_64bits(key_buf, key_len);
+                spec_fp = XXH3_64bits(key_scratch.data(), key_len);
                 spec_fp = spec_fp ? spec_fp : 1;
             }
         } else {
@@ -1702,7 +1705,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                     slot.perm_idx = static_cast<u32>(hit_idx);
                     slot.len = static_cast<u32>(key_len);
                     if (!spec_fp_slot_inplace) {
-                        std::memcpy(slot.buf.data(), key_buf, key_len);
+                        std::memcpy(slot.buf.data(), key_scratch.data(), key_len);
                     }
                 }
                 if (spec_fp_validate) {
@@ -1872,7 +1875,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                     slot.perm_idx = static_cast<u32>(perm_idx);
                     slot.len = static_cast<u32>(key_len);
                     if (!spec_fp_slot_inplace) {
-                        std::memcpy(slot.buf.data(), key_buf, key_len);
+                        std::memcpy(slot.buf.data(), key_scratch.data(), key_len);
                     }
                 }
             }

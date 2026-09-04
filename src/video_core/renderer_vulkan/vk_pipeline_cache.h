@@ -408,6 +408,11 @@ private:
         alignas(64) std::array<u8, 4096> buf{};
     };
     std::array<GatherSlot, MaxShaderStages> gather_slots{};
+    // The specialization key under construction. A member, not a 4 KB stack
+    // array in the per-draw lookup: sized to GatherSlot::buf because the
+    // validate mode copies a whole slot into it. Written only by the parser
+    // thread, which is the sole entry to the lookup.
+    alignas(64) std::array<u8, 4096> key_scratch{};
     u64 lookup_pipe_gen_{}; // pipe_gen of the current pipeline lookup
     void (*pre_compile_hook_)(void*){};
     void* pre_compile_user_{};
