@@ -273,14 +273,15 @@ size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
     return out.size();
 }
 
-// GPU command thread only, like the delta slots.
-void DescWriteOverflow() {
-    UNREACHABLE_MSG("Descriptor write list is full");
-}
-
 Pipeline::DescriptorWrites partial_scratch;
 
 } // namespace
+
+// Out of line and externally linked: the header's inline Next() calls it from
+// every translation unit that fills a descriptor write list.
+void DescWriteOverflow() {
+    UNREACHABLE_MSG("Descriptor write list is full");
+}
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
