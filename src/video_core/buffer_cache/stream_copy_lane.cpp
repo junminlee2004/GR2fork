@@ -3,7 +3,12 @@
 
 #include <chrono>
 #include <cstring>
+#include "common/arch.h"
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(ARCH_X86_64)
 #include <emmintrin.h>
+#endif
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>
 #define SHAD_COPY_LANE_MWAITX 1
@@ -14,6 +19,19 @@
 namespace VideoCore {
 
 namespace {
+
+// The spin hint each target actually has, in the ladder common/spin_lock.cpp
+// already ships. The lane spins on three paths and MWAITX covers none of them
+// off x86.
+void CpuPause() {
+#if defined(ARCH_X86_64)
+    _mm_pause();
+#elif defined(ARCH_ARM64) && defined(_MSC_VER)
+    __yield();
+#elif defined(ARCH_ARM64)
+    asm("yield");
+#endif
+}
 
 bool CpuHasMwaitx() {
 #ifdef SHAD_COPY_LANE_MWAITX
@@ -37,7 +55,7 @@ void MonitorWait(const void* line, u32 ticks) {
 #else
     (void)line;
     (void)ticks;
-    _mm_pause();
+    CpuPause();
 #endif
 }
 
@@ -168,7 +186,7 @@ void StreamCopyLane::WorkerLoop() {
                 continue;
             }
             for (int i = 0; i < 64; ++i) {
-                _mm_pause();
+                CpuPause();
             }
             continue;
         }
@@ -200,7 +218,7 @@ void StreamCopyLane::DrainProducer() {
         // Help instead of stalling: the producer drains jobs itself, so a
         // descheduled worker can never wedge a submit.
         if (!TryDrainOne()) {
-            _mm_pause();
+            CpuPause();
         }
     }
     barrier_wait_ns_ +=
@@ -214,7 +232,7 @@ void StreamCopyLane::DrainRemote() {
     }
     const u64 target = published_.load(std::memory_order_acquire);
     while (copies_done_.load(std::memory_order_acquire) < target) {
-        _mm_pause();
+        CpuPause();
     }
 }
 
