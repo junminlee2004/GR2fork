@@ -810,8 +810,9 @@ void Rasterizer::OnSubmit() {
             const auto off = buffer_cache.DrainOffloadStats();
             if (off.jobs || off.fallbacks) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} per300f",
-                         off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns));
+                         "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} "
+                         "empty={} per300f",
+                         off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
             }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,

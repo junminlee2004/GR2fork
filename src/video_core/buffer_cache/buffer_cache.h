@@ -124,6 +124,9 @@ public:
         u64 vetoes;
         u64 fallbacks;
         u64 wait_ns;
+        // Fault windows that found nothing to download. Counted whatever the
+        // settings say, so an owner-join design can be sized before it exists.
+        u64 empty;
     };
 
     /// Snapshot and reset the offloaded-readback counters (for periodic logs).
@@ -131,7 +134,8 @@ public:
         return {offload_jobs_.exchange(0, std::memory_order_relaxed),
                 offload_vetoes_.exchange(0, std::memory_order_relaxed),
                 offload_fallbacks_.exchange(0, std::memory_order_relaxed),
-                offload_wait_ns_.exchange(0, std::memory_order_relaxed)};
+                offload_wait_ns_.exchange(0, std::memory_order_relaxed),
+                join_empty_.exchange(0, std::memory_order_relaxed)};
     }
 
     struct StreamCopyStats {
@@ -577,6 +581,7 @@ private:
     std::atomic<u64> offload_vetoes_{};
     std::atomic<u64> offload_fallbacks_{};
     std::atomic<u64> offload_wait_ns_{};
+    std::atomic<u64> join_empty_{};
     // Stream copy cache counters; hits count probes that return a cached
     // offset. The probes and the telemetry drain both run on the GPU command
     // thread, so plain counters suffice.

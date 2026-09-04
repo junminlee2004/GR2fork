@@ -612,6 +612,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
                 });
         });
     if (total_size_bytes == 0) {
+        join_empty_.fetch_add(1, std::memory_order_relaxed);
         // Nothing pending for the window. Unlike the synchronous form, empty
         // does not imply resolved here: another thread's in-flight job may own
         // the ranges while the bits are still set. Marking CPU-dirty in that
