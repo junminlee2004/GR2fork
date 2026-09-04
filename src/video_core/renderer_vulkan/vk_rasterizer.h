@@ -332,7 +332,6 @@ private:
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
 
     u32 set_write_index{};
@@ -340,15 +339,27 @@ private:
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
 
-    // The bool is the pass-2 guest/special discriminant: with FindBuffer
-    // elision a guest binding can carry a null id, so the id no longer
-    // doubles as that sentinel.
-    using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64, bool>;
-    boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    // Pass 1 hands pass 2 the guest base, the clamped size and the id it
+    // resolved; the rest of the V# is dead after pass 1, so a new pass-2
+    // consumer must re-read the sharp. The guest/special discriminant rides in
+    // a caller-held bitmask: with FindBuffer elision a guest binding can carry
+    // a null id, and a clamped guest size can legitimately be zero, so neither
+    // field can double as the sentinel. Declared last so no hot member moves.
+    struct BufferBindingInfo {
+        VAddr base;
+        u64 size;
+        u32 id;
+    };
+    static_assert(sizeof(BufferBindingInfo) == 24);
+    static_assert(Shader::NUM_BUFFERS <= 64, "the guest mask is one u64");
+    std::array<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings{};
+    std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos{};
+    u32 buffer_info_n_{};
 
     // Buffer bind scratch census. Five stores per stage, none per binding:
     // the per-stage binding count is the multiplier every estimate of this

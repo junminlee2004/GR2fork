@@ -5,6 +5,8 @@
 #include <cstring>
 #include <limits>
 
+#include <boost/container/throw_exception.hpp>
+
 #include <xxhash.h>
 
 #include "common/rdtsc.h"
@@ -1207,7 +1209,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_write_index = 0;
     set_writes.clear();
     buffer_barriers.clear();
-    buffer_infos.clear();
+    buffer_info_n_ = 0;
     image_infos.clear();
 
     bool uses_dma = false;
@@ -1416,10 +1418,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     if (batch_copy_lock_) {
         copy_scope.emplace(Core::Memory::Instance());
     }
-    buffer_bindings.clear();
+    DEBUG_ASSERT(stage.buffers.size() <= buffer_bindings.size());
+    u64 guest_mask = 0;
 
     const bool elide_findbuffer = elide_findbuffer_;
-    for (const auto& desc : stage.buffers) {
+    for (u32 i = 0, n = static_cast<u32>(stage.buffers.size()); i < n; ++i) {
+        const auto& desc = stage.buffers[i];
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
@@ -1435,10 +1439,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                size <= VideoCore::BufferCache::CACHING_PAGESIZE && !stage.uses_dma;
             const auto buffer_id =
                 defer ? VideoCore::BufferId{} : buffer_cache.FindBuffer(vsharp.base_address, size);
-            buffer_bindings.emplace_back(buffer_id, vsharp, size, true);
-        } else {
-            buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0, false);
+            buffer_bindings[i] = {vsharp.base_address, size, buffer_id.index};
+            guest_mask |= u64{1} << i;
         }
+        // The special arm writes nothing: pass 2 reads a slot only with its
+        // mask bit set, and several predecessors here have no base to store.
     }
 
     const u32 stage_binds = static_cast<u32>(stage.buffers.size());
@@ -1447,27 +1452,37 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     bindscratch_bindmax_ = std::max<u64>(bindscratch_bindmax_, stage_binds);
 
     // Second pass to re-bind buffers that were updated after binding
-    const u32 first_info = static_cast<u32>(buffer_infos.size());
+    const u32 first_info = buffer_info_n_;
+    u32 info_n = first_info;
     const u32 first_binding = binding.unified;
-    for (u32 i = 0; i < buffer_bindings.size(); i++) {
-        const auto& [buffer_id, vsharp, size, is_guest] = buffer_bindings[i];
+    for (u32 i = 0, n = static_cast<u32>(stage.buffers.size()); i < n; ++i) {
+        // Every arm below appends exactly one info, so one check per iteration
+        // reproduces the static_vector's per-append throw.
+        if (info_n == buffer_infos.size()) [[unlikely]] {
+            boost::container::throw_bad_alloc();
+        }
+        const auto& bb = buffer_bindings[i];
+        const bool is_guest = ((guest_mask >> i) & 1) != 0;
         const auto& desc = stage.buffers[i];
         const u32 alignment = instance.StorageMinAlignment();
         // Buffer is not from the cache, either a special buffer or unbound.
         if (!is_guest) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
-                buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
+                buffer_infos[info_n++] =
+                    vk::DescriptorBufferInfo{gds_buf->Handle(), 0, gds_buf->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const u32 ubo_size = stage.srt_info.flattened_bufsize_dw * sizeof(u32);
                 const u64 offset = vk_buffer.Copy(stage.flat_ud, ubo_size, alignment);
-                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                buffer_infos[info_n++] =
+                    vk::DescriptorBufferInfo{vk_buffer.Handle(), offset, ubo_size};
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
                 if (liverpool->regs.clipper_control.user_clip_plane_enable == 0) {
-                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                    buffer_infos[info_n++] =
+                        vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
                 } else {
                     auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
@@ -1480,27 +1495,31 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                     const u32 ubo_size = static_cast<u32>(sizeof(planes));
                     const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
-                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                    buffer_infos[info_n++] =
+                        vk::DescriptorBufferInfo{vk_buffer.Handle(), offset, ubo_size};
                 }
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
-                buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
+                buffer_infos[info_n++] =
+                    vk::DescriptorBufferInfo{bda_buffer->Handle(), 0, bda_buffer->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
-                buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
+                buffer_infos[info_n++] =
+                    vk::DescriptorBufferInfo{fault_buffer->Handle(), 0, fault_buffer->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
                 const auto& cs_program = liverpool->GetCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
-                buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                buffer_infos[info_n++] =
+                    vk::DescriptorBufferInfo{lds_buffer.Handle(), offset, lds_size};
             } else {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                buffer_infos[info_n++] = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
             }
         } else {
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
-                vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
+                bb.base, bb.size, desc.is_written, desc.is_formatted, VideoCore::BufferId{bb.id});
             // Power-of-two Vulkan alignment: the generic AlignDown emitted a
             // hardware divide here at binding rate.
             const u32 offset_aligned = static_cast<u32>(offset & ~u64{alignment - 1});
@@ -1509,7 +1528,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 WarnUnalignedBufferBinding(static_cast<u32>(i), stage.pgm_hash);
             }
             push_data.AddOffset(binding.buffer, adjust);
-            buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
+            buffer_infos[info_n++] =
+                vk::DescriptorBufferInfo{vk_buffer->Handle(), offset_aligned, bb.size + adjust};
             if (auto barrier =
                     vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
                                                           : vk::AccessFlagBits2::eShaderRead,
@@ -1517,7 +1537,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_barriers.emplace_back(*barrier);
             }
             if (desc.is_written && desc.is_formatted) {
-                texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                texture_cache.InvalidateMemoryFromGPU(bb.base, bb.size);
             }
         }
 
@@ -1529,7 +1549,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // descriptorCount-1 eStorageBuffer carrying this stage's flags - the
     // identity a consecutive-binding update requires. descriptorCount 0 is
     // illegal, hence the guard.
-    const u64 stage_infos = buffer_infos.size() - first_info;
+    buffer_info_n_ = info_n;
+    const u64 stage_infos = info_n - first_info;
     bindscratch_infos_ += stage_infos;
     bindscratch_infomax_ = std::max<u64>(bindscratch_infomax_, stage_infos);
 
