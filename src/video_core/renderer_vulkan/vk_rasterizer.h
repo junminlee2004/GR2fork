@@ -336,7 +336,10 @@ private:
 
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
-    Shader::PushData push_data;
+    // 120 bytes: unaligned it straddles three cache lines, so every draw's
+    // rebuild touches a third line for eight bytes of it. The value-init is a
+    // no-op today and the base case for a prefix-clear memo later.
+    alignas(64) Shader::PushData push_data{};
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
