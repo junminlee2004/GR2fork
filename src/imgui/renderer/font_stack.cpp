@@ -3,6 +3,7 @@
 
 #include "font_stack.h"
 
+#include "core/libraries/ime/ime_kb_layout.h"
 #include "font_data.h"
 
 namespace {
@@ -99,6 +100,9 @@ const ImWchar* GetPrimaryTextRanges(ImFontAtlas* atlas) {
         rb.AddRanges(atlas->GetGlyphRangesVietnamese());
         rb.AddRanges(kLatinExtendedRanges);
         rb.AddRanges(kSymbolsRanges);
+        // The keyboard labels the IME draws, so they are baked rather than
+        // requested from a frozen font at draw time.
+        Libraries::Ime::AddImeKeyboardGlyphsToFontRanges(rb);
         rb.BuildRanges(&ranges);
     }
     return ranges.Data;

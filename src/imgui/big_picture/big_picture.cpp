@@ -268,6 +268,15 @@ void Launch(char* executableName, bool sameProcess) {
     io.Fonts->TexMaxWidth = atlas_max;
     io.Fonts->TexMaxHeight = atlas_max;
     io.Fonts->Build();
+    // Freeze the fonts once the atlas is baked; see imgui_core.cpp. This imgui rasterizes missing
+    // glyphs and sizes on demand, which is only sound with a backend that
+    // uploads texture updates; ours uploads the atlas once. Outside a frame the
+    // atlas is unlocked, so a text measurement there could grow it into a
+    // texture the backend never sees, or fail the pack outright. A frozen font
+    // draws the fallback glyph and scales its baked size instead.
+    for (ImFont* font : io.Fonts->Fonts) {
+        font->Flags |= ImFontFlags_NoLoadGlyphs | ImFontFlags_LockBakedSizes;
+    }
 
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
