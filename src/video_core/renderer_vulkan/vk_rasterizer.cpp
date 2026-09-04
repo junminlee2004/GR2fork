@@ -1206,7 +1206,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
     }
 
-    set_write_index = 0;
     set_writes.clear();
     buffer_barriers.clear();
     buffer_info_n_ = 0;
@@ -1222,10 +1221,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             continue;
         }
         // A stage's buffers and its samplers each collapse into one write; the
-        // image loop still emits one per descriptor array. Exact, so
-        // set_write_index ends on set_writes.size().
-        set_writes.resize(set_writes.size() + !stage->buffers.empty() + stage->images.size() +
-                          !stage->samplers.empty());
+        // image loop still emits one per descriptor array. The list hands out
+        // its own slots now, so no per-stage growth step is needed.
         stage->PushUd(binding, push_data);
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
@@ -1410,6 +1407,10 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+static_assert(Shader::NUM_IMAGES + 2 * Shader::MaxStageTypes <= Pipeline::NUM_DESCRIPTOR_WRITES);
+static_assert(Shader::NUM_IMAGES + Shader::NUM_BUFFERS / 2 + 2 * Shader::MaxStageTypes <=
+              Pipeline::NUM_DESCRIPTOR_WRITES);
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     // One shared-lock hold covers every guest copy this stage stages
@@ -1556,7 +1557,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
     binding.unified += static_cast<u32>(stage.buffers.size());
     if (!stage.buffers.empty()) {
-        auto& set_write = set_writes[set_write_index++];
+        auto& set_write = set_writes.Next();
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = first_binding;
         set_write.dstArrayElement = 0;
@@ -1746,7 +1747,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& [_, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
-        auto& set_write = set_writes[set_write_index++];
+        auto& set_write = set_writes.Next();
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
         set_write.dstArrayElement = 0;
@@ -1783,7 +1784,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // update requires. descriptorCount 0 is illegal, hence the guard.
     binding.unified += static_cast<u32>(stage.samplers.size());
     if (!stage.samplers.empty()) {
-        auto& set_write = set_writes[set_write_index++];
+        auto& set_write = set_writes.Next();
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = first_sampler_binding;
         set_write.dstArrayElement = 0;

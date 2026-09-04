@@ -334,7 +334,6 @@ private:
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
 
-    u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;

@@ -274,6 +274,10 @@ size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
 }
 
 // GPU command thread only, like the delta slots.
+void DescWriteOverflow() {
+    UNREACHABLE_MSG("Descriptor write list is full");
+}
+
 Pipeline::DescriptorWrites partial_scratch;
 
 } // namespace
@@ -462,13 +466,22 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                 // is sent whole.
                 const size_t runs = CompactDescriptorWrites(set_writes, slot, partial_scratch);
                 if (runs <= set_writes.size() + (slot.desc_count - slot.desc_changed) / 2) {
-                    cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, partial_scratch);
+                    cmdbuf.pushDescriptorSetKHR(
+                        bind_point, pipeline_layout, 0,
+                        vk::ArrayProxy<const vk::WriteDescriptorSet>(
+                            static_cast<uint32_t>(partial_scratch.size()), partial_scratch.data()));
                 } else {
                     ++slot.split;
-                    cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+                    cmdbuf.pushDescriptorSetKHR(
+                        bind_point, pipeline_layout, 0,
+                        vk::ArrayProxy<const vk::WriteDescriptorSet>(
+                            static_cast<uint32_t>(set_writes.size()), set_writes.data()));
                 }
             } else {
-                cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+                cmdbuf.pushDescriptorSetKHR(
+                    bind_point, pipeline_layout, 0,
+                    vk::ArrayProxy<const vk::WriteDescriptorSet>(
+                        static_cast<uint32_t>(set_writes.size()), set_writes.data()));
             }
             if (timed_miss) {
                 ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
@@ -497,7 +510,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
             }
             return;
         }
-        cmdbuf.pushDescriptorSetKHR(bind_point, pipeline_layout, 0, set_writes);
+        cmdbuf.pushDescriptorSetKHR(
+            bind_point, pipeline_layout, 0,
+            vk::ArrayProxy<const vk::WriteDescriptorSet>(static_cast<uint32_t>(set_writes.size()),
+                                                         set_writes.data()));
         return;
     }
 
@@ -505,7 +521,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
+    instance.GetDevice().updateDescriptorSets(
+        vk::ArrayProxy<const vk::WriteDescriptorSet>(static_cast<uint32_t>(set_writes.size()),
+                                                     set_writes.data()),
+        {});
     cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, desc_set, {});
     // The heap set replaces this bind point's set 0 behind the delta cache;
     // the bump makes its next probe miss.

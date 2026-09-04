@@ -7,6 +7,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
+#include <array>
 #include <span>
 #include <string_view>
 #include <boost/container/small_vector.hpp>
@@ -27,6 +28,8 @@ class Instance;
 class Scheduler;
 class DescriptorHeap;
 class PipelineLayoutCache;
+
+void DescWriteOverflow();
 
 class Pipeline {
 public:
@@ -60,7 +63,61 @@ public:
         return is_compute;
     }
 
-    using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
+    static constexpr u32 NUM_DESCRIPTOR_WRITES = 128;
+
+    /// Permanent, value-initialised once. The old vector re-value-initialised
+    /// every element it grew into on every draw, while the fill sites overwrite
+    /// all but sType, pNext and pTexelBufferView, which are constant for the
+    /// life of the process. begin/end are bounded by count, never by capacity,
+    /// so a stale tail entry is unreachable.
+    class DescriptorWriteList {
+    public:
+        void clear() noexcept {
+            count = 0;
+        }
+        bool empty() const noexcept {
+            return count == 0;
+        }
+        std::size_t size() const noexcept {
+            return count;
+        }
+        vk::WriteDescriptorSet* data() noexcept {
+            return writes.data();
+        }
+        const vk::WriteDescriptorSet* data() const noexcept {
+            return writes.data();
+        }
+        vk::WriteDescriptorSet* begin() noexcept {
+            return writes.data();
+        }
+        vk::WriteDescriptorSet* end() noexcept {
+            return writes.data() + count;
+        }
+        const vk::WriteDescriptorSet* begin() const noexcept {
+            return writes.data();
+        }
+        const vk::WriteDescriptorSet* end() const noexcept {
+            return writes.data() + count;
+        }
+        /// Fails closed: the assert helpers in this tree return, so running
+        /// past the array would write into whatever follows it.
+        vk::WriteDescriptorSet& Next() noexcept {
+            if (count >= NUM_DESCRIPTOR_WRITES) [[unlikely]] {
+                DescWriteOverflow();
+                return overflow_slot;
+            }
+            return writes[count++];
+        }
+        void push_back(const vk::WriteDescriptorSet& w) noexcept {
+            Next() = w;
+        }
+
+    private:
+        std::array<vk::WriteDescriptorSet, NUM_DESCRIPTOR_WRITES> writes{};
+        vk::WriteDescriptorSet overflow_slot{};
+        u32 count{};
+    };
+    using DescriptorWrites = DescriptorWriteList;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
     void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
