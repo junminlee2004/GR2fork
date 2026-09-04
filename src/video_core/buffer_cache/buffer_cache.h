@@ -354,6 +354,13 @@ private:
 
     /// Records the barriers and copy commands for a completed upload batch.
     /// Out of line so the no-upload walk in SynchronizeBuffer stays compact.
+    /// The slot path of ObtainBuffer: taken when the range cannot be served
+    /// from the stream ring. Outlined so the ring path, which is most binds,
+    /// does not carry its code through the instruction fetcher.
+    SHAD_NO_INLINE std::pair<Buffer*, u32> ObtainBufferSlot(VAddr device_addr, u32 size,
+                                                            bool is_written, bool is_texel_buffer,
+                                                            BufferId buffer_id);
+
     SHAD_NO_INLINE void EmitBufferUpload(Buffer& buffer, vk::Buffer src_buffer,
                                          std::span<const vk::BufferCopy> copies);
 

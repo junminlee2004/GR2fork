@@ -1695,6 +1695,11 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             return {&stream_buffer, offset};
         }
     }
+    return ObtainBufferSlot(device_addr, size, is_written, is_texel_buffer, buffer_id);
+}
+
+std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 size, bool is_written,
+                                                      bool is_texel_buffer, BufferId buffer_id) {
     if (IsBufferInvalid(buffer_id)) {
         buffer_id = FindBuffer(device_addr, size);
     }
