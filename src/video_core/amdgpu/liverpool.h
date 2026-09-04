@@ -305,6 +305,10 @@ public:
         u64 run_packets;   // packets consumed by the run loop
         u64 runs;          // run loop entries that consumed at least one
         u64 outer_packets; // packets that reached the full dispatch
+        // Which opcode ended each run, so the packets that reach the full
+        // dispatch can be named instead of inferred. Its own line: the poll
+        // word one cache line up is written by the guest submit thread.
+        alignas(64) std::array<u64, 256> break_opcode{};
     };
     RunStats run_stats{};
 

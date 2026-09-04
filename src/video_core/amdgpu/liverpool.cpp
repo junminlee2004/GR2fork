@@ -639,6 +639,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 } else if (masked == 0xC0006900u) {
                     SetContextRegHot(h, words);
                 } else if (!is_pad && !is_nop0) {
+                    ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
                     break;
                 }
                 dcb = dcb.subspan(words + 1);
