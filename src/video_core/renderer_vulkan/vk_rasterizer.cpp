@@ -1049,6 +1049,10 @@ void Rasterizer::OnSubmit() {
                          "foreign={} per300f",
                          tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null,
                          tf.foreign);
+                if (tf.peek_word + tf.peek_split != 0) {
+                    LOG_INFO(Render_Skipcache, "[SkipCache] PEEK1W word={} split={} per300f",
+                             tf.peek_word, tf.peek_split);
+                }
             }
             if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f",

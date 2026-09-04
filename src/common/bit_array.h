@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include "common/assert.h"
 #include "common/types.h"
 
 #ifdef __AVX2__
@@ -210,6 +211,14 @@ public:
         if (first_word == last_word) {
             return (data[first_word] & start_mask & end_mask) != 0;
         }
+        return AnyInRangeMultiWord(first_word, last_word, start_mask, end_mask);
+    }
+
+    /// The straddling case, outlined. Its vector loop makes every caller that
+    /// inlines AnyInRange end in a vzeroupper it never executes, and the
+    /// tracker probes that dominate the callers are single-word.
+    SHAD_NO_INLINE bool AnyInRangeMultiWord(size_t first_word, size_t last_word, u64 start_mask,
+                                            u64 end_mask) const {
         // Accumulate rather than exit early: without the data-dependent branch
         // the compiler vectorises the scan, which beats a word-at-a-time loop
         // on arrays this size even when a hit sits in the first word.

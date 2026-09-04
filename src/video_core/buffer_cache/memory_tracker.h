@@ -107,6 +107,13 @@ public:
                 foreign_stats_.gpu_fast.fetch_add(1, std::memory_order_relaxed);
             } else {
                 ++fast_stats_.gpu_fast;
+                const u64 region_offset = query_cpu_addr & TRACKER_HIGHER_PAGE_MASK;
+                const size_t first = (region_offset / TRACKER_BYTES_PER_PAGE) >> 6;
+                const size_t last = ((region_offset + (query_size ? query_size - 1 : 0)) /
+                                     TRACKER_BYTES_PER_PAGE) >>
+                                    6;
+                fast_stats_.peek_word += first == last;
+                fast_stats_.peek_split += first != last;
             }
             if (region == nullptr) {
                 return false;
@@ -862,6 +869,11 @@ private:
         u64 single_null{};
         u64 gpu_fast{};
         u64 gpu_walk{};
+        // Whether a single-region GPU probe covers one bitset word or straddles
+        // two: the input that decides whether an inline single-word peek is
+        // worth its code size on this workload.
+        u64 peek_word{};
+        u64 peek_split{};
     };
     FastPathStats fast_stats_;
 
@@ -881,6 +893,8 @@ public:
         u64 gpu_walk;
         u64 single_null;
         u64 foreign; // of the two above, the ones the fault path contributed
+        u64 peek_word;
+        u64 peek_split;
     };
     FastPathDrain DrainFastPathStats() {
         const u64 foreign_fast = foreign_stats_.gpu_fast.exchange(0, std::memory_order_relaxed);
@@ -890,7 +904,9 @@ public:
                                 fast_stats_.gpu_fast + foreign_fast,
                                 fast_stats_.gpu_walk + foreign_walk,
                                 fast_stats_.single_null,
-                                foreign_fast + foreign_walk};
+                                foreign_fast + foreign_walk,
+                                fast_stats_.peek_word,
+                                fast_stats_.peek_split};
         fast_stats_ = {};
         return out;
     }
