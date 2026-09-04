@@ -220,6 +220,9 @@ public:
         u64 blocked_ns{};
         u64 bytes{};
         u64 maps{};
+        // Maps that reached the drain call. Last, so the maps/bytes pair the
+        // map path folds into one vector add keeps its pairing.
+        u64 armed{};
     };
     RingStats& Stats() {
         return ring_stats_;

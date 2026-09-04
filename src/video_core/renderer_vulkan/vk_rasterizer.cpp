@@ -810,8 +810,9 @@ void Rasterizer::OnSubmit() {
             auto& st = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Stats();
             const u64 hz = tsc_hz_;
             LOG_INFO(Render_Skipcache,
-                     "[SkipCache] RING maps={} MiB={} wraps={} blocked_ms={} per300f", st.maps,
-                     st.bytes >> 20, st.wraps, hz ? st.blocked_ns * 1000 / hz : 0);
+                     "[SkipCache] RING maps={} MiB={} wraps={} armed={} blocked_ms={} per300f",
+                     st.maps, st.bytes >> 20, st.wraps, st.armed,
+                     hz ? st.blocked_ns * 1000 / hz : 0);
             st = VideoCore::StreamBuffer::RingStats{};
             if (const auto rp = scheduler.DrainRenderScopeStats(); rp.calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] RPASS calls={} restarts={} per300f",

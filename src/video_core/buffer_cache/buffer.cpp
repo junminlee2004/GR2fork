@@ -222,10 +222,15 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
     }
 
     const u64 mapped_upper_bound = offset + size;
-    // Call elided in the no-wrap steady state: the callee's first line
-    // returns true when no invalidation is outstanding.
-    if (invalidation_mark && !WaitPendingOperations(mapped_upper_bound, allow_wait)) {
-        return {nullptr, 0};
+    // The callee's own first loop condition, hoisted: with the bound already
+    // drained past this map the loop cannot run and the call returns true, so
+    // testing it here elides all but the maps that advance the drain. The mark
+    // stays engaged from the first wrap until a lap is fully drained below.
+    if (invalidation_mark && mapped_upper_bound > wait_bound) {
+        ++ring_stats_.armed;
+        if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
+            return {nullptr, 0};
+        }
     }
 
     return {mapped_data.data() + offset, offset};
@@ -301,6 +306,12 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
             scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
         wait_bound = watch.upper_bound;
         ++wait_cursor;
+    }
+    // The lap is retired once its last watch is consumed: nothing this mark
+    // guards can block again, so disarm it. A refused wait returned above, so
+    // a live drain can never be disarmed by a caller that would not wait.
+    if (wait_cursor == *invalidation_mark) {
+        invalidation_mark.reset();
     }
     return true;
 }
