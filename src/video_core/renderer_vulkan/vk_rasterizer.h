@@ -340,6 +340,8 @@ private:
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    // Constructed and destroyed two or three times per draw as a local.
+    boost::container::static_vector<u32, Shader::NUM_IMAGES> image_descriptor_array_sizes;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 

@@ -1569,13 +1569,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     image_bindings.clear();
+    image_descriptor_array_sizes.clear();
     const u32 first_image_idx = image_infos.size();
     // For loading/storing to explicit mip levels, when no native instruction support, bind an array
     // of descriptors consecutively, 1 for each mip level. The shader can index this with LOD
     // operand.
     // This array holds the size of each consecutive array with the number of bindings consumed.
     // This is currently always 1 for anything other than mip fallback arrays.
-    boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     AmdGpu::Image tsharp_scratch{};
     for (const auto& image_desc : stage.images) {
