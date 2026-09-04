@@ -1015,9 +1015,10 @@ void Rasterizer::OnSubmit() {
                 const auto ls = lane.DrainStats();
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] LANE jobs={} MiB={} unres={} full={} barriers={} "
-                         "wait_ms={} mwaits={} woke={} per300f",
+                         "wait_ms={} mwaits={} woke={} wjobs={}/{}/{}/{} help={} per300f",
                          ls.jobs, ls.bytes >> 20, ls.inline_unresolved, ls.inline_full, ls.barriers,
-                         ls.barrier_wait_ns / 1000000, ls.mwaits, ls.mwait_wakes);
+                         ls.barrier_wait_ns / 1000000, ls.mwaits, ls.mwait_wakes, ls.worker_jobs[0],
+                         ls.worker_jobs[1], ls.worker_jobs[2], ls.worker_jobs[3], ls.helper_jobs);
             }
             buffer_cache.EmitMirrorTelemetry();
         }

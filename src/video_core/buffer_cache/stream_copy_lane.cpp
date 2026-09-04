@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include "common/arch.h"
@@ -70,6 +71,9 @@ void StreamCopyLane::Init(u32 num_workers, bool hardened, u32 idle_ticks) {
     if (num_workers == 0 || !threads_.empty()) {
         return;
     }
+    // Public entry point: clamp here rather than trust the caller, because the
+    // rank indexes a fixed-size cell array.
+    num_workers = std::min<u32>(num_workers, kMaxWorkers);
     hardened_ = hardened;
     idle_ticks_ = CpuHasMwaitx() ? idle_ticks : 0;
     slots_ = std::make_unique<Slot[]>(kRingSlots);
@@ -80,7 +84,7 @@ void StreamCopyLane::Init(u32 num_workers, bool hardened, u32 idle_ticks) {
     producer_tid_.store(0, std::memory_order_relaxed);
     threads_.reserve(num_workers);
     for (u32 i = 0; i < num_workers; ++i) {
-        threads_.emplace_back([this] { WorkerLoop(); });
+        threads_.emplace_back([this, i] { WorkerLoop(i); });
     }
     num_workers_.store(num_workers, std::memory_order_release);
 }
@@ -99,6 +103,9 @@ void StreamCopyLane::Shutdown() {
     }
     threads_.clear();
     slots_.reset();
+    // The cells, published_ and dequeue_pos_ are cumulative for the object's
+    // life and must be reset together or not at all: zeroing only the cells
+    // would leave the next DrainProducer waiting on a carried-over target.
 }
 
 bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
@@ -134,7 +141,7 @@ bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
     return true;
 }
 
-bool StreamCopyLane::TryDrainOne() {
+bool StreamCopyLane::ClaimAndCopy() {
     u64 pos = dequeue_pos_.load(std::memory_order_relaxed);
     Slot* slot = nullptr;
     while (true) {
@@ -150,19 +157,46 @@ bool StreamCopyLane::TryDrainOne() {
     }
     const Job job = slot->job;
     // Recycle the slot before the copy: the producer only reuses it a full
-    // lap later, and the payload bytes are ordered by copies_done_ below.
+    // lap later, and the payload bytes are ordered by the caller's completion
+    // store, which every drain waiter reads with acquire.
     slot->seq.store(pos + kRingSlots, std::memory_order_release);
     std::memcpy(job.dst, job.src, job.size);
-    copies_done_.fetch_add(1, std::memory_order_release);
     return true;
 }
 
-void StreamCopyLane::WorkerLoop() {
+bool StreamCopyLane::TryDrainShared() {
+    if (!ClaimAndCopy()) {
+        return false;
+    }
+    // Unconditional, in both lane modes: guest fault threads reach the drains
+    // through Buffer::Copy -> Map -> MapWrap, so this is not the worker path.
+    cells_[kHelperCell].done.fetch_add(1, std::memory_order_release);
+    return true;
+}
+
+u64 StreamCopyLane::Completed() const {
+    u64 total = 0;
+    for (const Cell& cell : cells_) {
+        total += cell.done.load(std::memory_order_acquire);
+    }
+    return total;
+}
+
+void StreamCopyLane::WorkerLoop(u32 rank) {
     Common::SetCurrentThreadName("shadPS4:CopyLane");
     u32 idle_rounds = 0;
     const u32 idle_ticks = idle_ticks_;
+    Cell& cell = cells_[rank];
+    // Seeded, not zeroed: a rank reused after Shutdown+Init must continue its
+    // cell, or the first store regresses a total the drains wait on.
+    u64 local_done = cell.done.load(std::memory_order_relaxed);
+    u64 local_mwaits = cell.mwaits.load(std::memory_order_relaxed);
+    u64 local_wakes = cell.mwait_wakes.load(std::memory_order_relaxed);
     while (true) {
-        if (TryDrainOne()) {
+        if (ClaimAndCopy()) {
+            // Release: the bytes are in place before the count that publishes
+            // them. Only this thread writes the line, so it is a plain store.
+            cell.done.store(++local_done, std::memory_order_release);
             idle_rounds = 0;
             continue;
         }
@@ -179,9 +213,9 @@ void StreamCopyLane::WorkerLoop() {
                     continue;
                 }
                 MonitorWait(&published_, idle_ticks);
-                mwaits_.fetch_add(1, std::memory_order_relaxed);
+                cell.mwaits.store(++local_mwaits, std::memory_order_relaxed);
                 if (published_.load(std::memory_order_acquire) != seen) {
-                    mwait_wakes_.fetch_add(1, std::memory_order_relaxed);
+                    cell.mwait_wakes.store(++local_wakes, std::memory_order_relaxed);
                 }
                 continue;
             }
@@ -209,18 +243,27 @@ void StreamCopyLane::DrainProducer() {
     // fault-path flushes reach this from guest threads, and on the producer
     // itself the two are always equal (published_ is stored on every push).
     const u64 target = hardened_ ? published_.load(std::memory_order_acquire) : enqueue_pos_;
-    if (copies_done_.load(std::memory_order_acquire) >= target) {
+    // The hint first: summing five worker-written lines on every already-drained
+    // submit would put back the contention this split removes.
+    if (completed_seen_.load(std::memory_order_relaxed) >= target) {
+        return;
+    }
+    u64 done = Completed();
+    if (done >= target) {
+        completed_seen_.store(done, std::memory_order_relaxed);
         return;
     }
     ++barriers_;
     const auto t0 = std::chrono::steady_clock::now();
-    while (copies_done_.load(std::memory_order_acquire) < target) {
+    while (done < target) {
         // Help instead of stalling: the producer drains jobs itself, so a
         // descheduled worker can never wedge a submit.
-        if (!TryDrainOne()) {
+        if (!TryDrainShared()) {
             CpuPause();
         }
+        done = Completed();
     }
+    completed_seen_.store(done, std::memory_order_relaxed);
     barrier_wait_ns_ +=
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count();
@@ -231,22 +274,47 @@ void StreamCopyLane::DrainRemote() {
         return;
     }
     const u64 target = published_.load(std::memory_order_acquire);
-    while (copies_done_.load(std::memory_order_acquire) < target) {
-        CpuPause();
+    // Same hint as the producer drain: a guest unmap almost always finds the
+    // lane idle, and spinning on the sum would read five worker lines a lap.
+    if (completed_seen_.load(std::memory_order_relaxed) >= target) {
+        return;
     }
+    u64 done = Completed();
+    while (done < target) {
+        CpuPause();
+        done = Completed();
+    }
+    completed_seen_.store(done, std::memory_order_relaxed);
 }
 
 StreamCopyLane::Stats StreamCopyLane::DrainStats() {
-    const Stats out{
-        .jobs = jobs_,
-        .bytes = bytes_,
-        .inline_unresolved = inline_unresolved_,
-        .inline_full = inline_full_,
-        .barriers = barriers_,
-        .barrier_wait_ns = barrier_wait_ns_,
-        .mwaits = mwaits_.exchange(0, std::memory_order_relaxed),
-        .mwait_wakes = mwait_wakes_.exchange(0, std::memory_order_relaxed),
-    };
+    // Deltas against producer-held baselines: an exchange here would be a
+    // command-thread RMW on a line a worker is writing every job.
+    Stats out{};
+    out.jobs = jobs_;
+    out.bytes = bytes_;
+    out.inline_unresolved = inline_unresolved_;
+    out.inline_full = inline_full_;
+    out.barriers = barriers_;
+    out.barrier_wait_ns = barrier_wait_ns_;
+    u64 mwaits = 0;
+    u64 wakes = 0;
+    for (u32 i = 0; i < kCells; ++i) {
+        const u64 done = cells_[i].done.load(std::memory_order_relaxed);
+        const u64 slice = done - done_base_[i];
+        done_base_[i] = done;
+        if (i == kHelperCell) {
+            out.helper_jobs = slice;
+        } else {
+            out.worker_jobs[i] = slice;
+        }
+        mwaits += cells_[i].mwaits.load(std::memory_order_relaxed);
+        wakes += cells_[i].mwait_wakes.load(std::memory_order_relaxed);
+    }
+    out.mwaits = mwaits - mwaits_base_;
+    out.mwait_wakes = wakes - wakes_base_;
+    mwaits_base_ = mwaits;
+    wakes_base_ = wakes;
     jobs_ = 0;
     bytes_ = 0;
     inline_unresolved_ = 0;
