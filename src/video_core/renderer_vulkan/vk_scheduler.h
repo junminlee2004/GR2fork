@@ -422,6 +422,17 @@ public:
     std::array<WaitStat, static_cast<size_t>(WaitSite::Count)>& WaitStats() {
         return wait_stats_;
     }
+    struct RenderScopeStats {
+        u64 calls;    // BeginRendering entries
+        u64 restarts; // of those, the ones that really opened a pass
+    };
+    /// GPU command thread: returns and resets the render scope census.
+    RenderScopeStats DrainRenderScopeStats() {
+        const RenderScopeStats out{rs_calls_, rs_restarts_};
+        rs_calls_ = rs_restarts_ = 0;
+        return out;
+    }
+
     void RecordWait(WaitSite site, u64 ns) {
         auto& w = wait_stats_[static_cast<size_t>(site)];
         ++w.count;
@@ -548,6 +559,10 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    // The first direct measurement of the render scope rate: everything the
+    // campaign has quoted for it so far came from branch-edge inference.
+    u64 rs_calls_{};
+    u64 rs_restarts_{};
     tracy::VkCtxScope* profiler_scope{};
 };
 

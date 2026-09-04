@@ -207,6 +207,8 @@ private:
     // Snapshot of the framework's FindImage counters at the last report; the
     // per-window line prints the deltas (Forced mode never resets them).
     VideoCore::Skipcache::CacheCounters findimg_last_{};
+    VideoCore::Skipcache::CacheCounters br_last_{};
+    VideoCore::Skipcache::CacheCounters rt_last_{};
     VideoCore::Skipcache::CacheCounters dynstate_last_{};
     u64 dyn_stamp_last_{};
     u64 gfx_stamp_last_{};

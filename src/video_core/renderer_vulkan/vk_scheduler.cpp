@@ -34,9 +34,11 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    ++rs_calls_;
     if (is_rendering && render_state == new_state) {
         return;
     }
+    ++rs_restarts_;
     EndRendering();
     is_rendering = true;
     render_state = new_state;

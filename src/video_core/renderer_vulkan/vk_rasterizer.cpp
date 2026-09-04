@@ -793,6 +793,10 @@ void Rasterizer::OnSubmit() {
                      "[SkipCache] RING maps={} MiB={} wraps={} blocked_ms={} per300f", st.maps,
                      st.bytes >> 20, st.wraps, hz ? st.blocked_ns * 1000 / hz : 0);
             st = VideoCore::StreamBuffer::RingStats{};
+            if (const auto rp = scheduler.DrainRenderScopeStats(); rp.calls) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] RPASS calls={} restarts={} per300f",
+                         rp.calls, rp.restarts);
+            }
             auto& ws = scheduler.WaitStats();
             const auto ms = [hz](u64 ns) { return hz ? ns * 1000 / hz : 0; };
             LOG_INFO(Render_Skipcache,
@@ -886,6 +890,20 @@ void Rasterizer::OnSubmit() {
                              d(&Skipcache::CacheCounters::verify_diverged),
                              d(&Skipcache::CacheCounters::verify_aborted));
                     findimg_last_ = fc;
+                }
+                // The render scope and render target caches have never had a
+                // reported hit rate; both are probed on the same draw entry.
+                const auto& bc = skipcache.Counters(Skipcache::CacheId::BeginRendering);
+                const auto& rc = skipcache.Counters(Skipcache::CacheId::PrepareRt);
+                if (bc.eligible != br_last_.eligible || rc.eligible != rt_last_.eligible) {
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] BRRT br={}/{} brpop={}/{} rt={}/{} per300f",
+                             bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
+                             bc.populated - br_last_.populated,
+                             bc.populate_refused - br_last_.populate_refused,
+                             rc.eligible - rt_last_.eligible, rc.hits - rt_last_.hits);
+                    br_last_ = bc;
+                    rt_last_ = rc;
                 }
             }
             if (const auto& dc = skipcache.Counters(Skipcache::CacheId::DynState);
