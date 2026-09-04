@@ -349,6 +349,16 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
+
+    // Buffer bind scratch census. Five stores per stage, none per binding:
+    // the per-stage binding count is the multiplier every estimate of this
+    // path's cost rests on and it has never been measured. Declared last so
+    // no hot member's offset moves.
+    u64 bindscratch_calls_{};
+    u64 bindscratch_binds_{};
+    u64 bindscratch_bindmax_{};
+    u64 bindscratch_infos_{};
+    u64 bindscratch_infomax_{};
 };
 
 } // namespace Vulkan

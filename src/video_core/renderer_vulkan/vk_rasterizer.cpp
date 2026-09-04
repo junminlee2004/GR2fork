@@ -814,6 +814,15 @@ void Rasterizer::OnSubmit() {
                      st.maps, st.bytes >> 20, st.wraps, st.armed,
                      hz ? st.blocked_ns * 1000 / hz : 0);
             st = VideoCore::StreamBuffer::RingStats{};
+            if (bindscratch_calls_) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] BINDSCRATCH calls={} binds={} bindmax={} infos={} "
+                         "infomax={} per300f",
+                         bindscratch_calls_, bindscratch_binds_, bindscratch_bindmax_,
+                         bindscratch_infos_, bindscratch_infomax_);
+                bindscratch_calls_ = bindscratch_binds_ = bindscratch_bindmax_ = 0;
+                bindscratch_infos_ = bindscratch_infomax_ = 0;
+            }
             if (const auto rp = scheduler.DrainRenderScopeStats(); rp.calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] RPASS calls={} restarts={} per300f",
                          rp.calls, rp.restarts);
@@ -1432,6 +1441,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         }
     }
 
+    const u32 stage_binds = static_cast<u32>(stage.buffers.size());
+    ++bindscratch_calls_;
+    bindscratch_binds_ += stage_binds;
+    bindscratch_bindmax_ = std::max<u64>(bindscratch_bindmax_, stage_binds);
+
     // Second pass to re-bind buffers that were updated after binding
     const u32 first_info = static_cast<u32>(buffer_infos.size());
     const u32 first_binding = binding.unified;
@@ -1515,6 +1529,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // descriptorCount-1 eStorageBuffer carrying this stage's flags - the
     // identity a consecutive-binding update requires. descriptorCount 0 is
     // illegal, hence the guard.
+    const u64 stage_infos = buffer_infos.size() - first_info;
+    bindscratch_infos_ += stage_infos;
+    bindscratch_infomax_ = std::max<u64>(bindscratch_infomax_, stage_infos);
+
     binding.unified += static_cast<u32>(stage.buffers.size());
     if (!stage.buffers.empty()) {
         auto& set_write = set_writes[set_write_index++];
