@@ -42,6 +42,18 @@ static SHAD_NO_INLINE void WarnUnalignedBufferBinding(u32 index, u64 pgm_hash) {
                 pgm_hash);
 }
 
+static SHAD_NO_INLINE void WarnInvalidTsharp(const AmdGpu::Image& tsharp,
+                                             AmdGpu::DataFormat data_fmt,
+                                             AmdGpu::NumberFormat num_fmt) {
+    // Takes the whole sharp: pitch and width are bitfields and cannot bind to
+    // a reference of their own.
+    LOG_WARNING(Render_Vulkan,
+                "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                "data_format={}, num_format={}",
+                tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
+                static_cast<u32>(num_fmt));
+}
+
 static SHAD_NO_INLINE void WarnMetadataTextureRead() {
     LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
 }
@@ -1600,11 +1612,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
-            LOG_WARNING(Render_Vulkan,
-                        "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
-                        "data_format={}, num_format={}",
-                        tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
-                        static_cast<u32>(num_fmt));
+            WarnInvalidTsharp(tsharp, data_fmt, num_fmt);
             for (u32 i = 0; i < num_bindings; ++i) {
                 image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             }
