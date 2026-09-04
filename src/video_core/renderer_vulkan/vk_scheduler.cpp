@@ -35,6 +35,12 @@ Scheduler::~Scheduler() {
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
     ++rs_calls_;
+#ifndef NDEBUG
+    // While the colour tail is still zeroed by every producer, the narrowed
+    // relation and the whole-struct one must agree exactly.
+    DEBUG_ASSERT((render_state == new_state) ==
+                 (std::memcmp(&render_state, &new_state, sizeof(RenderState)) == 0));
+#endif
     if (is_rendering && render_state == new_state) {
         return;
     }
