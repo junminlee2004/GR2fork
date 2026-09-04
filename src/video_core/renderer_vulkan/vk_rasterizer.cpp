@@ -1426,10 +1426,13 @@ static_assert(Shader::NUM_IMAGES + Shader::NUM_BUFFERS / 2 + 2 * Shader::MaxStag
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     // One shared-lock hold covers every guest copy this stage stages
-    // (flatbuf, clip planes, stream uploads); see GuestCopyScope.
+    // (flatbuf, clip planes, stream uploads); see GuestCopyScope. A hold armed
+    // by the draw or the packet run already owns the lock, in which case this
+    // scope would construct only to find itself a non-owner; the flag test is
+    // that same check, made before the scope instead of inside it.
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock_) {
-        copy_scope.emplace(Core::Memory::Instance());
+    if (batch_copy_lock_ && !Core::MemoryManager::tls_in_guest_copy_scope) {
+        copy_scope.emplace(memory);
     }
     DEBUG_ASSERT(stage.buffers.size() <= buffer_bindings.size());
     u64 guest_mask = 0;
