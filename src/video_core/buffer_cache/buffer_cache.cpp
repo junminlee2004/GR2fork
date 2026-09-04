@@ -371,7 +371,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 // download requests while the first one is in flight.
                 damp_entries_.fetch_add(1, std::memory_order_relaxed);
                 int spin = 0;
-                for (; spin < 400 && memory_tracker->IsRegionGpuModified(device_addr, size);
+                // Foreign: this damping loop runs on whichever thread faulted,
+                // which is usually a guest thread but can be GpuComm itself.
+                for (; spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size);
                      ++spin) {
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
                 }
@@ -417,7 +419,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             // The faulted range itself may sit outside the vetoed regions, in
             // which case its pages are clear and the fault is resolved even if
             // part of the window was not.
-            if (job.fully_cleared || !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+            if (job.fully_cleared ||
+                !memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
                 return;
             }
         }

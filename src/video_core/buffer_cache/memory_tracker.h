@@ -94,19 +94,31 @@ public:
             });
     }
 
-    /// Returns true if a region has been modified from the GPU
+    /// Returns true if a region has been modified from the GPU.
+    /// Foreign = the readback fault path, which probes from whichever thread
+    /// took the fault; it counts on its own line so the bind path, which is
+    /// GPU-command-thread confined, needs no lock prefix per probe.
+    template <bool Foreign = false>
     bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         RegionManager* region;
         if (TrySingleRegion(query_cpu_addr, query_size, region)) [[likely]] {
             RENDERER_TRACE;
-            fast_stats_.gpu_fast.fetch_add(1, std::memory_order_relaxed);
+            if constexpr (Foreign) {
+                foreign_stats_.gpu_fast.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ++fast_stats_.gpu_fast;
+            }
             if (region == nullptr) {
                 return false;
             }
             return region->template PeekRegionModified<Type::GPU>(
                 query_cpu_addr & TRACKER_HIGHER_PAGE_MASK, query_size);
         }
-        fast_stats_.gpu_walk.fetch_add(1, std::memory_order_relaxed);
+        if constexpr (Foreign) {
+            foreign_stats_.gpu_walk.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ++fast_stats_.gpu_walk;
+        }
         return IteratePages<false>(
             query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
                 return manager->template PeekRegionModified<Type::GPU>(offset, size);
@@ -842,16 +854,24 @@ private:
     // not be drained into. GPU-command-thread confined, like gpu_write_seq.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
     u32 upload_walk_depth_{};
-    // Probe telemetry on a line of its own: the gpu pair is bumped from guest
-    // fault handlers as well as the GPU command thread.
+    // Probe telemetry on a line of its own. Every bump here is the GPU
+    // command thread's and is drained there, so these are plain adds.
     struct alignas(64) FastPathStats {
         u64 sum_fast{};
         u64 sum_walk{};
         u64 single_null{};
+        u64 gpu_fast{};
+        u64 gpu_walk{};
+    };
+    FastPathStats fast_stats_;
+
+    // The readback path probes from the faulting guest thread; those two sites
+    // count here so the bind path's own counters need no lock prefix.
+    struct alignas(64) ForeignPathStats {
         std::atomic<u64> gpu_fast{};
         std::atomic<u64> gpu_walk{};
     };
-    FastPathStats fast_stats_;
+    ForeignPathStats foreign_stats_;
 
 public:
     struct FastPathDrain {
@@ -860,13 +880,18 @@ public:
         u64 gpu_fast;
         u64 gpu_walk;
         u64 single_null;
+        u64 foreign; // of the two above, the ones the fault path contributed
     };
     FastPathDrain DrainFastPathStats() {
-        const FastPathDrain out{fast_stats_.sum_fast, fast_stats_.sum_walk,
-                                fast_stats_.gpu_fast.exchange(0, std::memory_order_relaxed),
-                                fast_stats_.gpu_walk.exchange(0, std::memory_order_relaxed),
-                                fast_stats_.single_null};
-        fast_stats_.sum_fast = fast_stats_.sum_walk = fast_stats_.single_null = 0;
+        const u64 foreign_fast = foreign_stats_.gpu_fast.exchange(0, std::memory_order_relaxed);
+        const u64 foreign_walk = foreign_stats_.gpu_walk.exchange(0, std::memory_order_relaxed);
+        const FastPathDrain out{fast_stats_.sum_fast,
+                                fast_stats_.sum_walk,
+                                fast_stats_.gpu_fast + foreign_fast,
+                                fast_stats_.gpu_walk + foreign_walk,
+                                fast_stats_.single_null,
+                                foreign_fast + foreign_walk};
+        fast_stats_ = {};
         return out;
     }
 

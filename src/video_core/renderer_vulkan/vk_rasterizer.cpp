@@ -1044,8 +1044,10 @@ void Rasterizer::OnSubmit() {
             if (const auto tf = buffer_cache.DrainTrackerFastStats();
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] TRKFAST sum1={} sumwalk={} gpu1={} gpuwalk={} nul={} per300f",
-                         tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null);
+                         "[SkipCache] TRKFAST sum1={} sumwalk={} gpu1={} gpuwalk={} nul={} "
+                         "foreign={} per300f",
+                         tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null,
+                         tf.foreign);
             }
             if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f",
