@@ -1590,11 +1590,17 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             const size_t set_idx = RangeMemoIndex(device_addr, size, kSets);
             auto& set = cache.sets[set_idx];
             const u64 tick = scheduler.CurrentTick();
-            u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+            // Read where it is consumed. Under the resolved epoch the key is
+            // the walk's own sum, computed per compare below and assigned on
+            // the miss arm before the populate, so the generation load here
+            // was a per-bind acquire whose value never reached a compare.
+            u64 mem_key = 0;
             bool mem_key_ok = true;
             RegionManager* region = nullptr;
             const bool resolved = mirror_mode_ && stream_copy_resolved_epoch_;
-            if (mirror_mode_ && !resolved) {
+            if (!mirror_mode_) {
+                mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
+            } else if (!resolved) {
                 const auto sum = memory_tracker->Sum256ForRange(device_addr, size);
                 mem_key = sum.sum;
                 mem_key_ok = sum.ok;
