@@ -343,6 +343,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const bool timed = skipcache.SampleTimer(CacheId::PrepareRt);
         const u64 t0 = timed ? skipcache.Now() : 0;
         rt_stamp = liverpool->GetGfxStateStamp();
+        rt_stamp_moves_ += rt_stamp != rt_stamp_last_;
+        rt_stamp_last_ = rt_stamp;
         rt_tex_gen = skipcache.Gens().tex_gen.load(std::memory_order_acquire);
         rt_pipe_gen = skipcache.Gens().pipe_gen.load(std::memory_order_acquire);
         rt_would_hit = RtMemoProbe(pipeline, rt_stamp, rt_tex_gen, rt_pipe_gen);
@@ -895,15 +897,30 @@ void Rasterizer::OnSubmit() {
                 // reported hit rate; both are probed on the same draw entry.
                 const auto& bc = skipcache.Counters(Skipcache::CacheId::BeginRendering);
                 const auto& rc = skipcache.Counters(Skipcache::CacheId::PrepareRt);
-                if (bc.eligible != br_last_.eligible || rc.eligible != rt_last_.eligible) {
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] BRRT br={}/{} brpop={}/{} rt={}/{} per300f",
+                if (bc.eligible != br_last_.eligible) {
+                    LOG_INFO(Render_Skipcache, "[SkipCache] BRRT br={}/{} brpop={}/{} per300f",
                              bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
                              bc.populated - br_last_.populated,
-                             bc.populate_refused - br_last_.populate_refused,
-                             rc.eligible - rt_last_.eligible, rc.hits - rt_last_.hits);
+                             bc.populate_refused - br_last_.populate_refused);
                     br_last_ = bc;
+                }
+                if (rc.eligible != rt_last_.eligible) {
+                    const auto d = [&](u64 Skipcache::CacheCounters::* f) {
+                        return rc.*f - rt_last_.*f;
+                    };
+                    LOG_INFO(
+                        Render_Skipcache,
+                        "[SkipCache] RTMEMO probes={} hits={} cold={} key={} reg={} tex={} "
+                        "pipe={} veto={} stampmv={} per300f",
+                        d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
+                        d(&Skipcache::CacheCounters::miss_cold),
+                        d(&Skipcache::CacheCounters::miss_key),
+                        rc.miss_gen[Skipcache::LaneReg] - rt_last_.miss_gen[Skipcache::LaneReg],
+                        rc.miss_gen[Skipcache::LaneTex] - rt_last_.miss_gen[Skipcache::LaneTex],
+                        rc.miss_gen[Skipcache::LanePipe] - rt_last_.miss_gen[Skipcache::LanePipe],
+                        rc.veto[0] - rt_last_.veto[0], rt_stamp_moves_);
                     rt_last_ = rc;
+                    rt_stamp_moves_ = 0;
                 }
             }
             if (const auto& dc = skipcache.Counters(Skipcache::CacheId::DynState);

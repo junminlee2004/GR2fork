@@ -209,6 +209,10 @@ private:
     VideoCore::Skipcache::CacheCounters findimg_last_{};
     VideoCore::Skipcache::CacheCounters br_last_{};
     VideoCore::Skipcache::CacheCounters rt_last_{};
+    // How often the register stamp the render target memo keys on moves
+    // between probes: its miss floor, and the sizing input for a wider key.
+    u64 rt_stamp_last_{};
+    u64 rt_stamp_moves_{};
     VideoCore::Skipcache::CacheCounters dynstate_last_{};
     u64 dyn_stamp_last_{};
     u64 gfx_stamp_last_{};
