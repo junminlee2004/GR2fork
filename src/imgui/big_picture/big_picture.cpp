@@ -261,9 +261,7 @@ void Launch(char* executableName, bool sameProcess) {
     io.FontDefault = ImGui::FontStack::AddPrimaryUiFont(
         io.Fonts, 64.0f, EmulatorSettings.GetConsoleLanguage(), cfgBase, true);
     io.FontGlobalScale = 0.5f;
-    // Same cap as the main UI's atlas: this imgui stops growing at 8192 per
-    // side, and a CJK console language can need more. Follow what the
-    // renderer can create, floored to the power of two the packer requires.
+    // size the big picture font atlas cap from the renderer limit
     const auto max_dim = SDL_GetNumberProperty(SDL_GetRendererProperties(renderer),
                                                SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 8192);
     const int atlas_max = static_cast<int>(std::bit_floor(std::max<u64>(max_dim, 512)));

@@ -104,10 +104,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     FontStack::AddPrimaryUiFont(ImGui::GetIO().Fonts, 64.0f, EmulatorSettings.GetConsoleLanguage(),
                                 font_cfg, true);
 
-    // Every glyph of three UI sizes is baked up front, and this imgui caps the
-    // atlas at 8192 per side where the previous one let the height run to
-    // whatever the device accepted; a CJK console language needs more rows
-    // than that. Let it grow to the largest image the device can create,
+    // Let the atlas size grow to the largest image the device can create,
     // floored to the power of two the packer requires.
     const u32 max_dim = instance.GetPhysicalDevice().getProperties().limits.maxImageDimension2D;
     const int atlas_max = static_cast<int>(std::bit_floor(std::max<u32>(max_dim, 512u)));
