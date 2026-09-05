@@ -233,7 +233,7 @@ struct DynRegBlock {
 #define DYN_REG_BLOCK(member)                                                                      \
     DynRegBlock {                                                                                  \
         static_cast<u32>(offsetof(Regs, member) / sizeof(u32)),                                    \
-            static_cast<u32>(sizeof(Regs::member) / sizeof(u32))                                   \
+            static_cast<u32>(sizeof(Regs::member) / (sizeof(u32)))                                 \
     }
 constexpr std::array kDynRegBlocks = {
     DYN_REG_BLOCK(window_scissor),
