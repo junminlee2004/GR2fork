@@ -41,6 +41,7 @@ struct RenderAttachment {
     };
 };
 static_assert(std::has_unique_object_representations_v<RenderAttachment>);
+static_assert(sizeof(RenderAttachment) == 32);
 
 struct RenderState {
     std::array<RenderAttachment, 8> color_attachments;
@@ -50,40 +51,38 @@ struct RenderState {
     u16 num_layers;
     u16 num_color_attachments;
 
+    // One attachment as four explicit word compares. The OR-of-XORs form is
+    // what keeps this out of the library: an early-exit chain of equalities
+    // over adjacent memory is folded back into a bcmp call, and a constant
+    // 96- or 128-byte memcmp exceeds the inline budget the same way.
+    static bool AttachmentEqual(const RenderAttachment& a, const RenderAttachment& b) noexcept {
+        const auto wa = std::bit_cast<std::array<u64, 4>>(a);
+        const auto wb = std::bit_cast<std::array<u64, 4>>(b);
+        return ((wa[0] ^ wb[0]) | (wa[1] ^ wb[1]) | (wa[2] ^ wb[2]) | (wa[3] ^ wb[3])) == 0;
+    }
+
     // Only the live extent can differ: every producer leaves the colour slots
     // at and past num_color_attachments zeroed and no consumer reads them, so
     // comparing the whole 296 bytes was comparing a constant tail. The shape
     // words go first, then the depth attachment, which is what actually
-    // changes when a render target moves. The constant-size arms matter: a
-    // runtime-length compare keeps the library call this exists to delete.
-    // Memory safety rests on num_color_attachments <= 8, which holds because
-    // it is std::bit_width of the u8 mrt_mask (vk_rasterizer.cpp:2123); a
-    // widening of mrt_mask would have to revisit this.
+    // changes when a render target moves. Memory safety rests on
+    // num_color_attachments <= 8, which holds because it is std::bit_width of
+    // the pipeline key's u32 mrt_mask, itself bounded by the fragment shader's
+    // NUM_COLOR_BUFFERS exports; a widening of that bound would revisit this.
     bool operator==(const RenderState& other) const noexcept {
         if (width != other.width || height != other.height || num_layers != other.num_layers ||
             num_color_attachments != other.num_color_attachments) {
             return false;
         }
-        if (std::memcmp(&depth_stencil_attachment, &other.depth_stencil_attachment,
-                        sizeof(RenderAttachment)) != 0) {
+        if (!AttachmentEqual(depth_stencil_attachment, other.depth_stencil_attachment)) {
             return false;
         }
-        const void* a = color_attachments.data();
-        const void* b = other.color_attachments.data();
-        switch (num_color_attachments) {
-        case 0:
-            return true;
-        case 1:
-            return std::memcmp(a, b, sizeof(RenderAttachment)) == 0;
-        case 2:
-            return std::memcmp(a, b, 2 * sizeof(RenderAttachment)) == 0;
-        case 3:
-            return std::memcmp(a, b, 3 * sizeof(RenderAttachment)) == 0;
-        case 4:
-            return std::memcmp(a, b, 4 * sizeof(RenderAttachment)) == 0;
-        default:
-            return std::memcmp(a, b, size_t{num_color_attachments} * sizeof(RenderAttachment)) == 0;
+        for (u32 i = 0; i < num_color_attachments; ++i) {
+            if (!AttachmentEqual(color_attachments[i], other.color_attachments[i])) {
+                return false;
+            }
         }
+        return true;
     }
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
