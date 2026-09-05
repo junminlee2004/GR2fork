@@ -11,6 +11,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 #include "common/alignment.h"
+#include "common/arch.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
@@ -25,6 +26,11 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(ARCH_X86_64)
+#include <emmintrin.h>
+#endif
 
 namespace VideoCore {
 
@@ -56,6 +62,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
+    writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
@@ -444,6 +451,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 }
                 s.download = job.staging->mapped_data.data();
                 s.total = static_cast<u32>(s.pieces.size());
+                if (writeback_helper_ && !liverpool->OnGpuThread()) {
+                    // readback_writeback_helper: the priority thread waits the
+                    // same fence and takes islands until the cursor runs out;
+                    // a late arrival costs only the help. The share is
+                    // captured, never the job, which the bounded path moves.
+                    auto share = job.share;
+                    scheduler.DeferPriorityOperationAt(job.wait_tick,
+                                                       [this, share] { HelpAsPriority(*share); });
+                    prio_posted_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             const u64 t0 = Common::FencedRDTSC();
             if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
@@ -645,7 +662,7 @@ void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
     job.copied = true;
 }
 
-bool BufferCache::HelpWriteBack(WriteBackShare& s) {
+bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes) {
     auto* memory = Core::Memory::Instance();
     // The hold comes before the first claim, so no claimed island waits on
     // the map while the owner waits on it.
@@ -669,7 +686,45 @@ bool BufferCache::HelpWriteBack(WriteBackShare& s) {
     } while (idx < s.total);
     share_helped_.fetch_add(n, std::memory_order_relaxed);
     share_helped_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    if (copied_bytes != nullptr) {
+        *copied_bytes += bytes;
+    }
     return true;
+}
+
+namespace {
+// One spin-wait step: a pause on x86, a yield on ARM, nothing elsewhere.
+inline void SpinRelax() {
+#if defined(ARCH_X86_64)
+    _mm_pause();
+#elif defined(ARCH_ARM64) && defined(_MSC_VER)
+    __yield();
+#elif defined(ARCH_ARM64)
+    asm("yield");
+#endif
+}
+} // namespace
+
+void BufferCache::HelpAsPriority(WriteBackShare& s) {
+    if (!s.coherent) {
+        // Non-coherent staging needs the owner's InvalidateForRead first: a
+        // short pause-spin on ready, then late (the owner copies everything).
+        constexpr u32 kReadySpins = 2048;
+        for (u32 i = 0; i < kReadySpins && !s.ready.load(std::memory_order_acquire); ++i) {
+            SpinRelax();
+        }
+        if (!s.ready.load(std::memory_order_acquire)) {
+            prio_late_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    u64 bytes = 0;
+    if (HelpWriteBack(s, &bytes)) {
+        prio_helped_.fetch_add(1, std::memory_order_relaxed);
+        prio_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        prio_late_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
@@ -796,6 +851,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
         }
         if (job.share) {
             job.share->tick = job.wait_tick;
+            job.share->coherent = job.staging->is_coherent;
             entry.share = job.share;
             share_shares_.fetch_add(1, std::memory_order_relaxed);
         }

@@ -286,7 +286,8 @@ private:
     /// its downloaded islands so the threads parked behind it copy a share.
     /// pieces, download, total and total_bytes are filled by the owner before
     /// ready and read by every copier; next hands islands out, done counts the
-    /// finished ones for the owner's tail wait; tick is what a joiner waits on.
+    /// finished ones for the owner's tail wait; tick is what a joiner waits on;
+    /// coherent lets the priority helper claim before the owner's invalidate.
     /// download is dereferenced only after a successful claim.
     struct WriteBackShare {
         struct Piece {
@@ -297,6 +298,7 @@ private:
         std::vector<Piece> pieces;
         const u8* download = nullptr;
         u64 tick = 0;
+        bool coherent = false;
         u64 total_bytes = 0;
         u32 total = 0;
         alignas(64) std::atomic<u32> next{0};
@@ -349,8 +351,14 @@ private:
     void WriteBackFaultDownload(FaultDownloadJob& job, u8 copier);
 
     /// Copies islands of another job's share until its cursor is exhausted;
-    /// false when none was left. Any thread, once the share is ready.
-    bool HelpWriteBack(WriteBackShare& share);
+    /// false when none was left. Any thread, once the share is ready. The
+    /// bytes it copied are added to copied_bytes when one is given.
+    bool HelpWriteBack(WriteBackShare& share, u64* copied_bytes = nullptr);
+
+    /// Priority-ops thread, after the share's fence: copies islands until the
+    /// cursor is exhausted; gives up as late when a non-coherent owner has not
+    /// published yet.
+    void HelpAsPriority(WriteBackShare& share);
 
     using OwnedIslands = boost::container::small_vector<std::pair<VAddr, u32>, 16>;
     /// Islands of in-flight readbacks that overlap [start, end), sorted by
@@ -584,15 +592,20 @@ public:
         u64 helped_bytes;
         u64 owner_islands;
         u64 tail_ns;
+        u64 prio_posted;
+        u64 prio_helped;
+        u64 prio_bytes;
+        u64 prio_late;
     };
     WriteBackShareStats DrainWriteBackShareStats() {
         const auto take = [](std::atomic<u64>& c) {
             return c.exchange(0, std::memory_order_relaxed);
         };
-        return WriteBackShareStats{take(share_shares_),       take(share_joins_),
-                                   take(share_fencewaits_),   take(share_helped_),
-                                   take(share_helped_bytes_), take(share_owner_islands_),
-                                   take(share_tail_ns_)};
+        return WriteBackShareStats{
+            take(share_shares_),  take(share_joins_),        take(share_fencewaits_),
+            take(share_helped_),  take(share_helped_bytes_), take(share_owner_islands_),
+            take(share_tail_ns_), take(prio_posted_),        take(prio_helped_),
+            take(prio_bytes_),    take(prio_late_)};
     }
     struct WrittenRangeStats {
         u64 binds;
@@ -716,6 +729,7 @@ private:
     bool writeback_hold_{};
     bool writeback_offload_{};
     bool writeback_share_{};
+    bool writeback_helper_{};
     bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
     u64 vinput_calls_{};
@@ -763,6 +777,10 @@ private:
     std::atomic<u64> share_helped_bytes_{};
     std::atomic<u64> share_owner_islands_{};
     std::atomic<u64> share_tail_ns_{};
+    std::atomic<u64> prio_posted_{};
+    std::atomic<u64> prio_helped_{};
+    std::atomic<u64> prio_bytes_{};
+    std::atomic<u64> prio_late_{};
 };
 
 } // namespace VideoCore

@@ -550,6 +550,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU descHeapRecycle: {}", EmulatorSettings.IsDescHeapRecycle());
     LOG_INFO(Config, "GPU pushDescFullLimit: {}", EmulatorSettings.IsPushDescFullLimit());
     LOG_INFO(Config, "GPU readbackWritebackShare: {}", EmulatorSettings.IsReadbackWritebackShare());
+    LOG_INFO(Config, "GPU readbackWritebackHelper: {}",
+             EmulatorSettings.IsReadbackWritebackHelper());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

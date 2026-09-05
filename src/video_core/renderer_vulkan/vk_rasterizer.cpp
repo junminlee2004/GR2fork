@@ -953,9 +953,11 @@ void Rasterizer::OnSubmit() {
             if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "
-                         "helped_KiB={} owner_islands={} tail_us={} per300f",
+                         "helped_KiB={} owner_islands={} tail_us={} prio_posted={} "
+                         "prio_helped={} prio_KiB={} prio_late={} per300f",
                          ws.shares, ws.joins, ws.fencewaits, ws.helped, ws.helped_bytes >> 10,
-                         ws.owner_islands, hz ? ws.tail_ns * 1000000 / hz : 0);
+                         ws.owner_islands, hz ? ws.tail_ns * 1000000 / hz : 0, ws.prio_posted,
+                         ws.prio_helped, ws.prio_bytes >> 10, ws.prio_late);
             }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
