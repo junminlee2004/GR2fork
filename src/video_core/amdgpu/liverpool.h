@@ -245,15 +245,6 @@ private:
                                                 const u32* payload);
     SHAD_FORCE_INLINE void SetShRegHot(const union PM4Header* header, u32 count);
     SHAD_NO_INLINE void SetShRegCompute(const union PM4Header* header, u32 count);
-    // The state packets whose arms neither suspend nor reach the rasterizer,
-    // shared by their switch cases and the register run loop so the routes
-    // cannot drift. RunStatePacket runs one of them in place behind
-    // parser_run_wide and answers false for anything else.
-    SHAD_FORCE_INLINE void SetUconfigRegHot(const union PM4Header* header, u32 count);
-    SHAD_FORCE_INLINE void IndexTypeHot(const union PM4Header* header);
-    SHAD_FORCE_INLINE void NumInstancesHot(const union PM4Header* header);
-    SHAD_FORCE_INLINE bool RunStatePacket(u32 masked, const union PM4Header* header, const u32* p,
-                                          u32 words);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
@@ -287,7 +278,6 @@ private:
     // the title's own visibility logic then culls those draws before issue.
     bool occlude_all_{};
     bool reg_run_{};
-    bool run_wide_{};
 
     struct ConstantEngine {
         void Reset() {
@@ -320,7 +310,6 @@ public:
         u64 run_packets;   // packets consumed by the run loop
         u64 runs;          // run loop entries that consumed at least one
         u64 outer_packets; // packets that reached the full dispatch
-        u64 wide_packets;  // state packets the run loop consumed behind parser_run_wide
         // Which opcode ended each run, so the packets that reach the full
         // dispatch can be named instead of inferred. Its own line: the poll
         // word one cache line up is written by the guest submit thread.

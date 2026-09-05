@@ -866,8 +866,7 @@ void Rasterizer::OnSubmit() {
             auto& pk = liverpool->packet_stats;
             auto& rs = liverpool->run_stats;
             // The six opcodes that most often end a register run: the packets
-            // the run loop cannot absorb at the current setting, ranked,
-            // rather than a residual.
+            // the run loop cannot absorb, ranked, rather than a residual.
             std::string brk;
             for (u32 n = 0; n < 6; ++n) {
                 u32 top = 0;
@@ -886,10 +885,9 @@ void Rasterizer::OnSubmit() {
             }
             LOG_INFO(Render,
                      "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} run={} runs={} "
-                     "outer={} wide={} brk={} per300f",
+                     "outer={} brk={} per300f",
                      pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
-                     pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets, rs.wide_packets,
-                     brk);
+                     pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets, brk);
             pk = {};
             rs = {};
         }
