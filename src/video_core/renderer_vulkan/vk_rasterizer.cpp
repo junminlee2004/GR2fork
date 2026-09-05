@@ -259,6 +259,15 @@ bool Rasterizer::RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u6
         ++ctr.miss_gen[LanePipe];
         return false;
     }
+#ifndef NDEBUG
+    // The equal texture generation above is the certificate: image_uid is
+    // written only by the Image constructor, whose registration ends in a
+    // generation bump, and both the unregister and the delete of a slot bump
+    // it too, so an identity change cannot hide behind an equal generation.
+    // The loop was a partial guard, never a proof, and a guest-thread unmap
+    // freeing under the texture mutex bumps the generation before the next
+    // probe as well; the residual window between this compare and the replay
+    // is one the loop never closed either. Debug builds keep it as an audit.
     for (u32 cb = 0; cb < m.cb_count; ++cb) {
         if (!m.cb_id[cb]) {
             continue;
@@ -267,6 +276,8 @@ bool Rasterizer::RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u6
         if (image.image_uid != m.cb_uid[cb] ||
             False(image.flags & VideoCore::ImageFlagBits::Registered)) {
             ++ctr.veto[0];
+            DEBUG_ASSERT_MSG(false,
+                             "render target identity changed under an equal texture generation");
             return false;
         }
     }
@@ -275,9 +286,12 @@ bool Rasterizer::RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u6
         if (image.image_uid != m.db_uid ||
             False(image.flags & VideoCore::ImageFlagBits::Registered)) {
             ++ctr.veto[0];
+            DEBUG_ASSERT_MSG(false,
+                             "render target identity changed under an equal texture generation");
             return false;
         }
     }
+#endif
     return true;
 }
 
@@ -943,6 +957,8 @@ void Rasterizer::OnSubmit() {
                 }
                 // The render scope and render target caches have never had a
                 // reported hit rate; both are probed on the same draw entry.
+                // RTMEMO veto= prints 0 by construction in release: the identity
+                // audit behind it is compiled only into debug builds.
                 const auto& bc = skipcache.Counters(Skipcache::CacheId::BeginRendering);
                 const auto& rc = skipcache.Counters(Skipcache::CacheId::PrepareRt);
                 if (bc.eligible != br_last_.eligible) {
