@@ -102,10 +102,12 @@ struct SpecSharpMasks {
     u64 sampler;
 };
 
-// Gather image and buffer reads that missed the in-place arm this window;
-// drained by DumpSharpReadStats.
+// Gather image and buffer reads outside the in-place arm this window: slow
+// ones assembled through Fetch, const buffers keyed as zero without
+// assembling. Drained by DumpSharpReadStats.
 u64 sharp_gather_slow_reads = 0;
 u64 sharp_gather_slow_buffers = 0;
+u64 sharp_gather_const_buffers = 0;
 
 const SpecSharpMasks& GetSpecSharpMasks() noexcept {
     static const SpecSharpMasks masks = [] {
@@ -229,6 +231,15 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
             if ((w1 >> 62) != 0) [[unlikely]] {
                 w1 = 0;
             }
+        } else if (d.sharp_fetch.load_mask == 0 && d.post_op == Shader::SharpFetchPostOp::None &&
+                   (d.sharp_fetch.immediates[0] | d.sharp_fetch.immediates[1] |
+                    d.sharp_fetch.immediates[2] | d.sharp_fetch.immediates[3]) == 0) {
+            // No dword is loaded and none is set, so num_records is 0 whether
+            // the sharp assembles as zero or as Null; keep is 0 and the words
+            // fold as zero.
+            ++sharp_gather_const_buffers;
+            w0 = 0;
+            w1 = 0;
         } else {
             ++sharp_gather_slow_buffers;
             const auto w = std::bit_cast<std::array<u64, 2>>(d.GetSharp(info));
@@ -1192,12 +1203,15 @@ void PipelineCache::NoteSharpVerdicts(const Shader::Info& info) {
 
 void PipelineCache::DumpSharpReadStats() {
     // img/buf/smp are direct/slow descriptor counts cumulative over program creation;
-    // gslow/bslow are this window's gather image and buffer reads that assembled.
+    // gslow/bslow are this window's gather image and buffer reads that assembled
+    // through Fetch; bconst the buffer reads keyed as zero without assembling.
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] SHARPREAD img={}/{} buf={}/{} smp={}/{} gslow={} bslow={} per300f",
+             "[SkipCache] SHARPREAD img={}/{} buf={}/{} smp={}/{} gslow={} bslow={} bconst={} "
+             "per300f",
              sharp_direct_img, sharp_slow_img, sharp_direct_buf, sharp_slow_buf, sharp_direct_smp,
-             sharp_slow_smp, sharp_gather_slow_reads, sharp_gather_slow_buffers);
-    sharp_gather_slow_reads = sharp_gather_slow_buffers = 0;
+             sharp_slow_smp, sharp_gather_slow_reads, sharp_gather_slow_buffers,
+             sharp_gather_const_buffers);
+    sharp_gather_slow_reads = sharp_gather_slow_buffers = sharp_gather_const_buffers = 0;
 }
 
 void PipelineCache::DumpProgramIdentityStats() {
