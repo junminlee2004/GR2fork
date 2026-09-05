@@ -213,6 +213,20 @@ struct Info : InfoPersistent {
         flat_ud = flattened_ud_buf.data();
     }
 
+    // Derives every descriptor's in-place read verdict. Runs once per Info: after
+    // TranslateProgram in CompileModule and after the preload's Deserialize.
+    void ResolveDirectReads() noexcept {
+        for (auto& d : buffers) {
+            d.ResolveDirectRead();
+        }
+        for (auto& d : images) {
+            d.ResolveDirectRead();
+        }
+        for (auto& d : samplers) {
+            d.ResolveDirectRead();
+        }
+    }
+
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
         ASSERT(tess_consts_dword_offset >= 0); // We've already tracked the V# UD
         auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),

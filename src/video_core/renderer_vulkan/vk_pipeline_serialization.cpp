@@ -261,6 +261,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     if (!LoadShaderMeta(ar, program->info, fetch_out, spec, perm_idx)) {
         return false;
     }
+    NoteSharpVerdicts(program->info);
     if (spec_fp_cache) {
         // Signatures are not serialized; without recomputing here the (sig, sig2) resolve
         // would treat every preloaded permutation as unknown and compile a duplicate.
@@ -411,6 +412,7 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     info.Read(flattened_ud_buf);
     // Preload builds descriptor layouts from these sharps before any draw refreshes them.
     flat_ud = flattened_ud_buf.data();
+    ResolveDirectReads();
 
     return srt_info.Deserialize(ar);
 }

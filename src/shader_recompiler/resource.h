@@ -32,6 +32,11 @@ struct SharpFetch {
     std::array<u32, N> immediates;
     std::array<SharpLocation, N> offsets;
     u8 load_mask;
+    // Derived read verdict, never trusted from disk: 1 when the sharp is one contiguous
+    // full-mask load with no post-op, so readers take it in place from flat_ud. The owner's
+    // ResolveDirectRead sets it after the passes and after a preload; the defaulted
+    // operator== compares it, which only the patching-pass dedupe of fresh Infos uses.
+    u8 direct{};
 
     bool operator==(const SharpFetch&) const = default;
 
@@ -105,6 +110,13 @@ struct BufferResource {
         return buffer_type != BufferType::Guest;
     }
 
+    // Derives sharp_fetch.direct; the offset bound keeps the in-place read inside the flat
+    // buffer where Fetch's UNKNOWN_LOCATION check would have rejected the last dwords.
+    void ResolveDirectRead() noexcept {
+        sharp_fetch.direct = post_op == SharpFetchPostOp::None && sharp_fetch.IsContiguousLoad() &&
+                             sharp_fetch.offsets[0] < UNKNOWN_LOCATION - decltype(sharp_fetch)::N;
+    }
+
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
         if (!sharp_fetch.Fetch(info.flat_ud, &buffer)) {
@@ -143,14 +155,25 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
+    // Derives sharp_fetch.direct; an r128 T# is half a sharp and always assembles.
+    void ResolveDirectRead() noexcept {
+        sharp_fetch.direct = !is_r128 && post_op == SharpFetchPostOp::None &&
+                             sharp_fetch.IsContiguousLoad() &&
+                             sharp_fetch.offsets[0] < UNKNOWN_LOCATION - decltype(sharp_fetch)::N;
+    }
+
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.flat_ud, &image)) {
-            return AmdGpu::Image::Null(is_depth);
-        }
-        if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
-            image.type = u64(AmdGpu::ImageType::Color2DArray);
-            image.depth = (image.depth + 1) * 6 - 1;
+        if (sharp_fetch.direct) [[likely]] {
+            std::memcpy(&image, info.flat_ud + sharp_fetch.offsets[0], sizeof(image));
+        } else {
+            if (!Fetch(info.flat_ud, &image)) {
+                return AmdGpu::Image::Null(is_depth);
+            }
+            if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
+                image.type = u64(AmdGpu::ImageType::Color2DArray);
+                image.depth = (image.depth + 1) * 6 - 1;
+            }
         }
         // Unlogged for the same inlining reason as the buffer form above.
         if (!image.Valid()) [[unlikely]] {
@@ -184,8 +207,7 @@ struct ImageResource {
     // post-op; scratch carries the value on every other arm and for the null
     // fixups, which build the same Null objects the by-value form builds.
     const AmdGpu::Image& GetSharpRef(const auto& info, AmdGpu::Image& scratch) const noexcept {
-        if (is_r128 || post_op != SharpFetchPostOp::None || !sharp_fetch.IsContiguousLoad())
-            [[unlikely]] {
+        if (!sharp_fetch.direct) [[unlikely]] {
             scratch = GetSharp(info);
             return scratch;
         }
@@ -227,6 +249,12 @@ struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
+
+    // Derives sharp_fetch.direct; see BufferResource::ResolveDirectRead.
+    void ResolveDirectRead() noexcept {
+        sharp_fetch.direct = post_op == SharpFetchPostOp::None && sharp_fetch.IsContiguousLoad() &&
+                             sharp_fetch.offsets[0] < UNKNOWN_LOCATION - decltype(sharp_fetch)::N;
+    }
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};

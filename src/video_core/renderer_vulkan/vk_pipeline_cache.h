@@ -249,6 +249,8 @@ public:
     void DumpLayoutStats();
     /// Per-window telemetry for the canonical specialization key; silent when it is off.
     void DumpSpecFpStats();
+    /// Per-window telemetry for the descriptors' in-place read verdicts.
+    void DumpSharpReadStats();
 
 private:
     bool RefreshGraphicsKey();
@@ -435,6 +437,14 @@ private:
     u64 specfp_slot_pf{};
     u64 specfp_fused{};
     u64 specfp_fused_miss{};
+    /// Descriptors created with and without the in-place read verdict, cumulative.
+    u64 sharp_direct_img{};
+    u64 sharp_slow_img{};
+    u64 sharp_direct_buf{};
+    u64 sharp_slow_buf{};
+    u64 sharp_direct_smp{};
+    u64 sharp_slow_smp{};
+    void NoteSharpVerdicts(const Shader::Info& info);
     void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
                          const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so

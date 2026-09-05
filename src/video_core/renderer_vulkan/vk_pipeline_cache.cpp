@@ -102,6 +102,10 @@ struct SpecSharpMasks {
     u64 sampler;
 };
 
+// Gather image reads that missed the in-place arm this window; drained by
+// DumpSharpReadStats.
+u64 sharp_gather_slow_reads = 0;
+
 const SpecSharpMasks& GetSpecSharpMasks() noexcept {
     static const SpecSharpMasks masks = [] {
         // Not const: a constant here would be diagnosed as a truncating store.
@@ -221,8 +225,12 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
     put(&valid, sizeof(valid));
     valid = 0;
     n = 0;
+    AmdGpu::Image image_scratch{};
     for (const auto& d : info.images) {
-        const AmdGpu::Image s = d.GetSharp(info);
+        if (!d.sharp_fetch.direct) [[unlikely]] {
+            ++sharp_gather_slow_reads;
+        }
+        const AmdGpu::Image& s = d.GetSharpRef(info, image_scratch);
         const u64 keep = s.base_address != 0 ? ~u64{0} : 0;
         valid |= (keep & 1) << n++;
         const auto iw = std::bit_cast<std::array<u64, 4>>(s);
@@ -1089,6 +1097,28 @@ void PipelineCache::DumpSpecFpStats() {
             specfp_slot_pf = specfp_fused = specfp_fused_miss = 0;
 }
 
+void PipelineCache::NoteSharpVerdicts(const Shader::Info& info) {
+    for (const auto& d : info.buffers) {
+        ++(d.sharp_fetch.direct ? sharp_direct_buf : sharp_slow_buf);
+    }
+    for (const auto& d : info.images) {
+        ++(d.sharp_fetch.direct ? sharp_direct_img : sharp_slow_img);
+    }
+    for (const auto& d : info.samplers) {
+        ++(d.sharp_fetch.direct ? sharp_direct_smp : sharp_slow_smp);
+    }
+}
+
+void PipelineCache::DumpSharpReadStats() {
+    // img/buf/smp are direct/slow descriptor counts cumulative over program creation;
+    // gslow is this window's gather image reads that took the assembling arm.
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] SHARPREAD img={}/{} buf={}/{} smp={}/{} gslow={} per300f",
+             sharp_direct_img, sharp_slow_img, sharp_direct_buf, sharp_slow_buf, sharp_direct_smp,
+             sharp_slow_smp, sharp_gather_slow_reads);
+    sharp_gather_slow_reads = 0;
+}
+
 void PipelineCache::DumpProgramIdentityStats() {
     if (pgmid_map_hits == 0 && pgmid_map_probes == 0) {
         return;
@@ -1460,6 +1490,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    info.ResolveDirectReads();
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.stage, perm_idx, "spv");
 
@@ -1546,6 +1577,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
             auto start = binding;
             auto ri_compile = runtime_info;
             const auto module = CompileModule(created->info, ri_compile, params.code, 0, binding);
+            NoteSharpVerdicts(created->info);
             auto spec = Shader::StageSpecialization(created->info, ri_compile, profile, start);
             const auto perm_hash = HashCombine(params.hash, 0);
 
