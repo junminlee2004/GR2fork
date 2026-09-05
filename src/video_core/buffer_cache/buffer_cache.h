@@ -282,6 +282,28 @@ private:
     template <bool async>
     void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
 
+    /// readback_writeback_share: the owner of an in-flight readback publishes
+    /// its downloaded islands so the threads parked behind it copy a share.
+    /// pieces, download, total and total_bytes are filled by the owner before
+    /// ready and read by every copier; next hands islands out, done counts the
+    /// finished ones for the owner's tail wait; tick is what a joiner waits on.
+    /// download is dereferenced only after a successful claim.
+    struct WriteBackShare {
+        struct Piece {
+            VAddr dst;
+            u64 src_off;
+            u32 size;
+        };
+        std::vector<Piece> pieces;
+        const u8* download = nullptr;
+        u64 tick = 0;
+        u64 total_bytes = 0;
+        u32 total = 0;
+        alignas(64) std::atomic<u32> next{0};
+        std::atomic<u32> done{0};
+        std::atomic<bool> ready{false};
+    };
+
     /**
      * One offloaded fault readback in flight. Filled on the GPU command thread
      * (PrepareFaultDownload), the semaphore wait happens on the faulting guest
@@ -307,6 +329,11 @@ private:
         bool copied = false;
         bool has_download = false;
         bool fully_cleared = false; // FinishFaultDownload verdict
+        // readback_writeback_share: this job's islands, and the in-flight
+        // owners of the faulted range an empty job may help instead of sleeping.
+        std::shared_ptr<WriteBackShare> share;
+        boost::container::small_vector<std::shared_ptr<WriteBackShare>, 4> joins;
+        u64 join_tick = 0; // newest fence among the joined owners
     };
 
     /// Records download copies for an offloaded fault readback and flushes the
@@ -320,6 +347,10 @@ private:
     /// Copies every downloaded island into guest memory through the backing
     /// view. Any thread; the caller has waited out job.wait_tick.
     void WriteBackFaultDownload(FaultDownloadJob& job, u8 copier);
+
+    /// Copies islands of another job's share until its cursor is exhausted;
+    /// false when none was left. Any thread, once the share is ready.
+    bool HelpWriteBack(WriteBackShare& share);
 
     using OwnedIslands = boost::container::small_vector<std::pair<VAddr, u32>, 16>;
     /// Islands of in-flight readbacks that overlap [start, end), sorted by
@@ -545,6 +576,24 @@ public:
         wboff_guest_ = wboff_prio_ = wboff_gpucomm_ = wboff_excluded_ = wboff_copy_ns_ = 0;
         return out;
     }
+    struct WriteBackShareStats {
+        u64 shares;
+        u64 joins;
+        u64 fencewaits;
+        u64 helped;
+        u64 helped_bytes;
+        u64 owner_islands;
+        u64 tail_ns;
+    };
+    WriteBackShareStats DrainWriteBackShareStats() {
+        const auto take = [](std::atomic<u64>& c) {
+            return c.exchange(0, std::memory_order_relaxed);
+        };
+        return WriteBackShareStats{take(share_shares_),       take(share_joins_),
+                                   take(share_fencewaits_),   take(share_helped_),
+                                   take(share_helped_bytes_), take(share_owner_islands_),
+                                   take(share_tail_ns_)};
+    }
     struct WrittenRangeStats {
         u64 binds;
         u64 fresh;
@@ -580,6 +629,7 @@ private:
         VAddr lo;
         VAddr hi;
         std::vector<std::pair<VAddr, u32>> islands;
+        std::shared_ptr<WriteBackShare> share; // readback_writeback_share
     };
     std::vector<InflightDownload> inflight_downloads_;
     u64 next_inflight_id_{1};
@@ -665,6 +715,7 @@ private:
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
     bool writeback_offload_{};
+    bool writeback_share_{};
     bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
     u64 vinput_calls_{};
@@ -703,6 +754,15 @@ private:
     alignas(64) std::atomic<u64> damp_entries_{};
     std::atomic<u64> damp_iters_{};
     std::atomic<u64> damp_stuck_{};
+    // readback_writeback_share census: shares and joins from the GPU command
+    // thread, the rest from the copying guest threads. Read by the WBSHARE line.
+    alignas(64) std::atomic<u64> share_shares_{};
+    std::atomic<u64> share_joins_{};
+    std::atomic<u64> share_fencewaits_{};
+    std::atomic<u64> share_helped_{};
+    std::atomic<u64> share_helped_bytes_{};
+    std::atomic<u64> share_owner_islands_{};
+    std::atomic<u64> share_tail_ns_{};
 };
 
 } // namespace VideoCore

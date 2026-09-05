@@ -950,6 +950,13 @@ void Rasterizer::OnSubmit() {
                          "per300f",
                          wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
             }
+            if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "
+                         "helped_KiB={} owner_islands={} tail_us={} per300f",
+                         ws.shares, ws.joins, ws.fencewaits, ws.helped, ws.helped_bytes >> 10,
+                         ws.owner_islands, hz ? ws.tail_ns * 1000000 / hz : 0);
+            }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
                 LOG_INFO(Render_Skipcache,

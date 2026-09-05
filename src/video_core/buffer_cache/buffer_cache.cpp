@@ -55,6 +55,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
+    writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
@@ -360,6 +361,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     if (offload_mode != GpuReadbackOffloadMode::OffloadDisabled) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             FaultDownloadJob job;
+            if (writeback_share_) {
+                job.share = std::make_shared<WriteBackShare>();
+            }
             liverpool->SendCommand<true>(
                 [&] { PrepareFaultDownload(job, device_addr, size, is_write); });
             if (!job.has_download) {
@@ -370,16 +374,76 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 // tight loop and hammering the GPU command thread with empty
                 // download requests while the first one is in flight.
                 damp_entries_.fetch_add(1, std::memory_order_relaxed);
-                int spin = 0;
+                u64 spin = 0;
                 // Foreign: this damping loop runs on whichever thread faulted,
                 // which is usually a guest thread but can be GpuComm itself.
-                for (; spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size);
-                     ++spin) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (!job.joins.empty() && !liverpool->OnGpuThread()) {
+                    // readback_writeback_share: the joined owners' islands are
+                    // what keeps this range marked, so wait on their fence
+                    // once and copy a share of their islands instead of
+                    // sleeping. The budget is the same 400 x 50 us envelope,
+                    // charged from the clock; spin >= 400 means it ran out.
+                    constexpr u64 kDampBudgetNs = 400 * 50'000;
+                    const auto t_start = std::chrono::steady_clock::now();
+                    const auto elapsed_ns = [&] {
+                        return static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t_start)
+                                .count());
+                    };
+                    bool fence_seen = false;
+                    while (spin < 400 &&
+                           memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
+                        bool helped = false;
+                        for (const auto& s : job.joins) {
+                            if (s->ready.load(std::memory_order_acquire)) {
+                                helped |= HelpWriteBack(*s);
+                            }
+                        }
+                        if (helped) {
+                            continue;
+                        }
+                        if (!fence_seen) {
+                            const u64 el = elapsed_ns();
+                            if (el >= kDampBudgetNs) {
+                                spin = 400;
+                                break;
+                            }
+                            scheduler.GetMasterSemaphore()->WaitFor(job.join_tick,
+                                                                    kDampBudgetNs - el);
+                            // A timeout means the budget is gone as well.
+                            fence_seen = true;
+                            spin = std::min<u64>(400, elapsed_ns() / 50'000);
+                            share_fencewaits_.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                        ++spin;
+                    }
+                } else {
+                    for (;
+                         spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size);
+                         ++spin) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
                 }
-                damp_iters_.fetch_add(static_cast<u64>(spin), std::memory_order_relaxed);
-                damp_stuck_.fetch_add(spin == 400, std::memory_order_relaxed);
+                damp_iters_.fetch_add(spin, std::memory_order_relaxed);
+                damp_stuck_.fetch_add(spin >= 400, std::memory_order_relaxed);
                 return;
+            }
+            if (job.share) {
+                // The copy list in a form that survives the bounded path's job
+                // move; published to the copiers by ready in the write-back.
+                auto& s = *job.share;
+                s.pieces.reserve(job.copies.size());
+                for (const auto& copy : job.copies) {
+                    s.pieces.push_back(WriteBackShare::Piece{job.buffer_base + copy.srcOffset,
+                                                             copy.dstOffset,
+                                                             static_cast<u32>(copy.size)});
+                    s.total_bytes += copy.size;
+                }
+                s.download = job.staging->mapped_data.data();
+                s.total = static_cast<u32>(s.pieces.size());
             }
             const u64 t0 = Common::FencedRDTSC();
             if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
@@ -545,16 +609,67 @@ void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
         hold.emplace(memory);
     }
     const u64 t0 = Common::FencedRDTSC();
-    for (const auto& copy : job.copies) {
-        memory->TryWriteBacking(std::bit_cast<u8*>(job.buffer_base + copy.srcOffset),
-                                download + copy.dstOffset, copy.size);
-        ++job.written_islands;
-        job.written_bytes += copy.size;
+    if (job.share) {
+        // readback_writeback_share: the islands go out through the cursor;
+        // joiners take some, this thread takes the rest and then waits for
+        // every claimed one, so the bytes are all in place when it returns.
+        auto& s = *job.share;
+        s.ready.store(true, std::memory_order_release);
+        u64 mine = 0;
+        for (u32 idx = s.next.fetch_add(1, std::memory_order_acq_rel); idx < s.total;
+             idx = s.next.fetch_add(1, std::memory_order_acq_rel)) {
+            const auto& p = s.pieces[idx];
+            memory->TryWriteBacking(std::bit_cast<u8*>(p.dst), download + p.src_off, p.size);
+            s.done.fetch_add(1, std::memory_order_release);
+            ++mine;
+        }
+        const u64 t_tail = Common::FencedRDTSC();
+        while (s.done.load(std::memory_order_acquire) < s.total) {
+            std::this_thread::yield();
+        }
+        share_tail_ns_.fetch_add(Common::FencedRDTSC() - t_tail, std::memory_order_relaxed);
+        share_owner_islands_.fetch_add(mine, std::memory_order_relaxed);
+        job.written_islands = s.total;
+        job.written_bytes = s.total_bytes;
+    } else {
+        for (const auto& copy : job.copies) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(job.buffer_base + copy.srcOffset),
+                                    download + copy.dstOffset, copy.size);
+            ++job.written_islands;
+            job.written_bytes += copy.size;
+        }
     }
     job.copy_ns = Common::FencedRDTSC() - t0;
     hold.reset();
     job.copier = copier;
     job.copied = true;
+}
+
+bool BufferCache::HelpWriteBack(WriteBackShare& s) {
+    auto* memory = Core::Memory::Instance();
+    // The hold comes before the first claim, so no claimed island waits on
+    // the map while the owner waits on it.
+    std::optional<Core::MemoryManager::GuestCopyScope> hold;
+    if (writeback_hold_) {
+        hold.emplace(memory);
+    }
+    u32 idx = s.next.fetch_add(1, std::memory_order_acq_rel);
+    if (idx >= s.total) {
+        return false;
+    }
+    u64 n = 0;
+    u64 bytes = 0;
+    do {
+        const auto& p = s.pieces[idx];
+        memory->TryWriteBacking(std::bit_cast<u8*>(p.dst), s.download + p.src_off, p.size);
+        s.done.fetch_add(1, std::memory_order_release);
+        ++n;
+        bytes += p.size;
+        idx = s.next.fetch_add(1, std::memory_order_acq_rel);
+    } while (idx < s.total);
+    share_helped_.fetch_add(n, std::memory_order_relaxed);
+    share_helped_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
 }
 
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
@@ -616,6 +731,21 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
         });
     if (total_size_bytes == 0) {
         join_empty_.fetch_add(1, std::memory_order_relaxed);
+        if (writeback_share_) {
+            // readback_writeback_share: hand the caller the in-flight owners
+            // of the faulted range, so it waits on their fence and copies a
+            // share of their islands. An entry outside the faulted range is
+            // not what the caller's damping test waits on.
+            for (const auto& e : inflight_downloads_) {
+                if (e.share && e.lo < device_addr + size && e.hi > device_addr) {
+                    job.joins.push_back(e.share);
+                    job.join_tick = std::max<u64>(job.join_tick, e.share->tick);
+                }
+            }
+            if (!job.joins.empty()) {
+                share_joins_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         // Nothing pending for the window. Unlike the synchronous form, empty
         // does not imply resolved here: another thread's in-flight job may own
         // the ranges while the bits are still set. Marking CPU-dirty in that
@@ -663,6 +793,11 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
         for (const auto& copy : job.copies) {
             entry.islands.emplace_back(job.buffer_base + copy.srcOffset,
                                        static_cast<u32>(copy.size));
+        }
+        if (job.share) {
+            job.share->tick = job.wait_tick;
+            entry.share = job.share;
+            share_shares_.fetch_add(1, std::memory_order_relaxed);
         }
         inflight_downloads_.push_back(std::move(entry));
     }
