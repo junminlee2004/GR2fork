@@ -75,6 +75,16 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+// The memo's miss arm: the same four selects MakeUserData makes, written in
+// place so the rest of push_data keeps the prefix-clear invariant.
+void Rasterizer::RefreshViewportPush() {
+    const auto& regs = liverpool->regs;
+    push_data.xoffset = regs.viewport_control.xoffset_enable ? regs.viewports[0].xoffset : 0.f;
+    push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
+    push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
+    push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, page_manager{this},
@@ -112,6 +122,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         EmulatorSettings.IsDynStateMemo() &&
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
     dyn_class_stamp_ = dyn_memo_enabled_ && EmulatorSettings.IsDynStateStamp();
+    // A dormant funnel freezes both stamp lanes, so the memo would go permanently stale.
+    push_vp_memo_ = EmulatorSettings.IsPushVpMemo() && liverpool->IsGfxStampActive();
+    if (EmulatorSettings.IsPushVpMemo() && !push_vp_memo_) {
+        LOG_WARNING(Render_Vulkan, "push_vp_memo needs adaptive_skipcaches_mode != 0; it is off");
+    }
     // Same pinning: the rt lane is latched from the boot values.
     rt_state_stamp_ =
         EmulatorSettings.IsRtStateStamp() &&
@@ -1140,6 +1155,12 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] PUSHCONST probes={} hits={} per300f",
                          pc.probes, pc.hits);
             }
+            if (pushvp_probes_) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] PUSHVP probes={} hits={} udw={} bow={} per300f",
+                         pushvp_probes_, pushvp_hits_, pushvp_udw_, pushvp_bow_);
+                pushvp_probes_ = pushvp_hits_ = pushvp_udw_ = pushvp_bow_ = 0;
+            }
             const auto us = buffer_cache.DrainUploadCopyStats();
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
@@ -1316,7 +1337,37 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(liverpool->regs);
+    if (push_vp_memo_) {
+        // The four floats depend only on viewport_control and viewports[0],
+        // both in the dyn block table, so an unmoved stamp lane proves them
+        // unchanged and they stay in place. The async-compute queue never
+        // flushes the stamp, so a dispatch running under a pending viewport
+        // write pushes floats that only a position-writing stage reads, which
+        // compute never is; the next graphics draw flushes and rebuilds.
+        const u64 stamp =
+            dyn_class_stamp_ ? liverpool->GetDynStateStamp() : liverpool->GetGfxStateStamp();
+        ++pushvp_probes_;
+        if (stamp == vp_push_stamp_) {
+            ++pushvp_hits_;
+        } else {
+            vp_push_stamp_ = stamp;
+            RefreshViewportPush();
+        }
+        // Constant-size clears of the prefixes the previous draw wrote; a
+        // runtime-length memset would be a library call per draw.
+        if (push_ud_hw_ != 0) {
+            push_data.ud_regs = {};
+        }
+        if (push_bo_hw_ != 0) {
+            push_data.buf_offsets = {};
+        }
+        // Maximal until the stage loop records the real marks, so an escaping
+        // throw leaves the next draw clearing everything.
+        push_ud_hw_ = Shader::NUM_USER_DATA_REGS;
+        push_bo_hw_ = Shader::NUM_BUFFERS;
+    } else {
+        push_data = MakeUserData(liverpool->regs);
+    }
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -1328,6 +1379,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
+    }
+    if (push_vp_memo_) {
+        push_ud_hw_ = binding.user_data;
+        push_bo_hw_ = binding.buffer;
+        pushvp_udw_ += binding.user_data;
+        pushvp_bow_ += binding.buffer;
     }
 
     if (uses_dma) {

@@ -347,6 +347,15 @@ private:
     // rebuild touches a third line for eight bytes of it. The value-init is a
     // no-op today and the base case for a prefix-clear memo later.
     alignas(64) Shader::PushData push_data{};
+    // push_vp_memo: the high-water marks of the previous draw's user-data and
+    // buffer-offset writes, pinned into push_data's second line so the prefix
+    // clear and the marks share the lines the build already writes. Every
+    // byte at or past a mark is zero, which the dedup's byte-identity needs.
+    u32 push_ud_hw_{Shader::NUM_USER_DATA_REGS};
+    u32 push_bo_hw_{Shader::NUM_BUFFERS};
+    u64 vp_push_stamp_{};
+    bool push_vp_memo_{};
+    SHAD_NO_INLINE void RefreshViewportPush();
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
@@ -399,6 +408,11 @@ private:
     u32 br_color_bits_{};
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> br_color_samples_{};
     bool draw_samples_target_{};
+    // push_vp_memo census: probes, stamp hits and the summed high-water marks.
+    u64 pushvp_probes_{};
+    u64 pushvp_hits_{};
+    u64 pushvp_udw_{};
+    u64 pushvp_bow_{};
     // The attachment views the memo left in place, for the mode-3 audit.
     std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS> rt_memo_cb_view_{};
     VideoCore::ImageViewInfo rt_memo_db_view_{};
