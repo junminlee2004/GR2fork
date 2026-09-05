@@ -215,15 +215,29 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
     u64 valid = 0;
     u32 n = 0;
     for (const auto& d : info.buffers) {
-        if (!d.sharp_fetch.direct) [[unlikely]] {
+        u64 w0;
+        u64 w1;
+        if (d.sharp_fetch.direct) [[likely]] {
+            // In place and word by word: a 16-byte copy into a temporary is
+            // stored as one vector and reloaded as two scalars, and the upper
+            // reload cannot forward from that store. The type bits are the
+            // Valid() test GetSharp makes; its Null() carries no records, so
+            // an invalid sharp keys as zero words on both paths.
+            const u32* src = info.flat_ud + d.sharp_fetch.offsets[0];
+            std::memcpy(&w0, src, sizeof(w0));
+            std::memcpy(&w1, src + 2, sizeof(w1));
+            if ((w1 >> 62) != 0) [[unlikely]] {
+                w1 = 0;
+            }
+        } else {
             ++sharp_gather_slow_buffers;
+            const auto w = std::bit_cast<std::array<u64, 2>>(d.GetSharp(info));
+            w0 = w[0];
+            w1 = w[1];
         }
-        const AmdGpu::Buffer s = d.GetSharp(info);
-        const u64 keep = s.num_records != 0 ? ~u64{0} : 0;
+        const u64 keep = (w1 & 0xFFFFFFFFu) != 0 ? ~u64{0} : 0;
         valid |= (keep & 1) << n++;
-        auto w = std::bit_cast<std::array<u64, 2>>(s);
-        w[0] &= m.buffer[0] & keep;
-        w[1] &= m.buffer[1] & keep;
+        const std::array<u64, 2> w{w0 & m.buffer[0] & keep, w1 & m.buffer[1] & keep};
         put(&w, sizeof(w));
     }
     put(&valid, sizeof(valid));
@@ -255,10 +269,20 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
     valid = 0;
     n = 0;
     for (const auto& d : info.samplers) {
-        const AmdGpu::Sampler s = d.GetSharp(info);
-        const u64 keep = (s.raw0 | s.raw1) != 0 ? ~u64{0} : 0;
+        u64 raw0;
+        u64 raw1;
+        if (d.sharp_fetch.direct) [[likely]] {
+            const u32* src = info.flat_ud + d.sharp_fetch.offsets[0];
+            std::memcpy(&raw0, src, sizeof(raw0));
+            std::memcpy(&raw1, src + 2, sizeof(raw1));
+        } else {
+            const AmdGpu::Sampler s = d.GetSharp(info);
+            raw0 = s.raw0;
+            raw1 = s.raw1;
+        }
+        const u64 keep = (raw0 | raw1) != 0 ? ~u64{0} : 0;
         valid |= (keep & 1) << n++;
-        const u64 w = s.raw0 & m.sampler & keep;
+        const u64 w = raw0 & m.sampler & keep;
         put(&w, sizeof(w));
     }
     put(&valid, sizeof(valid));
