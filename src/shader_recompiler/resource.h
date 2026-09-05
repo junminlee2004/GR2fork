@@ -119,13 +119,17 @@ struct BufferResource {
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
-        if (!sharp_fetch.Fetch(info.flat_ud, &buffer)) {
-            return AmdGpu::Buffer::Null();
-        }
-        if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
-            reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
-        } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
-            buffer.base_address += info.pgm_base;
+        if (sharp_fetch.direct) [[likely]] {
+            std::memcpy(&buffer, info.flat_ud + sharp_fetch.offsets[0], sizeof(buffer));
+        } else {
+            if (!sharp_fetch.Fetch(info.flat_ud, &buffer)) {
+                return AmdGpu::Buffer::Null();
+            }
+            if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
+                reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
+            } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
+                buffer.base_address += info.pgm_base;
+            }
         }
         // No logging here: the fmt machinery a log line drags in makes this
         // function too big to inline, and it runs once per descriptor per
@@ -258,6 +262,10 @@ struct SamplerResource {
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
+        if (sharp_fetch.direct) [[likely]] {
+            std::memcpy(&sampler, info.flat_ud + sharp_fetch.offsets[0], sizeof(sampler));
+            return sampler;
+        }
         sharp_fetch.Fetch(info.flat_ud, &sampler);
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
             const u32 tsharp_dw3 = info.flat_ud[post_op_tsharp_dw3_off];

@@ -102,9 +102,10 @@ struct SpecSharpMasks {
     u64 sampler;
 };
 
-// Gather image reads that missed the in-place arm this window; drained by
-// DumpSharpReadStats.
+// Gather image and buffer reads that missed the in-place arm this window;
+// drained by DumpSharpReadStats.
 u64 sharp_gather_slow_reads = 0;
+u64 sharp_gather_slow_buffers = 0;
 
 const SpecSharpMasks& GetSpecSharpMasks() noexcept {
     static const SpecSharpMasks masks = [] {
@@ -214,6 +215,9 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
     u64 valid = 0;
     u32 n = 0;
     for (const auto& d : info.buffers) {
+        if (!d.sharp_fetch.direct) [[unlikely]] {
+            ++sharp_gather_slow_buffers;
+        }
         const AmdGpu::Buffer s = d.GetSharp(info);
         const u64 keep = s.num_records != 0 ? ~u64{0} : 0;
         valid |= (keep & 1) << n++;
@@ -1111,12 +1115,12 @@ void PipelineCache::NoteSharpVerdicts(const Shader::Info& info) {
 
 void PipelineCache::DumpSharpReadStats() {
     // img/buf/smp are direct/slow descriptor counts cumulative over program creation;
-    // gslow is this window's gather image reads that took the assembling arm.
+    // gslow/bslow are this window's gather image and buffer reads that assembled.
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] SHARPREAD img={}/{} buf={}/{} smp={}/{} gslow={} per300f",
+             "[SkipCache] SHARPREAD img={}/{} buf={}/{} smp={}/{} gslow={} bslow={} per300f",
              sharp_direct_img, sharp_slow_img, sharp_direct_buf, sharp_slow_buf, sharp_direct_smp,
-             sharp_slow_smp, sharp_gather_slow_reads);
-    sharp_gather_slow_reads = 0;
+             sharp_slow_smp, sharp_gather_slow_reads, sharp_gather_slow_buffers);
+    sharp_gather_slow_reads = sharp_gather_slow_buffers = 0;
 }
 
 void PipelineCache::DumpProgramIdentityStats() {
