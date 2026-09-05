@@ -565,6 +565,13 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+// The sampled guard timing, kept off the hot function's frame.
+static SHAD_NO_INLINE void RecordGuardSample(VideoCore::Skipcache::Framework& sc,
+                                             VideoCore::Skipcache::CacheCounters& ctr, u64 t0) {
+    ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
+    ++ctr.guard_samples;
+}
+
 ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp) {
     using namespace VideoCore::Skipcache;
     auto& sc = Framework::Instance();
@@ -580,14 +587,18 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     const bool timed = sc.SampleTimer(kCache);
     const u64 t0 = timed ? sc.Now() : 0;
     const u64 tex_gen = sc.Gens().tex_gen.load(std::memory_order_acquire);
-    const auto raw = std::bit_cast<std::array<u64, 4>>(tsharp);
-    // The index words are read straight from the T#: a narrow reload of the
-    // 32-byte copy above would wait on the store queue.
+    // The key words are read straight from the T#, all four: the way scan
+    // compares them one at a time, so the function keeps no 32-byte copy of
+    // the sharp on its frame and the compare cannot lower to a library call.
     const std::byte* const tp = reinterpret_cast<const std::byte*>(&tsharp);
     u64 w0;
     u64 w1;
+    u64 w2;
+    u64 w3;
     std::memcpy(&w0, tp, 8);
     std::memcpy(&w1, tp + 8, 8);
+    std::memcpy(&w2, tp + 16, 8);
+    std::memcpy(&w3, tp + 24, 8);
     const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
                         static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
     const u8 type = static_cast<u8>(desc.type);
@@ -601,10 +612,6 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         // Every T# word reaches the set index through its own odd multiplier;
         // the top bits are taken because a product's low bits see only the low
         // input bits.
-        u64 w2;
-        u64 w3;
-        std::memcpy(&w2, tp + 16, 8);
-        std::memcpy(&w3, tp + 24, 8);
         const u64 mix = (w0 ^ view_key) * 0x9E3779B97F4A7C15ULL + w1 * 0xC2B2AE3D27D4EB4FULL +
                         (w2 ^ w3) * 0x165667B19E3779F9ULL;
         set_index = mix >> memo_set_shift;
@@ -617,8 +624,10 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     // itself still carries the recorded identity. No two valid ways hold the
     // same key: a populate happens only after no valid way matched.
     u32 way = 0;
-    while (way < ways && !(set[way].valid && set[way].tsharp_raw == raw && set[way].type == type &&
-                           set[way].view_key == view_key)) {
+    while (way < ways &&
+           !(set[way].valid && set[way].tsharp_raw[0] == w0 && set[way].tsharp_raw[1] == w1 &&
+             set[way].tsharp_raw[2] == w2 && set[way].tsharp_raw[3] == w3 &&
+             set[way].type == type && set[way].view_key == view_key)) {
         ++way;
     }
     const bool matched = way < ways;
@@ -651,8 +660,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         e.touch_stamp = ++findimg_touch_seq_;
     }
     if (timed) {
-        ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
-        ++ctr.guard_samples;
+        RecordGuardSample(sc, ctr, t0);
     }
     if (would_hit) {
         ++ctr.hits;
@@ -706,6 +714,28 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             desc.memo_slot = static_cast<u16>(slot);
         }
     }
+    return FindImageMemoizedSlow(desc, tsharp, e,
+                                 u64{ways} | u64{matched} << 8 | u64{would_hit} << 9 |
+                                     u64{deferred} << 10 | u64{timed} << 11,
+                                 tex_gen);
+}
+
+ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image& tsharp,
+                                            FindImageMemoEntry& e, u64 packed, u64 tex_gen) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::FindImage;
+    auto& ctr = sc.Counters(kCache);
+    const u32 ways = static_cast<u32>(packed & 0xFF);
+    const bool matched = ((packed >> 8) & 1) != 0;
+    const bool would_hit = ((packed >> 9) & 1) != 0;
+    const bool deferred = ((packed >> 10) & 1) != 0;
+    const bool timed = ((packed >> 11) & 1) != 0;
+    // Recomputed from the entry, never from set_index * ways: with one way the
+    // index is masked, not multiplied.
+    const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
+    const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
+                        static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
     // Authoritative path, exactly once; prediction is only compared, never
     // served, outside the consumed-hit flow above.
     const ImageId predicted = would_hit ? e.image_id : ImageId{};
@@ -735,7 +765,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             ++findimg_evictions_;
         }
         e.valid = false;
-        e.tsharp_raw = raw;
+        e.tsharp_raw = std::bit_cast<std::array<u64, 4>>(tsharp);
         e.type = static_cast<u8>(desc.type);
         e.view_key = view_key;
         e.image_id = real;

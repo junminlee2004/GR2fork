@@ -575,6 +575,11 @@ private:
     static constexpr size_t FindImageMemoEntries = 2048;
     std::array<FindImageMemoEntry, FindImageMemoEntries> find_image_memo_{};
     u32 MemoVictim(const FindImageMemoEntry* set, u32 ways) const;
+    // The authoritative arm of FindImageMemoized: the real lookup, the verify
+    // and the populate. packed = ways | matched << 8 | would_hit << 9 |
+    // deferred << 10 | timed << 11, one register for the probe's verdicts.
+    SHAD_NO_INLINE ImageId FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image& tsharp,
+                                                 FindImageMemoEntry& e, u64 packed, u64 tex_gen);
     u64 view_memo_hits_{};
     u64 view_memo_slow_{};
     u64 view_memo_writebacks_{};
