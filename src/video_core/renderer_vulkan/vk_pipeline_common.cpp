@@ -402,7 +402,14 @@ void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bin
                   is_compute ? "Compute" : "Graphics", debug_name);
 }
 
-Pipeline::~Pipeline() = default;
+Pipeline::~Pipeline() {
+    // An owned layout dies with the pipeline and the driver may hand its
+    // handle value to a layout of another shape: the heap forgets the sets
+    // it cached under it, in the recycling ring and in the batch map alike.
+    if (owned_desc_layout) {
+        desc_heap.Forget(*owned_desc_layout);
+    }
+}
 
 void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const {

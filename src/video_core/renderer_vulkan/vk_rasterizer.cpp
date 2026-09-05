@@ -993,6 +993,7 @@ void Rasterizer::OnSubmit() {
             pipeline_cache.DumpRuntimeInfoMemoStats();
             pipeline_cache.DumpLayoutStats();
             pipeline_cache.DumpHeapPipelineStats();
+            pipeline_cache.DumpDescHeapStats();
             const auto vm = texture_cache.DrainViewMemoStats();
             if (vm.hits || vm.slow) {
                 LOG_INFO(Render_Skipcache,

@@ -1186,6 +1186,16 @@ void PipelineCache::DumpHeapPipelineStats() {
              graphics_pipelines.size() + compute_pipelines.size());
 }
 
+void PipelineCache::DumpDescHeapStats() {
+    const auto hs = desc_heap.DrainStats();
+    if (hs.commits == 0) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] DESCHEAP commits={} reused={} fresh={} live={} pools={} per300f",
+             hs.commits, hs.reused, hs.fresh, hs.live, hs.pools);
+}
+
 void PipelineCache::DumpSpecFpStats() {
     if (spec_fp_canonical == 0) {
         return;

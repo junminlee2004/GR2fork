@@ -106,9 +106,24 @@ public:
     ~DescriptorHeap();
 
     vk::DescriptorSet Commit(vk::DescriptorSetLayout set_layout);
+    /// Drops every set cached under a layout that is about to be destroyed.
+    void Forget(vk::DescriptorSetLayout set_layout);
+    struct Stats {
+        u64 commits;
+        u64 reused;
+        u64 fresh;
+        u64 live;
+        u64 pools;
+    };
+    /// GPU command thread: returns and resets the recycling census; live and
+    /// pools are gauges.
+    Stats DrainStats();
 
 private:
+    using DescSetBatch = boost::container::static_vector<vk::DescriptorSet, DescriptorSetBatch>;
     void CreateDescriptorPool();
+    vk::Result AllocateBatch(vk::DescriptorSetLayout set_layout, DescSetBatch& out);
+    vk::DescriptorSet CommitRecycled(vk::DescriptorSetLayout set_layout);
 
 private:
     vk::Device device;
@@ -117,8 +132,23 @@ private:
     std::span<const vk::DescriptorPoolSize> pool_sizes;
     vk::DescriptorPool curr_pool;
     std::deque<std::pair<vk::DescriptorPool, u64>> pending_pools;
-    using DescSetBatch = boost::container::static_vector<vk::DescriptorSet, DescriptorSetBatch>;
     tsl::robin_map<u64, DescSetBatch> descriptor_sets;
+    // desc_heap_recycle: per layout, the sets handed out in tick order; the
+    // front is reused once its tick retired. A pool that filled up moves to
+    // full_pools and stays alive unreset (its unused remainder is stranded,
+    // bounded by the pool count) because rings still point into it.
+    struct RecycledSet {
+        vk::DescriptorSet set;
+        u64 tick;
+    };
+    tsl::robin_map<u64, std::deque<RecycledSet>> recycled;
+    std::vector<vk::DescriptorPool> full_pools;
+    bool recycle{};
+    bool warned_{};
+    u64 commits_{};
+    u64 reused_{};
+    u64 fresh_{};
+    u64 live_{};
 };
 
 } // namespace Vulkan
