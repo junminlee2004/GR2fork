@@ -1038,11 +1038,24 @@ void Rasterizer::OnSubmit() {
                          ss.slow, ss.touches, ss.map);
             }
             const auto dd = skipcache.DrainDescDeltaStats();
-            if (dd.probes) {
+            if (dd.probes || dd.heap) {
+                // key + gen + cold + veto0 + whole == probes - hits - partial, so
+                // whole is defined by that identity rather than counted twice.
+                const auto& dc = skipcache.Counters(Skipcache::CacheId::DescDelta);
+                const u64 key = dc.miss_key - desc_last_.miss_key;
+                const u64 gen =
+                    dc.miss_gen[Skipcache::LaneTick] - desc_last_.miss_gen[Skipcache::LaneTick];
+                const u64 cold = dc.miss_cold - desc_last_.miss_cold;
+                const u64 veto0 = dc.veto[0] - desc_last_.veto[0];
+                const u64 misses = dd.probes - dd.hits - dd.partial;
+                const u64 whole = misses - std::min<u64>(misses, key + gen + cold + veto0);
+                desc_last_ = dc;
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] DESCDELTA probes={} hits={} partial={} descs={} pushed={} "
-                         "split={} per300f",
-                         dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split);
+                         "split={} runs={} key={} gen={} cold={} whole={} heap={} heapdescs={} "
+                         "per300f",
+                         dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split, dd.runs,
+                         key, gen, cold, whole, dd.heap, dd.heap_descs);
             }
             if (const auto inv = texture_cache.DrainInvalidateFilterStats(); inv.probes) {
                 LOG_INFO(Render_Skipcache,

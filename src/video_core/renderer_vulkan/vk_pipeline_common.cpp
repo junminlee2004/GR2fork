@@ -544,6 +544,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                 // is sent whole.
                 const size_t runs = CompactDescriptorWrites(set_writes, slot, partial_scratch);
                 if (runs <= set_writes.size() + (slot.desc_count - slot.desc_changed) / 2) {
+                    slot.runs += runs;
                     cmdbuf.pushDescriptorSetKHR(
                         bind_point, pipeline_layout, 0,
                         vk::ArrayProxy<const vk::WriteDescriptorSet>(
@@ -596,6 +597,16 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
     }
 
     const auto desc_set = desc_heap.Commit(desc_layout);
+    {
+        // The heap leg is the delta-free stream; its size prices any future
+        // second push set. DescDeltaState is ungated.
+        auto& hs = VideoCore::Skipcache::Framework::Instance().DescDeltaState(
+            bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0);
+        ++hs.heap;
+        for (const auto& set_write : set_writes) {
+            hs.heap_descs += set_write.descriptorCount;
+        }
+    }
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }

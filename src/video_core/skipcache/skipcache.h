@@ -362,6 +362,11 @@ public:
         u64 descs{};
         u64 pushed{};
         u64 split{};
+        // Writes a partial push sent, and the pushes that went through the
+        // descriptor heap outside the delta path with their descriptor count.
+        u64 runs{};
+        u64 heap{};
+        u64 heap_descs{};
         alignas(64) std::array<u8, 16384> blob{};
         std::array<u8, 1024> changed{};
     };
@@ -375,6 +380,9 @@ public:
         u64 descs;
         u64 pushed;
         u64 split;
+        u64 runs;
+        u64 heap;
+        u64 heap_descs;
     };
     DescDeltaStats DrainDescDeltaStats() {
         DescDeltaStats out{};
@@ -385,7 +393,11 @@ public:
             out.descs += slot.descs;
             out.pushed += slot.pushed;
             out.split += slot.split;
-            slot.probes = slot.hits = slot.partial = slot.descs = slot.pushed = slot.split = 0;
+            out.runs += slot.runs;
+            out.heap += slot.heap;
+            out.heap_descs += slot.heap_descs;
+            slot.probes = slot.hits = slot.partial = slot.descs = slot.pushed = slot.split =
+                slot.runs = slot.heap = slot.heap_descs = 0;
         }
         return out;
     }

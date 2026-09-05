@@ -213,6 +213,9 @@ private:
     // between probes: its miss floor, and the sizing input for a wider key.
     u64 rt_stamp_last_{};
     u64 rt_stamp_moves_{};
+    // Last drained framework counters of the descriptor delta cache; the
+    // DESCDELTA line prints the window's miss lanes from the difference.
+    VideoCore::Skipcache::CacheCounters desc_last_{};
     VideoCore::Skipcache::CacheCounters dynstate_last_{};
     u64 dyn_stamp_last_{};
     u64 gfx_stamp_last_{};
