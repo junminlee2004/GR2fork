@@ -635,14 +635,21 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             // ends at anything else, which the dispatch below then handles.
             // A queued command ends the run through the poll above, so no
             // packet executes with a command waiting and the hold armed.
+            // The cursor pair stays in registers for the whole run and the
+            // span is written back once: the span itself is live across the
+            // outer loop and its switch, so advancing it per packet was a
+            // stack read-modify-write on every packet. Both statistics are
+            // no-ops for an empty run, which two thirds of entries are.
             u32 run = 0;
             bool command_break = false;
-            while (!dcb.empty()) {
+            const u32* p = dcb.data();
+            size_t rem = dcb.size();
+            while (rem != 0) {
                 if (num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
                     command_break = true;
                     break;
                 }
-                const auto* h = reinterpret_cast<const PM4Header*>(dcb.data());
+                const auto* h = reinterpret_cast<const PM4Header*>(p);
                 const u32 raw = h->raw;
                 const u32 masked = raw & 0xC000FF00u;
                 const bool is_pad = (raw >> 30) == 2;
@@ -650,7 +657,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 // before the payload is read and the exit advances two words.
                 const bool is_nop0 = (raw & 0xFFFFFF00u) == 0xC0001000u;
                 const u32 words = is_pad ? 0 : h->type3.NumWords();
-                if (words + 1 > dcb.size()) {
+                if (words + 1 > rem) {
                     break;
                 }
                 if (masked == 0xC0007600u) {
@@ -661,12 +668,16 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                     ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
                     break;
                 }
-                dcb = dcb.subspan(words + 1);
+                p += words + 1;
+                rem -= words + 1;
                 ++run;
             }
-            run_stats.run_packets += run;
-            run_stats.runs += run != 0;
-            if (command_break || dcb.empty()) {
+            dcb = std::span<const u32>{p, rem};
+            if (run != 0) {
+                run_stats.run_packets += run;
+                ++run_stats.runs;
+            }
+            if (command_break || rem == 0) {
                 continue;
             }
             ++run_stats.outer_packets;
