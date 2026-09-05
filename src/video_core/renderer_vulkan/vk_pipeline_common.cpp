@@ -26,9 +26,9 @@ namespace Skipcache = VideoCore::Skipcache;
 namespace {
 
 // The four key header fields are contiguous, and so are the payload fields of
-// every info struct, so each run copies as raw bytes. The image copy is 20 and
-// not sizeof: a VkDescriptorImageInfo's four tail padding bytes are never
-// initialised, and feeding them to the memcmp would make it nondeterministic.
+// every info struct, so each run copies as raw bytes. An image info is 24
+// deterministic bytes: the rasterizer's AppendImageInfo zeroes the four tail
+// padding bytes after construction, so copies and compares take the struct whole.
 // Offsets are checked on the C structs because MSVC rejects offsetof on the
 // vulkan.hpp wrappers; the wrappers are what gets indexed, so their strides are
 // checked against the C ones.
@@ -44,11 +44,13 @@ static_assert(sizeof(vk::DescriptorBufferInfo) == sizeof(VkDescriptorBufferInfo)
               offsetof(VkDescriptorBufferInfo, offset) == 8 &&
               offsetof(VkDescriptorBufferInfo, range) == 16);
 static_assert(sizeof(vk::DescriptorImageInfo) == sizeof(VkDescriptorImageInfo) &&
-              sizeof(VkDescriptorImageInfo) >= 20 &&
+              sizeof(VkDescriptorImageInfo) == 24 &&
               offsetof(VkDescriptorImageInfo, sampler) == 0 &&
               offsetof(VkDescriptorImageInfo, imageView) == 8 &&
               offsetof(VkDescriptorImageInfo, imageLayout) == 16);
 static_assert(sizeof(vk::BufferView) == 8);
+static_assert(sizeof(Skipcache::Framework::DescDeltaSlot::write_changed) >=
+              Pipeline::NUM_DESCRIPTOR_WRITES);
 
 // Serialize a descriptor write list into a deterministic byte stream, payload
 // contents included. Returns 0 on any unknown descriptor type or overflow:
@@ -85,7 +87,7 @@ size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
         case vk::DescriptorType::eSampler: {
             const auto* const infos = w.pImageInfo;
             for (u32 i = 0; i < count; ++i) {
-                put(&infos[i], 20);
+                put(&infos[i], 24);
             }
             break;
         }
@@ -104,12 +106,56 @@ size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
     return static_cast<size_t>(cursor - out.data());
 }
 
+// XOR-OR of two byte ranges, 8 bytes at a time; bytes is a multiple of 8.
+// Accumulating instead of exiting early keeps this a plain vector reduction
+// rather than a library compare.
+u64 DiffWords(const void* a, const void* b, size_t bytes) noexcept {
+    const u8* pa = static_cast<const u8*>(a);
+    const u8* pb = static_cast<const u8*>(b);
+    u64 acc = 0;
+    for (size_t i = 0; i < bytes; i += 8) {
+        u64 x, y;
+        std::memcpy(&x, pa + i, 8);
+        std::memcpy(&y, pb + i, 8);
+        acc |= x ^ y;
+    }
+    return acc;
+}
+
+template <size_t N>
+u64 DiffFixed(const void* a, const void* b) noexcept {
+    static_assert(N % 8 == 0);
+    const u8* pa = static_cast<const u8*>(a);
+    const u8* pb = static_cast<const u8*>(b);
+    u64 acc = 0;
+    for (size_t i = 0; i < N; i += 8) {
+        u64 x, y;
+        std::memcpy(&x, pa + i, 8);
+        std::memcpy(&y, pb + i, 8);
+        acc |= x ^ y;
+    }
+    return acc;
+}
+
+// One descriptor of a compile-time stride, copied without ever forming the
+// runtime-length memcpy the walk must not call on its hit path.
+template <size_t N>
+void CopyFixed(void* dst, const void* src) noexcept {
+#if defined(__clang__)
+    __builtin_memcpy_inline(dst, src, N);
+#else
+    std::memcpy(dst, src, N);
+#endif
+}
+
 // Walks the write list once, leaving blob equal to the serialized form and
-// reporting whether any byte differed; compares run even when an earlier key
-// field already missed - one loop is cheaper than two. Same chunking and
-// bail rules as SerializeDescriptorWrites.
-// The mapped form also records a per-descriptor verdict in the slot, which a
-// partial push consumes; the unmapped form is the plain walk.
+// reporting whether any byte differed. Each write is compared whole first;
+// only a changed write pays the per-descriptor verdicts and the copy, so an
+// unchanged set stores nothing. Same chunking and bail rules as
+// SerializeDescriptorWrites.
+// The mapped form also records a per-write verdict and, for changed writes,
+// a per-descriptor verdict in the slot, which a partial push consumes; the
+// unmapped form is the plain walk.
 template <bool kMap>
 size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
                              Skipcache::Framework::DescDeltaSlot& slot, bool& changed) {
@@ -117,46 +163,49 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
     u8* cursor = blob.data();
     const u8* const limit = blob.data() + blob.size();
     u64 diff = 0;
-    const auto sync8 = [&](const void* p) -> u64 {
-        u64 a, b;
-        std::memcpy(&a, p, 8);
-        std::memcpy(&b, cursor, 8);
-        const u64 x = a ^ b;
-        diff |= x;
-        std::memcpy(cursor, p, 8);
-        cursor += 8;
-        return x;
-    };
-    const auto sync4 = [&](const void* p) -> u64 {
-        u32 a, b;
-        std::memcpy(&a, p, 4);
-        std::memcpy(&b, cursor, 4);
-        const u64 x = a ^ b;
-        diff |= x;
-        std::memcpy(cursor, p, 4);
-        cursor += 4;
-        return x;
-    };
     // The verdict counters live in locals: they share the slot with the blob
     // the cursor stores into, so a slot-resident counter is reloaded after
-    // every store, and the reload of a pair a vector store just wrote does not
-    // forward. Every exit writes them back, so a bail leaves the slot as before.
+    // every store. Every exit writes them back, so a bail leaves the slot as
+    // before.
     [[maybe_unused]] u8* const verdicts = kMap ? slot.changed.data() : nullptr;
+    [[maybe_unused]] u8* const write_verdicts = kMap ? slot.write_changed.data() : nullptr;
     [[maybe_unused]] u32 n = 0;
     [[maybe_unused]] u32 n_changed = 0;
+    [[maybe_unused]] u32 w_idx = 0;
     [[maybe_unused]] u64 hdr_diff = 0;
     const auto write_back = [&] {
         if constexpr (kMap) {
             slot.desc_count = n;
             slot.desc_changed = n_changed;
             slot.header_changed = hdr_diff != 0;
+            slot.write_count = w_idx;
         }
     };
-    const auto note = [&]([[maybe_unused]] u64 d) {
+    const auto sync_payload = [&]<size_t Stride>(const void* payload, u32 count) {
+        const size_t bytes = size_t{count} * Stride;
+        const u64 d =
+            count == 1 ? DiffFixed<Stride>(payload, cursor) : DiffWords(payload, cursor, bytes);
+        diff |= d;
         if constexpr (kMap) {
-            const u32 c = d != 0;
-            verdicts[n++] = static_cast<u8>(c);
-            n_changed += c;
+            write_verdicts[w_idx++] = d != 0;
+        }
+        if (d == 0) {
+            if constexpr (kMap) {
+                n += count;
+            }
+            cursor += bytes;
+            return;
+        }
+        const u8* src = static_cast<const u8*>(payload);
+        for (u32 i = 0; i < count; ++i) {
+            if constexpr (kMap) {
+                const u32 c = DiffFixed<Stride>(src, cursor) != 0;
+                verdicts[n++] = static_cast<u8>(c);
+                n_changed += c;
+            }
+            CopyFixed<Stride>(cursor, src);
+            src += Stride;
+            cursor += Stride;
         }
     };
     for (const auto& w : writes) {
@@ -173,39 +222,30 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
             }
         }
         const VkWriteDescriptorSet& raw = w;
-        [[maybe_unused]] const u64 header = sync8(&raw.dstBinding) | sync8(&raw.descriptorCount);
+        const u64 header = DiffFixed<16>(&raw.dstBinding, cursor);
+        diff |= header;
         if constexpr (kMap) {
             hdr_diff |= header;
         }
+        if (header != 0) {
+            CopyFixed<16>(cursor, &raw.dstBinding);
+        }
+        cursor += 16;
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
-        case vk::DescriptorType::eStorageBuffer: {
-            const auto* const infos = w.pBufferInfo;
-            for (u32 i = 0; i < count; ++i) {
-                const VkDescriptorBufferInfo& info = infos[i];
-                note(sync8(&info.buffer) | sync8(&info.offset) | sync8(&info.range));
-            }
+        case vk::DescriptorType::eStorageBuffer:
+            sync_payload.template operator()<24>(w.pBufferInfo, count);
             break;
-        }
         case vk::DescriptorType::eSampledImage:
         case vk::DescriptorType::eStorageImage:
         case vk::DescriptorType::eCombinedImageSampler:
-        case vk::DescriptorType::eSampler: {
-            const auto* const infos = w.pImageInfo;
-            for (u32 i = 0; i < count; ++i) {
-                const VkDescriptorImageInfo& info = infos[i];
-                note(sync8(&info.sampler) | sync8(&info.imageView) | sync4(&info.imageLayout));
-            }
+        case vk::DescriptorType::eSampler:
+            sync_payload.template operator()<24>(w.pImageInfo, count);
             break;
-        }
         case vk::DescriptorType::eUniformTexelBuffer:
-        case vk::DescriptorType::eStorageTexelBuffer: {
-            const auto* const views = w.pTexelBufferView;
-            for (u32 i = 0; i < count; ++i) {
-                note(sync8(&views[i]));
-            }
+        case vk::DescriptorType::eStorageTexelBuffer:
+            sync_payload.template operator()<8>(w.pTexelBufferView, count);
             break;
-        }
         default:
             write_back();
             return 0;
@@ -226,9 +266,15 @@ size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
                                Pipeline::DescriptorWrites& out) {
     out.clear();
     u32 k = 0;
+    u32 w_idx = 0;
     for (const auto& w : in) {
         const u32 count = w.descriptorCount;
         ASSERT(k + count <= map.desc_count);
+        // A write the mapped walk saw unchanged carries no per-descriptor verdicts.
+        if (!map.write_changed[w_idx++]) {
+            k += count;
+            continue;
+        }
         switch (w.descriptorType) {
         case vk::DescriptorType::eUniformBuffer:
         case vk::DescriptorType::eStorageBuffer:
@@ -413,15 +459,15 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
                 }
                 return partial;
             }();
+            const u64 tick = scheduler.CurrentTick();
+            const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
+            const u64 foreign = sc.ForeignPushGen(idx);
             bool changed = false;
             const size_t size =
                 inplace
                     ? (partial_enabled ? MatchDescriptorWrites<true>(set_writes, slot, changed)
                                        : MatchDescriptorWrites<false>(set_writes, slot, changed))
                     : SerializeDescriptorWrites(set_writes, scratch);
-            const u64 tick = scheduler.CurrentTick();
-            const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
-            const u64 foreign = sc.ForeignPushGen(idx);
             bool would_hit = false;
             bool partial_ok = false;
             if (size == 0) {

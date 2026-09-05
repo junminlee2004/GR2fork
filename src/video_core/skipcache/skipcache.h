@@ -354,6 +354,10 @@ public:
         u32 desc_count{};
         u32 desc_changed{};
         bool header_changed{};
+        // Per-write verdicts of the last mapped walk, valid up to write_count;
+        // a write recorded unchanged has no per-descriptor verdicts.
+        std::array<u8, 128> write_changed{};
+        u32 write_count{};
         u64 partial{};
         u64 descs{};
         u64 pushed{};

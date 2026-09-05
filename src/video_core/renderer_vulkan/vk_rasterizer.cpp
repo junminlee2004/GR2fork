@@ -1583,6 +1583,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+// Every image info reaches the descriptor delta walk as 24 deterministic
+// bytes: the four tail padding bytes are zeroed after construction, since a
+// copy from a temporary may carry garbage into them. A writer that bypasses
+// this fails toward a spurious miss, a push of correct bytes, never a wrong skip.
+template <typename Infos>
+static void AppendImageInfo(Infos& infos, vk::Sampler sampler, vk::ImageView view,
+                            vk::ImageLayout layout) {
+    static_assert(sizeof(vk::DescriptorImageInfo) == 24);
+    auto& info = infos.emplace_back(sampler, view, layout);
+    std::memset(reinterpret_cast<u8*>(&info) + 20, 0, 4);
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     image_bindings.clear();
     image_descriptor_array_sizes.clear();
@@ -1687,7 +1699,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (auto& [image_id, desc] : image_bindings) {
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
-            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            AppendImageInfo(image_infos, VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -1750,7 +1762,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, image_view, bound_layout);
+            AppendImageInfo(image_infos, VK_NULL_HANDLE, image_view, bound_layout);
         }
     }
 
@@ -1780,7 +1792,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
-        image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+        AppendImageInfo(image_infos, vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
     }
 
     // Each spanned binding is a descriptorCount-1 eSampler with this stage's
