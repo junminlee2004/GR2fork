@@ -248,6 +248,8 @@ public:
     void DumpRuntimeInfoMemoStats();
     /// Shared layout count against the pipeline count; silent when sharing is off.
     void DumpLayoutStats();
+    /// Pipelines whose set 0 takes the descriptor heap leg, against the pipeline count.
+    void DumpHeapPipelineStats();
     /// Per-window telemetry for the canonical specialization key; silent when it is off.
     void DumpSpecFpStats();
     /// Per-window telemetry for the descriptors' in-place read verdicts.

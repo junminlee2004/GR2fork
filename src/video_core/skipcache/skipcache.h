@@ -367,6 +367,12 @@ public:
         u64 runs{};
         u64 heap{};
         u64 heap_descs{};
+        // Heap pushes bucketed by descriptor total (<= the push limit, <= 40,
+        // <= 48, <= 64, more) and the heap descriptors that are images or
+        // samplers: what a second push set would have to carry.
+        std::array<u64, 5> heap_hist{};
+        u64 heap_images{};
+        u64 heap_samplers{};
         alignas(64) std::array<u8, 16384> blob{};
         std::array<u8, 1024> changed{};
     };
@@ -383,6 +389,9 @@ public:
         u64 runs;
         u64 heap;
         u64 heap_descs;
+        std::array<u64, 5> heap_hist;
+        u64 heap_images;
+        u64 heap_samplers;
     };
     DescDeltaStats DrainDescDeltaStats() {
         DescDeltaStats out{};
@@ -396,8 +405,15 @@ public:
             out.runs += slot.runs;
             out.heap += slot.heap;
             out.heap_descs += slot.heap_descs;
+            for (size_t i = 0; i < slot.heap_hist.size(); ++i) {
+                out.heap_hist[i] += slot.heap_hist[i];
+            }
+            out.heap_images += slot.heap_images;
+            out.heap_samplers += slot.heap_samplers;
             slot.probes = slot.hits = slot.partial = slot.descs = slot.pushed = slot.split =
                 slot.runs = slot.heap = slot.heap_descs = 0;
+            slot.heap_hist = {};
+            slot.heap_images = slot.heap_samplers = 0;
         }
         return out;
     }

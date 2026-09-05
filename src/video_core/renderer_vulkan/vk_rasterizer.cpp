@@ -992,6 +992,7 @@ void Rasterizer::OnSubmit() {
             pipeline_cache.DumpSharpReadStats();
             pipeline_cache.DumpRuntimeInfoMemoStats();
             pipeline_cache.DumpLayoutStats();
+            pipeline_cache.DumpHeapPipelineStats();
             const auto vm = texture_cache.DrainViewMemoStats();
             if (vm.hits || vm.slow) {
                 LOG_INFO(Render_Skipcache,
@@ -1160,9 +1161,12 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] DESCDELTA probes={} hits={} partial={} descs={} pushed={} "
                          "split={} runs={} key={} gen={} cold={} whole={} heap={} heapdescs={} "
-                         "per300f",
+                         "heap32={} heap40={} heap48={} heap64={} heapbig={} heapimg={} "
+                         "heapsmp={} per300f",
                          dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split, dd.runs,
-                         key, gen, cold, whole, dd.heap, dd.heap_descs);
+                         key, gen, cold, whole, dd.heap, dd.heap_descs, dd.heap_hist[0],
+                         dd.heap_hist[1], dd.heap_hist[2], dd.heap_hist[3], dd.heap_hist[4],
+                         dd.heap_images, dd.heap_samplers);
             }
             if (const auto inv = texture_cache.DrainInvalidateFilterStats(); inv.probes) {
                 LOG_INFO(Render_Skipcache,

@@ -63,6 +63,11 @@ public:
         return is_compute;
     }
 
+    /// Whether set 0 is pushed; false means the descriptor heap leg.
+    bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors;
+    }
+
     static constexpr u32 NUM_DESCRIPTOR_WRITES = 128;
 
     /// Permanent, value-initialised once. The old vector re-value-initialised

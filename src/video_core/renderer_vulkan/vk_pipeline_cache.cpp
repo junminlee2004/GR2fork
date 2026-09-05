@@ -1174,6 +1174,18 @@ void PipelineCache::DumpLayoutStats() {
              graphics_pipelines.size() + compute_pipelines.size());
 }
 
+void PipelineCache::DumpHeapPipelineStats() {
+    u64 heap = 0;
+    for (const auto& [key, pipeline] : graphics_pipelines) {
+        heap += !pipeline->UsesPushDescriptors();
+    }
+    for (const auto& [key, pipeline] : compute_pipelines) {
+        heap += !pipeline->UsesPushDescriptors();
+    }
+    LOG_INFO(Render_Skipcache, "[SkipCache] HEAPPIPES heap={} of {}", heap,
+             graphics_pipelines.size() + compute_pipelines.size());
+}
+
 void PipelineCache::DumpSpecFpStats() {
     if (spec_fp_canonical == 0) {
         return;

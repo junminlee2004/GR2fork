@@ -603,9 +603,27 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers&
         auto& hs = VideoCore::Skipcache::Framework::Instance().DescDeltaState(
             bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0);
         ++hs.heap;
+        u32 descs = 0;
+        u32 images = 0;
+        u32 samplers = 0;
         for (const auto& set_write : set_writes) {
-            hs.heap_descs += set_write.descriptorCount;
+            descs += set_write.descriptorCount;
+            if (set_write.descriptorType == vk::DescriptorType::eSampledImage ||
+                set_write.descriptorType == vk::DescriptorType::eStorageImage) {
+                images += set_write.descriptorCount;
+            } else if (set_write.descriptorType == vk::DescriptorType::eSampler) {
+                samplers += set_write.descriptorCount;
+            }
         }
+        hs.heap_descs += descs;
+        hs.heap_images += images;
+        hs.heap_samplers += samplers;
+        const u32 limit = instance.MaxPushDescriptors();
+        ++hs.heap_hist[descs <= limit ? 0
+                       : descs <= 40  ? 1
+                       : descs <= 48  ? 2
+                       : descs <= 64  ? 3
+                                      : 4];
     }
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
