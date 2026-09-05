@@ -313,6 +313,7 @@ Liverpool::Liverpool() {
     gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     reg_run_ = EmulatorSettings.IsParserRegRun();
+    run_wide_ = reg_run_ && EmulatorSettings.IsParserRunWide();
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -607,6 +608,61 @@ SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count
     }
 }
 
+// Every NOP payload tag shares this prefix; a payload word outside it is data
+// the parser ignores. The contract any future tag must keep.
+constexpr u32 kNopTagPrefix = 0x68750000u;
+static_assert((PM4CmdNop::PayloadType::PatchedFlip & 0xFFFFF000u) == kNopTagPrefix);
+static_assert((PM4CmdNop::PayloadType::DebugMarkerPush & 0xFFFFF000u) == kNopTagPrefix);
+static_assert((PM4CmdNop::PayloadType::DebugMarkerPop & 0xFFFFF000u) == kNopTagPrefix);
+static_assert((PM4CmdNop::PayloadType::DebugColorMarkerPush & 0xFFFFF000u) == kNopTagPrefix);
+
+SHAD_FORCE_INLINE void Liverpool::SetUconfigRegHot(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    gfx_stamp.WriteRegs(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
+                        header + 2, (count - 1) * sizeof(u32),
+                        Regs::UconfigRegWordOffset + set_data->reg_offset);
+}
+
+SHAD_FORCE_INLINE void Liverpool::IndexTypeHot(const PM4Header* header) {
+    const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
+    if (regs.index_buffer_type.raw != index_type->raw) {
+        regs.index_buffer_type.raw = index_type->raw;
+        gfx_stamp.MarkDirty();
+    }
+}
+
+SHAD_FORCE_INLINE void Liverpool::NumInstancesHot(const PM4Header* header) {
+    const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
+    regs.num_instances.num_instances = num_instances->num_instances;
+}
+
+// State packets whose dispatch arms neither suspend nor reach the rasterizer,
+// run in place so a draw's preamble stays in the run loop. false leaves the
+// packet to the dispatch untouched. A tagged NOP (a 0x68750xxx payload word)
+// is a marker or flip and always dispatches.
+SHAD_FORCE_INLINE bool Liverpool::RunStatePacket(u32 masked, const PM4Header* header, const u32* p,
+                                                 u32 words) {
+    if (words == 0) {
+        return false;
+    }
+    if (masked == 0xC0001000u) {
+        return (p[1] & 0xFFFFF000u) != kNopTagPrefix;
+    }
+    if (masked == 0xC0007900u) {
+        SetUconfigRegHot(header, words);
+        return true;
+    }
+    if (masked == 0xC0002A00u) {
+        IndexTypeHot(header);
+        return true;
+    }
+    if (masked == 0xC0002F00u) {
+        NumInstancesHot(header);
+        return true;
+    }
+    return false;
+}
+
 std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                    uintptr_t base_addr) {
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -635,12 +691,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             // ends at anything else, which the dispatch below then handles.
             // A queued command ends the run through the poll above, so no
             // packet executes with a command waiting and the hold armed.
-            // The cursor pair stays in registers for the whole run and the
-            // span is written back once: the span itself is live across the
-            // outer loop and its switch, so advancing it per packet was a
-            // stack read-modify-write on every packet. Both statistics are
-            // no-ops for an empty run, which two thirds of entries are.
+            // The cursor pair is the span's data pointer and remaining count,
+            // written back once after the run; both statistics are no-ops for
+            // an empty run, which two thirds of entries are.
             u32 run = 0;
+            u32 wide = 0;
             bool command_break = false;
             const u32* p = dcb.data();
             size_t rem = dcb.size();
@@ -665,8 +720,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 } else if (masked == 0xC0006900u) {
                     SetContextRegHot(h, words);
                 } else if (!is_pad && !is_nop0) {
-                    ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
-                    break;
+                    if (!run_wide_ || !RunStatePacket(masked, h, p, words)) {
+                        ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
+                        break;
+                    }
+                    ++wide;
                 }
                 p += words + 1;
                 rem -= words + 1;
@@ -675,6 +733,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             dcb = std::span<const u32>{p, rem};
             if (run != 0) {
                 run_stats.run_packets += run;
+                run_stats.wide_packets += wide;
                 ++run_stats.runs;
             }
             if (command_break || rem == 0) {
@@ -787,10 +846,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::SetUconfigReg: {
-            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-            gfx_stamp.WriteRegs(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                                header + 2, (count - 1) * sizeof(u32),
-                                Regs::UconfigRegWordOffset + set_data->reg_offset);
+            SetUconfigRegHot(header, count);
             break;
         }
         case PM4ItOpcode::SetPredication: {
@@ -799,11 +855,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::IndexType: {
-            const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
-            if (regs.index_buffer_type.raw != index_type->raw) {
-                regs.index_buffer_type.raw = index_type->raw;
-                gfx_stamp.MarkDirty();
-            }
+            IndexTypeHot(header);
             break;
         }
         case PM4ItOpcode::DrawIndex2: {
@@ -1048,8 +1100,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::NumInstances: {
-            const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
-            regs.num_instances.num_instances = num_instances->num_instances;
+            NumInstancesHot(header);
             break;
         }
         case PM4ItOpcode::IndexBase: {
