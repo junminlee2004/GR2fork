@@ -544,6 +544,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              EmulatorSettings.IsTextureInvalidateFilter());
     LOG_INFO(Config, "GPU rtStateStamp: {}", EmulatorSettings.IsRtStateStamp());
     LOG_INFO(Config, "GPU pushVpMemo: {}", EmulatorSettings.IsPushVpMemo());
+    LOG_INFO(Config, "GPU riMemoFusedCmp: {}", EmulatorSettings.IsRiMemoFusedCmp());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

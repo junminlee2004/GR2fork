@@ -351,11 +351,20 @@ private:
     std::array<RuntimeInputMemo*, MaxShaderStages> ri_memo_last{};
     bool ri_input_memo{};
     bool ri_memo_validate{};
+    // ri_memo_fused_cmp: the snapshot also folds its words against the
+    // candidate entry, so the common hit skips the memcmp scan entirely.
+    bool ri_memo_fused_cmp{};
     u64 rimemo_hits{};
     u64 rimemo_misses{};
     u64 rimemo_restores{};
     u64 rimemo_vmiss{};
-    u32 SnapshotRuntimeInputs(Shader::Stage stage, u32* out) const;
+    u64 rimemo_fused{};
+    u64 rimemo_scan{};
+    // Fuse: cmp names the candidate's words and *diff receives the OR of every
+    // differing word; without it the body is the plain snapshot.
+    template <bool Fuse>
+    SHAD_NO_INLINE u32 SnapshotRuntimeInputs(Shader::Stage stage, u32* __restrict out,
+                                             const u32* __restrict cmp, u64* diff) const;
     bool MemoRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage, RuntimeInfoStamp& slot);
     // Per logical stage: the last resolved program. Programs are added to
     // program_cache and never removed or re-seated (unique_ptr values survive

@@ -657,12 +657,45 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
 // The words each memoized arm of BuildRuntimeInfo reads: the program settings
 // first so a program switch fails at word 0, the color buffers and the
 // interpolant table last. Every other arm reads guest memory or code.
-u32 PipelineCache::SnapshotRuntimeInputs(Stage stage, u32* out) const {
+template <bool Fuse>
+SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(Stage stage, u32* __restrict out,
+                                                        const u32* __restrict cmp,
+                                                        u64* diff) const {
     const auto& regs = liverpool->regs;
     u32 n = 0;
+    // Two accumulators: a single OR chain over up to 59 words is a latency
+    // chain the core cannot overlap. Words are read from the source through
+    // memcpy, never through an aliasing pointer, so padding reaches the entry
+    // exactly as the block copy wrote it.
+    [[maybe_unused]] u64 d0 = 0;
+    [[maybe_unused]] u64 d1 = 0;
+    const auto fold = [&]([[maybe_unused]] const void* src, [[maybe_unused]] u32 words) {
+        if constexpr (Fuse) {
+            const u8* p = static_cast<const u8*>(src);
+            const u32* c = cmp + n;
+            u32 i = 0;
+            for (; i + 2 <= words; i += 2) {
+                u64 x, y;
+                std::memcpy(&x, p + i * sizeof(u32), sizeof(x));
+                std::memcpy(&y, c + i, sizeof(y));
+                if (i & 2) {
+                    d1 |= x ^ y;
+                } else {
+                    d0 |= x ^ y;
+                }
+            }
+            if (i < words) {
+                u32 x, y;
+                std::memcpy(&x, p + i * sizeof(u32), sizeof(x));
+                std::memcpy(&y, c + i, sizeof(y));
+                d0 |= u64{x ^ y};
+            }
+        }
+    };
     const auto put = [&](const auto& v) {
         static_assert(sizeof(v) % sizeof(u32) == 0);
         std::memcpy(out + n, &v, sizeof(v));
+        fold(&v, static_cast<u32>(sizeof(v) / sizeof(u32)));
         n += sizeof(v) / sizeof(u32);
     };
     switch (stage) {
@@ -690,6 +723,7 @@ u32 PipelineCache::SnapshotRuntimeInputs(Stage stage, u32* out) const {
         put(graphics_key.color_buffers);
         const u32 count = std::min<u32>(num_interp, static_cast<u32>(regs.ps_inputs.size()));
         std::memcpy(out + n, regs.ps_inputs.data(), count * sizeof(u32));
+        fold(regs.ps_inputs.data(), count);
         n += count;
         break;
     }
@@ -705,21 +739,38 @@ u32 PipelineCache::SnapshotRuntimeInputs(Stage stage, u32* out) const {
         break;
     }
     ASSERT(n <= kRuntimeInputWords);
+    if constexpr (Fuse) {
+        *diff = d0 | d1;
+    }
     return n;
 }
 
 bool PipelineCache::MemoRuntimeInfo(Stage stage, LogicalStage l_stage, RuntimeInfoStamp& slot) {
     std::array<u32, kRuntimeInputWords> words;
-    const u32 n = SnapshotRuntimeInputs(stage, words.data());
-    if (n == 0) {
-        return false;
-    }
     const u32 l = static_cast<u32>(l_stage);
     auto& entries = ri_memo[l];
     RuntimeInputMemo*& last = ri_memo_last[l];
+    // The fused form compares against the candidate while it snapshots. Two
+    // entries never hold the same words (a miss writes the non-last entry and
+    // a miss means neither matched), so probing the candidate first cannot
+    // change which entry is selected; the scan below only skips it.
+    RuntimeInputMemo* const cand = last ? last : &entries[0];
+    u64 diff = 0;
+    const u32 n = ri_memo_fused_cmp
+                      ? SnapshotRuntimeInputs<true>(stage, words.data(), cand->words.data(), &diff)
+                      : SnapshotRuntimeInputs<false>(stage, words.data(), nullptr, nullptr);
+    if (n == 0) {
+        return false;
+    }
+    const bool fused_hit = ri_memo_fused_cmp && cand->used && cand->n_words == n && diff == 0;
+    if (ri_memo_fused_cmp) {
+        rimemo_fused += fused_hit;
+        rimemo_scan += !fused_hit;
+    }
     for (auto& e : entries) {
-        if (!e.used || e.n_words != n ||
-            std::memcmp(e.words.data(), words.data(), n * sizeof(u32)) != 0) {
+        if (fused_hit ? &e != cand
+                      : (ri_memo_fused_cmp && &e == cand) || !e.used || e.n_words != n ||
+                            std::memcmp(e.words.data(), words.data(), n * sizeof(u32)) != 0) {
             continue;
         }
         if (&e != last) {
@@ -824,6 +875,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // stamp state, never Framework::Active().
     ri_stamp_gate = EmulatorSettings.IsRuntimeInfoStampGate() && liverpool->IsGfxStampActive();
     ri_input_memo = EmulatorSettings.IsRuntimeInfoInputMemo();
+    ri_memo_fused_cmp = ri_input_memo && EmulatorSettings.IsRiMemoFusedCmp();
     ri_memo_validate = ri_input_memo && Skipcache::Framework::Instance().ActiveMode() ==
                                             Skipcache::Mode::ValidateOnly;
     // The reuse copies the previous key back before the stage resolve, so the
@@ -1073,9 +1125,10 @@ void PipelineCache::DumpRuntimeInfoMemoStats() {
     if (!ri_input_memo) {
         return;
     }
-    LOG_INFO(Render_Skipcache, "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} per300f",
-             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss);
-    rimemo_hits = rimemo_misses = rimemo_restores = rimemo_vmiss = 0;
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} fused={} scan={} per300f",
+             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss, rimemo_fused, rimemo_scan);
+    rimemo_hits = rimemo_misses = rimemo_restores = rimemo_vmiss = rimemo_fused = rimemo_scan = 0;
 }
 
 void PipelineCache::DumpLayoutStats() {
