@@ -669,6 +669,10 @@ struct GPUSettings {
     // state packets whose handlers neither suspend nor reach the rasterizer:
     // SetUconfigReg, IndexType, NumInstances and untagged NOPs. Inert without parser_reg_run.
     Setting<bool> parser_run_wide{false};
+    // Re-certifies the render-scope cache on a moved memory generation from each bound
+    // attachment's image fast-state word (the word UpdateImage's no-op tier reads) instead
+    // of rebuilding. Needs image_fast_state and adaptive_skipcaches_mode != 0.
+    Setting<bool> br_mem_fast_state{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -794,6 +798,7 @@ struct GPUSettings {
             make_override<GPUSettings>("push_vp_memo", &GPUSettings::push_vp_memo),
             make_override<GPUSettings>("ri_memo_fused_cmp", &GPUSettings::ri_memo_fused_cmp),
             make_override<GPUSettings>("parser_run_wide", &GPUSettings::parser_run_wide),
+            make_override<GPUSettings>("br_mem_fast_state", &GPUSettings::br_mem_fast_state),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -825,7 +830,7 @@ struct GPUSettings {
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, parser_run_wide
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, parser_run_wide, br_mem_fast_state
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1160,6 +1165,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, PushVpMemo, push_vp_memo)
     SETTING_FORWARD_BOOL(m_gpu, RiMemoFusedCmp, ri_memo_fused_cmp)
     SETTING_FORWARD_BOOL(m_gpu, ParserRunWide, parser_run_wide)
+    SETTING_FORWARD_BOOL(m_gpu, BrMemFastState, br_mem_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

@@ -229,6 +229,16 @@ public:
         return image;
     }
 
+    // Twin of UpdateImageFast: UpdateImage would take its no-op tier for this
+    // image right now (clean, tracked, touched within the interval). Reads the
+    // slot directly so the LRU is not touched.
+    [[nodiscard]] bool IsImageUpdateNoop(ImageId id, u64 now_tick) const noexcept {
+        const u64 fast = slot_images[id].ReadFastState();
+        return (fast & (Image::kFastStateDirty | Image::kFastStateTracked)) ==
+                   Image::kFastStateTracked &&
+               now_tick - (fast >> Image::kFastStateTouchShift) <= kTouchIntervalTicks;
+    }
+
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];

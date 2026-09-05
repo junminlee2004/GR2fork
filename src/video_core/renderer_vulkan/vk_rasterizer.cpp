@@ -131,6 +131,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     rt_state_stamp_ =
         EmulatorSettings.IsRtStateStamp() &&
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    // The re-certification reads the image word the no-op tier reads, so it
+    // follows image_fast_state.
+    br_mem_fast_state_ =
+        EmulatorSettings.IsBrMemFastState() && EmulatorSettings.IsImageFastState() &&
+        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    if (EmulatorSettings.IsBrMemFastState() && !EmulatorSettings.IsImageFastState()) {
+        LOG_WARNING(Render_Vulkan, "br_mem_fast_state needs image_fast_state; it is off");
+    }
     // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
@@ -1025,10 +1033,13 @@ void Rasterizer::OnSubmit() {
                     for (size_t i = 0; i < bc.veto.size(); ++i) {
                         vetoes += bc.veto[i] - br_last_.veto[i];
                     }
+                    // mem= is the moved-generation probes the attachment words
+                    // could not re-certify (every one of them with
+                    // br_mem_fast_state off); memok= the ones they did.
                     LOG_INFO(Render_Skipcache,
                              "[SkipCache] BRRT br={}/{} brpop={}/{} key={} reg={} tick={} mem={} "
                              "tex={} idg={} veto={} vdepth={} vcolor={} vfbl={} same={} "
-                             "sameopen={} per300f",
+                             "sameopen={} memok={} per300f",
                              bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
                              bc.populated - br_last_.populated,
                              bc.populate_refused - br_last_.populate_refused,
@@ -1036,10 +1047,10 @@ void Rasterizer::OnSubmit() {
                              lane(Skipcache::LaneTick), lane(Skipcache::LaneMem),
                              lane(Skipcache::LaneTex), lane(Skipcache::LaneImgDirty), vetoes,
                              br_veto_depth_, br_veto_color_, br_veto_fbl_, br_same_state_,
-                             br_same_open_);
+                             br_same_open_, br_mem_recert_);
                     br_last_ = bc;
                     br_veto_depth_ = br_veto_color_ = br_veto_fbl_ = br_same_state_ =
-                        br_same_open_ = 0;
+                        br_same_open_ = br_mem_recert_ = 0;
                 }
                 if (rc.eligible != rt_last_.eligible) {
                     const auto d = [&](u64 Skipcache::CacheCounters::* f) {
@@ -2058,7 +2069,8 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
         ++ctr.miss_gen[LaneTick];
         return false;
     }
-    if (c.token.mem_gen != token.mem_gen) {
+    const bool mem_moved = c.token.mem_gen != token.mem_gen;
+    if (mem_moved && !br_mem_fast_state_) {
         ++ctr.miss_gen[LaneMem];
         return false;
     }
@@ -2091,6 +2103,25 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
             ++ctr.veto[BrVetoCtlBits];
             return false;
         }
+    }
+    if (mem_moved) {
+        // The body's one memory input is UpdateImage on each attachment; its
+        // no-op tier is decided by the image word alone, so read that word
+        // per attachment in place of the global generation. After the tex
+        // lane: the slot identities behind the guards are certified.
+        for (u32 cb = 0; cb < c.cb_count; ++cb) {
+            const auto id = c.cb_guard[cb].image_id;
+            if (id && !texture_cache.IsImageUpdateNoop(id, token.tick)) {
+                ++ctr.miss_gen[LaneMem];
+                return false;
+            }
+        }
+        if (c.has_db && !texture_cache.IsImageUpdateNoop(c.db_guard.image_id, token.tick)) {
+            ++ctr.miss_gen[LaneMem];
+            return false;
+        }
+        br_cache_.token.mem_gen = token.mem_gen;
+        ++br_mem_recert_;
     }
     // Generation short-circuit: with the meta and layout lanes unchanged
     // since the last populate or verified pass, every per-attachment guard

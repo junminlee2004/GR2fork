@@ -546,6 +546,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU pushVpMemo: {}", EmulatorSettings.IsPushVpMemo());
     LOG_INFO(Config, "GPU riMemoFusedCmp: {}", EmulatorSettings.IsRiMemoFusedCmp());
     LOG_INFO(Config, "GPU parserRunWide: {}", EmulatorSettings.IsParserRunWide());
+    LOG_INFO(Config, "GPU brMemFastState: {}", EmulatorSettings.IsBrMemFastState());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
