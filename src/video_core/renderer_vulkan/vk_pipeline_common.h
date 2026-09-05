@@ -134,6 +134,8 @@ protected:
     void AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
                        vk::DescriptorSetLayoutCreateFlags flags,
                        const vk::PushConstantRange& push_constants, std::string_view debug_name);
+    /// Whether count set-0 descriptors fit the device's push descriptor limit.
+    [[nodiscard]] bool FitsPushDescriptors(u32 count) const;
 
     const Instance& instance;
     Scheduler& scheduler;

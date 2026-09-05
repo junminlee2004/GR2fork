@@ -73,7 +73,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .size = sizeof(Shader::PushData),
     };
 
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    uses_push_descriptors = FitsPushDescriptors(binding);
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

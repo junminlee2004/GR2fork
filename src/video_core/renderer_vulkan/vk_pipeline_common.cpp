@@ -402,6 +402,13 @@ void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bin
                   is_compute ? "Compute" : "Graphics", debug_name);
 }
 
+bool Pipeline::FitsPushDescriptors(u32 count) const {
+    // The limit is inclusive; the older test kept a pipeline whose total
+    // equals it on the descriptor heap.
+    static const bool full = EmulatorSettings.IsPushDescFullLimit();
+    return full ? count <= instance.MaxPushDescriptors() : count < instance.MaxPushDescriptors();
+}
+
 Pipeline::~Pipeline() {
     // An owned layout dies with the pipeline and the driver may hand its
     // handle value to a layout of another shape: the heap forgets the sets
