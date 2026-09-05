@@ -1776,16 +1776,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // and appending to image_infos.
     const u32 first_sampler_info = static_cast<u32>(image_infos.size());
     const u32 first_sampler_binding = binding.unified;
-    AmdGpu::Image aniso_scratch{};
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
-        if (sampler.disable_aniso) {
-            const AmdGpu::Image& tsharp =
-                stage.images[sampler.associated_image].GetSharpRef(stage, aniso_scratch);
-            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
-                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
-            }
-        }
         const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
     }
