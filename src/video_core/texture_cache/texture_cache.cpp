@@ -980,14 +980,8 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
-        image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
-            std::unique_lock lk{download_images_mutex};
-            download_images.emplace(image_id);
-        }
-    }
-    if (desc.type == BindingType::Storage || image_update_direct) {
+        FindTextureStorage(image, image_id);
+    } else if (image_update_direct) {
         UpdateImage(image, image_id);
     } else {
         MaybeUpdateImage(image_id);
@@ -1000,6 +994,20 @@ vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc)
         ++view_memo_hits_;
         return desc.memo_view;
     }
+    return FindTextureSlow(image, image_id, desc);
+}
+
+void TextureCache::FindTextureStorage(Image& image, ImageId image_id) {
+    image.flags |= ImageFlagBits::GpuModified;
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        image.info.guest_address != 0) {
+        std::unique_lock lk{download_images_mutex};
+        download_images.emplace(image_id);
+    }
+    UpdateImage(image, image_id);
+}
+
+vk::ImageView TextureCache::FindTextureSlow(Image& image, ImageId image_id, const ImageDesc& desc) {
     const vk::ImageView handle = image.FindViewHandle(desc.view_info);
     if (desc.memo_slot != ImageDesc::NoMemoSlot) {
         // Write-back under the full key: the binding passes run all probes

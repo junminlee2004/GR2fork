@@ -477,6 +477,12 @@ private:
         TouchImageSlow(image, id);
     }
     void TouchImageSlow(Image& image, ImageId id);
+    // FindTexture's two cold arms: the storage binding's mark-and-update, and
+    // the view resolve with its memo write-back. The header keeps only the
+    // update dispatch and the memoized-handle return.
+    SHAD_NO_INLINE void FindTextureStorage(Image& image, ImageId image_id);
+    SHAD_NO_INLINE vk::ImageView FindTextureSlow(Image& image, ImageId image_id,
+                                                 const ImageDesc& desc);
     /// Touch from a caller that does not hold the cache mutex; the touch log
     /// takes it, the list runs unlocked as it always has.
     void TouchImageUnlocked(Image& image, ImageId id) {
