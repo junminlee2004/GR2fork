@@ -464,6 +464,10 @@ public:
         rs_calls_ = rs_restarts_ = rs_interrupted_ = 0;
         return out;
     }
+    /// GPU command thread: whether a dynamic rendering pass is open right now.
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
 
     void RecordWait(WaitSite site, u64 ns) {
         auto& w = wait_stats_[static_cast<size_t>(site)];

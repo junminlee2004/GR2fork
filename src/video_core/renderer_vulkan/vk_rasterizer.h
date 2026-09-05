@@ -416,6 +416,9 @@ private:
     // The attachment views the memo left in place, for the mode-3 audit.
     std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS> rt_memo_cb_view_{};
     VideoCore::ImageViewInfo rt_memo_db_view_{};
+    // BRRT census: the three ctl-bits veto inputs, and misses whose fresh
+    // state equalled the snapshot they replaced (with the pass still open).
+    u64 br_veto_depth_{}, br_veto_color_{}, br_veto_fbl_{}, br_same_state_{}, br_same_open_{};
 };
 
 } // namespace Vulkan

@@ -1027,14 +1027,19 @@ void Rasterizer::OnSubmit() {
                     }
                     LOG_INFO(Render_Skipcache,
                              "[SkipCache] BRRT br={}/{} brpop={}/{} key={} reg={} tick={} mem={} "
-                             "tex={} idg={} veto={} per300f",
+                             "tex={} idg={} veto={} vdepth={} vcolor={} vfbl={} same={} "
+                             "sameopen={} per300f",
                              bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
                              bc.populated - br_last_.populated,
                              bc.populate_refused - br_last_.populate_refused,
                              bc.miss_key - br_last_.miss_key, lane(Skipcache::LaneReg),
                              lane(Skipcache::LaneTick), lane(Skipcache::LaneMem),
-                             lane(Skipcache::LaneTex), lane(Skipcache::LaneImgDirty), vetoes);
+                             lane(Skipcache::LaneTex), lane(Skipcache::LaneImgDirty), vetoes,
+                             br_veto_depth_, br_veto_color_, br_veto_fbl_, br_same_state_,
+                             br_same_open_);
                     br_last_ = bc;
+                    br_veto_depth_ = br_veto_color_ = br_veto_fbl_ = br_same_state_ =
+                        br_same_open_ = 0;
                 }
                 if (rc.eligible != rt_last_.eligible) {
                     const auto d = [&](u64 Skipcache::CacheCounters::* f) {
@@ -2071,13 +2076,18 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
     }
     if (rt_state_stamp_) {
         // The control bits the body reads, and its one non-register input:
-        // whether this draw binds a colour target as a texture.
+        // whether this draw binds a colour target as a texture. Each input
+        // is counted on its own for the BRRT line.
         const auto& regs = liverpool->regs;
-        if (((std::bit_cast<u32>(regs.depth_control) ^ br_depth_bits_) & kRtDepthControlBits) !=
-                0 ||
-            ((std::bit_cast<u32>(regs.color_control) ^ br_color_bits_) & kRtColorControlBits) !=
-                0 ||
-            draw_samples_target_ != c.attachment_feedback_loop) {
+        const bool depth_moved =
+            ((std::bit_cast<u32>(regs.depth_control) ^ br_depth_bits_) & kRtDepthControlBits) != 0;
+        const bool color_moved =
+            ((std::bit_cast<u32>(regs.color_control) ^ br_color_bits_) & kRtColorControlBits) != 0;
+        const bool fbl_moved = draw_samples_target_ != c.attachment_feedback_loop;
+        if (depth_moved || color_moved || fbl_moved) {
+            br_veto_depth_ += depth_moved;
+            br_veto_color_ += color_moved;
+            br_veto_fbl_ += fbl_moved;
             ++ctr.veto[BrVetoCtlBits];
             return false;
         }
@@ -2244,6 +2254,12 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
         br_depth_bits_ = std::bit_cast<u32>(regs.depth_control) & kRtDepthControlBits;
         br_color_bits_ = std::bit_cast<u32>(regs.color_control) & kRtColorControlBits;
     }
+    // The refused or invalid snapshot is still in place: a byte-equal rebuild
+    // is a miss whose cause the body could not see. Consumed by the BRRT line;
+    // is_rendering is read after the body's Transits.
+    const bool same = fresh == br_cache_.state;
+    br_same_state_ += same;
+    br_same_open_ += same && scheduler.IsRendering();
     br_cache_.state = fresh;
     br_cache_.attachment_feedback_loop = attachment_feedback_loop;
     {
