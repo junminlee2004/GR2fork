@@ -404,10 +404,24 @@ public:
     /// Single-region form of the tracker's word-epoch sum for a range this
     /// manager fully covers: same loads, same sum, same poison rule. The
     /// caller proves size != 0 and coverage by recording the region only from
-    /// a walk that certified the range.
+    /// a walk that certified the range. A range inside one epoch word, which
+    /// is nearly every call, is answered here; the straddling walk is outlined
+    /// so its unrolled loop does not sit in every caller. The poison word is
+    /// read before the epoch word on both arms, so a concurrent poison-and-bump
+    /// pair is seen from the same side either way.
     [[nodiscard]] bool EpochSumResolved(u64 offset, u64 size, u64& sum) const noexcept {
         const size_t w0 = offset >> EPOCH_WORD_BITS;
         const size_t w1 = (offset + size - 1) >> EPOCH_WORD_BITS;
+        if (w0 != w1) [[unlikely]] {
+            return EpochSumResolvedMultiWord(w0, w1, sum);
+        }
+        const u32 poison = poison_words.load(std::memory_order_acquire);
+        sum = word_epochs[w0].load(std::memory_order_acquire);
+        return ((poison >> w0) & 1u) == 0;
+    }
+
+    [[nodiscard]] SHAD_NO_INLINE bool EpochSumResolvedMultiWord(size_t w0, size_t w1,
+                                                                u64& sum) const noexcept {
         const u32 poison = poison_words.load(std::memory_order_acquire);
         u64 s = 0;
         for (size_t w = w0; w <= w1; ++w) {

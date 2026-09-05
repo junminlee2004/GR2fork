@@ -250,8 +250,11 @@ public:
     }
 
     /// Twin of Sum256ForRange that also names the region when one covers the
-    /// whole range; the resolved memo probe reads that region directly.
-    EpochSum256 Sum256ForRangeResolved(VAddr cpu_addr, u64 size, RegionManager*& region) noexcept {
+    /// whole range; the resolved memo probe reads that region directly. Forced
+    /// inline: its two callers are the stream-copy and index-bind memo probes,
+    /// and the heuristic inliner has declined the neighbouring GPU probe there.
+    SHAD_FORCE_INLINE EpochSum256 Sum256ForRangeResolved(VAddr cpu_addr, u64 size,
+                                                         RegionManager*& region) noexcept {
         region = nullptr;
         RegionManager* single;
         if (size <= MAX_EPOCH_SUM_SPAN && TrySingleRegion(cpu_addr, size, single)) [[likely]] {
