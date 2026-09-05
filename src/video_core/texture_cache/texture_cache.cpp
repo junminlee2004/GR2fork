@@ -626,7 +626,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     if (!matched) {
         // No valid way holds the key: a free way makes this a cold miss,
         // otherwise the least recently used way is the conflict victim.
-        way = MemoVictim(set, ways, set_index);
+        way = MemoVictim(set, ways);
         if (set[way].valid) {
             ++ctr.miss_key;
         } else {
@@ -648,7 +648,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     FindImageMemoEntry& e = set[way];
     const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
     if (matched && ways > 1) {
-        MemoTouch(ways, set_index, way);
+        e.touch_stamp = ++findimg_touch_seq_;
     }
     if (timed) {
         ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
@@ -756,10 +756,10 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             e.valid = true;
             sc.NotifyPopulated(kCache);
         }
-        // Touched on every populate, a failed commit included: the order byte
-        // is a permutation only if every way that was written was ranked.
+        // Stamped on every populate, a failed commit included, so a written way
+        // never outranks a valid one at the next victim scan.
         if (ways > 1) {
-            MemoTouch(ways, set_index, way);
+            e.touch_stamp = ++findimg_touch_seq_;
         }
     }
     return real;
@@ -1755,29 +1755,21 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectSamplers();
 }
 
-// The order byte lists a set's ways two bits per rank, most recent first; the
-// last rank is the victim once every way is valid.
-u32 TextureCache::MemoVictim(const FindImageMemoEntry* set, u32 ways, size_t set_index) const {
+// The victim is the first invalid way, else the way with the smallest touch
+// stamp; with one way the scan never reads the stamp line.
+u32 TextureCache::MemoVictim(const FindImageMemoEntry* set, u32 ways) const {
     for (u32 w = 0; w < ways; ++w) {
         if (!set[w].valid) {
             return w;
         }
     }
-    return ways == 1 ? 0 : (find_image_memo_order_[set_index] >> (2 * (ways - 1))) & 3;
-}
-
-void TextureCache::MemoTouch(u32 ways, size_t set_index, u32 way) {
-    u8& order = find_image_memo_order_[set_index];
-    u8 out = static_cast<u8>(way);
-    u32 rank = 1;
-    for (u32 r = 0; r < ways; ++r) {
-        const u32 v = (order >> (2 * r)) & 3;
-        if (v != way && rank < ways) {
-            out |= static_cast<u8>(v << (2 * rank));
-            ++rank;
+    u32 victim = 0;
+    for (u32 w = 1; w < ways; ++w) {
+        if (set[w].touch_stamp < set[victim].touch_stamp) {
+            victim = w;
         }
     }
-    order = out;
+    return victim;
 }
 
 void TextureCache::TouchImageSlow(Image& image, ImageId id) {

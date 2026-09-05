@@ -542,7 +542,8 @@ public:
 
 private:
     // Image memo entry: line 0 holds what a probe and a hit read, line 1 what a
-    // consumed hit copies out, line 2 the stamps of the locked touch path.
+    // consumed hit copies out, line 2 the stamps of the locked touch path and
+    // the recency stamp the victim scan reads.
     struct alignas(64) FindImageMemoEntry {
         std::array<u64, 4> tsharp_raw{};
         u64 image_uid{};
@@ -564,16 +565,16 @@ private:
         // no-op (0 = none) and the descriptor layout the backing held then.
         u64 bind_epoch{};
         vk::ImageLayout bind_layout{};
+        // Last touch; the smallest stamp in a full set is the LRU victim.
+        u64 touch_stamp{};
     };
     static_assert(sizeof(FindImageMemoEntry) == 192);
     static_assert(offsetof(FindImageMemoEntry, view_info) == 64);
     static_assert(offsetof(FindImageMemoEntry, access_tick) == 128);
+    static_assert(offsetof(FindImageMemoEntry, touch_stamp) == 160);
     static constexpr size_t FindImageMemoEntries = 2048;
     std::array<FindImageMemoEntry, FindImageMemoEntries> find_image_memo_{};
-    // One byte per set: the ways two bits per rank, most recently used first.
-    std::array<u8, FindImageMemoEntries> find_image_memo_order_{};
-    u32 MemoVictim(const FindImageMemoEntry* set, u32 ways, size_t set_index) const;
-    void MemoTouch(u32 ways, size_t set_index, u32 way);
+    u32 MemoVictim(const FindImageMemoEntry* set, u32 ways) const;
     u64 view_memo_hits_{};
     u64 view_memo_slow_{};
     u64 view_memo_writebacks_{};
@@ -729,6 +730,7 @@ private:
     u32 memo_set_shift; // 64 - log2(sets): the mixed T# key's top bits index the set
     std::array<u64, 4> findimg_way_hits_{};
     u64 findimg_evictions_{};
+    u64 findimg_touch_seq_{};
     u64 findimg_consumed_{};
     u64 findimg_touch_locks_{};
     PageTable page_table;
