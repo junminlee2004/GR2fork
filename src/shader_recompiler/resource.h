@@ -21,6 +21,9 @@ using SharpLocation = u16;
 
 constexpr SharpLocation UNKNOWN_LOCATION = std::numeric_limits<u16>::max();
 
+// Readers take the sharp through Info::flat_ud, never flattened_ud_buf: the fork's
+// RefreshFlatBuf leaves that vector empty for walker-less shaders and aliases flat_ud
+// to the user-data registers instead of copying them per bind.
 template <typename T>
 struct SharpFetch {
     static constexpr std::size_t N = sizeof(T) / sizeof(u32);
@@ -104,7 +107,7 @@ struct BufferResource {
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
-        if (!sharp_fetch.Fetch(info.flattened_ud_buf.data(), &buffer)) {
+        if (!sharp_fetch.Fetch(info.flat_ud, &buffer)) {
             return AmdGpu::Buffer::Null();
         }
         if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
@@ -142,7 +145,7 @@ struct ImageResource {
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.flattened_ud_buf.data(), &image)) {
+        if (!Fetch(info.flat_ud, &image)) {
             return AmdGpu::Image::Null(is_depth);
         }
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
@@ -186,8 +189,8 @@ struct ImageResource {
             scratch = GetSharp(info);
             return scratch;
         }
-        const auto& raw = *reinterpret_cast<const AmdGpu::Image*>(info.flattened_ud_buf.data() +
-                                                                  sharp_fetch.offsets[0]);
+        const auto& raw =
+            *reinterpret_cast<const AmdGpu::Image*>(info.flat_ud + sharp_fetch.offsets[0]);
         if (!raw.Valid()) [[unlikely]] {
             scratch = AmdGpu::Image::Null(is_depth);
             return scratch;
@@ -227,9 +230,9 @@ struct SamplerResource {
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
-        sharp_fetch.Fetch(info.flattened_ud_buf.data(), &sampler);
+        sharp_fetch.Fetch(info.flat_ud, &sampler);
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
-            const u32 tsharp_dw3 = info.flattened_ud_buf[post_op_tsharp_dw3_off];
+            const u32 tsharp_dw3 = info.flat_ud[post_op_tsharp_dw3_off];
             if (((tsharp_dw3 >> 12) & 0xff) == 0) {
                 sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
