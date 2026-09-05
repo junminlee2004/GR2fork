@@ -132,6 +132,22 @@ public:
             });
     }
 
+    /// The GPU probe for a range whose single covering region the caller
+    /// resolved in this same call, from TrySingleRegion or a memo entry
+    /// certified for exactly [addr, addr + size); size != 0. GPU command
+    /// thread only: the foreign fault-path probes never reach it.
+    [[nodiscard]] bool IsRegionGpuModifiedIn(RegionManager* region, VAddr addr, u64 size) noexcept {
+        RENDERER_TRACE;
+        ++fast_stats_.gpu_fast;
+        ++fast_stats_.fused;
+        const u64 region_offset = addr & TRACKER_HIGHER_PAGE_MASK;
+        const size_t first = (region_offset / TRACKER_BYTES_PER_PAGE) >> 6;
+        const size_t last = ((region_offset + (size ? size - 1 : 0)) / TRACKER_BYTES_PER_PAGE) >> 6;
+        fast_stats_.peek_word += first == last;
+        fast_stats_.peek_split += first != last;
+        return region->template PeekRegionModified<Type::GPU>(region_offset, size);
+    }
+
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<false>(dirty_cpu_addr, query_size,
@@ -877,6 +893,8 @@ private:
         // worth its code size on this workload.
         u64 peek_word{};
         u64 peek_split{};
+        // GPU probes that reused the region the caller had already resolved.
+        u64 fused{};
     };
     FastPathStats fast_stats_;
 
@@ -898,6 +916,7 @@ public:
         u64 foreign; // of the two above, the ones the fault path contributed
         u64 peek_word;
         u64 peek_split;
+        u64 fused;
     };
     FastPathDrain DrainFastPathStats() {
         const u64 foreign_fast = foreign_stats_.gpu_fast.exchange(0, std::memory_order_relaxed);
@@ -909,7 +928,8 @@ public:
                                 fast_stats_.single_null,
                                 foreign_fast + foreign_walk,
                                 fast_stats_.peek_word,
-                                fast_stats_.peek_split};
+                                fast_stats_.peek_split,
+                                fast_stats_.fused};
         fast_stats_ = {};
         return out;
     }

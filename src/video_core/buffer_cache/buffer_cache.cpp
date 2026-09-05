@@ -1231,12 +1231,14 @@ void BufferCache::BindIndexBuffer(
     // all ask the same question about the same range, and a memo hit whose
     // range is proven clean at the current GPU-dirty generation needs no walk.
     std::optional<bool> index_gpu_modified{};
+    // Named by this call's resolving walk when one region covers the range;
+    // the final probe below reuses it instead of resolving again.
+    RegionManager* region = nullptr;
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         const u64 tick = scheduler.CurrentTick();
         u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
         bool mem_key_ok = true;
-        RegionManager* region = nullptr;
         const bool resolved = mirror_mode_ && stream_copy_resolved_epoch_;
         const bool tag_hit = index_bind_valid_ && index_bind_addr_ == index_address &&
                              index_bind_size_ == index_buffer_size &&
@@ -1296,7 +1298,10 @@ void BufferCache::BindIndexBuffer(
     }
     // has_value distinguishes an unresolved answer from a resolved false.
     if (!index_gpu_modified.has_value()) {
-        index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
+        index_gpu_modified =
+            region != nullptr
+                ? memory_tracker->IsRegionGpuModifiedIn(region, index_address, index_buffer_size)
+                : IsRegionGpuModified(index_address, index_buffer_size);
         if (index_bind_valid_ && !*index_gpu_modified) {
             // The walked range is exactly the stamped memo range, so a fresh
             // clean answer seeds the walk skip for the next hit.
@@ -1652,7 +1657,11 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                     return {&stream_buffer, hit->offset};
                 }
                 stream_genwalk_ += !gpu_modified;
-                if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
+                // A certified hit already resolved the entry's region for this
+                // exact range, so the peek needs no second resolve.
+                if (gpu_modified ? !*gpu_modified
+                    : fast ? !memory_tracker->IsRegionGpuModifiedIn(hit->region, device_addr, size)
+                           : !IsRegionGpuModified(device_addr, size)) {
                     hit->gpu_gen = gpu_dirty_generation_;
                     ++stream_copy_hits_;
                     stream_copy_fast_ += fast;
@@ -1668,7 +1677,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                     mem_key = sum.sum;
                     mem_key_ok = sum.ok;
                 }
-                if (gpu_modified ? !*gpu_modified : !IsRegionGpuModified(device_addr, size)) {
+                if (gpu_modified ? !*gpu_modified
+                    : region != nullptr
+                        ? !memory_tracker->IsRegionGpuModifiedIn(region, device_addr, size)
+                        : !IsRegionGpuModified(device_addr, size)) {
                     MirrorOracleProbe(device_addr, size, false, false);
                     const u64 offset =
                         stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());

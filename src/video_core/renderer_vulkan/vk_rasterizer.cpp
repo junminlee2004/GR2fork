@@ -1070,9 +1070,9 @@ void Rasterizer::OnSubmit() {
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] TRKFAST sum1={} sumwalk={} gpu1={} gpuwalk={} nul={} "
-                         "foreign={} per300f",
+                         "foreign={} fused={} per300f",
                          tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null,
-                         tf.foreign);
+                         tf.foreign, tf.fused);
                 if (tf.peek_word + tf.peek_split != 0) {
                     LOG_INFO(Render_Skipcache, "[SkipCache] PEEK1W word={} split={} per300f",
                              tf.peek_word, tf.peek_split);
