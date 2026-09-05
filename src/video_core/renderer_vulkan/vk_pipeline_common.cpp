@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
@@ -256,11 +257,44 @@ size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
     return static_cast<size_t>(cursor - blob.data());
 }
 
+// The count of a compaction that would not fit the write list: larger than any
+// bound the caller compares against, so the set is pushed whole. Unreachable on
+// radv, whose 32 push descriptors bound the descriptor count, but a real hole
+// elsewhere, and the write list itself only fails closed by dropping runs.
+constexpr size_t kRunsOverflow = std::numeric_limits<size_t>::max();
+
+// One write of a compaction: the identity fields and exactly one payload
+// pointer, the others null. A field copy of the source write would hand the
+// driver whatever the other pointer slots last held.
+vk::WriteDescriptorSet MakeRun(const vk::WriteDescriptorSet& w, u32 first, u32 count) {
+    vk::WriteDescriptorSet run{};
+    run.dstSet = w.dstSet;
+    run.dstBinding = w.dstBinding + first;
+    run.dstArrayElement = 0;
+    run.descriptorCount = count;
+    run.descriptorType = w.descriptorType;
+    switch (w.descriptorType) {
+    case vk::DescriptorType::eUniformBuffer:
+    case vk::DescriptorType::eStorageBuffer:
+        run.pBufferInfo = w.pBufferInfo + first;
+        break;
+    case vk::DescriptorType::eUniformTexelBuffer:
+    case vk::DescriptorType::eStorageTexelBuffer:
+        run.pTexelBufferView = w.pTexelBufferView + first;
+        break;
+    default:
+        run.pImageInfo = w.pImageInfo + first;
+        break;
+    }
+    return run;
+}
+
 // Compacts the write list to the descriptors the mapped walk saw change.
 // Buffer and sampler writes span consecutive count-1 bindings, so each
 // maximal run of changed descriptors becomes one write on its own binding;
 // image writes are one binding with an array, so they go whole or not at all.
-// The layouts come from the graphics and compute pipeline builders.
+// The layouts come from the graphics and compute pipeline builders. Returns
+// kRunsOverflow when the runs would not fit the write list.
 size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
                                const Skipcache::Framework::DescDeltaSlot& map,
                                Pipeline::DescriptorWrites& out) {
@@ -289,16 +323,10 @@ size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
                 while (j < count && map.changed[k + j]) {
                     ++j;
                 }
-                vk::WriteDescriptorSet run = w;
-                run.dstBinding = w.dstBinding + i;
-                run.dstArrayElement = 0;
-                run.descriptorCount = j - i;
-                if (w.descriptorType == vk::DescriptorType::eSampler) {
-                    run.pImageInfo = w.pImageInfo + i;
-                } else {
-                    run.pBufferInfo = w.pBufferInfo + i;
+                if (out.size() >= Pipeline::NUM_DESCRIPTOR_WRITES) {
+                    return kRunsOverflow;
                 }
-                out.push_back(run);
+                out.push_back(MakeRun(w, i, j - i));
                 i = j;
             }
             break;
@@ -309,7 +337,10 @@ size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
                 any |= map.changed[k + i] != 0;
             }
             if (any) {
-                out.push_back(w);
+                if (out.size() >= Pipeline::NUM_DESCRIPTOR_WRITES) {
+                    return kRunsOverflow;
+                }
+                out.push_back(MakeRun(w, 0, count));
             }
             break;
         }
