@@ -7,6 +7,7 @@
 #include <memory>
 #include <variant>
 #include <tsl/robin_map.h>
+#include "common/assert.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -382,6 +383,22 @@ private:
         u64 program_hash{};
     };
     std::array<StageIdentity, MaxShaderStages> stage_identity{};
+    // GetProgram's cold arms, outlined so its frame carries neither a
+    // StageSpecialization nor a compile path: the first-ever build of a
+    // program, and the permutation resolve that runs when every fast tier
+    // missed. Publish is every exit's hand-off to the pipeline lookups.
+    SHAD_FORCE_INLINE u64 Publish(u32 out_slot, Shader::LogicalStage l_stage,
+                                  const Shader::Info* out_info, vk::ShaderModule module,
+                                  const Program* pgm, u32 perm_idx, u64 hash);
+    SHAD_NO_INLINE u64 CreateProgramSlow(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                         const Shader::ShaderParams& params,
+                                         Shader::Backend::Bindings& binding, u32 out_slot,
+                                         std::unique_ptr<Program>& created_slot, StageIdentity& id);
+    SHAD_NO_INLINE u64 ResolvePermutationSlow(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                              const Shader::ShaderParams& params,
+                                              Shader::Backend::Bindings& binding, u32 out_slot,
+                                              Program* program, u64 spec_fp, bool spec_fp_eligible,
+                                              size_t key_len);
     bool shader_params_memo{};
     // Direct-mapped table behind stage_identity, indexed by the code address:
     // a program a stage returns to resolves from it, validated by the search's

@@ -1573,23 +1573,51 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+// Every exit of GetProgram publishes through here instead of returning a tuple
+// the caller unpacks: infos and modules feed the pipeline lookups, the fetch
+// shader reference feeds the vertex format walk and the graphics pipeline
+// constructor, and compute stages carry none.
+SHAD_FORCE_INLINE u64 PipelineCache::Publish(u32 out_slot, LogicalStage l_stage,
+                                             const Shader::Info* out_info, vk::ShaderModule module,
+                                             const Program* pgm, u32 perm_idx, u64 hash) {
+    DEBUG_ASSERT(out_slot < MaxShaderStages);
+    infos[out_slot] = out_info;
+    modules[out_slot] = module;
+    const FetchShaderRef ref{pgm, perm_idx};
+    if (l_stage != LogicalStage::Compute && ref) {
+        fetch_shader_ref = ref;
+    }
+    return hash;
+}
+
+// The first-ever build of a program: a few hundred calls per session, each
+// carrying a StageSpecialization that must not sit in GetProgram's frame.
+u64 PipelineCache::CreateProgramSlow(Stage stage, LogicalStage l_stage,
+                                     const Shader::ShaderParams& params,
+                                     Shader::Backend::Bindings& binding, u32 out_slot,
+                                     std::unique_ptr<Program>& created_slot, StageIdentity& id) {
+    const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
+    created_slot = std::make_unique<Program>(stage, l_stage, params);
+    auto& created = created_slot;
+    auto start = binding;
+    auto ri_compile = runtime_info;
+    const auto module = CompileModule(created->info, ri_compile, params.code, 0, binding);
+    NoteSharpVerdicts(created->info);
+    auto spec = Shader::StageSpecialization(created->info, ri_compile, profile, start);
+    const auto perm_hash = HashCombine(params.hash, 0);
+
+    if (spec_fp_cache) {
+        spec.ComputeSig();
+    }
+    RegisterShaderMeta(created->info, spec.fetch_shader_data, spec, perm_hash, 0);
+    created->AddPermut(module, std::move(spec));
+    id.program = created.get();
+    id.program_hash = params.hash;
+    return Publish(out_slot, l_stage, &created->info, module, created.get(), 0u, perm_hash);
+}
+
 u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::ShaderParams& params,
                               Shader::Backend::Bindings& binding, u32 out_slot) {
-    // Every exit publishes through here instead of returning a tuple the
-    // caller unpacks: infos and modules feed the pipeline lookups, the fetch
-    // shader reference feeds the vertex format walk and the graphics pipeline
-    // constructor, and compute stages carry none.
-    const auto publish = [&](const Shader::Info* out_info, vk::ShaderModule module,
-                             const Program* pgm, u32 perm_idx, u64 hash) -> u64 {
-        DEBUG_ASSERT(out_slot < MaxShaderStages);
-        infos[out_slot] = out_info;
-        modules[out_slot] = module;
-        const FetchShaderRef ref{pgm, perm_idx};
-        if (l_stage != LogicalStage::Compute && ref) {
-            fetch_shader_ref = ref;
-        }
-        return hash;
-    };
     // Reference, not copy: the member persists until the next
     // BuildRuntimeInfo call, and copying the struct per resolve was measured
     // per-draw-stage cost. Compile branches make their own mutable copy
@@ -1629,23 +1657,7 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
         ++pgmid_map_probes;
         auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
         if (new_program) {
-            it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
-            auto& created = it_pgm.value();
-            auto start = binding;
-            auto ri_compile = runtime_info;
-            const auto module = CompileModule(created->info, ri_compile, params.code, 0, binding);
-            NoteSharpVerdicts(created->info);
-            auto spec = Shader::StageSpecialization(created->info, ri_compile, profile, start);
-            const auto perm_hash = HashCombine(params.hash, 0);
-
-            if (spec_fp_cache) {
-                spec.ComputeSig();
-            }
-            RegisterShaderMeta(created->info, spec.fetch_shader_data, spec, perm_hash, 0);
-            created->AddPermut(module, std::move(spec));
-            id.program = created.get();
-            id.program_hash = params.hash;
-            return publish(&created->info, module, created.get(), 0u, perm_hash);
+            return CreateProgramSlow(stage, l_stage, params, binding, out_slot, it_pgm.value(), id);
         }
         program = it_pgm.value().get();
         id.program = program;
@@ -1733,8 +1745,8 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                         ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
                     }
                     info.AddBindings(binding);
-                    return publish(&program->info, slot.module, program, slot.perm_idx,
-                                   slot.perm_hash);
+                    return Publish(out_slot, l_stage, &program->info, slot.module, program,
+                                   slot.perm_idx, slot.perm_hash);
                 }
                 slot.program = nullptr;
                 spec_fp = XXH3_64bits(slot.buf.data(), key_len);
@@ -1767,8 +1779,8 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
                         ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
                     }
                     info.AddBindings(binding);
-                    return publish(&program->info, slot.module, program, slot.perm_idx,
-                                   slot.perm_hash);
+                    return Publish(out_slot, l_stage, &program->info, slot.module, program,
+                                   slot.perm_idx, slot.perm_hash);
                 }
             }
             if (key_len != 0) {
@@ -1804,7 +1816,8 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
             }
             info.AddBindings(binding);
             program->last_hit_perm = static_cast<u32>(hit_idx);
-            return publish(&program->info, module, program, static_cast<u32>(hit_idx), hit_hash);
+            return Publish(out_slot, l_stage, &program->info, module, program,
+                           static_cast<u32>(hit_idx), hit_hash);
         };
         // MRU front: consecutive draws overwhelmingly repeat the fingerprint,
         // and this compare reads a line the probe already has hot.
@@ -1869,6 +1882,17 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
             }
         }
     }
+    return ResolvePermutationSlow(stage, l_stage, params, binding, out_slot, program, spec_fp,
+                                  spec_fp_eligible, key_len);
+}
+
+u64 PipelineCache::ResolvePermutationSlow(Stage stage, LogicalStage l_stage,
+                                          const Shader::ShaderParams& params,
+                                          Shader::Backend::Bindings& binding, u32 out_slot,
+                                          Program* program, u64 spec_fp, bool spec_fp_eligible,
+                                          size_t key_len) {
+    auto& info = program->info;
+    const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
     auto& spec = spec_scratch;
     spec.Rebuild(info, runtime_info, profile, binding);
 #ifdef _DEBUG
@@ -1970,7 +1994,8 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
             }
         }
         program->last_hit_perm = static_cast<u32>(perm_idx);
-        return publish(&program->info, module, program, static_cast<u32>(perm_idx), perm_hash);
+        return Publish(out_slot, l_stage, &program->info, module, program,
+                       static_cast<u32>(perm_idx), perm_hash);
     }
 
     auto it = program->modules.end();
@@ -1999,7 +2024,8 @@ u64 PipelineCache::GetProgram(Stage stage, LogicalStage l_stage, const Shader::S
         perm_hash = HashCombine(params.hash, perm_idx);
     }
     program->last_hit_perm = static_cast<u32>(perm_idx);
-    return publish(&program->info, module, program, static_cast<u32>(perm_idx), perm_hash);
+    return Publish(out_slot, l_stage, &program->info, module, program, static_cast<u32>(perm_idx),
+                   perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
