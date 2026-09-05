@@ -654,6 +654,10 @@ struct GPUSettings {
     // registered images before taking the texture cache mutex, so a fault in
     // memory no image covers skips the locked page table walk.
     Setting<bool> texture_invalidate_filter{false};
+    // Keys the render-target memo and the render-scope cache on a stamp lane bumped only by
+    // the CB/DB registers their bodies read, and on mrt_mask/color_samples instead of the
+    // pipeline identity. Needs adaptive_skipcaches_mode != 0.
+    Setting<bool> rt_state_stamp{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -775,6 +779,7 @@ struct GPUSettings {
                                        &GPUSettings::upload_arm_chunk_bytes),
             make_override<GPUSettings>("texture_invalidate_filter",
                                        &GPUSettings::texture_invalidate_filter),
+            make_override<GPUSettings>("rt_state_stamp", &GPUSettings::rt_state_stamp),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -806,7 +811,7 @@ struct GPUSettings {
     findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1137,6 +1142,7 @@ public:
     SETTING_FORWARD(m_gpu, StreamCopyLaneThreads, stream_copy_lane_threads)
     SETTING_FORWARD(m_gpu, UploadArmChunkBytes, upload_arm_chunk_bytes)
     SETTING_FORWARD_BOOL(m_gpu, TextureInvalidateFilter, texture_invalidate_filter)
+    SETTING_FORWARD_BOOL(m_gpu, RtStateStamp, rt_state_stamp)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

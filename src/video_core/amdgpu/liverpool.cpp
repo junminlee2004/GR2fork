@@ -262,16 +262,28 @@ constexpr std::array kDynRegBlocks = {
     DYN_REG_BLOCK(line_control),
     DYN_REG_BLOCK(blend_constants),
 };
+
+// The register blocks the render-target memo and the render-scope cache read.
+// depth_control and color_control are left out on purpose: those consumers
+// compare the bits they read themselves, so a change elsewhere in the two
+// words moves neither cache.
+constexpr std::array kRtRegBlocks = {
+    DYN_REG_BLOCK(color_buffers),         DYN_REG_BLOCK(color_target_mask),
+    DYN_REG_BLOCK(depth_buffer),          DYN_REG_BLOCK(depth_view),
+    DYN_REG_BLOCK(depth_htile_data_base), DYN_REG_BLOCK(depth_render_control),
+    DYN_REG_BLOCK(depth_clear),           DYN_REG_BLOCK(stencil_clear),
+};
 #undef DYN_REG_BLOCK
-consteval bool DynRegBlocksInRange() {
-    for (const auto& block : kDynRegBlocks) {
+consteval bool RegBlocksInRange(const auto& blocks) {
+    for (const auto& block : blocks) {
         if (block.word < Regs::ContextRegWordOffset || block.word + block.count > Regs::NumRegs) {
             return false;
         }
     }
     return true;
 }
-static_assert(DynRegBlocksInRange());
+static_assert(RegBlocksInRange(kDynRegBlocks));
+static_assert(RegBlocksInRange(kRtRegBlocks));
 
 } // namespace
 
@@ -292,6 +304,13 @@ Liverpool::Liverpool() {
     gfx_stamp.dyn_mask_words = static_cast<u32>(dyn_reg_mask_.size() * 64);
     gfx_stamp.classify =
         gfx_stamp.active && EmulatorSettings.IsDynStateStamp() && EmulatorSettings.IsDynStateMemo();
+    for (const auto& block : kRtRegBlocks) {
+        for (u32 w = block.word - Regs::ContextRegWordOffset, end = w + block.count; w < end; ++w) {
+            rt_reg_mask_[w >> 6] |= u64{1} << (w & 63);
+        }
+    }
+    gfx_stamp.rt_mask = rt_reg_mask_.data();
+    gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     reg_run_ = EmulatorSettings.IsParserRegRun();
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};

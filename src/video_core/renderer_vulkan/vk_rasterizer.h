@@ -381,6 +381,27 @@ private:
     u64 bindscratch_bindmax_{};
     u64 bindscratch_infos_{};
     u64 bindscratch_infomax_{};
+
+    // rt_state_stamp: the render-target memo and the render-scope cache key on
+    // the stamp's rt lane and on the pipeline key's mrt_mask (and colour sample
+    // counts) instead of the pipeline identity, and compare the depth_control
+    // and color_control bits their bodies read against these populate-time
+    // snapshots. draw_samples_target_ is the render-scope body's one
+    // non-register input: whether this draw binds a colour target as a
+    // texture. Declared last so no hot member moves.
+    u64 RtLaneStamp() const noexcept;
+    bool rt_state_stamp_{};
+    u32 rt_memo_mrt_mask_{};
+    u32 rt_memo_depth_bits_{};
+    u32 rt_memo_color_bits_{};
+    u32 br_mrt_mask_{};
+    u32 br_depth_bits_{};
+    u32 br_color_bits_{};
+    std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> br_color_samples_{};
+    bool draw_samples_target_{};
+    // The attachment views the memo left in place, for the mode-3 audit.
+    std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS> rt_memo_cb_view_{};
+    VideoCore::ImageViewInfo rt_memo_db_view_{};
 };
 
 } // namespace Vulkan

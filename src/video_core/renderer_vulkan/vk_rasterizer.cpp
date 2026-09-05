@@ -112,6 +112,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         EmulatorSettings.IsDynStateMemo() &&
         EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
     dyn_class_stamp_ = dyn_memo_enabled_ && EmulatorSettings.IsDynStateStamp();
+    // Same pinning: the rt lane is latched from the boot values.
+    rt_state_stamp_ =
+        EmulatorSettings.IsRtStateStamp() &&
+        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
     // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
     // to measure, and calling it from the per-300-frame telemetry block put a
     // deterministic two-frame stall on the GPU command thread every ~17s.
@@ -234,6 +238,18 @@ bool Rasterizer::FilterDrawSlow() {
     return true;
 }
 
+// The depth_control and color_control bits the render-target bodies read:
+// stencil_enable, depth_enable and depth_write_enable; degamma_enable and
+// mode. The rt stamp lane leaves those registers out, so the memos compare
+// these bits themselves against a populate-time snapshot.
+constexpr u32 kRtDepthControlBits = 0x7;
+constexpr u32 kRtColorControlBits = 0x78;
+static_assert(sizeof(AmdGpu::DepthControl) == 4 && sizeof(AmdGpu::ColorControl) == 4);
+
+u64 Rasterizer::RtLaneStamp() const noexcept {
+    return rt_state_stamp_ ? liverpool->GetRtStateStamp() : liverpool->GetGfxStateStamp();
+}
+
 bool Rasterizer::RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u64 tex_gen,
                              u64 pipe_gen) {
     using namespace VideoCore::Skipcache;
@@ -243,13 +259,24 @@ bool Rasterizer::RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u6
         ++ctr.miss_cold;
         return false;
     }
-    if (m.pipeline != pipeline) {
+    if (rt_state_stamp_ ? rt_memo_mrt_mask_ != pipeline->GetGraphicsKey().mrt_mask
+                        : m.pipeline != pipeline) {
         ++ctr.miss_key;
         return false;
     }
     if (m.reg_stamp != reg_stamp) {
         ++ctr.miss_gen[LaneReg];
         return false;
+    }
+    if (rt_state_stamp_) {
+        const auto& regs = liverpool->regs;
+        if (((std::bit_cast<u32>(regs.depth_control) ^ rt_memo_depth_bits_) &
+             kRtDepthControlBits) != 0 ||
+            ((std::bit_cast<u32>(regs.color_control) ^ rt_memo_color_bits_) &
+             kRtColorControlBits) != 0) {
+            ++ctr.veto[1];
+            return false;
+        }
     }
     if (m.tex_gen != tex_gen) {
         ++ctr.miss_gen[LaneTex];
@@ -322,9 +349,11 @@ void Rasterizer::RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pi
     const u32 cb_count = std::bit_width(pipeline->GetGraphicsKey().mrt_mask);
     if (would_hit && sc.GetState(kCache) != State::Learning) {
         const auto& m = rt_memo_;
-        bool same = m.cb_count == cb_count && m.db_id == db_desc.first;
+        bool same = m.cb_count == cb_count && m.db_id == db_desc.first &&
+                    (!m.db_id || rt_memo_db_view_ == db_desc.second.view_info);
         for (u32 cb = 0; same && cb < cb_count; ++cb) {
-            same = m.cb_id[cb] == cb_descs[cb].first;
+            same = m.cb_id[cb] == cb_descs[cb].first &&
+                   (!m.cb_id[cb] || rt_memo_cb_view_[cb] == cb_descs[cb].second.view_info);
         }
         if (same) {
             sc.RecordVerifyClean(kCache);
@@ -353,6 +382,16 @@ void Rasterizer::RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pi
     m.reg_stamp = reg_stamp;
     m.pipe_gen = pipe_gen;
     m.tex_gen = tex_gen;
+    {
+        const auto& regs = liverpool->regs;
+        rt_memo_mrt_mask_ = pipeline->GetGraphicsKey().mrt_mask;
+        rt_memo_depth_bits_ = std::bit_cast<u32>(regs.depth_control) & kRtDepthControlBits;
+        rt_memo_color_bits_ = std::bit_cast<u32>(regs.color_control) & kRtColorControlBits;
+        for (u32 cb = 0; cb < cb_count; ++cb) {
+            rt_memo_cb_view_[cb] = cb_descs[cb].second.view_info;
+        }
+        rt_memo_db_view_ = db_desc.second.view_info;
+    }
     if (sc.Gens().tex_gen.load(std::memory_order_acquire) == tex_gen) {
         m.valid = true;
         sc.NotifyPopulated(kCache);
@@ -370,7 +409,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         ++ctr.eligible;
         const bool timed = skipcache.SampleTimer(CacheId::PrepareRt);
         const u64 t0 = timed ? skipcache.Now() : 0;
-        rt_stamp = liverpool->GetGfxStateStamp();
+        rt_stamp = RtLaneStamp();
         rt_stamp_moves_ += rt_stamp != rt_stamp_last_;
         rt_stamp_last_ = rt_stamp;
         const u64 gfx_stamp = liverpool->GetGfxStateStamp();
@@ -1024,8 +1063,9 @@ void Rasterizer::OnSubmit() {
                 dyn_stamp_last_ = dyn_stamp;
             }
             if (const auto rf = liverpool->DrainRegFunnelStats(); rf.calls) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] REGFUNNEL calls={} classified={} per300f",
-                         rf.calls, rf.classified);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] REGFUNNEL calls={} classified={} rtclass={} per300f",
+                         rf.calls, rf.classified, rf.classified_rt);
             }
             if (bindpf_img_) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] BINDPF img={} backing={} per300f",
@@ -1255,6 +1295,7 @@ void Rasterizer::BindingSkipProbeBody(const Pipeline* pipeline) {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    draw_samples_target_ = false;
     if (pipeline->IsCompute() && TakeComputeShortcut(pipeline)) [[unlikely]] {
         return false;
     }
@@ -1765,6 +1806,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // storage and feedback loop doesn't make sense for them
             if ((image.binding.force_general || image.binding.is_target) &&
                 !image.info.props.is_depth) {
+                draw_samples_target_ = draw_samples_target_ || image.binding.is_target != 0;
                 image.Transit(instance.IsAttachmentFeedbackLoopLayoutSupported() &&
                                       image.binding.is_target
                                   ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
@@ -1868,6 +1910,7 @@ enum BrVeto : u8 {
     BrVetoBacking = 4,
     BrVetoLayout = 5,
     BrVetoSubres = 6,
+    BrVetoCtlBits = 7,
 };
 
 bool Rasterizer::BrGuardAttachment(const BrAttachmentGuard& g,
@@ -1937,7 +1980,9 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
         ++ctr.miss_cold;
         return false;
     }
-    if (c.pipeline != pipeline) { // compared, never dereferenced
+    if (rt_state_stamp_ ? br_mrt_mask_ != pipeline->GetGraphicsKey().mrt_mask ||
+                              br_color_samples_ != pipeline->GetGraphicsKey().color_samples
+                        : c.pipeline != pipeline) { // the pointer is compared, never dereferenced
         ++ctr.miss_key;
         return false;
     }
@@ -1964,6 +2009,19 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
     if (c.token.img_dirty_gen != token.img_dirty_gen) {
         ++ctr.miss_gen[LaneImgDirty];
         return false;
+    }
+    if (rt_state_stamp_) {
+        // The control bits the body reads, and its one non-register input:
+        // whether this draw binds a colour target as a texture.
+        const auto& regs = liverpool->regs;
+        if (((std::bit_cast<u32>(regs.depth_control) ^ br_depth_bits_) & kRtDepthControlBits) !=
+                0 ||
+            ((std::bit_cast<u32>(regs.color_control) ^ br_color_bits_) & kRtColorControlBits) !=
+                0 ||
+            draw_samples_target_ != c.attachment_feedback_loop) {
+            ++ctr.veto[BrVetoCtlBits];
+            return false;
+        }
     }
     // Generation short-circuit: with the meta and layout lanes unchanged
     // since the last populate or verified pass, every per-attachment guard
@@ -2044,7 +2102,7 @@ void Rasterizer::BrVerify(const RenderState& fresh, const VideoCore::Skipcache::
     }
     // Racing cross-thread invalidation between hit-check and compare is an
     // abort, not a divergence.
-    const DrawToken t2 = sc.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
+    const DrawToken t2 = sc.Capture(RtLaneStamp(), scheduler.CurrentTick());
     if (t2.mem_gen != token.mem_gen || t2.tex_gen != token.tex_gen ||
         t2.pipe_gen != token.pipe_gen) {
         sc.RecordVerifyAborted(kBR);
@@ -2120,6 +2178,13 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
         g.slice = g.base_layer;
     }
     br_cache_.pipeline = pipeline;
+    {
+        const auto& key = pipeline->GetGraphicsKey();
+        br_mrt_mask_ = key.mrt_mask;
+        br_color_samples_ = key.color_samples;
+        br_depth_bits_ = std::bit_cast<u32>(regs.depth_control) & kRtDepthControlBits;
+        br_color_bits_ = std::bit_cast<u32>(regs.color_control) & kRtColorControlBits;
+    }
     br_cache_.state = fresh;
     br_cache_.attachment_feedback_loop = attachment_feedback_loop;
     {
@@ -2129,7 +2194,7 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     }
     // Commit re-check: a cross-thread invalidation landing mid-build forces
     // the next probe to miss (seqlock consumer side).
-    const DrawToken t2 = sc.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
+    const DrawToken t2 = sc.Capture(RtLaneStamp(), scheduler.CurrentTick());
     if (t2.mem_gen != token.mem_gen || t2.tex_gen != token.tex_gen ||
         t2.pipe_gen != token.pipe_gen) {
         return; // br_cache_.valid stays false
@@ -2152,7 +2217,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         ++ctr.eligible;
         const bool timed = skipcache.SampleTimer(CacheId::BeginRendering);
         const u64 t0 = timed ? skipcache.Now() : 0;
-        br_token = skipcache.Capture(liverpool->GetGfxStateStamp(), scheduler.CurrentTick());
+        br_token = skipcache.Capture(RtLaneStamp(), scheduler.CurrentTick());
         br_would_hit = BrProbe(br_token, pipeline);
         if (timed) {
             ctr.guard_ns += skipcache.CorrectSample(skipcache.Now() - t0);

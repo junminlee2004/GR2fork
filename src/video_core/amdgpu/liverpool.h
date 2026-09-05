@@ -72,13 +72,18 @@ struct Liverpool {
     u64 GetDynStateStamp() const noexcept {
         return gfx_stamp.dyn_value;
     }
+    u64 GetRtStateStamp() const noexcept {
+        return gfx_stamp.rt_value;
+    }
     struct RegFunnelStats {
         u64 calls;
         u64 classified;
+        u64 classified_rt;
     };
     RegFunnelStats DrainRegFunnelStats() noexcept {
-        const RegFunnelStats out{gfx_stamp.funnel_calls, gfx_stamp.funnel_classified};
-        gfx_stamp.funnel_calls = gfx_stamp.funnel_classified = 0;
+        const RegFunnelStats out{gfx_stamp.funnel_calls, gfx_stamp.funnel_classified,
+                                 gfx_stamp.funnel_classified_rt};
+        gfx_stamp.funnel_calls = gfx_stamp.funnel_classified = gfx_stamp.funnel_classified_rt = 0;
         return out;
     }
     bool IsGfxStampActive() const noexcept {
@@ -319,6 +324,10 @@ private:
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
     s32 curr_qid{-1};
+    // One bit per context register word the render-target memo and the
+    // render-scope cache read; the stamp's rt lane classifies writes against
+    // it. Declared last so last_cb_extent and last_db_extent keep their offsets.
+    std::array<u64, (Regs::NumRegs - Regs::ContextRegWordOffset) / 64> rt_reg_mask_{};
 };
 
 } // namespace AmdGpu
