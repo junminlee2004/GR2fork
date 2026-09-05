@@ -1991,14 +1991,19 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
 }
 
 RenderState Rasterizer::BrReplay(const GraphicsPipeline* pipeline) {
-    // Consumed hit: replay the clear-free snapshot. SetBackingSamples is
-    // cheap and idempotent; re-running it preserves the slow path's every-draw
-    // re-assertion.
+    // Consumed hit: replay the clear-free snapshot. The sample guard mirrors
+    // the callee's early return from the image's own line: the callee reads
+    // the last field of the 528-byte backing, which nothing else on the draw
+    // path touches, so the every-draw re-assertion stays without the miss.
     const auto& key = pipeline->GetGraphicsKey();
     for (u32 cb = 0; cb < br_cache_.cb_count; ++cb) {
         const auto& g = br_cache_.cb_guard[cb];
         if (g.image_id) {
-            texture_cache.GetImage(g.image_id).SetBackingSamples(key.color_samples[cb]);
+            auto& image = texture_cache.GetImage(g.image_id);
+            const u32 samples = key.color_samples[cb];
+            if (image.backing_num_samples != samples) {
+                image.SetBackingSamples(samples);
+            }
         }
     }
     attachment_feedback_loop = br_cache_.attachment_feedback_loop;
@@ -2185,7 +2190,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             image = &texture_cache.GetImage(image_id);
         }
         texture_cache.MaybeUpdateImage(image_id);
-        image->SetBackingSamples(key.color_samples[cb]);
+        if (const u32 samples = key.color_samples[cb]; image->backing_num_samples != samples) {
+            image->SetBackingSamples(samples);
+        }
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
