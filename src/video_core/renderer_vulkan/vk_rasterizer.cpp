@@ -359,6 +359,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         rt_stamp = liverpool->GetGfxStateStamp();
         rt_stamp_moves_ += rt_stamp != rt_stamp_last_;
         rt_stamp_last_ = rt_stamp;
+        const u64 gfx_stamp = liverpool->GetGfxStateStamp();
+        rt_gfx_moves_ += gfx_stamp != rt_gfx_last_;
+        rt_gfx_last_ = gfx_stamp;
         rt_tex_gen = skipcache.Gens().tex_gen.load(std::memory_order_acquire);
         rt_pipe_gen = skipcache.Gens().pipe_gen.load(std::memory_order_acquire);
         rt_would_hit = RtMemoProbe(pipeline, rt_stamp, rt_tex_gen, rt_pipe_gen);
@@ -838,8 +841,9 @@ void Rasterizer::OnSubmit() {
                 bindscratch_infos_ = bindscratch_infomax_ = 0;
             }
             if (const auto rp = scheduler.DrainRenderScopeStats(); rp.calls) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] RPASS calls={} restarts={} per300f",
-                         rp.calls, rp.restarts);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] RPASS calls={} restarts={} interrupted={} per300f", rp.calls,
+                         rp.restarts, rp.interrupted);
             }
             auto& ws = scheduler.WaitStats();
             const auto ms = [hz](u64 ns) { return hz ? ns * 1000 / hz : 0; };
@@ -942,10 +946,22 @@ void Rasterizer::OnSubmit() {
                 const auto& bc = skipcache.Counters(Skipcache::CacheId::BeginRendering);
                 const auto& rc = skipcache.Counters(Skipcache::CacheId::PrepareRt);
                 if (bc.eligible != br_last_.eligible) {
-                    LOG_INFO(Render_Skipcache, "[SkipCache] BRRT br={}/{} brpop={}/{} per300f",
+                    const auto lane = [&](Skipcache::MissLane l) {
+                        return bc.miss_gen[l] - br_last_.miss_gen[l];
+                    };
+                    u64 vetoes = 0;
+                    for (size_t i = 0; i < bc.veto.size(); ++i) {
+                        vetoes += bc.veto[i] - br_last_.veto[i];
+                    }
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] BRRT br={}/{} brpop={}/{} key={} reg={} tick={} mem={} "
+                             "tex={} idg={} veto={} per300f",
                              bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
                              bc.populated - br_last_.populated,
-                             bc.populate_refused - br_last_.populate_refused);
+                             bc.populate_refused - br_last_.populate_refused,
+                             bc.miss_key - br_last_.miss_key, lane(Skipcache::LaneReg),
+                             lane(Skipcache::LaneTick), lane(Skipcache::LaneMem),
+                             lane(Skipcache::LaneTex), lane(Skipcache::LaneImgDirty), vetoes);
                     br_last_ = bc;
                 }
                 if (rc.eligible != rt_last_.eligible) {
@@ -955,16 +971,18 @@ void Rasterizer::OnSubmit() {
                     LOG_INFO(
                         Render_Skipcache,
                         "[SkipCache] RTMEMO probes={} hits={} cold={} key={} reg={} tex={} "
-                        "pipe={} veto={} stampmv={} per300f",
+                        "pipe={} veto={} stampmv={} bits={} gfxmv={} per300f",
                         d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
                         d(&Skipcache::CacheCounters::miss_cold),
                         d(&Skipcache::CacheCounters::miss_key),
                         rc.miss_gen[Skipcache::LaneReg] - rt_last_.miss_gen[Skipcache::LaneReg],
                         rc.miss_gen[Skipcache::LaneTex] - rt_last_.miss_gen[Skipcache::LaneTex],
                         rc.miss_gen[Skipcache::LanePipe] - rt_last_.miss_gen[Skipcache::LanePipe],
-                        rc.veto[0] - rt_last_.veto[0], rt_stamp_moves_);
+                        rc.veto[0] - rt_last_.veto[0], rt_stamp_moves_,
+                        rc.veto[1] - rt_last_.veto[1], rt_gfx_moves_);
                     rt_last_ = rc;
                     rt_stamp_moves_ = 0;
+                    rt_gfx_moves_ = 0;
                 }
             }
             if (const auto& dc = skipcache.Counters(Skipcache::CacheId::DynState);

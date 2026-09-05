@@ -41,6 +41,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     DEBUG_ASSERT((render_state == new_state) ==
                  (std::memcmp(&render_state, &new_state, sizeof(RenderState)) == 0));
 #endif
+    rs_interrupted_ += !is_rendering;
     if (is_rendering && render_state == new_state) {
         return;
     }

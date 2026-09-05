@@ -455,13 +455,14 @@ public:
         return wait_stats_;
     }
     struct RenderScopeStats {
-        u64 calls;    // BeginRendering entries
-        u64 restarts; // of those, the ones that really opened a pass
+        u64 calls;       // BeginRendering entries
+        u64 restarts;    // of those, the ones that really opened a pass
+        u64 interrupted; // entries that found no pass open: a dispatch or barrier closed it
     };
     /// GPU command thread: returns and resets the render scope census.
     RenderScopeStats DrainRenderScopeStats() {
-        const RenderScopeStats out{rs_calls_, rs_restarts_};
-        rs_calls_ = rs_restarts_ = 0;
+        const RenderScopeStats out{rs_calls_, rs_restarts_, rs_interrupted_};
+        rs_calls_ = rs_restarts_ = rs_interrupted_ = 0;
         return out;
     }
 
@@ -595,6 +596,7 @@ private:
     // campaign has quoted for it so far came from branch-edge inference.
     u64 rs_calls_{};
     u64 rs_restarts_{};
+    u64 rs_interrupted_{};
     tracy::VkCtxScope* profiler_scope{};
 };
 

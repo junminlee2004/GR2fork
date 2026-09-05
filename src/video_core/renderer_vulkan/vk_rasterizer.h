@@ -213,6 +213,10 @@ private:
     // between probes: its miss floor, and the sizing input for a wider key.
     u64 rt_stamp_last_{};
     u64 rt_stamp_moves_{};
+    // The whole-register-file stamp's moves beside the lane the memo keys on;
+    // equal until a narrower lane is selected, then the gap is the lane's win.
+    u64 rt_gfx_last_{};
+    u64 rt_gfx_moves_{};
     // Last drained framework counters of the descriptor delta cache; the
     // DESCDELTA line prints the window's miss lanes from the difference.
     VideoCore::Skipcache::CacheCounters desc_last_{};
