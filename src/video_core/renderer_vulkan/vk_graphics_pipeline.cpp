@@ -486,6 +486,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading, std::string_view debu
                 .descriptorCount = num_bindings,
                 .stageFlags = stage_bit,
             });
+            has_desc_arrays |= num_bindings > 1;
             binding += num_bindings;
         }
         for (const auto& sampler : stage->samplers) {

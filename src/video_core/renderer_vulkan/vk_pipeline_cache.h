@@ -334,6 +334,7 @@ private:
     u64 key_reuse_rebuilds{}; // stamp repeated, the stage resolve changed the key
     u64 key_reuse_stamp_misses{};
     u64 key_reuse_mismatches{};
+    u64 key_refresh_same{}; // repeated key returned without a map probe
     // Cached value of the spec_mru_perm_probe setting, read once at construction.
     bool spec_mru_perm_probe{};
     // Stamp gate for BuildRuntimeInfo: while the graphics register stamp and
@@ -378,6 +379,7 @@ private:
     u64 rimemo_vmiss{};
     u64 rimemo_fused{};
     u64 rimemo_scan{};
+    u64 rimemo_dup{}; // misses whose rebuilt struct equalled a resident entry
     // Fuse: cmp names the candidate's words and *diff receives the OR of every
     // differing word; without it the body is the plain snapshot.
     template <bool Fuse>

@@ -835,6 +835,14 @@ bool PipelineCache::MemoRuntimeInfo(Stage stage, LogicalStage l_stage, RuntimeIn
         return true;
     }
     BuildRuntimeInfo(stage, l_stage);
+    // Census: a rebuilt struct equal to a resident one is a miss a memo keyed
+    // on the derived words would have hit. Read by the RIMEMO line.
+    for (const auto& r : entries) {
+        if (r.used && std::memcmp(&r.ri, &runtime_infos[l], sizeof(Shader::RuntimeInfo)) == 0) {
+            ++rimemo_dup;
+            break;
+        }
+    }
     RuntimeInputMemo& e = &entries[0] == last ? entries[1] : entries[0];
     e.n_words = static_cast<u8>(n);
     std::memcpy(e.words.data(), words.data(), n * sizeof(u32));
@@ -1022,6 +1030,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         graphics_key == last_graphics_key) {
         last_key_stamp = liverpool->GetGfxStateStamp();
         key_is_last = true;
+        ++key_refresh_same;
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -1161,9 +1170,12 @@ void PipelineCache::DumpRuntimeInfoMemoStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} fused={} scan={} per300f",
-             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss, rimemo_fused, rimemo_scan);
+             "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} fused={} scan={} dup={} "
+             "per300f",
+             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss, rimemo_fused, rimemo_scan,
+             rimemo_dup);
     rimemo_hits = rimemo_misses = rimemo_restores = rimemo_vmiss = rimemo_fused = rimemo_scan = 0;
+    rimemo_dup = 0;
 }
 
 void PipelineCache::DumpLayoutStats() {
@@ -1176,13 +1188,16 @@ void PipelineCache::DumpLayoutStats() {
 
 void PipelineCache::DumpHeapPipelineStats() {
     u64 heap = 0;
+    u64 arrays = 0;
     for (const auto& [key, pipeline] : graphics_pipelines) {
         heap += !pipeline->UsesPushDescriptors();
+        arrays += pipeline->HasDescriptorArrays();
     }
     for (const auto& [key, pipeline] : compute_pipelines) {
         heap += !pipeline->UsesPushDescriptors();
+        arrays += pipeline->HasDescriptorArrays();
     }
-    LOG_INFO(Render_Skipcache, "[SkipCache] HEAPPIPES heap={} of {}", heap,
+    LOG_INFO(Render_Skipcache, "[SkipCache] HEAPPIPES heap={} arrays={} of {}", heap, arrays,
              graphics_pipelines.size() + compute_pipelines.size());
 }
 
@@ -1254,11 +1269,12 @@ void PipelineCache::DumpKeyReuseStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] KEYREUSE hits={} rebuilds={} misses={} mismatches={} hdiff={} per300f",
+             "[SkipCache] KEYREUSE hits={} rebuilds={} misses={} mismatches={} hdiff={} "
+             "samekey={} per300f",
              key_reuse_hits, key_reuse_rebuilds, key_reuse_stamp_misses, key_reuse_mismatches,
-             key_reuse_diff_decisions);
+             key_reuse_diff_decisions, key_refresh_same);
     key_reuse_hits = key_reuse_rebuilds = key_reuse_stamp_misses = key_reuse_mismatches = 0;
-    key_reuse_diff_decisions = 0;
+    key_reuse_diff_decisions = key_refresh_same = 0;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {

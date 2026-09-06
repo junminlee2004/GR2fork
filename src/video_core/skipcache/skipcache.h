@@ -379,6 +379,35 @@ public:
     DescDeltaSlot& DescDeltaState(size_t bind_point_index) {
         return desc_delta_[bind_point_index];
     }
+    // desc_heap_shadow_census: a shadow slot per bind point the heap leg walks
+    // as if its first maxPushDescriptors descriptors were a push set; nothing
+    // consumes a verdict, the counters feed the HEAPSHADOW line.
+    DescDeltaSlot& HeapShadow(size_t bind_point_index) {
+        return heap_shadow_[bind_point_index];
+    }
+    struct HeapShadowCounters {
+        u64 probes;
+        u64 hits;
+        u64 partial;
+        u64 whole;
+        u64 key;
+        u64 gen;
+        u64 veto;
+        u64 pushed;
+        u64 prefix;
+        u64 tail_descs;
+        u64 tail_same;
+        u64 tail_probed;
+        u64 compute;
+    };
+    HeapShadowCounters& HeapShadowCount() {
+        return heap_shadow_ctr_;
+    }
+    HeapShadowCounters DrainHeapShadowStats() {
+        const HeapShadowCounters out = heap_shadow_ctr_;
+        heap_shadow_ctr_ = {};
+        return out;
+    }
     struct DescDeltaStats {
         u64 probes;
         u64 hits;
@@ -573,6 +602,8 @@ private:
     std::array<u64, 2> foreign_push_gen_{};
     std::array<u64, 2> foreign_pipeline_gen_{};
     std::array<u8, 16384> desc_delta_scratch_{};
+    std::array<DescDeltaSlot, 2> heap_shadow_{};
+    HeapShadowCounters heap_shadow_ctr_{};
 
     struct {
         InvalidateFn fn;

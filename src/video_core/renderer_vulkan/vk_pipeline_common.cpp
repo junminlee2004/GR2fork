@@ -437,6 +437,7 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     static const bool push_const_dedup = EmulatorSettings.IsPushConstDedup();
+    static const bool heap_shadow = EmulatorSettings.IsDescHeapShadowCensus();
     bool push_same = false;
     if (push_const_dedup) {
         // A push identical to the last one on this command buffer, through
@@ -481,6 +482,11 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
     }
 
     if (uses_push_descriptors) {
+        if (heap_shadow) {
+            // A push pipeline leaves set 0 holding its layout, which the next
+            // heap pipeline's shadow probe must see as a key miss.
+            Skipcache::Framework::Instance().HeapShadow(IsCompute() ? 1 : 0).valid = false;
+        }
         // Descriptor delta cache: push descriptors are command buffer state,
         // so re-pushing a byte-identical write set onto the same command
         // buffer and layout is a spec-level no-op; skipping it saves the
@@ -639,6 +645,84 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                        : descs <= 48  ? 2
                        : descs <= 64  ? 3
                                       : 4];
+    }
+    if (heap_shadow) {
+        // Set 0 = the first split descriptors pushed through the delta cache,
+        // the rest a heap tail: the walk runs against a shadow slot before
+        // dstSet is stamped (the serialized header excludes it); the bind
+        // below is unchanged and no verdict is consumed.
+        auto& sc = VideoCore::Skipcache::Framework::Instance();
+        const size_t idx = bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0;
+        auto& sh = sc.HeapShadow(idx);
+        auto& hc = sc.HeapShadowCount();
+        const u64 shadow_tick = scheduler.CurrentTick();
+        const u64 foreign = sc.ForeignPushGen(idx);
+        const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
+        const u32 split = instance.MaxPushDescriptors();
+        u32 total = 0;
+        for (const auto& set_write : set_writes) {
+            total += set_write.descriptorCount;
+        }
+        const u32 prefix = std::min<u32>(total, split);
+        const u32 tail = total - prefix;
+        bool changed = false;
+        const size_t size = MatchDescriptorWrites<true>(set_writes, sh, changed);
+        ++hc.probes;
+        hc.compute += idx;
+        hc.prefix += prefix;
+        hc.tail_descs += tail;
+        if (size == 0) {
+            ++hc.veto;
+        } else if (!sh.valid) {
+            ++hc.key;
+        } else if (sh.tick != shadow_tick || sh.foreign_gen != foreign) {
+            ++hc.gen;
+        } else if (sh.layout != layout) {
+            ++hc.key;
+        } else if (!changed) {
+            ++hc.hits;
+            hc.tail_probed += tail;
+            hc.tail_same += tail;
+        } else {
+            u32 prefix_changed = 0;
+            u32 tail_changed = 0;
+            u32 k = 0;
+            for (size_t w = 0; w < set_writes.size() && w < sh.write_changed.size(); ++w) {
+                const u32 n = set_writes[w].descriptorCount;
+                if (k + n > sh.changed.size()) {
+                    break;
+                }
+                if (sh.write_changed[w]) {
+                    for (u32 i = 0; i < n; ++i) {
+                        if (!sh.changed[k + i]) {
+                            continue;
+                        }
+                        if (k + i < split) {
+                            ++prefix_changed;
+                        } else {
+                            ++tail_changed;
+                        }
+                    }
+                }
+                k += n;
+            }
+            hc.tail_probed += tail;
+            hc.tail_same += tail - tail_changed;
+            if (prefix_changed == 0) {
+                ++hc.hits;
+            } else if (!sh.header_changed && prefix_changed * 4 <= prefix * 3) {
+                ++hc.partial;
+                hc.pushed += prefix_changed;
+            } else {
+                ++hc.whole;
+                hc.pushed += prefix;
+            }
+        }
+        sh.valid = size != 0;
+        sh.tick = shadow_tick;
+        sh.foreign_gen = foreign;
+        sh.layout = layout;
+        sh.size = static_cast<u32>(size);
     }
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;

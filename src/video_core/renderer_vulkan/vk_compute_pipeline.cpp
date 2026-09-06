@@ -56,6 +56,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .descriptorCount = num_bindings,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
+        has_desc_arrays |= num_bindings > 1;
         binding += num_bindings;
     }
     for (const auto& sampler : info->samplers) {

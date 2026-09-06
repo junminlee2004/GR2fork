@@ -68,6 +68,10 @@ public:
     bool UsesPushDescriptors() const noexcept {
         return uses_push_descriptors;
     }
+    /// Whether any set-0 binding is a descriptor array (a mip fallback image).
+    bool HasDescriptorArrays() const noexcept {
+        return has_desc_arrays;
+    }
 
     static constexpr u32 NUM_DESCRIPTOR_WRITES = 128;
 
@@ -165,6 +169,7 @@ protected:
     vk::UniqueDescriptorSetLayout owned_desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
+    bool has_desc_arrays{};
     bool is_compute;
 };
 

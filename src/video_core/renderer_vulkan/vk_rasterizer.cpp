@@ -1201,6 +1201,15 @@ void Rasterizer::OnSubmit() {
                          dd.heap_hist[1], dd.heap_hist[2], dd.heap_hist[3], dd.heap_hist[4],
                          dd.heap_images, dd.heap_samplers);
             }
+            if (const auto hs = skipcache.DrainHeapShadowStats(); hs.probes) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] HEAPSHADOW probes={} hits={} partial={} whole={} key={} "
+                         "gen={} veto={} pushed={} prefix={} taildescs={} tailsame={} "
+                         "tailprobed={} compute={} per300f",
+                         hs.probes, hs.hits, hs.partial, hs.whole, hs.key, hs.gen, hs.veto,
+                         hs.pushed, hs.prefix, hs.tail_descs, hs.tail_same, hs.tail_probed,
+                         hs.compute);
+            }
             if (const auto inv = texture_cache.DrainInvalidateFilterStats(); inv.probes) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] IMGFAULT probes={} skips={} unsound={} per300f", inv.probes,
