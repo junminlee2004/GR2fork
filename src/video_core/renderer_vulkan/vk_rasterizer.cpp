@@ -1999,15 +1999,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (!image_id) {
             AppendImageInfo(image_infos, VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
-            if (auto& old_image = texture_cache.GetImage(image_id);
-                old_image.binding.needs_rebind) {
-                old_image.binding = {};
+            // One slot lookup per binding: the rebind path is the only one
+            // that changes image_id, so only it refetches.
+            VideoCore::Image* image_ptr = &texture_cache.GetImage(image_id);
+            if (image_ptr->binding.needs_rebind) [[unlikely]] {
+                image_ptr->binding = {};
                 image_id = texture_cache.FindImage(desc);
+                image_ptr = &texture_cache.GetImage(image_id);
             }
 
             bound_images.emplace_back(image_id);
 
-            auto& image = texture_cache.GetImage(image_id);
+            auto& image = *image_ptr;
             const vk::ImageView image_view = texture_cache.FindTexture(image_id, desc);
             vk::ImageLayout bound_layout;
 
