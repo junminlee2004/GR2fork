@@ -157,9 +157,12 @@ void CopyFixed(void* dst, const void* src) noexcept {
 // The mapped form also records a per-write verdict and, for changed writes,
 // a per-descriptor verdict in the slot, which a partial push consumes; the
 // unmapped form is the plain walk.
+// Inlined at every call site: with a second caller (the heap shadow census)
+// the walk was outlined and its loop lost its registers.
 template <bool kMap>
-size_t MatchDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes,
-                             Skipcache::Framework::DescDeltaSlot& slot, bool& changed) {
+SHAD_FORCE_INLINE size_t MatchDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes,
+                                               Skipcache::Framework::DescDeltaSlot& slot,
+                                               bool& changed) {
     auto& blob = slot.blob;
     u8* cursor = blob.data();
     const u8* const limit = blob.data() + blob.size();
@@ -720,9 +723,11 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
         }
         sh.valid = size != 0;
         sh.tick = shadow_tick;
-        sh.foreign_gen = foreign;
         sh.layout = layout;
         sh.size = static_cast<u32>(size);
+        // The bump this bind makes below is the one the two-set world would
+        // not make; the shadow expects the generation after it.
+        sh.foreign_gen = foreign + 1;
     }
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
