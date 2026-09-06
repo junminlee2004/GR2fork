@@ -448,6 +448,7 @@ private:
     u32 vertex_bind_step1_{};
     u64 vertex_bind_tick_{};
     u64 vertex_input_tick_{};
+    u64 vertex_input_gen_{}; // foreign pipeline gen at the last vertex input emit
     u64 vertex_bind_mem_key_{};
     u64 vertex_bind_clean_gpu_gen_{};
     bool vertex_bind_valid_{};
@@ -529,12 +530,13 @@ public:
         u64 chain;
         u64 layout;
         u64 bind;
+        u64 fetchskip;
     };
     VertexInputStats DrainVertexInputStats() {
-        const VertexInputStats out{vinput_calls_, vinput_built_,  vinput_binds_,
-                                   vinput_chain_, vinput_layout_, vinput_bind_};
+        const VertexInputStats out{vinput_calls_,  vinput_built_, vinput_binds_,    vinput_chain_,
+                                   vinput_layout_, vinput_bind_,  vinput_fetchskip_};
         vinput_calls_ = vinput_built_ = vinput_binds_ = vinput_chain_ = vinput_layout_ =
-            vinput_bind_ = 0;
+            vinput_bind_ = vinput_fetchskip_ = 0;
         return out;
     }
     struct WritebackStats {
@@ -751,12 +753,14 @@ private:
     bool writeback_helper_{};
     bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
+    bool vinput_fetch_key_{};
     u64 vinput_calls_{};
     u64 vinput_built_{};
     u64 vinput_binds_{};
     u64 vinput_chain_{};
     u64 vinput_layout_{};
     u64 vinput_bind_{};
+    u64 vinput_fetchskip_{};
     u64 writeback_loops_{};
     u64 writeback_islands_{};
     u64 writeback_bytes_{};

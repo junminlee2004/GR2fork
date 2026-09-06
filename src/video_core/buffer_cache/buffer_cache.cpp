@@ -65,6 +65,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
+    vinput_fetch_key_ = EmulatorSettings.IsVinputFetchKey() && vertex_lazy_desc_;
+    if (EmulatorSettings.IsVinputFetchKey() && !vertex_lazy_desc_) {
+        LOG_WARNING(Render_Vulkan, "vinput_fetch_key needs vertex_input_lazy_desc; the vertex "
+                                   "input memo stays pipeline-keyed");
+    }
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
     // Latched single-threaded, before any GPU-thread pool operation.
     GpuRangeSetMutex::lockfree = EmulatorSettings.IsGpuRangeSetLockfree();
@@ -1131,7 +1136,9 @@ void BufferCache::BindVertexBuffers(
     // pipeline's own fetch shader, so the pipeline pointer and the two step
     // rates key them; only stride and format vary under a fixed pipeline.
     // Both legs record one entry per fetch shader attribute, in attribute
-    // order; an unbound attribute reads back as the span {~0, 0}.
+    // order; an unbound attribute reads back as the span {~0, 0}. Bits 48-63
+    // of the lazy word carry the attribute's semantic and step-rate operand:
+    // with them the record alone determines the vertex input description.
     u32 count = 0;
     bool layout_same = memo_active;
     bool bind_same = memo_active;
@@ -1168,7 +1175,8 @@ void BufferCache::BindVertexBuffers(
                 const AmdGpu::Buffer sharp = attrib.GetSharp(vs_info);
                 guest_buffers.emplace_back(sharp);
                 fold(sharp.base_address, sharp.GetSize(),
-                     (u64{static_cast<u32>(sharp.GetDataFmt())} << 40) |
+                     (u64{attrib.semantic} << 48) | (u64{attrib.instance_data} << 56) |
+                         (u64{static_cast<u32>(sharp.GetDataFmt())} << 40) |
                          (u64{static_cast<u32>(sharp.GetNumberFmt())} << 32) | sharp.GetStride());
             }
         }
@@ -1180,7 +1188,9 @@ void BufferCache::BindVertexBuffers(
     }
     // The count the hashes only implied closes both records; a bind match
     // implies a layout match, which keeps the bind memo's early return sound.
-    layout_same &= count == vertex_bind_count_ && &pipeline == vertex_bind_pipeline_ &&
+    const bool pipe_same = &pipeline == vertex_bind_pipeline_;
+    const bool fetch_keyed = vinput_fetch_key_ && lazy;
+    layout_same &= count == vertex_bind_count_ && (fetch_keyed || pipe_same) &&
                    regs.vgt_instance_step_rate_0 == vertex_bind_step0_ &&
                    regs.vgt_instance_step_rate_1 == vertex_bind_step1_;
     bind_same &= layout_same;
@@ -1238,8 +1248,12 @@ void BufferCache::BindVertexBuffers(
         // Update current vertex inputs, unless the layout is unchanged on
         // this command buffer.
         const u64 input_tick = scheduler.CurrentTick();
+        // A static-vertex-input pipeline bound on this command buffer (the
+        // blit helper) replaces the dynamic state; the foreign gen certifies
+        // none intervened. Read with the fetch key only, which widens the memo.
+        const u64 vi_gen = fetch_keyed ? skipcache.ForeignPipelineGen(0) : vertex_input_gen_;
         if (!memo_active || !vertex_input_valid_ || !layout_same ||
-            vertex_input_tick_ != input_tick) {
+            vertex_input_tick_ != input_tick || vertex_input_gen_ != vi_gen) {
             if (lazy) {
                 ++vinput_built_;
                 pipeline.GetVertexInputs(
@@ -1250,7 +1264,10 @@ void BufferCache::BindVertexBuffers(
             const auto cmdbuf = scheduler.CommandBuffer();
             cmdbuf.setVertexInputEXT(bindings, attributes);
             vertex_input_tick_ = input_tick;
+            vertex_input_gen_ = vi_gen;
             vertex_input_valid_ = memo_active;
+        } else {
+            vinput_fetchskip_ += !pipe_same;
         }
     }
 
