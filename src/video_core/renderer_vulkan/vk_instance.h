@@ -119,6 +119,11 @@ public:
         return maintenance_8;
     }
 
+    /// Returns true if VK_KHR_maintenance6 is supported
+    bool IsMaintenance6Supported() const {
+        return maintenance_6;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
@@ -518,6 +523,7 @@ private:
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
     bool maintenance_8{};
+    bool maintenance_6{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};

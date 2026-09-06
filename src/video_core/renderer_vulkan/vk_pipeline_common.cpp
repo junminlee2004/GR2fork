@@ -355,6 +355,28 @@ size_t CompactDescriptorWrites(std::span<const vk::WriteDescriptorSet> in,
 
 Pipeline::DescriptorWrites partial_scratch;
 
+// The maintenance6 entry points take the same arguments in a struct and skip
+// the runtime's forwarding wrapper (a struct build plus a tail call per push).
+SHAD_FORCE_INLINE void PushSet(vk::CommandBuffer cmdbuf, bool direct,
+                               vk::ShaderStageFlags stage_flags, vk::PipelineLayout layout,
+                               vk::PipelineBindPoint bind_point, u32 count,
+                               const vk::WriteDescriptorSet* writes) {
+    if (direct) {
+        const vk::PushDescriptorSetInfo info{
+            .pNext = nullptr,
+            .stageFlags = stage_flags,
+            .layout = layout,
+            .set = 0u,
+            .descriptorWriteCount = count,
+            .pDescriptorWrites = writes,
+        };
+        cmdbuf.pushDescriptorSet2(info);
+    } else {
+        cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0u,
+                                    vk::ArrayProxy<const vk::WriteDescriptorSet>(count, writes));
+    }
+}
+
 } // namespace
 
 // Out of line and externally linked: the header's inline Next() calls it from
@@ -367,7 +389,8 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
                    PipelineLayoutCache* layouts_, bool is_compute_ /*= false*/)
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
-      layouts{layouts_}, is_compute{is_compute_} {}
+      layouts{layouts_}, is_compute{is_compute_}, direct_push{instance_.IsMaintenance6Supported()} {
+}
 
 void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
                              vk::DescriptorSetLayoutCreateFlags flags,
@@ -476,7 +499,19 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
         }
     }
     if (!push_same) {
-        cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+        if (direct_push) {
+            const vk::PushConstantsInfo info{
+                .pNext = nullptr,
+                .layout = pipeline_layout,
+                .stageFlags = stage_flags,
+                .offset = 0u,
+                .size = sizeof(push_data),
+                .pValues = &push_data,
+            };
+            cmdbuf.pushConstants2(info);
+        } else {
+            cmdbuf.pushConstants(pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+        }
     }
 
     // Bind descriptor set.
@@ -569,22 +604,16 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 const size_t runs = CompactDescriptorWrites(set_writes, slot, partial_scratch);
                 if (runs <= set_writes.size() + (slot.desc_count - slot.desc_changed) / 2) {
                     slot.runs += runs;
-                    cmdbuf.pushDescriptorSetKHR(
-                        bind_point, pipeline_layout, 0,
-                        vk::ArrayProxy<const vk::WriteDescriptorSet>(
-                            static_cast<uint32_t>(partial_scratch.size()), partial_scratch.data()));
+                    PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
+                            static_cast<u32>(partial_scratch.size()), partial_scratch.data());
                 } else {
                     ++slot.split;
-                    cmdbuf.pushDescriptorSetKHR(
-                        bind_point, pipeline_layout, 0,
-                        vk::ArrayProxy<const vk::WriteDescriptorSet>(
-                            static_cast<uint32_t>(set_writes.size()), set_writes.data()));
+                    PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
+                            static_cast<u32>(set_writes.size()), set_writes.data());
                 }
             } else {
-                cmdbuf.pushDescriptorSetKHR(
-                    bind_point, pipeline_layout, 0,
-                    vk::ArrayProxy<const vk::WriteDescriptorSet>(
-                        static_cast<uint32_t>(set_writes.size()), set_writes.data()));
+                PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
+                        static_cast<u32>(set_writes.size()), set_writes.data());
             }
             if (timed_miss) {
                 ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
@@ -613,10 +642,8 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
             }
             return;
         }
-        cmdbuf.pushDescriptorSetKHR(
-            bind_point, pipeline_layout, 0,
-            vk::ArrayProxy<const vk::WriteDescriptorSet>(static_cast<uint32_t>(set_writes.size()),
-                                                         set_writes.data()));
+        PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
+                static_cast<u32>(set_writes.size()), set_writes.data());
         return;
     }
 

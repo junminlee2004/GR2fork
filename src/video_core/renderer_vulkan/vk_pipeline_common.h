@@ -171,6 +171,8 @@ protected:
     bool uses_push_descriptors{};
     bool has_desc_arrays{};
     bool is_compute;
+    // maintenance6 entry points skip the runtime's forwarding wrappers.
+    const bool direct_push;
 };
 
 } // namespace Vulkan
