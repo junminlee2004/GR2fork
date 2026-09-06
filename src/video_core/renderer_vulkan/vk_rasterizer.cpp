@@ -578,7 +578,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const RenderState& state = BeginRendering(pipeline);
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     u32 first_index = 0;
@@ -698,7 +698,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const RenderState& state = BeginRendering(pipeline);
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
@@ -2288,7 +2288,7 @@ bool Rasterizer::BrProbe(const VideoCore::Skipcache::DrawToken& token,
     return true;
 }
 
-RenderState Rasterizer::BrReplay(const GraphicsPipeline* pipeline) {
+const RenderState& Rasterizer::BrReplay(const GraphicsPipeline* pipeline) {
     // Consumed hit: replay the clear-free snapshot. The sample guard mirrors
     // the callee's early return from the image's own line: the callee reads
     // the last field of the 528-byte backing, which nothing else on the draw
@@ -2450,7 +2450,7 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     sc.NotifyPopulated(VideoCore::Skipcache::CacheId::BeginRendering);
 }
 
-RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     using VideoCore::Skipcache::CacheId;
     using VideoCore::Skipcache::DrawToken;
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
@@ -2484,7 +2484,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
-    RenderState state{};
+    // The zero-init is load-bearing: RenderState::operator== compares the
+    // colour tail byte-wise, so the member is reset, not reused.
+    RenderState& state = fresh_state_;
+    state = {};
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();

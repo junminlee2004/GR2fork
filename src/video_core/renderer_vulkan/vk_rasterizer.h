@@ -121,7 +121,7 @@ public:
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
-    RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    const RenderState& BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -190,7 +190,7 @@ private:
     };
     bool BrProbe(const VideoCore::Skipcache::DrawToken& token, const GraphicsPipeline* pipeline);
     bool BrGuardAttachment(const BrAttachmentGuard& g, VideoCore::Skipcache::CacheCounters& ctr);
-    RenderState BrReplay(const GraphicsPipeline* pipeline);
+    const RenderState& BrReplay(const GraphicsPipeline* pipeline);
     void BrVerify(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token);
     void BrPopulate(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token,
                     const GraphicsPipeline* pipeline);
@@ -439,6 +439,11 @@ private:
     // re-certified from the attachment words.
     bool br_mem_fast_state_{};
     u64 br_mem_recert_{};
+    /// Valid until the next BeginRendering. Nothing between
+    /// Rasterizer::BeginRendering and scheduler.BeginRendering(state) writes
+    /// br_cache_.state or fresh_state_ (a flush inside the binds only clears
+    /// valid), so a reference to either survives the binds.
+    RenderState fresh_state_{};
 };
 
 } // namespace Vulkan
