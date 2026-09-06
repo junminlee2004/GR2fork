@@ -607,6 +607,47 @@ SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count
     }
 }
 
+SHAD_NO_INLINE std::span<const u32> Liverpool::RunRegisterRun(std::span<const u32> dcb) {
+    // Own frame: the caller's register budget is spent, so this loop keeps
+    // its cursor pair and count in registers. The poll after each packet
+    // keeps "a command waits at most one packet" without the caller's poll.
+    u32 run = 0;
+    const u32* p = dcb.data();
+    size_t rem = dcb.size();
+    while (true) {
+        const auto* h = reinterpret_cast<const PM4Header*>(p);
+        const u32 raw = h->raw;
+        const u32 masked = raw & 0xC000FF00u;
+        const bool is_pad = (raw >> 30) == 2;
+        // An empty NOP is a no-op in the dispatch too: its arm returns
+        // before the payload is read and the exit advances two words.
+        const bool is_nop0 = (raw & 0xFFFFFF00u) == 0xC0001000u;
+        const u32 words = is_pad ? 0 : h->type3.NumWords();
+        if (words + 1 > rem) {
+            break;
+        }
+        if (masked == 0xC0007600u) {
+            SetShRegHot(h, words);
+        } else if (masked == 0xC0006900u) {
+            SetContextRegHot(h, words);
+        } else if (!is_pad && !is_nop0) {
+            ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
+            break;
+        }
+        p += words + 1;
+        rem -= words + 1;
+        ++run;
+        if (rem == 0 || num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            break;
+        }
+    }
+    if (run != 0) {
+        run_stats.run_packets += run;
+        ++run_stats.runs;
+    }
+    return std::span<const u32>{p, rem};
+}
+
 std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                    uintptr_t base_addr) {
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
@@ -629,64 +670,13 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             DrainCommands();
         }
 
-        if (reg_run_) {
-            // The packets that cannot suspend: register writes take their hot
-            // handlers, type-2 padding and empty NOPs advance, and the run
-            // ends at anything else, which the dispatch below then handles.
-            // A queued command ends the run through the poll above, so no
-            // packet executes with a command waiting and the hold armed.
-            // The cursor pair is the span's data pointer and remaining count,
-            // written back once after the run; both statistics are no-ops for
-            // an empty run, which two thirds of entries are.
-            u32 run = 0;
-            bool command_break = false;
-            const u32* p = dcb.data();
-            size_t rem = dcb.size();
-            while (rem != 0) {
-                if (num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
-                    command_break = true;
-                    break;
-                }
-                const auto* h = reinterpret_cast<const PM4Header*>(p);
-                const u32 raw = h->raw;
-                const u32 masked = raw & 0xC000FF00u;
-                const bool is_pad = (raw >> 30) == 2;
-                // An empty NOP is a no-op in the dispatch too: its arm returns
-                // before the payload is read and the exit advances two words.
-                const bool is_nop0 = (raw & 0xFFFFFF00u) == 0xC0001000u;
-                const u32 words = is_pad ? 0 : h->type3.NumWords();
-                if (words + 1 > rem) {
-                    break;
-                }
-                if (masked == 0xC0007600u) {
-                    SetShRegHot(h, words);
-                } else if (masked == 0xC0006900u) {
-                    SetContextRegHot(h, words);
-                } else if (!is_pad && !is_nop0) {
-                    ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
-                    break;
-                }
-                p += words + 1;
-                rem -= words + 1;
-                ++run;
-            }
-            dcb = std::span<const u32>{p, rem};
-            if (run != 0) {
-                run_stats.run_packets += run;
-                ++run_stats.runs;
-            }
-            if (command_break || rem == 0) {
-                continue;
-            }
-            ++run_stats.outer_packets;
-        }
-
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         if (header->type != 3) [[unlikely]] {
             // Type-2 packets are used for padding purposes.
             if (header->type != 2) {
                 UnhandledPm4Type(header);
             }
+            ++run_stats.outer_packets;
             dcb = NextPacket(dcb, 1);
             continue;
         }
@@ -703,18 +693,28 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         // Register-write runs dominate the packet mix; one masked compare on
         // type+opcode routes them past the 142-target indirect jump. The mask
         // drops predicate and shader_type, which both handlers ignore, so the
-        // routing is bit-identical to the switch arms below.
+        // routing is bit-identical to the switch arms below. A register
+        // packet also opens a run, which consumes every register write, pad
+        // and empty NOP behind it in its own frame; a run that consumed
+        // nothing is a truncated first packet, reported through NextPacket.
         const u32 hdr_masked = header->raw & 0xC000FF00u;
-        if (hdr_masked == 0xC0007600u) { // SetShReg
-            SetShRegHot(header, count);
+        if (hdr_masked == 0xC0007600u || hdr_masked == 0xC0006900u) {
+            if (reg_run_) {
+                const auto rest = RunRegisterRun(dcb);
+                if (rest.size() != dcb.size()) {
+                    dcb = rest;
+                    continue;
+                }
+            }
+            if ((header->raw & 0xC000FF00u) == 0xC0007600u) {
+                SetShRegHot(header, count);
+            } else {
+                SetContextRegHot(header, count);
+            }
             dcb = NextPacket(dcb, count + 1);
             continue;
         }
-        if (hdr_masked == 0xC0006900u) { // SetContextReg
-            SetContextRegHot(header, count);
-            dcb = NextPacket(dcb, count + 1);
-            continue;
-        }
+        ++run_stats.outer_packets;
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);

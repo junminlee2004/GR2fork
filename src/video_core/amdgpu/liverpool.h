@@ -245,6 +245,11 @@ private:
                                                 const u32* payload);
     SHAD_FORCE_INLINE void SetShRegHot(const union PM4Header* header, u32 count);
     SHAD_NO_INLINE void SetShRegCompute(const union PM4Header* header, u32 count);
+    // Consumes the register write at the front of dcb and every register
+    // write, type-2 pad and empty NOP after it; a truncated packet ends the
+    // run unconsumed. The caller polls before the first packet, the loop
+    // after every other one.
+    SHAD_NO_INLINE std::span<const u32> RunRegisterRun(std::span<const u32> dcb);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
@@ -304,8 +309,9 @@ private:
     std::atomic<u32> num_commands{};
 
 public:
-    // Register run census, behind parser_reg_run. Declared after num_commands
-    // so the poll word keeps its line. GPU-parser-thread confined.
+    // Register run census: run/runs behind parser_reg_run, outer counts every
+    // packet reaching the opcode switch. Declared after num_commands so the
+    // poll word keeps its line. GPU-parser-thread confined.
     struct RunStats {
         u64 run_packets;   // packets consumed by the run loop
         u64 runs;          // run loop entries that consumed at least one
