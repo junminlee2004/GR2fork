@@ -518,6 +518,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU bindNoopMemo: {}", EmulatorSettings.IsBindNoopMemo());
     LOG_INFO(Config, "GPU specKeyFast: {}", EmulatorSettings.GetSpecKeyFast());
     LOG_INFO(Config, "GPU gpuRangeSetLockfree: {}", EmulatorSettings.IsGpuRangeSetLockfree());
+    LOG_INFO(Config, "GPU gpuRangeSetFlat: {}", EmulatorSettings.IsGpuRangeSetFlat());
     LOG_INFO(Config, "GPU readbackWritebackHold: {}", EmulatorSettings.IsReadbackWritebackHold());
     LOG_INFO(Config, "GPU backingWriteMemo: {}", EmulatorSettings.IsBackingWriteMemo());
     LOG_INFO(Config, "GPU imageUpdateDirect: {}", EmulatorSettings.IsImageUpdateDirect());

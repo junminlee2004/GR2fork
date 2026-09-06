@@ -68,6 +68,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     written_range_mode_ = std::min<u32>(EmulatorSettings.GetWrittenRangeFast(), 3);
     // Latched single-threaded, before any GPU-thread pool operation.
     GpuRangeSetMutex::lockfree = EmulatorSettings.IsGpuRangeSetLockfree();
+    GpuModifiedRangeSet::flat = EmulatorSettings.IsGpuRangeSetFlat();
     if (written_range_mode_ >= 3) {
         pending_batch_.reserve(PendingLaneCapacity);
     }
@@ -1695,10 +1696,7 @@ void BufferCache::FoldLane(std::vector<PendingRange>& lane, VAddr lo, VAddr hi) 
             return a.addr == b.addr && a.size == b.size;
         });
     pending_batch_.erase(dup.begin(), dup.end());
-    auto hint = gpu_modified_ranges.End();
-    for (const PendingRange& e : pending_batch_) {
-        hint = gpu_modified_ranges.Add(hint, e.addr, e.size);
-    }
+    gpu_modified_ranges.AddSortedBatch(std::span<const PendingRange>{pending_batch_});
     ++pending_folds_;
     pending_folded_ += pending_batch_.size();
 }

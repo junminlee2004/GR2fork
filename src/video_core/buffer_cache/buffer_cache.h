@@ -472,7 +472,7 @@ private:
     u64 critical_gc_memory = 0;
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
-    GpuRangeSet gpu_modified_ranges;
+    GpuModifiedRangeSet gpu_modified_ranges;
     // Bumped only on clean->dirty coverage transitions; an entry stamped with
     // the current value is proven GPU-clean without walking the range set.
     // Overlapping in-flight fault downloads can leave the range set covering
@@ -629,10 +629,24 @@ public:
         GpuRangeSetMutex::skips = 0;
         return out;
     }
-    /// GPU command thread: the interval count of the GPU-modified range set,
-    /// read by the GPURANGE line to bound the set before any container change.
-    u64 GpuModifiedRangeCount() const {
-        return gpu_modified_ranges.m_ranges_set.iterative_size();
+    struct GpuRangeStats {
+        u64 flat;
+        u64 live;
+        u64 batches;
+        u64 batched;
+        u64 moved;
+        u64 subs;
+    };
+    /// GPU command thread: the GPU-modified range set's container, its live
+    /// interval count and the flat container's counters, read by the GPURANGE line.
+    GpuRangeStats DrainGpuRangeStats() {
+        const auto fs = gpu_modified_ranges.vec.DrainStats();
+        return GpuRangeStats{GpuModifiedRangeSet::flat,
+                             gpu_modified_ranges.Size(),
+                             fs.batches,
+                             fs.batched,
+                             fs.moved,
+                             fs.subs};
     }
 
 private:

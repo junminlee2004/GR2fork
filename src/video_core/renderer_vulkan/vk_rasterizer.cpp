@@ -1229,8 +1229,11 @@ void Rasterizer::OnSubmit() {
                          "folded={} full={} direct={} lockskips={} per300f",
                          wr.binds, wr.fresh, wr.hits, wr.adds, wr.shrinks, wr.folds, wr.folded,
                          wr.full, wr.direct, wr.lockskips);
-                LOG_INFO(Render_Skipcache, "[SkipCache] GPURANGE live={} per300f",
-                         buffer_cache.GpuModifiedRangeCount());
+                const auto gr = buffer_cache.DrainGpuRangeStats();
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] GPURANGE flat={} live={} batches={} batched={} moved={} "
+                         "subs={} per300f",
+                         gr.flat, gr.live, gr.batches, gr.batched, gr.moved, gr.subs);
             }
             const auto ds = buffer_cache.DrainDmaSyncStats();
             if (ds.calls) {

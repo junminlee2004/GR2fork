@@ -570,6 +570,9 @@ struct GPUSettings {
     // The GPU-modified range set gets its own node pool whose mutex is skipped:
     // every operation on that set runs on the GPU command thread.
     Setting<bool> gpu_range_set_lockfree{false};
+    // Keeps the GPU-modified range set as a sorted vector with one merge per fold
+    // instead of the interval tree; meant for written_range_fast 3 and Precise readbacks.
+    Setting<bool> gpu_range_set_flat{false};
     // Hold the guest-copy shared lock once per readback write-back loop instead
     // of once per island.
     Setting<bool> readback_writeback_hold{false};
@@ -779,6 +782,7 @@ struct GPUSettings {
             make_override<GPUSettings>("spec_key_fast", &GPUSettings::spec_key_fast),
             make_override<GPUSettings>("gpu_range_set_lockfree",
                                        &GPUSettings::gpu_range_set_lockfree),
+            make_override<GPUSettings>("gpu_range_set_flat", &GPUSettings::gpu_range_set_flat),
             make_override<GPUSettings>("readback_writeback_hold",
                                        &GPUSettings::readback_writeback_hold),
             make_override<GPUSettings>("backing_write_memo", &GPUSettings::backing_write_memo),
@@ -848,7 +852,7 @@ struct GPUSettings {
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
     bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, \
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front, \
-    findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
+    findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
     key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper
@@ -1161,6 +1165,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BindNoopMemo, bind_noop_memo)
     SETTING_FORWARD(m_gpu, SpecKeyFast, spec_key_fast)
     SETTING_FORWARD_BOOL(m_gpu, GpuRangeSetLockfree, gpu_range_set_lockfree)
+    SETTING_FORWARD_BOOL(m_gpu, GpuRangeSetFlat, gpu_range_set_flat)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackHold, readback_writeback_hold)
     SETTING_FORWARD_BOOL(m_gpu, BackingWriteMemo, backing_write_memo)
     SETTING_FORWARD_BOOL(m_gpu, ImageUpdateDirect, image_update_direct)

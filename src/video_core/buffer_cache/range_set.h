@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <mutex>
+#include <span>
+#include <vector>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -152,6 +155,298 @@ struct BasicRangeSet {
 
 using RangeSet = BasicRangeSet<RangeSetsAllocator>;
 using GpuRangeSet = BasicRangeSet<GpuRangeSetAllocator>;
+
+// Sorted, disjoint, non-touching intervals in a vector: the canonical form of
+// the joining interval set above, with its edge semantics (a zero-size add or
+// subtract is a no-op; a zero-size query is contained and never intersects).
+// GPU command thread only, like the set it stands in for.
+class FlatRangeSet {
+public:
+    struct Interval {
+        VAddr lo;
+        VAddr hi;
+    };
+    struct Stats {
+        u64 batches;
+        u64 batched;
+        u64 moved;
+        u64 subs;
+    };
+
+    FlatRangeSet() {
+        v_.reserve(4096);
+        scratch_.reserve(4096);
+        merged_.reserve(4096);
+    }
+
+    void Add(VAddr base, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        const Interval one{base, base + size};
+        MergeRun(std::span<const Interval>{&one, 1});
+    }
+
+    /// Ascending batch sorted by (addr, size) and unique on the pair; entries
+    /// may nest or overlap, so they are coalesced with a running end first.
+    template <class T>
+    void AddSortedBatch(std::span<const T> batch) {
+        if (batch.empty()) {
+            return;
+        }
+        ++stats_.batches;
+        stats_.batched += batch.size();
+        scratch_.clear();
+        for (const auto& e : batch) {
+            if (e.size == 0) {
+                continue;
+            }
+            const VAddr lo = e.addr;
+            const VAddr hi = e.addr + e.size;
+            if (!scratch_.empty() && lo <= scratch_.back().hi) {
+                scratch_.back().hi = std::max<VAddr>(scratch_.back().hi, hi);
+            } else {
+                scratch_.push_back(Interval{lo, hi});
+            }
+        }
+        if (!scratch_.empty()) {
+            MergeRun(std::span<const Interval>{scratch_});
+        }
+    }
+
+    void Subtract(VAddr base, size_t size) {
+        if (size == 0 || v_.empty()) {
+            return;
+        }
+        ++stats_.subs;
+        const VAddr s = base;
+        const VAddr e = base + size;
+        auto it = std::upper_bound(v_.begin(), v_.end(), s,
+                                   [](VAddr x, const Interval& i) { return x < i.hi; });
+        if (it == v_.end() || it->lo >= e) {
+            return;
+        }
+        if (it->lo < s && it->hi > e) {
+            // A strictly covering interval splits in two.
+            const VAddr hi = it->hi;
+            it->hi = s;
+            stats_.moved += static_cast<u64>(v_.end() - it);
+            v_.insert(it + 1, Interval{e, hi});
+            return;
+        }
+        auto first_erase = it;
+        if (it->lo < s) {
+            it->hi = s; // the head keeps [lo, s)
+            first_erase = it + 1;
+        }
+        auto last = first_erase;
+        while (last != v_.end() && last->hi <= e) {
+            ++last;
+        }
+        if (last != v_.end() && last->lo < e) {
+            last->lo = e; // the tail keeps [e, hi)
+        }
+        stats_.moved += static_cast<u64>(v_.end() - last);
+        v_.erase(first_erase, last);
+    }
+
+    void Clear() {
+        v_.clear();
+    }
+
+    bool Contains(VAddr base, size_t size) const {
+        if (size == 0) {
+            return true;
+        }
+        const VAddr e = base + size;
+        auto it = std::upper_bound(v_.begin(), v_.end(), base,
+                                   [](VAddr x, const Interval& i) { return x < i.lo; });
+        if (it == v_.begin()) {
+            return false;
+        }
+        --it;
+        return it->hi >= e;
+    }
+
+    bool Intersects(VAddr base, size_t size) const {
+        if (size == 0 || v_.empty()) {
+            return false;
+        }
+        const VAddr e = base + size;
+        auto it = std::upper_bound(v_.begin(), v_.end(), base,
+                                   [](VAddr x, const Interval& i) { return x < i.hi; });
+        return it != v_.end() && it->lo < e;
+    }
+
+    template <typename Func>
+    void ForEach(Func&& func) const {
+        for (const Interval& i : v_) {
+            func(i.lo, i.hi);
+        }
+    }
+
+    template <typename Func>
+    void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
+        if (size == 0 || v_.empty()) {
+            return;
+        }
+        const VAddr s = base_addr;
+        const VAddr e = base_addr + size;
+        auto it = std::upper_bound(v_.begin(), v_.end(), s,
+                                   [](VAddr x, const Interval& i) { return x < i.hi; });
+        for (; it != v_.end() && it->lo < e; ++it) {
+            func(std::max<VAddr>(it->lo, s), std::min<VAddr>(it->hi, e));
+        }
+    }
+
+    template <typename Func>
+    void ForEachNotInRange(VAddr base_addr, size_t size, Func&& func) const {
+        const VAddr end_addr = base_addr + size;
+        ForEachInRange(base_addr, size, [&](VAddr range_addr, VAddr range_end) {
+            if (size_t gap_size = range_addr - base_addr; gap_size != 0) {
+                func(base_addr, gap_size);
+            }
+            base_addr = range_end;
+        });
+        if (base_addr != end_addr) {
+            func(base_addr, end_addr - base_addr);
+        }
+    }
+
+    u64 Size() const {
+        return v_.size();
+    }
+
+    Stats DrainStats() {
+        const Stats out = stats_;
+        stats_ = {};
+        return out;
+    }
+
+private:
+    // Merges a sorted, disjoint batch into the run of v_ it touches (every
+    // interval with hi >= batch.lo and lo <= batch.hi): the union is built in
+    // merged_ and replaces the run with one tail move.
+    void MergeRun(std::span<const Interval> in) {
+        const VAddr blo = in.front().lo;
+        const VAddr bhi = in.back().hi;
+        auto first = std::lower_bound(v_.begin(), v_.end(), blo,
+                                      [](const Interval& i, VAddr x) { return i.hi < x; });
+        auto last = std::upper_bound(first, v_.end(), bhi,
+                                     [](VAddr x, const Interval& i) { return x < i.lo; });
+        merged_.clear();
+        const auto emit = [&](Interval x) {
+            if (!merged_.empty() && x.lo <= merged_.back().hi) {
+                merged_.back().hi = std::max<VAddr>(merged_.back().hi, x.hi);
+            } else {
+                merged_.push_back(x);
+            }
+        };
+        auto a = first;
+        size_t b = 0;
+        while (a != last || b != in.size()) {
+            if (b == in.size() || (a != last && a->lo < in[b].lo)) {
+                emit(*a++);
+            } else {
+                emit(in[b++]);
+            }
+        }
+        const size_t pos = static_cast<size_t>(first - v_.begin());
+        const size_t old_n = static_cast<size_t>(last - first);
+        const size_t new_n = merged_.size();
+        const size_t common = std::min(old_n, new_n);
+        std::copy_n(merged_.begin(), common, v_.begin() + pos);
+        if (new_n > old_n) {
+            v_.insert(v_.begin() + pos + common, merged_.begin() + common, merged_.end());
+        } else if (old_n > new_n) {
+            v_.erase(v_.begin() + pos + common, v_.begin() + pos + old_n);
+        }
+        if (new_n != old_n) {
+            stats_.moved += static_cast<u64>(v_.size() - (pos + new_n));
+        }
+    }
+
+    std::vector<Interval> v_;
+    std::vector<Interval> scratch_;
+    std::vector<Interval> merged_;
+    Stats stats_{};
+};
+
+// The GPU-modified set behind one flag latched before any operation: the
+// interval tree today, the flat vector behind gpu_range_set_flat.
+struct GpuModifiedRangeSet {
+    static inline bool flat = false;
+    GpuRangeSet tree;
+    FlatRangeSet vec;
+
+    void Add(VAddr base, size_t size) {
+        if (flat) {
+            vec.Add(base, size);
+        } else {
+            tree.Add(base, size);
+        }
+    }
+    /// Ascending, (addr, size)-unique batch: one merge in the flat arm, the
+    /// hinted insert loop in the tree arm.
+    template <class T>
+    void AddSortedBatch(std::span<const T> batch) {
+        if (flat) {
+            vec.AddSortedBatch(batch);
+            return;
+        }
+        auto hint = tree.End();
+        for (const auto& e : batch) {
+            hint = tree.Add(hint, e.addr, e.size);
+        }
+    }
+    void Subtract(VAddr base, size_t size) {
+        if (flat) {
+            vec.Subtract(base, size);
+        } else {
+            tree.Subtract(base, size);
+        }
+    }
+    void Clear() {
+        if (flat) {
+            vec.Clear();
+        } else {
+            tree.Clear();
+        }
+    }
+    bool Contains(VAddr base, size_t size) const {
+        return flat ? vec.Contains(base, size) : tree.Contains(base, size);
+    }
+    bool Intersects(VAddr base, size_t size) const {
+        return flat ? vec.Intersects(base, size) : tree.Intersects(base, size);
+    }
+    template <typename Func>
+    void ForEach(Func&& func) const {
+        if (flat) {
+            vec.ForEach(std::forward<Func>(func));
+        } else {
+            tree.ForEach(std::forward<Func>(func));
+        }
+    }
+    template <typename Func>
+    void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
+        if (flat) {
+            vec.ForEachInRange(base_addr, size, std::forward<Func>(func));
+        } else {
+            tree.ForEachInRange(base_addr, size, std::forward<Func>(func));
+        }
+    }
+    template <typename Func>
+    void ForEachNotInRange(VAddr base_addr, size_t size, Func&& func) const {
+        if (flat) {
+            vec.ForEachNotInRange(base_addr, size, std::forward<Func>(func));
+        } else {
+            tree.ForEachNotInRange(base_addr, size, std::forward<Func>(func));
+        }
+    }
+    u64 Size() const {
+        return flat ? vec.Size() : tree.m_ranges_set.iterative_size();
+    }
+};
 
 template <typename T>
 class RangeMap {
