@@ -106,6 +106,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     bind_write_plan_ = std::min<u32>(EmulatorSettings.GetBindWritePlan(), 2u);
     bind_noop_ = texture_cache.BindNoopMemo();
     memo_first_ = texture_cache.MemoFirst();
+    findimg_hint_ = EmulatorSettings.IsFindimgSlotHint();
     if (EmulatorSettings.IsGuestCopyHoldSegment()) {
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
@@ -1172,6 +1173,11 @@ void Rasterizer::OnSubmit() {
                          fw.ways, fw.entries, fw.hits[0], fw.hits[1], fw.hits[2], fw.hits[3],
                          fw.evictions);
             }
+            if (const auto fh = texture_cache.DrainFindImageHintStats(); fh.probes) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] FINDIMGHINT probes={} hits={} none={} per300f", fh.probes,
+                         fh.hits, fh.none);
+            }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,
@@ -1408,6 +1414,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     plan_rejected_ = false;
     ++bindplan_binds_;
     bindplan_hits_ += plan_hit_;
+    if (findimg_hint_) {
+        image_hint_cur_ = pipeline->image_memo_hint.data();
+        image_hint_end_ = image_hint_cur_ + Pipeline::kImageMemoHints;
+    } else {
+        image_hint_cur_ = image_hint_end_ = nullptr;
+    }
 
     bool uses_dma = false;
 
@@ -1890,6 +1902,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         // hold one, and a scene of unbound slots must not depress its hit ratio.
         if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
             plan_rejected_ = true;
+            SkipImageHints(num_bindings);
             for (u32 i = 0; i < num_bindings; ++i) {
                 image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             }
@@ -1913,6 +1926,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
                 WarnInvalidTsharp(tsharp, data_fmt, num_fmt);
                 plan_rejected_ = true;
+                SkipImageHints(num_bindings);
                 for (u32 i = 0; i < num_bindings; ++i) {
                     image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
                                                 std::tuple{});
@@ -1943,11 +1957,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImageMemoized(desc, tsharp);
+            // Eager-view bindings never consume or populate the memo, so
+            // they take no hint; they still consume the ordinal.
+            u16* hint = nullptr;
+            if (image_hint_cur_ != image_hint_end_) {
+                hint = mip_fallback_mode == Shader::MipStorageFallbackMode::None ? image_hint_cur_
+                                                                                 : nullptr;
+                ++image_hint_cur_;
+            }
+            image_id = texture_cache.FindImageMemoized(desc, tsharp, hint);
             if (memo_first_ && !image_id) [[unlikely]] {
                 // The gate rejected the T#: this binding stays null and the
                 // rest of the array is filled the way the rejection arm does.
                 plan_rejected_ = true;
+                SkipImageHints(num_bindings - static_cast<u32>(i) - 1);
                 for (u32 j = static_cast<u32>(i) + 1; j < num_bindings; ++j) {
                     image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
                                                 std::tuple{});

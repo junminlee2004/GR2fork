@@ -30,6 +30,13 @@ class Scheduler;
 class DescriptorHeap;
 class PipelineLayoutCache;
 
+template <size_t N>
+constexpr std::array<u16, N> NoImageMemoHints() {
+    std::array<u16, N> hints{};
+    hints.fill(0xFFFF);
+    return hints;
+}
+
 void DescWriteOverflow();
 
 class Pipeline {
@@ -147,6 +154,10 @@ public:
         enum : u8 { Unbuilt, Ready, Ineligible } state{Unbuilt};
     };
     mutable BindWritePlan bind_plan;
+    // findimg_slot_hint: the memo entry each image binding ordinal's T# last
+    // matched or populated, 0xFFFF none. Never serialized.
+    static constexpr u32 kImageMemoHints = 32;
+    mutable std::array<u16, kImageMemoHints> image_memo_hint{NoImageMemoHints<kImageMemoHints>()};
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

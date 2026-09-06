@@ -585,7 +585,7 @@ static SHAD_NO_INLINE void RecordGuardSample(VideoCore::Skipcache::Framework& sc
     ++ctr.guard_samples;
 }
 
-ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp) {
+ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp, u16* hint) {
     using namespace VideoCore::Skipcache;
     auto& sc = Framework::Instance();
     constexpr auto kCache = CacheId::FindImage;
@@ -618,35 +618,59 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
                         static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
     const u8 type = static_cast<u8>(desc.type);
-    FindImageMemoEntry* set;
-    u32 ways;
-    size_t set_index = 0;
-    if (memo_ways == 0) {
-        set = &find_image_memo_[((w0 >> 8) ^ (w0 >> 40) ^ w1 ^ view_key) & 1023];
-        ways = 1;
-    } else {
-        // Every T# word reaches the set index through its own odd multiplier;
-        // the top bits are taken because a product's low bits see only the low
-        // input bits.
-        const u64 mix = (w0 ^ view_key) * 0x9E3779B97F4A7C15ULL + w1 * 0xC2B2AE3D27D4EB4FULL +
-                        (w2 ^ w3) * 0x165667B19E3779F9ULL;
-        set_index = mix >> memo_set_shift;
-        set = &find_image_memo_[set_index * memo_ways];
-        ways = memo_ways;
-    }
-    // Hit predicate: identical T#, same binding class, texture-cache structure
-    // untouched since populate (tex_gen covers register/unregister/delete and
-    // both rebind arms, so the slot provably was not reused), and the image
-    // itself still carries the recorded identity. No two valid ways hold the
-    // same key: a populate happens only after no valid way matched.
+    FindImageMemoEntry* set = nullptr;
+    const u32 ways = memo_ways == 0 ? 1u : memo_ways;
     u32 way = 0;
-    while (way < ways &&
-           !(set[way].valid && set[way].tsharp_raw[0] == w0 && set[way].tsharp_raw[1] == w1 &&
-             set[way].tsharp_raw[2] == w2 && set[way].tsharp_raw[3] == w3 &&
-             set[way].type == type && set[way].view_key == view_key)) {
-        ++way;
+    bool matched = false;
+    // findimg_slot_hint: the entry this binding ordinal last matched is tried
+    // first. It is a probe-order choice, not a certificate: it must pass the
+    // scan's full key compare, and since no two valid ways hold one key a
+    // hinted match is the entry the scan would have returned.
+    if (hint != nullptr) {
+        ++findimg_hint_probes_;
+        const u16 h = *hint;
+        if (h == ImageDesc::NoMemoSlot) {
+            ++findimg_hint_none_;
+        } else {
+            FindImageMemoEntry& c = find_image_memo_[h];
+            if (c.valid && c.tsharp_raw[0] == w0 && c.tsharp_raw[1] == w1 &&
+                c.tsharp_raw[2] == w2 && c.tsharp_raw[3] == w3 && c.type == type &&
+                c.view_key == view_key) {
+                if (memo_ways == 0) {
+                    set = &c;
+                } else {
+                    way = h & (ways - 1);
+                    set = &c - way;
+                }
+                matched = true;
+                ++findimg_hint_hits_;
+            }
+        }
     }
-    const bool matched = way < ways;
+    if (!matched) {
+        if (memo_ways == 0) {
+            set = &find_image_memo_[((w0 >> 8) ^ (w0 >> 40) ^ w1 ^ view_key) & 1023];
+        } else {
+            // Every T# word reaches the set index through its own odd multiplier;
+            // the top bits are taken because a product's low bits see only the low
+            // input bits.
+            const u64 mix = (w0 ^ view_key) * 0x9E3779B97F4A7C15ULL + w1 * 0xC2B2AE3D27D4EB4FULL +
+                            (w2 ^ w3) * 0x165667B19E3779F9ULL;
+            set = &find_image_memo_[(mix >> memo_set_shift) * memo_ways];
+        }
+        // Hit predicate: identical T#, same binding class, texture-cache structure
+        // untouched since populate (tex_gen covers register/unregister/delete and
+        // both rebind arms, so the slot provably was not reused), and the image
+        // itself still carries the recorded identity. No two valid ways hold the
+        // same key: a populate happens only after no valid way matched.
+        while (way < ways &&
+               !(set[way].valid && set[way].tsharp_raw[0] == w0 && set[way].tsharp_raw[1] == w1 &&
+                 set[way].tsharp_raw[2] == w2 && set[way].tsharp_raw[3] == w3 &&
+                 set[way].type == type && set[way].view_key == view_key)) {
+            ++way;
+        }
+        matched = way < ways;
+    }
     bool would_hit = false;
     if (!matched) {
         // No valid way holds the key: a free way makes this a cold miss,
@@ -672,6 +696,11 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     }
     FindImageMemoEntry& e = set[way];
     const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
+    if (hint != nullptr) {
+        // The entry a hit read or the slow arm will write: valid to hint at
+        // either way, since the next probe re-checks the key.
+        *hint = static_cast<u16>(slot);
+    }
     if (matched && ways > 1) {
         e.touch_stamp = ++findimg_touch_seq_;
     }

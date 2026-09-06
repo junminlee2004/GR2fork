@@ -192,7 +192,8 @@ public:
     /// FindImage with the adaptive memo skip cache in front, for the shader
     /// texture binding path. A hit skips the page-table walk and match loops
     /// but still touches the LRU and re-applies any overlap view rebase.
-    [[nodiscard]] ImageId FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp);
+    [[nodiscard]] ImageId FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp,
+                                            u16* hint = nullptr);
 
     /// UpdateImage with the adaptive dedup skip cache in front. Only sampled
     /// texture bindings and render-target reuse go through here; storage
@@ -627,6 +628,16 @@ public:
         std::array<u64, 4> hits;
         u64 evictions;
     };
+    struct FindImageHintStats {
+        u64 probes;
+        u64 hits;
+        u64 none;
+    };
+    FindImageHintStats DrainFindImageHintStats() {
+        const FindImageHintStats out{findimg_hint_probes_, findimg_hint_hits_, findimg_hint_none_};
+        findimg_hint_probes_ = findimg_hint_hits_ = findimg_hint_none_ = 0;
+        return out;
+    }
     FindImageWayStats DrainFindImageWayStats() {
         const FindImageWayStats out{memo_ways, find_image_memo_.size(), findimg_way_hits_,
                                     findimg_evictions_};
@@ -779,6 +790,9 @@ private:
     u32 memo_ways;      // findimg_memo_ways, clamped to 0/1/2/4 at construction
     u32 memo_set_shift; // 64 - log2(sets): the mixed T# key's top bits index the set
     std::array<u64, 4> findimg_way_hits_{};
+    u64 findimg_hint_probes_{};
+    u64 findimg_hint_hits_{};
+    u64 findimg_hint_none_{};
     u64 findimg_evictions_{};
     u64 findimg_touch_seq_{};
     u64 findimg_consumed_{};

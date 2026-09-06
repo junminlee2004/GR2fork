@@ -711,6 +711,10 @@ struct GPUSettings {
     // push of its first maxPushDescriptors descriptors would have hit; the bind itself is
     // unchanged. Costs 0.4-1.5% of the GPU thread while on: a measuring leg, off for kits.
     Setting<bool> desc_heap_shadow_census{false};
+    // Per pipeline, the image memo slot each image binding last matched; the probe
+    // compares that entry before the hashed way scan. Never a certificate: the
+    // entry must pass the full key compare and the generation checks as before.
+    Setting<bool> findimg_slot_hint{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -851,6 +855,7 @@ struct GPUSettings {
             make_override<GPUSettings>("index_bind_whole", &GPUSettings::index_bind_whole),
             make_override<GPUSettings>("desc_heap_shadow_census",
                                        &GPUSettings::desc_heap_shadow_census),
+            make_override<GPUSettings>("findimg_slot_hint", &GPUSettings::findimg_slot_hint),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -882,7 +887,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1229,6 +1234,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, VinputFetchKey, vinput_fetch_key)
     SETTING_FORWARD_BOOL(m_gpu, IndexBindWhole, index_bind_whole)
     SETTING_FORWARD_BOOL(m_gpu, DescHeapShadowCensus, desc_heap_shadow_census)
+    SETTING_FORWARD_BOOL(m_gpu, FindimgSlotHint, findimg_slot_hint)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

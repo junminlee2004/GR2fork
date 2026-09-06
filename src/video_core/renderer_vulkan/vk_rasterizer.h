@@ -264,6 +264,16 @@ private:
     u64 bindplan_mismatch_{};
     bool bind_noop_{};
     bool memo_first_{};
+    // findimg_slot_hint: the bound pipeline's hint cursor for BindTextures,
+    // both null when off. Every binding ordinal consumes one slot, rejected
+    // or not, so the ordinals stay stable from the first bind.
+    bool findimg_hint_{};
+    u16* image_hint_cur_{};
+    u16* image_hint_end_{};
+    void SkipImageHints(size_t n) {
+        image_hint_cur_ +=
+            std::min<size_t>(n, static_cast<size_t>(image_hint_end_ - image_hint_cur_));
+    }
     u64 bindnoop_hits_{};
     u64 bindnoop_slow_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms
