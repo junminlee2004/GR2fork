@@ -598,6 +598,13 @@ private:
     // deferred << 10 | timed << 11, one register for the probe's verdicts.
     SHAD_NO_INLINE ImageId FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image& tsharp,
                                                  FindImageMemoEntry& e, u64 packed, u64 tex_gen);
+    // findimg_memo_first: the T# validation the rasterizer ran before every
+    // probe, moved to the routes that reach FindImage. A pure function of the
+    // T# bytes; every populate follows a gated FindImage, so a consumed hit
+    // needs no gate, and a new populate site must be gated too.
+    SHAD_NO_INLINE bool GateTsharp(const AmdGpu::Image& tsharp);
+    u64 tsgate_calls_{};
+    u64 tsgate_rejects_{};
     u64 view_memo_hits_{};
     u64 view_memo_slow_{};
     u64 view_memo_writebacks_{};
@@ -629,6 +636,18 @@ public:
     }
     bool BindNoopMemo() const noexcept {
         return bind_noop;
+    }
+    bool MemoFirst() const noexcept {
+        return memo_first;
+    }
+    struct TsGateStats {
+        u64 calls;
+        u64 rejects;
+    };
+    TsGateStats DrainTsGateStats() {
+        const TsGateStats out{tsgate_calls_, tsgate_rejects_};
+        tsgate_calls_ = tsgate_rejects_ = 0;
+        return out;
     }
     struct BindNoopStats {
         u64 records;
@@ -745,6 +764,7 @@ private:
     bool sampler_lockfree;       // latched once at construction
     bool findimg_touch_lockfree; // latched once at construction
     bool findimg_touch_batch;    // latched once at construction; needs findimg_touch_lockfree
+    bool memo_first;             // latched once at construction
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
     bool lru_log;                // latched once at construction

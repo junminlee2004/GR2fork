@@ -8,6 +8,7 @@
 
 #include <xxhash.h>
 
+#include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -52,6 +53,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
       findimg_touch_batch{EmulatorSettings.IsFindimgTouchBatch() && findimg_touch_lockfree},
+      memo_first{EmulatorSettings.IsFindimgMemoFirst()},
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
       lru_log{EmulatorSettings.IsTextureLruLog()},
@@ -588,6 +590,9 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     auto& sc = Framework::Instance();
     constexpr auto kCache = CacheId::FindImage;
     if (!sc.Active() || !sc.ShouldProbe(kCache)) {
+        if (memo_first && !GateTsharp(tsharp)) [[unlikely]] {
+            return ImageId{};
+        }
         return FindImage(desc);
     }
     // Eager-view bindings carry a rewritten range the key does not cover;
@@ -742,6 +747,32 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                                  tex_gen);
 }
 
+SHAD_NO_INLINE bool TextureCache::GateTsharp(const AmdGpu::Image& tsharp) {
+    ++tsgate_calls_;
+    if (IsMeta(tsharp.Address())) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+    }
+    const auto data_fmt = tsharp.GetDataFmt();
+    const auto num_fmt = tsharp.GetNumberFmt();
+    if (data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+        ++tsgate_rejects_;
+        return false;
+    }
+    if (!Core::Memory::Instance()->IsValidGpuMapping(tsharp.Address(), 0) ||
+        !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+        // Takes the whole sharp: pitch and width are bitfields and cannot bind
+        // to a reference of their own.
+        LOG_WARNING(Render_Vulkan,
+                    "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                    "data_format={}, num_format={}",
+                    tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
+                    static_cast<u32>(num_fmt));
+        ++tsgate_rejects_;
+        return false;
+    }
+    return true;
+}
+
 ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image& tsharp,
                                             FindImageMemoEntry& e, u64 packed, u64 tex_gen) {
     using namespace VideoCore::Skipcache;
@@ -753,6 +784,11 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
     const bool would_hit = ((packed >> 9) & 1) != 0;
     const bool deferred = ((packed >> 10) & 1) != 0;
     const bool timed = ((packed >> 11) & 1) != 0;
+    // No valid way can hold a failing T#, so matched and would_hit are false
+    // here and nothing the verify or populate would have counted is skipped.
+    if (memo_first && !GateTsharp(tsharp)) [[unlikely]] {
+        return ImageId{};
+    }
     // Recomputed from the entry, never from set_index * ways: with one way the
     // index is masked, not multiplied.
     const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());

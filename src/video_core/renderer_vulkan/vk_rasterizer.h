@@ -263,6 +263,7 @@ private:
     u64 bindplan_defer_{};
     u64 bindplan_mismatch_{};
     bool bind_noop_{};
+    bool memo_first_{};
     u64 bindnoop_hits_{};
     u64 bindnoop_slow_{};
     u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms

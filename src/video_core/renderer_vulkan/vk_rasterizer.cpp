@@ -105,6 +105,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     bind_prefetch_ = EmulatorSettings.IsBindLinePrefetch();
     bind_write_plan_ = std::min<u32>(EmulatorSettings.GetBindWritePlan(), 2u);
     bind_noop_ = texture_cache.BindNoopMemo();
+    memo_first_ = texture_cache.MemoFirst();
     if (EmulatorSettings.IsGuestCopyHoldSegment()) {
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
@@ -1131,6 +1132,11 @@ void Rasterizer::OnSubmit() {
                          bindnoop_hits_, bindnoop_slow_, bn.records, bn.zero);
                 bindnoop_hits_ = bindnoop_slow_ = 0;
             }
+            if (memo_first_) {
+                const auto ts = texture_cache.DrainTsGateStats();
+                LOG_INFO(Render_Skipcache, "[SkipCache] TSGATE calls={} rejects={} per300f",
+                         ts.calls, ts.rejects);
+            }
             if (const auto af = texture_cache.DrainAddrFilterStats(); af.calls) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] ADDRFILT calls={} cands={} fast={} walk={} per300f", af.calls,
@@ -1860,41 +1866,48 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     AmdGpu::Image tsharp_scratch{};
     for (const auto& image_desc : stage.images) {
         const AmdGpu::Image& tsharp = image_desc.GetSharpRef(stage, tsharp_scratch);
-        if (texture_cache.IsMeta(tsharp.Address())) [[unlikely]] {
-            WarnMetadataTextureRead();
-        }
-
-        const auto data_fmt = tsharp.GetDataFmt();
-        const auto num_fmt = tsharp.GetNumberFmt();
         // The reject paths below must consume the descriptor count the layout
         // declared for this image, or every later binding number in this stage
         // and in the stages after it drifts off the layout.
         const u32 num_bindings = image_desc.NumBindings(tsharp);
-        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            plan_rejected_ = true;
-            for (u32 i = 0; i < num_bindings; ++i) {
-                image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            }
-            if (!plan_hit_) {
-                image_descriptor_array_sizes.push_back(num_bindings);
-            }
-            continue;
-        }
-
-        if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
-            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
-            WarnInvalidTsharp(tsharp, data_fmt, num_fmt);
-            plan_rejected_ = true;
-            for (u32 i = 0; i < num_bindings; ++i) {
-                image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            }
-            if (!plan_hit_) {
-                image_descriptor_array_sizes.push_back(num_bindings);
-            }
-            continue;
-        }
-
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
+        // A null or format-less T# is rejected in every mode: the memo cannot
+        // hold one, and a scene of unbound slots must not depress its hit ratio.
+        if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
+            plan_rejected_ = true;
+            for (u32 i = 0; i < num_bindings; ++i) {
+                image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            }
+            if (!plan_hit_) {
+                image_descriptor_array_sizes.push_back(num_bindings);
+            }
+            continue;
+        }
+
+        // The rest of the validation is dead on a consumed memo hit (no valid
+        // entry holds a failing T#), so with findimg_memo_first the memo probes
+        // first and the gate runs on the routes that reach FindImage. Bindings
+        // with an eager view (mip fallback) are gated here, before the view.
+        if (!memo_first_ || mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+            if (texture_cache.IsMeta(tsharp.Address())) [[unlikely]] {
+                WarnMetadataTextureRead();
+            }
+            const auto data_fmt = tsharp.GetDataFmt();
+            const auto num_fmt = tsharp.GetNumberFmt();
+            if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+                !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+                WarnInvalidTsharp(tsharp, data_fmt, num_fmt);
+                plan_rejected_ = true;
+                for (u32 i = 0; i < num_bindings; ++i) {
+                    image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
+                                                std::tuple{});
+                }
+                if (!plan_hit_) {
+                    image_descriptor_array_sizes.push_back(num_bindings);
+                }
+                continue;
+            }
+        }
 
         for (auto i = 0; i < num_bindings; i++) {
             // Mip fallback rewrites the view range before the memo probe, so
@@ -1916,6 +1929,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             image_id = texture_cache.FindImageMemoized(desc, tsharp);
+            if (memo_first_ && !image_id) [[unlikely]] {
+                // The gate rejected the T#: this binding stays null and the
+                // rest of the array is filled the way the rejection arm does.
+                plan_rejected_ = true;
+                for (u32 j = static_cast<u32>(i) + 1; j < num_bindings; ++j) {
+                    image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
+                                                std::tuple{});
+                }
+                break;
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
