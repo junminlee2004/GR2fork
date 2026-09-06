@@ -153,6 +153,8 @@ private:
     bool IsComputeImageClear(const Pipeline* pipeline);
     /// The three compute shortcuts, out of the graphics bind path's lines.
     SHAD_NO_INLINE bool TakeComputeShortcut(const Pipeline* pipeline);
+    /// Builds a pipeline's descriptor write plan from the list this bind just emitted.
+    SHAD_NO_INLINE void BuildBindWritePlan(const Pipeline* pipeline);
 
 private:
     // =========================================================================
@@ -247,6 +249,19 @@ private:
     }
     u64 bindpf_img_{};
     u64 bindpf_backing_{};
+    // bind_write_plan: the mode, this bind's verdicts, and the write list the
+    // pipeline is handed (the plan's on a hit, the rebuilt one otherwise).
+    u32 bind_write_plan_{};
+    bool plan_hit_{};
+    bool plan_rejected_{};
+    vk::WriteDescriptorSet* bind_writes_{};
+    u32 bind_write_n_{};
+    u64 bindplan_binds_{};
+    u64 bindplan_hits_{};
+    u64 bindplan_builds_{};
+    u64 bindplan_dyn_{};
+    u64 bindplan_defer_{};
+    u64 bindplan_mismatch_{};
     bool bind_noop_{};
     u64 bindnoop_hits_{};
     u64 bindnoop_slow_{};

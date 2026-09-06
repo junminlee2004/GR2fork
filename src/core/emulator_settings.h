@@ -691,6 +691,9 @@ struct GPUSettings {
     // The priority-ops thread joins every offloaded readback as a second copier once
     // the fence signals; a late arrival copies nothing. Needs readback_writeback_share.
     Setting<bool> readback_writeback_helper{false};
+    // 0 off, 1 the per-pipeline descriptor write plan in place of the per-bind rebuild,
+    // 2 or more the plan built and compared with the rebuilt list (shadow).
+    Setting<u32> bind_write_plan{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -824,6 +827,7 @@ struct GPUSettings {
                                        &GPUSettings::readback_writeback_share),
             make_override<GPUSettings>("readback_writeback_helper",
                                        &GPUSettings::readback_writeback_helper),
+            make_override<GPUSettings>("bind_write_plan", &GPUSettings::bind_write_plan),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -855,7 +859,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1196,6 +1200,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, PushDescFullLimit, push_desc_full_limit)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackShare, readback_writeback_share)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackHelper, readback_writeback_helper)
+    SETTING_FORWARD(m_gpu, BindWritePlan, bind_write_plan)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

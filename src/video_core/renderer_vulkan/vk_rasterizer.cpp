@@ -103,6 +103,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     elide_findbuffer_ = EmulatorSettings.IsStreamFindBufferElide();
     bind_prefetch_ = EmulatorSettings.IsBindLinePrefetch();
+    bind_write_plan_ = std::min<u32>(EmulatorSettings.GetBindWritePlan(), 2u);
     bind_noop_ = texture_cache.BindNoopMemo();
     if (EmulatorSettings.IsGuestCopyHoldSegment()) {
         segment_copy_hold_ = true;
@@ -583,7 +584,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -722,7 +723,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -789,7 +790,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -829,7 +830,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -1114,6 +1115,15 @@ void Rasterizer::OnSubmit() {
                          bindpf_img_, bindpf_backing_);
                 bindpf_img_ = bindpf_backing_ = 0;
             }
+            if (bind_write_plan_ != 0) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] BINDPLAN binds={} hits={} builds={} dyn={} defer={} "
+                         "mismatch={} per300f",
+                         bindplan_binds_, bindplan_hits_, bindplan_builds_, bindplan_dyn_,
+                         bindplan_defer_, bindplan_mismatch_);
+                bindplan_binds_ = bindplan_hits_ = bindplan_builds_ = bindplan_dyn_ =
+                    bindplan_defer_ = bindplan_mismatch_ = 0;
+            }
             if (bind_noop_) {
                 const auto bn = texture_cache.DrainBindNoopStats();
                 LOG_INFO(Render_Skipcache,
@@ -1369,6 +1379,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_barriers.clear();
     buffer_info_n_ = 0;
     image_infos.clear();
+    // A ready plan stands in for the write list this bind would rebuild; the
+    // passes below still fill the info arrays the plan's entries point at.
+    auto& plan = pipeline->bind_plan;
+    plan_hit_ = bind_write_plan_ == 1 && plan.state == Pipeline::BindWritePlan::Ready;
+    plan_rejected_ = false;
+    ++bindplan_binds_;
+    bindplan_hits_ += plan_hit_;
 
     bool uses_dma = false;
 
@@ -1417,6 +1434,29 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
     }
+    if (plan_hit_) {
+        bind_writes_ = plan.writes.get();
+        bind_write_n_ = plan.count;
+    } else {
+        bind_writes_ = set_writes.data();
+        bind_write_n_ = static_cast<u32>(set_writes.size());
+        if (bind_write_plan_ != 0 && plan.state == Pipeline::BindWritePlan::Unbuilt) {
+            BuildBindWritePlan(pipeline);
+        } else if (bind_write_plan_ == 2 && plan.state == Pipeline::BindWritePlan::Ready) {
+            // Shadow: the header the delta cache serializes and the one info
+            // pointer the type selects; never dstSet or the unused pointer.
+            bool same = plan.count == bind_write_n_;
+            for (u32 i = 0; same && i < bind_write_n_; ++i) {
+                const auto& a = plan.writes[i];
+                const auto& b = set_writes.data()[i];
+                same = std::memcmp(&a.dstBinding, &b.dstBinding, 16) == 0 &&
+                       (a.descriptorType == vk::DescriptorType::eStorageBuffer
+                            ? a.pBufferInfo == b.pBufferInfo
+                            : a.pImageInfo == b.pImageInfo);
+            }
+            bindplan_mismatch_ += !same;
+        }
+    }
     if (push_vp_memo_) {
         push_ud_hw_ = binding.user_data;
         push_bo_hw_ = binding.buffer;
@@ -1438,6 +1478,35 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
 // The shortcuts keep their own compute guards: the gate at the bind site
 // makes them redundant today, and they protect any future direct caller.
+void Rasterizer::BuildBindWritePlan(const Pipeline* pipeline) {
+    // An image array whose count follows the T# gives every bind its own
+    // shape, and a bind that rejected a T# emitted a default type for it:
+    // neither list is the pipeline's.
+    auto& plan = pipeline->bind_plan;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& image : stage->images) {
+            if (image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                plan.state = Pipeline::BindWritePlan::Ineligible;
+                ++bindplan_dyn_;
+                return;
+            }
+        }
+    }
+    if (plan_rejected_) {
+        ++bindplan_defer_;
+        return;
+    }
+    const u32 count = static_cast<u32>(set_writes.size());
+    plan.writes = std::make_unique<vk::WriteDescriptorSet[]>(count);
+    std::copy_n(set_writes.data(), count, plan.writes.get());
+    plan.count = count;
+    plan.state = Pipeline::BindWritePlan::Ready;
+    ++bindplan_builds_;
+}
+
 bool Rasterizer::TakeComputeShortcut(const Pipeline* pipeline) {
     return IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
            IsComputeImageClear(pipeline);
@@ -1754,7 +1823,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     bindscratch_infomax_ = std::max<u64>(bindscratch_infomax_, stage_infos);
 
     binding.unified += static_cast<u32>(stage.buffers.size());
-    if (!stage.buffers.empty()) {
+    if (!plan_hit_ && !stage.buffers.empty()) {
         auto& set_write = set_writes.Next();
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = first_binding;
@@ -1801,20 +1870,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         // and in the stages after it drifts off the layout.
         const u32 num_bindings = image_desc.NumBindings(tsharp);
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            plan_rejected_ = true;
             for (u32 i = 0; i < num_bindings; ++i) {
                 image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             }
-            image_descriptor_array_sizes.push_back(num_bindings);
+            if (!plan_hit_) {
+                image_descriptor_array_sizes.push_back(num_bindings);
+            }
             continue;
         }
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
             WarnInvalidTsharp(tsharp, data_fmt, num_fmt);
+            plan_rejected_ = true;
             for (u32 i = 0; i < num_bindings; ++i) {
                 image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             }
-            image_descriptor_array_sizes.push_back(num_bindings);
+            if (!plan_hit_) {
+                image_descriptor_array_sizes.push_back(num_bindings);
+            }
             continue;
         }
 
@@ -1874,7 +1949,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
 
-        image_descriptor_array_sizes.push_back(num_bindings);
+        if (!plan_hit_) {
+            image_descriptor_array_sizes.push_back(num_bindings);
+        }
     }
 
     // Second pass to re-bind images that were updated after binding
@@ -1949,23 +2026,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
     }
 
-    u32 image_info_idx = first_image_idx;
-    u32 image_binding_idx = 0;
-    for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
-        auto& set_write = set_writes.Next();
-        set_write.dstSet = VK_NULL_HANDLE;
-        set_write.dstBinding = binding.unified;
-        set_write.dstArrayElement = 0;
-        set_write.descriptorCount = array_size;
-        set_write.descriptorType =
-            is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
-        set_write.pImageInfo = &image_infos[image_info_idx];
+    // On a plan hit binding.unified is not advanced past the image arrays and
+    // drifts for the rest of the bind; its only consumers are the dstBinding
+    // stores the same gate skips, so any new consumer must restore the walk.
+    if (!plan_hit_) {
+        u32 image_info_idx = first_image_idx;
+        u32 image_binding_idx = 0;
+        for (u32 array_size : image_descriptor_array_sizes) {
+            const auto& [_, desc] = image_bindings[image_binding_idx];
+            const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+            auto& set_write = set_writes.Next();
+            set_write.dstSet = VK_NULL_HANDLE;
+            set_write.dstBinding = binding.unified;
+            set_write.dstArrayElement = 0;
+            set_write.descriptorCount = array_size;
+            set_write.descriptorType =
+                is_storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage;
+            set_write.pImageInfo = &image_infos[image_info_idx];
 
-        image_info_idx += array_size;
-        image_binding_idx += array_size;
-        binding.unified += array_size;
+            image_info_idx += array_size;
+            image_binding_idx += array_size;
+            binding.unified += array_size;
+        }
     }
 
     // Both taken after the image writes have finished advancing binding.unified
@@ -1982,7 +2064,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // flags and no immutable sampler, which is what a consecutive-binding
     // update requires. descriptorCount 0 is illegal, hence the guard.
     binding.unified += static_cast<u32>(stage.samplers.size());
-    if (!stage.samplers.empty()) {
+    if (!plan_hit_ && !stage.samplers.empty()) {
         auto& set_write = set_writes.Next();
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = first_sampler_binding;

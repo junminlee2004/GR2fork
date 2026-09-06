@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <boost/container/small_vector.hpp>
@@ -125,8 +126,23 @@ public:
     using DescriptorWrites = DescriptorWriteList;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
-    void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+    void BindResources(std::span<vk::WriteDescriptorSet> set_writes,
+                       const BufferBarriers& buffer_barriers,
                        const Shader::PushData& push_data) const;
+
+    // bind_write_plan: the set-0 write list of a bind is a pure function of
+    // the stage lists (binding numbers, counts, types and the fixed slots of
+    // the rasterizer's info arrays), so the rasterizer builds it once from a
+    // rejection-free bind and hands it back in place of a rebuilt list. Its
+    // entries are mutable: the heap leg stamps dstSet into them each bind, so
+    // nothing may compare them byte for byte. Ineligible when an image array's
+    // count follows the T# (DynamicIndex).
+    struct BindWritePlan {
+        std::unique_ptr<vk::WriteDescriptorSet[]> writes;
+        u32 count{};
+        enum : u8 { Unbuilt, Ready, Ineligible } state{Unbuilt};
+    };
+    mutable BindWritePlan bind_plan;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

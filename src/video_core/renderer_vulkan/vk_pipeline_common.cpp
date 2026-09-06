@@ -56,7 +56,7 @@ static_assert(sizeof(Skipcache::Framework::DescDeltaSlot::write_changed) >=
 // Serialize a descriptor write list into a deterministic byte stream, payload
 // contents included. Returns 0 on any unknown descriptor type or overflow:
 // unknowns fail toward the slow path.
-size_t SerializeDescriptorWrites(const Pipeline::DescriptorWrites& writes,
+size_t SerializeDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes,
                                  std::array<u8, 16384>& out) {
     u8* cursor = out.data();
     const u8* const limit = out.data() + out.size();
@@ -158,7 +158,7 @@ void CopyFixed(void* dst, const void* src) noexcept {
 // a per-descriptor verdict in the slot, which a partial push consumes; the
 // unmapped form is the plain walk.
 template <bool kMap>
-size_t MatchDescriptorWrites(const Pipeline::DescriptorWrites& writes,
+size_t MatchDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes,
                              Skipcache::Framework::DescDeltaSlot& slot, bool& changed) {
     auto& blob = slot.blob;
     u8* cursor = blob.data();
@@ -295,7 +295,7 @@ vk::WriteDescriptorSet MakeRun(const vk::WriteDescriptorSet& w, u32 first, u32 c
 // image writes are one binding with an array, so they go whole or not at all.
 // The layouts come from the graphics and compute pipeline builders. Returns
 // kRunsOverflow when the runs would not fit the write list.
-size_t CompactDescriptorWrites(const Pipeline::DescriptorWrites& in,
+size_t CompactDescriptorWrites(std::span<const vk::WriteDescriptorSet> in,
                                const Skipcache::Framework::DescDeltaSlot& map,
                                Pipeline::DescriptorWrites& out) {
     out.clear();
@@ -418,7 +418,8 @@ Pipeline::~Pipeline() {
     }
 }
 
-void Pipeline::BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
+void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
+                             const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
