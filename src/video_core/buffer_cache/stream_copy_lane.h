@@ -113,10 +113,12 @@ private:
 
     // Producer-owned (GPU command thread); plain because single-writer. The
     // alignas(64) on published_ keeps the worker-touched atomics off this line.
+    // jobs_ and bytes_ are kept apart: adjacent they vectorise into one add
+    // whose constant load can straddle a page.
     alignas(64) u64 enqueue_pos_{};
     u64 jobs_{};
-    u64 bytes_{};
     u64 inline_unresolved_{};
+    u64 bytes_{};
     u64 inline_full_{};
     u64 barriers_{};
     u64 barrier_wait_ns_{};
