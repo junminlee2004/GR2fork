@@ -66,6 +66,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     vinput_fetch_key_ = EmulatorSettings.IsVinputFetchKey() && vertex_lazy_desc_;
+    index_bind_whole_ = EmulatorSettings.IsIndexBindWhole();
     if (EmulatorSettings.IsVinputFetchKey() && !vertex_lazy_desc_) {
         LOG_WARNING(Render_Vulkan, "vinput_fetch_key needs vertex_input_lazy_desc; the vertex "
                                    "input memo stays pipeline-keyed");
@@ -1430,8 +1431,9 @@ void BufferCache::BindVertexBuffers(
     }
 }
 
-void BufferCache::BindIndexBuffer(
-    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
+u32 BufferCache::BindIndexBuffer(
+    u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+    bool allow_whole) {
     const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock) {
@@ -1491,18 +1493,22 @@ void BufferCache::BindIndexBuffer(
             }
             certified = tag_hit && mem_key_ok && index_bind_mem_key_ == mem_key;
         }
+        // A caller whose firstIndex lives in the indirect args cannot inherit a
+        // whole bind with a non-zero first index; the fall-through reaches the
+        // exact-bind arm and clears the record.
+        certified &= allow_whole || index_whole_first_ == 0;
         if (certified) {
             // Same resolved index range already bound on this command buffer
             // with no intervening CPU write; an unchanged GPU-dirty generation
             // reproves the recorded clean answer without the region walk.
             if (index_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
-                return;
+                return index_whole_first_;
             }
             ++index_genwalk_;
             index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
             if (!*index_gpu_modified) {
                 index_bind_clean_gpu_gen_ = gpu_dirty_generation_;
-                return;
+                return index_whole_first_;
             }
         }
         index_bind_addr_ = index_address;
@@ -1538,7 +1544,34 @@ void BufferCache::BindIndexBuffer(
         }
     }
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+    // index_bind_whole: one bind per (handle, type, tick) at offset 0 with the
+    // draw addressed through firstIndex. A misaligned offset or a caller whose
+    // firstIndex lives in indirect args takes the exact bind and clears the
+    // record; no foreign index bind exists on this command buffer, so the
+    // key carries no foreign generation.
+    const bool whole =
+        index_bind_whole_ && allow_whole && skipcache.Active() && (offset & (index_size - 1)) == 0;
+    if (!whole) {
+        idxwhole_veto_ += index_bind_whole_;
+        index_whole_handle_ = VK_NULL_HANDLE;
+        index_whole_first_ = 0;
+        cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
+        return 0;
+    }
+    const VkBuffer handle = static_cast<VkBuffer>(vk_buffer->Handle());
+    const u64 whole_tick = scheduler.CurrentTick();
+    if (handle != index_whole_handle_ || index_whole_type_ != static_cast<u32>(index_type) ||
+        index_whole_tick_ != whole_tick) {
+        ++idxwhole_binds_;
+        index_whole_handle_ = handle;
+        index_whole_type_ = static_cast<u32>(index_type);
+        index_whole_tick_ = whole_tick;
+        cmdbuf.bindIndexBuffer(vk_buffer->Handle(), 0, index_type);
+    } else {
+        ++idxwhole_skips_;
+    }
+    index_whole_first_ = offset >> (is_index16 ? 1u : 2u);
+    return index_whole_first_;
 }
 
 void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {

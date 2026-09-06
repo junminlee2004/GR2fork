@@ -213,9 +213,12 @@ public:
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
-    /// Bind host index buffer for the current draw.
-    void BindIndexBuffer(u32 index_offset,
-                         boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
+    /// Bind host index buffer for the current draw. Returns the draw's
+    /// firstIndex: 0 for an exact bind, offset / index size for a whole bind;
+    /// a caller whose firstIndex lives in indirect args passes allow_whole false.
+    u32 BindIndexBuffer(u32 index_offset,
+                        boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
+                        bool allow_whole);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
@@ -461,6 +464,12 @@ private:
     RegionManager* index_bind_region_{}; // certifies the mem key without the walk
     u64 index_bind_clean_gpu_gen_{};
     bool index_bind_valid_{};
+    // index_bind_whole: the host buffer bound whole (offset 0) on this tick and
+    // the firstIndex the last bind answered; an exact bind clears the handle.
+    VkBuffer index_whole_handle_{};
+    u64 index_whole_tick_{};
+    u32 index_whole_type_{};
+    u32 index_whole_first_{};
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;
@@ -537,6 +546,16 @@ public:
                                    vinput_layout_, vinput_bind_,  vinput_fetchskip_};
         vinput_calls_ = vinput_built_ = vinput_binds_ = vinput_chain_ = vinput_layout_ =
             vinput_bind_ = vinput_fetchskip_ = 0;
+        return out;
+    }
+    struct IndexWholeStats {
+        u64 binds;
+        u64 skips;
+        u64 veto;
+    };
+    IndexWholeStats DrainIndexWholeStats() {
+        const IndexWholeStats out{idxwhole_binds_, idxwhole_skips_, idxwhole_veto_};
+        idxwhole_binds_ = idxwhole_skips_ = idxwhole_veto_ = 0;
         return out;
     }
     struct WritebackStats {
@@ -754,6 +773,7 @@ private:
     bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
     bool vinput_fetch_key_{};
+    bool index_bind_whole_{};
     u64 vinput_calls_{};
     u64 vinput_built_{};
     u64 vinput_binds_{};
@@ -761,6 +781,9 @@ private:
     u64 vinput_layout_{};
     u64 vinput_bind_{};
     u64 vinput_fetchskip_{};
+    u64 idxwhole_binds_{};
+    u64 idxwhole_skips_{};
+    u64 idxwhole_veto_{};
     u64 writeback_loops_{};
     u64 writeback_islands_{};
     u64 writeback_bytes_{};

@@ -581,8 +581,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto state = BeginRendering(pipeline);
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    u32 first_index = 0;
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+        first_index = buffer_cache.BindIndexBuffer(index_offset, buffer_barriers, true);
     }
 
     pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
@@ -597,7 +598,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     BindPipelineDedup(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     if (is_indexed) {
-        cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+        cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), first_index,
                            s32(vertex_offset), instance_offset);
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
@@ -701,7 +702,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(0, buffer_barriers);
+        buffer_cache.BindIndexBuffer(0, buffer_barriers, false);
     }
 
     const auto& [buffer, base] =
@@ -972,6 +973,11 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] VINPUT calls={} built={} binds={} chain={} layout={} bind={} "
                          "fetchskip={} per300f",
                          vi.calls, vi.built, vi.binds, vi.chain, vi.layout, vi.bind, vi.fetchskip);
+            }
+            if (const auto iw = buffer_cache.DrainIndexWholeStats();
+                iw.binds + iw.skips + iw.veto) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] IDXWHOLE binds={} skips={} veto={} per300f",
+                         iw.binds, iw.skips, iw.veto);
             }
             if (flush_draw_interval_ != 0) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
