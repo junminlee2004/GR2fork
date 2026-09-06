@@ -1513,20 +1513,6 @@ bool PipelineCache::RefreshGraphicsStages() {
             ++params_prefetches;
         }
     }
-    // The Vertex resolve reads the second word of every attribute V# from the
-    // table the user-data pair names, after the Fragment resolve; the table
-    // lines start their miss here. The pointer mask is ReadUdReg's.
-    if (fetch_hint_.valid && regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs) {
-        u64 base = 0;
-        std::memcpy(&base, &regs.vs_program.user_data[fetch_hint_.sgpr_base], sizeof(base));
-        const auto table = static_cast<uintptr_t>(base & 0xFFFFFFFFFFFFull);
-        const uintptr_t first = (table + fetch_hint_.first_dw * sizeof(u32) + 8) & ~uintptr_t{63};
-        const uintptr_t last = table + fetch_hint_.last_dw * sizeof(u32) + 8;
-        u32 lines = 0;
-        for (uintptr_t p = first; p <= last && lines < 4; p += 64, ++lines) {
-            __builtin_prefetch(reinterpret_cast<const void*>(p), 0, 3);
-        }
-    }
 
     bind_stage(Stage::Fragment, LogicalStage::Fragment);
 
@@ -1598,34 +1584,6 @@ bool PipelineCache::RefreshGraphicsStages() {
         break;
     default:
         UNREACHABLE_MSG("unhandled stage_en: {}", (u32)regs.stage_enable.raw);
-    }
-    // A layout is hinted only when every attribute reads one table through a
-    // user-data pointer pair; inline V#s and split tables stay unhinted. Rebuilt
-    // from the ref this draw published, consumed by the next draw; a module
-    // swapped in place under the same pair leaves a stale, harmless hint.
-    if (fetch_shader_ref.program != fetch_hint_.program ||
-        fetch_shader_ref.perm_idx != fetch_hint_.perm_idx) {
-        fetch_hint_ = {};
-        fetch_hint_.program = fetch_shader_ref.program;
-        fetch_hint_.perm_idx = fetch_shader_ref.perm_idx;
-        if (fetch_shader_ref && regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs) {
-            const auto& attrs = fetch_shader_ref.Get()->attributes;
-            bool one_table = !attrs.empty() &&
-                             attrs.front().sgpr_base + 1 < Shader::ShaderParams::NumShaderUserData;
-            u8 lo = 0xFF;
-            u8 hi = 0;
-            for (const auto& a : attrs) {
-                one_table &= a.sgpr_base == attrs.front().sgpr_base;
-                lo = std::min(lo, a.dword_offset);
-                hi = std::max(hi, a.dword_offset);
-            }
-            if (one_table) {
-                fetch_hint_.sgpr_base = attrs.front().sgpr_base;
-                fetch_hint_.first_dw = lo;
-                fetch_hint_.last_dw = hi;
-                fetch_hint_.valid = true;
-            }
-        }
     }
 
     const auto* vs_info = infos[static_cast<u32>(Shader::LogicalStage::Vertex)];
