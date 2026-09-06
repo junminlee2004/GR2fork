@@ -2058,9 +2058,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     }
                 }
             }
-            image.usage.storage |= is_storage;
-            image.usage.texture |= !is_storage;
-
             AppendImageInfo(image_infos, VK_NULL_HANDLE, image_view, bound_layout);
         }
     }
