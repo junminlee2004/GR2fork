@@ -294,6 +294,19 @@ private:
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     FetchShaderRef fetch_shader_ref{};
+    // Fetch-table hint from the last Vertex resolve: the program and permutation
+    // it came from, the user-data pair naming the table and the lowest and
+    // highest attribute dword offsets. The next draw prefetches those lines
+    // ahead of the Fragment stage; a stale hint only warms a line nothing reads.
+    struct FetchTableHint {
+        const Program* program{};
+        u32 perm_idx{};
+        u8 sgpr_base{};
+        u8 first_dw{};
+        u8 last_dw{};
+        bool valid{};
+    };
+    FetchTableHint fetch_hint_{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
