@@ -142,6 +142,24 @@ public:
                 view_ready = true;
             }
         }
+        // bind_image_lean: writes only what a deferred probe reads. The memo
+        // hit and the slow arm each overwrite every other field before pass
+        // two reads it; ClearMemo is the slow arm's half of that contract.
+        void PrimeDeferred(const AmdGpu::Image& image, const Shader::ImageResource& desc) {
+            info.reset();
+            type = desc.is_written ? BindingType::Storage : BindingType::Texture;
+            deferred_tsharp = image;
+            deferred_is_depth = desc.is_depth;
+            view_ready = false;
+            deferred_is_array = desc.is_array;
+        }
+        void ClearMemo() {
+            memo_view = vk::ImageView{};
+            memo_backing = nullptr;
+            memo_slot = NoMemoSlot;
+            memo_bind_epoch = 0;
+            memo_bind_layout = {};
+        }
     };
     // Rasterizer target descs are rebuilt with construct_at over an engaged
     // object; that stays legal only while nothing here needs a destructor.

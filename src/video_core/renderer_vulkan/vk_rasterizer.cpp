@@ -64,6 +64,10 @@ static SHAD_NO_INLINE void BindAssertFailed() {
     assert_fail_impl();
 }
 
+SHAD_NO_INLINE void ImageBindingsOverflow() {
+    BindAssertFailed();
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -107,6 +111,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     bind_noop_ = texture_cache.BindNoopMemo();
     memo_first_ = texture_cache.MemoFirst();
     findimg_hint_ = EmulatorSettings.IsFindimgSlotHint();
+    bind_lean_ = EmulatorSettings.IsBindImageLean() && bind_noop_;
+    if (EmulatorSettings.IsBindImageLean() && !bind_noop_) {
+        LOG_WARNING(
+            Render_Vulkan,
+            "bind_image_lean needs bind_noop_memo; image bindings run the full constructor");
+    }
     if (EmulatorSettings.IsGuestCopyHoldSegment()) {
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
@@ -1123,6 +1133,11 @@ void Rasterizer::OnSubmit() {
                          bindpf_img_, bindpf_backing_);
                 bindpf_img_ = bindpf_backing_ = 0;
             }
+            if (bind_lean_) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] BINDLEAN primes={} full={} per300f",
+                         bindlean_primes_, bindlean_full_);
+                bindlean_primes_ = bindlean_full_ = 0;
+            }
             if (bind_write_plan_ != 0) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] BINDPLAN binds={} hits={} builds={} dyn={} defer={} "
@@ -1941,10 +1956,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         for (auto i = 0; i < num_bindings; i++) {
             // Mip fallback rewrites the view range before the memo probe, so
             // only fallback-free bindings defer the view build to a memo miss.
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{},
-                std::tuple<const AmdGpu::Image&, const Shader::ImageResource&, bool>{
-                    tsharp, image_desc, mip_fallback_mode == Shader::MipStorageFallbackMode::None});
+            // With bind_image_lean those prime the probe's inputs in place.
+            ImageBindingInfo* slot;
+            if (bind_lean_ && mip_fallback_mode == Shader::MipStorageFallbackMode::None) {
+                slot = &image_bindings.PrimeNext();
+                slot->second.PrimeDeferred(tsharp, image_desc);
+                DEBUG_ASSERT(!slot->second.view_ready && texture_cache.BindNoopMemo());
+                ++bindlean_primes_;
+            } else {
+                slot = &image_bindings.emplace_back(
+                    std::piecewise_construct, std::tuple{},
+                    std::tuple<const AmdGpu::Image&, const Shader::ImageResource&, bool>{
+                        tsharp, image_desc,
+                        mip_fallback_mode == Shader::MipStorageFallbackMode::None});
+                ++bindlean_full_;
+            }
+            auto& [image_id, desc] = *slot;
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 if (num_bindings != 1) [[unlikely]] {

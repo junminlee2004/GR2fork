@@ -23,6 +23,9 @@ class MemoryManager;
 
 namespace Vulkan {
 
+// The image binding list's overflow: the assertion body, outlined.
+SHAD_NO_INLINE void ImageBindingsOverflow();
+
 class GraphicsPipeline;
 
 class Rasterizer {
@@ -267,6 +270,9 @@ private:
     // findimg_slot_hint: the bound pipeline's hint cursor for BindTextures,
     // both null when off. Every binding ordinal consumes one slot, rejected
     // or not, so the ordinals stay stable from the first bind.
+    bool bind_lean_{};
+    u64 bindlean_primes_{};
+    u64 bindlean_full_{};
     bool findimg_hint_{};
     u16* image_hint_cur_{};
     u16* image_hint_end_{};
@@ -384,7 +390,39 @@ private:
     SHAD_NO_INLINE void RefreshViewportPush();
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
-    boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    static_assert(std::is_trivially_destructible_v<ImageBindingInfo>);
+    // Objects built once; PrimeNext hands out the next one untouched for an
+    // in-place prime, emplace_back rebuilds one with construct_at.
+    struct ImageBindingList {
+        std::array<ImageBindingInfo, Shader::NUM_IMAGES> slots{};
+        u32 n{};
+        void clear() noexcept {
+            n = 0;
+        }
+        ImageBindingInfo& PrimeNext() {
+            if (n == slots.size()) [[unlikely]] {
+                ImageBindingsOverflow();
+            }
+            return slots[n++];
+        }
+        template <typename... Args>
+        ImageBindingInfo& emplace_back(Args&&... args) {
+            return *std::construct_at(&PrimeNext(), std::forward<Args>(args)...);
+        }
+        ImageBindingInfo& operator[](size_t i) {
+            return slots[i];
+        }
+        ImageBindingInfo* begin() {
+            return slots.data();
+        }
+        ImageBindingInfo* end() {
+            return slots.data() + n;
+        }
+        size_t size() const noexcept {
+            return n;
+        }
+    };
+    ImageBindingList image_bindings;
     // Constructed and destroyed two or three times per draw as a local.
     boost::container::static_vector<u32, Shader::NUM_IMAGES> image_descriptor_array_sizes;
     bool fault_process_pending{};

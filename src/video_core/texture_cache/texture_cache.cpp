@@ -590,6 +590,10 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     auto& sc = Framework::Instance();
     constexpr auto kCache = CacheId::FindImage;
     if (!sc.Active() || !sc.ShouldProbe(kCache)) {
+        // The only writer of the memo fields on this configuration: a primed
+        // desc (bind_image_lean) carries the previous binding's, and the
+        // bind no-op memo indexes the slot unchecked.
+        desc.ClearMemo();
         if (memo_first && !GateTsharp(tsharp)) [[unlikely]] {
             return ImageId{};
         }
@@ -766,9 +770,6 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
             }
             return e.image_id;
         }
-        if (view_memo) {
-            desc.memo_slot = static_cast<u16>(slot);
-        }
     }
     return FindImageMemoizedSlow(desc, tsharp, e,
                                  u64{ways} | u64{matched} << 8 | u64{would_hit} << 9 |
@@ -813,6 +814,10 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
     const bool would_hit = ((packed >> 9) & 1) != 0;
     const bool deferred = ((packed >> 10) & 1) != 0;
     const bool timed = ((packed >> 11) & 1) != 0;
+    // A primed desc (bind_image_lean) still carries the previous binding's memo
+    // fields; the gate below must never let a stale slot reach the bind no-op
+    // memo, which indexes it unchecked.
+    desc.ClearMemo();
     // No valid way can hold a failing T#, so matched and would_hit are false
     // here and nothing the verify or populate would have counted is skipped.
     if (memo_first && !GateTsharp(tsharp)) [[unlikely]] {
@@ -821,6 +826,11 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
     // Recomputed from the entry, never from set_index * ways: with one way the
     // index is masked, not multiplied.
     const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
+    // Every probe that reaches here wrote the slot before the split; the
+    // consumed hit writes its own. One write is the union of the old two.
+    if (view_memo) {
+        desc.memo_slot = static_cast<u16>(slot);
+    }
     const u8 view_key = static_cast<u8>(desc.deferred_is_depth) |
                         static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
     // Authoritative path, exactly once; prediction is only compared, never
@@ -861,9 +871,6 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
         e.view_backing = nullptr;
         e.bind_epoch = 0;
         e.bind_layout = {};
-        if (view_memo) {
-            desc.memo_slot = static_cast<u16>(slot);
-        }
         {
             const Image& image = slot_images[real];
             e.image_uid = image.image_uid;
