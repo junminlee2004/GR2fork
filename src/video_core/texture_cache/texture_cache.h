@@ -588,8 +588,9 @@ private:
     static_assert(offsetof(FindImageMemoEntry, view_info) == 64);
     static_assert(offsetof(FindImageMemoEntry, access_tick) == 128);
     static_assert(offsetof(FindImageMemoEntry, touch_stamp) == 160);
-    static constexpr size_t FindImageMemoEntries = 2048;
-    std::array<FindImageMemoEntry, FindImageMemoEntries> find_image_memo_{};
+    // Sized once at construction from findimg_memo_entries; a power of two,
+    // so the set index is the mixed key's top bits.
+    std::vector<FindImageMemoEntry> find_image_memo_;
     u32 MemoVictim(const FindImageMemoEntry* set, u32 ways) const;
     // The authoritative arm of FindImageMemoized: the real lookup, the verify
     // and the populate. packed = ways | matched << 8 | would_hit << 9 |
@@ -612,11 +613,13 @@ public:
     };
     struct FindImageWayStats {
         u32 ways;
+        u64 entries;
         std::array<u64, 4> hits;
         u64 evictions;
     };
     FindImageWayStats DrainFindImageWayStats() {
-        const FindImageWayStats out{memo_ways, findimg_way_hits_, findimg_evictions_};
+        const FindImageWayStats out{memo_ways, find_image_memo_.size(), findimg_way_hits_,
+                                    findimg_evictions_};
         findimg_way_hits_ = {};
         findimg_evictions_ = 0;
         return out;

@@ -555,6 +555,10 @@ struct GPUSettings {
     // index 2048 entries by every T# word into sets of that many ways with LRU
     // replacement. 3 acts as 2, higher values as 4.
     Setting<u32> findimg_memo_ways{0};
+    // Entry count of the image memo; sets = entries / findimg_memo_ways. Clamped to
+    // [1024, 32768] then rounded down to a power of two; 0 keeps 2048. Inert and
+    // unreported at findimg_memo_ways 0.
+    Setting<u32> findimg_memo_entries{2048};
     // Per texture memo entry, the backing epoch at which the shader-read
     // transit was a no-op and the layout it held; a repeat under that epoch skips
     // the transit probe and the backing's lines. Needs texture_view_memo.
@@ -770,6 +774,7 @@ struct GPUSettings {
             make_override<GPUSettings>("spec_fp_slot_inplace", &GPUSettings::spec_fp_slot_inplace),
             make_override<GPUSettings>("spec_fp_front", &GPUSettings::spec_fp_front),
             make_override<GPUSettings>("findimg_memo_ways", &GPUSettings::findimg_memo_ways),
+            make_override<GPUSettings>("findimg_memo_entries", &GPUSettings::findimg_memo_entries),
             make_override<GPUSettings>("bind_noop_memo", &GPUSettings::bind_noop_memo),
             make_override<GPUSettings>("spec_key_fast", &GPUSettings::spec_key_fast),
             make_override<GPUSettings>("gpu_range_set_lockfree",
@@ -843,7 +848,7 @@ struct GPUSettings {
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
     bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, \
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front, \
-    findimg_memo_ways, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
+    findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
     key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper
@@ -1152,6 +1157,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, SpecFpSlotInplace, spec_fp_slot_inplace)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpFront, spec_fp_front)
     SETTING_FORWARD(m_gpu, FindimgMemoWays, findimg_memo_ways)
+    SETTING_FORWARD(m_gpu, FindimgMemoEntries, findimg_memo_entries)
     SETTING_FORWARD_BOOL(m_gpu, BindNoopMemo, bind_noop_memo)
     SETTING_FORWARD(m_gpu, SpecKeyFast, spec_key_fast)
     SETTING_FORWARD_BOOL(m_gpu, GpuRangeSetLockfree, gpu_range_set_lockfree)

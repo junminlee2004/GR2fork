@@ -33,12 +33,17 @@ namespace {
 constexpr u32 ClampMemoWays(u32 v) {
     return v == 0 ? 0 : v >= 4 ? 4 : v >= 2 ? 2 : 1;
 }
+// 1024 keeps the direct-mapped mask in range, 32768 keeps memo_slot in u16.
+constexpr u32 ClampMemoEntries(u32 v) {
+    return v == 0 ? 2048u : std::bit_floor(std::clamp<u32>(v, 1024u, 32768u));
+}
 } // namespace
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
                            PageManager& tracker_)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+    : find_image_memo_(ClampMemoEntries(EmulatorSettings.GetFindimgMemoEntries())),
+      instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
@@ -52,7 +57,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       invalidate_filter{EmulatorSettings.IsTextureInvalidateFilter()},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
-          64 - std::countr_zero(u64{FindImageMemoEntries / std::max<u32>(memo_ways, 1u)}))} {
+          64 - std::countr_zero(u64{find_image_memo_.size() / std::max<u32>(memo_ways, 1u)}))} {
 
     invalidate_cover_ = std::make_unique<std::atomic<u64>[]>(CoverWords);
     if (EmulatorSettings.IsImageUpdateDirect() && !image_update_direct) {

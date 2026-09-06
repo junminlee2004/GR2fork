@@ -1144,8 +1144,10 @@ void Rasterizer::OnSubmit() {
             }
             if (const auto fw = texture_cache.DrainFindImageWayStats(); fw.ways) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] FINDIMGWAYS ways={} hits={}/{}/{}/{} evict={} per300f",
-                         fw.ways, fw.hits[0], fw.hits[1], fw.hits[2], fw.hits[3], fw.evictions);
+                         "[SkipCache] FINDIMGWAYS ways={} entries={} hits={}/{}/{}/{} evict={} "
+                         "per300f",
+                         fw.ways, fw.entries, fw.hits[0], fw.hits[1], fw.hits[2], fw.hits[3],
+                         fw.evictions);
             }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
