@@ -561,6 +561,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU descHeapShadowCensus: {}", EmulatorSettings.IsDescHeapShadowCensus());
     LOG_INFO(Config, "GPU findimgSlotHint: {}", EmulatorSettings.IsFindimgSlotHint());
     LOG_INFO(Config, "GPU bindImageLean: {}", EmulatorSettings.IsBindImageLean());
+    LOG_INFO(Config, "GPU descDeltaFlat: {}", EmulatorSettings.IsDescDeltaFlat());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

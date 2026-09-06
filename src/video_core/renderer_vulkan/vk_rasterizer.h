@@ -259,6 +259,11 @@ private:
     bool plan_rejected_{};
     vk::WriteDescriptorSet* bind_writes_{};
     u32 bind_write_n_{};
+    // The info array extents the bind filled, handed to the delta probe.
+    u32 bind_buffer_n_{};
+    u32 bind_image_n_{};
+    bool desc_delta_flat_{};
+    u64 bindplan_flat_{};
     u64 bindplan_binds_{};
     u64 bindplan_hits_{};
     u64 bindplan_builds_{};

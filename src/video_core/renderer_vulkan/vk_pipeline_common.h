@@ -137,9 +137,11 @@ public:
     using DescriptorWrites = DescriptorWriteList;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
+    // buffer_info_n / image_info_n: the rasterizer's info array extents this
+    // bind filled, which the flat descriptor delta checks against its plan.
     void BindResources(std::span<vk::WriteDescriptorSet> set_writes,
-                       const BufferBarriers& buffer_barriers,
-                       const Shader::PushData& push_data) const;
+                       const BufferBarriers& buffer_barriers, const Shader::PushData& push_data,
+                       u32 buffer_info_n, u32 image_info_n) const;
 
     // bind_write_plan: the set-0 write list of a bind is a pure function of
     // the stage lists (binding numbers, counts, types and the fixed slots of
@@ -152,6 +154,16 @@ public:
         std::unique_ptr<vk::WriteDescriptorSet[]> writes;
         u32 count{};
         enum : u8 { Unbuilt, Ready, Ineligible } state{Unbuilt};
+        // desc_delta_flat: the writes tile buffer_infos[0..buffer_descs) then
+        // image_infos[0..image_descs) in order, every descriptorCount in
+        // 1..63 and the total <= 63; first_desc[w] is the flat index of
+        // write w's first descriptor. Set only when that tiling was verified.
+        bool flat{};
+        u32 buffer_descs{};
+        u32 image_descs{};
+        const u8* buffer_base{};
+        const u8* image_base{};
+        std::array<u8, 64> first_desc{};
     };
     mutable BindWritePlan bind_plan;
     // findimg_slot_hint: the memo entry each image binding ordinal's T# last

@@ -111,6 +111,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     bind_noop_ = texture_cache.BindNoopMemo();
     memo_first_ = texture_cache.MemoFirst();
     findimg_hint_ = EmulatorSettings.IsFindimgSlotHint();
+    desc_delta_flat_ = EmulatorSettings.IsDescDeltaFlat();
     bind_lean_ = EmulatorSettings.IsBindImageLean() && bind_noop_;
     if (EmulatorSettings.IsBindImageLean() && !bind_noop_) {
         LOG_WARNING(
@@ -597,7 +598,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         first_index = buffer_cache.BindIndexBuffer(index_offset, buffer_barriers, true);
     }
 
-    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data,
+                            bind_buffer_n_, bind_image_n_);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -736,7 +738,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
-    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data,
+                            bind_buffer_n_, bind_image_n_);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -803,7 +806,8 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data,
+                            bind_buffer_n_, bind_image_n_);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -843,7 +847,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data);
+    pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data,
+                            bind_buffer_n_, bind_image_n_);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -1141,11 +1146,11 @@ void Rasterizer::OnSubmit() {
             if (bind_write_plan_ != 0) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] BINDPLAN binds={} hits={} builds={} dyn={} defer={} "
-                         "mismatch={} per300f",
+                         "mismatch={} flat={} per300f",
                          bindplan_binds_, bindplan_hits_, bindplan_builds_, bindplan_dyn_,
-                         bindplan_defer_, bindplan_mismatch_);
+                         bindplan_defer_, bindplan_mismatch_, bindplan_flat_);
                 bindplan_binds_ = bindplan_hits_ = bindplan_builds_ = bindplan_dyn_ =
-                    bindplan_defer_ = bindplan_mismatch_ = 0;
+                    bindplan_defer_ = bindplan_mismatch_ = bindplan_flat_ = 0;
             }
             if (bind_noop_) {
                 const auto bn = texture_cache.DrainBindNoopStats();
@@ -1216,11 +1221,11 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] DESCDELTA probes={} hits={} partial={} descs={} pushed={} "
                          "split={} runs={} key={} gen={} cold={} whole={} heap={} heapdescs={} "
                          "heap32={} heap40={} heap48={} heap64={} heapbig={} heapimg={} "
-                         "heapsmp={} per300f",
+                         "heapsmp={} flat={} unflat={} extmiss={} per300f",
                          dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split, dd.runs,
                          key, gen, cold, whole, dd.heap, dd.heap_descs, dd.heap_hist[0],
                          dd.heap_hist[1], dd.heap_hist[2], dd.heap_hist[3], dd.heap_hist[4],
-                         dd.heap_images, dd.heap_samplers);
+                         dd.heap_images, dd.heap_samplers, dd.flat, dd.unflat, dd.extmiss);
             }
             if (const auto hs = skipcache.DrainHeapShadowStats(); hs.probes) {
                 LOG_INFO(Render_Skipcache,
@@ -1483,6 +1488,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
     }
+    bind_buffer_n_ = buffer_info_n_;
+    bind_image_n_ = static_cast<u32>(image_infos.size());
     if (plan_hit_) {
         bind_writes_ = plan.writes.get();
         bind_write_n_ = plan.count;
@@ -1552,6 +1559,47 @@ void Rasterizer::BuildBindWritePlan(const Pipeline* pipeline) {
     plan.writes = std::make_unique<vk::WriteDescriptorSet[]>(count);
     std::copy_n(set_writes.data(), count, plan.writes.get());
     plan.count = count;
+    // desc_delta_flat: verify that the writes tile the two info arrays in
+    // order with bounded counts; any other shape keeps the write walk.
+    if (desc_delta_flat_) {
+        u32 bcur = 0;
+        u32 icur = 0;
+        bool flat = true;
+        for (u32 j = 0; j < count && flat; ++j) {
+            const auto& w = plan.writes[j];
+            const u32 n = w.descriptorCount;
+            if (n == 0 || n >= 64) {
+                flat = false;
+                break;
+            }
+            switch (w.descriptorType) {
+            case vk::DescriptorType::eStorageBuffer:
+                flat = w.pBufferInfo == buffer_infos.data() + bcur;
+                plan.first_desc[j] = static_cast<u8>(bcur);
+                bcur += n;
+                break;
+            case vk::DescriptorType::eSampledImage:
+            case vk::DescriptorType::eStorageImage:
+            case vk::DescriptorType::eSampler:
+                flat = w.pImageInfo == image_infos.data() + icur;
+                plan.first_desc[j] = static_cast<u8>(buffer_info_n_ + icur);
+                icur += n;
+                break;
+            default:
+                flat = false;
+                break;
+            }
+        }
+        flat = flat && bcur == buffer_info_n_ && icur == image_infos.size() && bcur + icur <= 63;
+        if (flat) {
+            plan.buffer_base = reinterpret_cast<const u8*>(buffer_infos.data());
+            plan.image_base = reinterpret_cast<const u8*>(image_infos.data());
+            plan.buffer_descs = bcur;
+            plan.image_descs = icur;
+            plan.flat = true;
+            ++bindplan_flat_;
+        }
+    }
     plan.state = Pipeline::BindWritePlan::Ready;
     ++bindplan_builds_;
 }

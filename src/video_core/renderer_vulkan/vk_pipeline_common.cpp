@@ -6,6 +6,9 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
@@ -147,6 +150,62 @@ void CopyFixed(void* dst, const void* src) noexcept {
 #else
     std::memcpy(dst, src, N);
 #endif
+}
+
+// Compares n 24-byte descriptors at src with dst, leaves dst equal to src and
+// returns a bit per descriptor that differed (bit i = descriptor i). n < 64.
+// Outlined: a leaf with two call sites inside BindResources' frame would
+// otherwise be inlined into a function with no registers to spare.
+SHAD_NO_INLINE u64 SyncDescriptors24(const u8* src, u8* dst, u32 n) noexcept {
+    u64 mask = 0;
+    u32 i = 0;
+#if defined(__AVX2__)
+    for (; i + 4 <= n; i += 4, src += 96, dst += 96) {
+        const __m256i s0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
+        const __m256i s1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 32));
+        const __m256i s2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 64));
+        const __m256i d0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst));
+        const __m256i d1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + 32));
+        const __m256i d2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + 64));
+        const u32 eq =
+            static_cast<u32>(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s0, d0)))) |
+            (static_cast<u32>(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s1, d1))))
+             << 4) |
+            (static_cast<u32>(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(s2, d2))))
+             << 8);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), s0);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 32), s1);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + 64), s2);
+        // Qword k belongs to descriptor k / 3: fold each triple onto its
+        // first bit, then gather bits 0, 3, 6, 9.
+        u32 ne = ~eq & 0xfffu;
+        ne |= (ne >> 1) | (ne >> 2);
+#if defined(__BMI2__)
+        const u32 bits = _pext_u32(ne, 0x249u);
+#else
+        const u32 bits = (ne & 1u) | ((ne >> 2) & 2u) | ((ne >> 4) & 4u) | ((ne >> 6) & 8u);
+#endif
+        mask |= u64{bits} << i;
+    }
+#endif
+    for (; i < n; ++i, src += 24, dst += 24) {
+        u64 x0;
+        u64 x1;
+        u64 x2;
+        u64 y0;
+        u64 y1;
+        u64 y2;
+        std::memcpy(&x0, src, 8);
+        std::memcpy(&x1, src + 8, 8);
+        std::memcpy(&x2, src + 16, 8);
+        std::memcpy(&y0, dst, 8);
+        std::memcpy(&y1, dst + 8, 8);
+        std::memcpy(&y2, dst + 16, 8);
+        const u64 d = (x0 ^ y0) | (x1 ^ y1) | (x2 ^ y2);
+        CopyFixed<24>(dst, src);
+        mask |= u64{d != 0} << i;
+    }
+    return mask;
 }
 
 // Walks the write list once, leaving blob equal to the serialized form and
@@ -353,6 +412,40 @@ size_t CompactDescriptorWrites(std::span<const vk::WriteDescriptorSet> in,
     return out.size();
 }
 
+// The flat form of CompactDescriptorWrites: the change bits come from the
+// plan's tiling instead of the mapped walk. A flat plan holds at most 63
+// descriptors, so the runs always fit the write list.
+static_assert(64 <= Pipeline::NUM_DESCRIPTOR_WRITES);
+size_t CompactDescriptorWritesFlat(std::span<const vk::WriteDescriptorSet> in, const u8* first_desc,
+                                   u64 mask, Pipeline::DescriptorWrites& out) {
+    out.clear();
+    u32 w_idx = 0;
+    for (const auto& w : in) {
+        const u32 count = w.descriptorCount;
+        u64 bits = (mask >> first_desc[w_idx++]) & ((u64{1} << count) - 1);
+        if (bits == 0) {
+            continue;
+        }
+        switch (w.descriptorType) {
+        case vk::DescriptorType::eUniformBuffer:
+        case vk::DescriptorType::eStorageBuffer:
+        case vk::DescriptorType::eSampler: {
+            while (bits != 0) {
+                const u32 first = static_cast<u32>(std::countr_zero(bits));
+                const u32 len = static_cast<u32>(std::countr_zero(~(bits >> first)));
+                out.push_back(MakeRun(w, first, len));
+                bits &= ~(((u64{1} << len) - 1) << first);
+            }
+            break;
+        }
+        default:
+            out.push_back(MakeRun(w, 0, count));
+            break;
+        }
+    }
+    return out.size();
+}
+
 Pipeline::DescriptorWrites partial_scratch;
 
 // The maintenance6 entry points take the same arguments in a struct and skip
@@ -446,7 +539,8 @@ Pipeline::~Pipeline() {
 
 void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                              const BufferBarriers& buffer_barriers,
-                             const Shader::PushData& push_data) const {
+                             const Shader::PushData& push_data, u32 buffer_info_n,
+                             u32 image_info_n) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
@@ -549,15 +643,55 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 }
                 return partial;
             }();
+            static const bool flat_enabled = [] {
+                const bool f = EmulatorSettings.IsDescDeltaFlat();
+                if (f && (!EmulatorSettings.IsDescDeltaInplace() ||
+                          !EmulatorSettings.IsDescLayoutShare())) {
+                    LOG_WARNING(Render_Vulkan, "flat descriptor deltas need desc_delta_inplace "
+                                               "and desc_layout_share; the write walk runs");
+                    return false;
+                }
+                return f;
+            }();
             const u64 tick = scheduler.CurrentTick();
             const u64 layout = std::bit_cast<u64>(static_cast<VkPipelineLayout>(pipeline_layout));
             const u64 foreign = sc.ForeignPushGen(idx);
             bool changed = false;
-            const size_t size =
-                inplace
-                    ? (partial_enabled ? MatchDescriptorWrites<true>(set_writes, slot, changed)
-                                       : MatchDescriptorWrites<false>(set_writes, slot, changed))
-                    : SerializeDescriptorWrites(set_writes, scratch);
+            // Flat delta: under a plan hit the write headers are a function of
+            // the layout, so only the two info arrays the plan tiles are
+            // compared, as 24-byte descriptors against the blob's flat form.
+            // The extents fail closed to the walk if an emission ever drifts.
+            const bool plan_hit = set_writes.data() == bind_plan.writes.get();
+            const bool flat = flat_enabled && bind_plan.flat && plan_hit &&
+                              buffer_info_n == bind_plan.buffer_descs &&
+                              image_info_n == bind_plan.image_descs;
+            u64 shape = 0;
+            size_t size;
+            if (flat) {
+                const u32 nb = bind_plan.buffer_descs;
+                const u32 ni = bind_plan.image_descs;
+                u8* blob = slot.blob.data();
+                const u64 mask =
+                    SyncDescriptors24(bind_plan.buffer_base, blob, nb) |
+                    (SyncDescriptors24(bind_plan.image_base, blob + size_t{nb} * 24, ni) << nb);
+                slot.mask = mask;
+                slot.desc_count = nb + ni;
+                slot.desc_changed = static_cast<u32>(std::popcount(mask));
+                slot.header_changed = false;
+                changed = mask != 0;
+                size = size_t{nb + ni} * 24;
+                shape = (u64{nb} << 32 | ni) | (u64{1} << 63);
+                ++slot.flat;
+            } else {
+                size = inplace ? (partial_enabled
+                                      ? MatchDescriptorWrites<true>(set_writes, slot, changed)
+                                      : MatchDescriptorWrites<false>(set_writes, slot, changed))
+                               : SerializeDescriptorWrites(set_writes, scratch);
+                ++slot.unflat;
+                if (flat_enabled && bind_plan.flat && plan_hit) {
+                    ++slot.extmiss;
+                }
+            }
             bool would_hit = false;
             bool partial_ok = false;
             if (size == 0) {
@@ -566,7 +700,12 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 ++ctr.miss_cold;
             } else if (slot.tick != tick || slot.foreign_gen != foreign) {
                 ++ctr.miss_gen[Skipcache::LaneTick];
-            } else if (slot.layout != layout) {
+            } else if (slot.layout != layout || slot.flat_shape != shape) {
+                // The shape discriminates the flat blob form from the
+                // serialized one: a flat probe against a serialized slot and
+                // the reverse must key-miss. The header certificate rests on
+                // layout handles never being reused within a tick, which
+                // holds for shared layouts (the cache never evicts).
                 ++ctr.miss_key;
             } else if (slot.size != size ||
                        (inplace ? changed
@@ -601,7 +740,10 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 // Each extra write costs the driver's per-write prologue, so a
                 // compaction that saves fewer descriptors than it adds writes
                 // is sent whole.
-                const size_t runs = CompactDescriptorWrites(set_writes, slot, partial_scratch);
+                const size_t runs =
+                    flat ? CompactDescriptorWritesFlat(set_writes, bind_plan.first_desc.data(),
+                                                       slot.mask, partial_scratch)
+                         : CompactDescriptorWrites(set_writes, slot, partial_scratch);
                 if (runs <= set_writes.size() + (slot.desc_count - slot.desc_changed) / 2) {
                     slot.runs += runs;
                     PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
@@ -629,6 +771,7 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 slot.valid = true;
                 slot.tick = tick;
                 slot.layout = layout;
+                slot.flat_shape = shape;
                 slot.foreign_gen = foreign;
                 slot.size = static_cast<u32>(size);
                 // The in-place walk already left the blob in its serialized form.

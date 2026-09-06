@@ -358,7 +358,14 @@ public:
         // a write recorded unchanged has no per-descriptor verdicts.
         std::array<u8, 128> write_changed{};
         u32 write_count{};
+        // desc_delta_flat: the blob form (0 serialized stream, bit 63 tagged
+        // (nb, ni) flat payloads) and the last flat walk's change bits.
+        u64 flat_shape{};
+        u64 mask{};
         u64 partial{};
+        u64 flat{};
+        u64 unflat{};
+        u64 extmiss{};
         u64 descs{};
         u64 pushed{};
         u64 split{};
@@ -412,6 +419,9 @@ public:
         u64 probes;
         u64 hits;
         u64 partial;
+        u64 flat;
+        u64 unflat;
+        u64 extmiss;
         u64 descs;
         u64 pushed;
         u64 split;
@@ -428,6 +438,9 @@ public:
             out.probes += slot.probes;
             out.hits += slot.hits;
             out.partial += slot.partial;
+            out.flat += slot.flat;
+            out.unflat += slot.unflat;
+            out.extmiss += slot.extmiss;
             out.descs += slot.descs;
             out.pushed += slot.pushed;
             out.split += slot.split;
@@ -441,6 +454,7 @@ public:
             out.heap_samplers += slot.heap_samplers;
             slot.probes = slot.hits = slot.partial = slot.descs = slot.pushed = slot.split =
                 slot.runs = slot.heap = slot.heap_descs = 0;
+            slot.flat = slot.unflat = slot.extmiss = 0;
             slot.heap_hist = {};
             slot.heap_images = slot.heap_samplers = 0;
         }
