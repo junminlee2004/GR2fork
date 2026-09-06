@@ -723,6 +723,11 @@ struct GPUSettings {
     // plan tiles, in 24-byte descriptors, and compacts from a change mask; needs
     // desc_delta_inplace and desc_layout_share. Default off.
     Setting<bool> desc_delta_flat{false};
+    // One certificate for the three per-draw memos on the all-hits path:
+    // 0 off, 1 fold the probes, 2 fold + scope serial (behaves as 1 until that
+    // leg lands), 3 shadow; values above 3 clamp to 3. Needs
+    // adaptive_skipcaches_mode 2; the boot latch turns it off otherwise.
+    Setting<u32> draw_glue_memo{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -866,6 +871,7 @@ struct GPUSettings {
             make_override<GPUSettings>("findimg_slot_hint", &GPUSettings::findimg_slot_hint),
             make_override<GPUSettings>("bind_image_lean", &GPUSettings::bind_image_lean),
             make_override<GPUSettings>("desc_delta_flat", &GPUSettings::desc_delta_flat),
+            make_override<GPUSettings>("draw_glue_memo", &GPUSettings::draw_glue_memo),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -897,7 +903,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1247,6 +1253,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FindimgSlotHint, findimg_slot_hint)
     SETTING_FORWARD_BOOL(m_gpu, BindImageLean, bind_image_lean)
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaFlat, desc_delta_flat)
+    SETTING_FORWARD(m_gpu, DrawGlueMemo, draw_glue_memo)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

@@ -138,6 +138,27 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     dyn_class_stamp_ = dyn_memo_enabled_ && EmulatorSettings.IsDynStateStamp();
     // A dormant funnel freezes both stamp lanes, so the memo would go permanently stale.
     push_vp_memo_ = EmulatorSettings.IsPushVpMemo() && liverpool->IsGfxStampActive();
+    glue_mode_ = std::min<u32>(EmulatorSettings.GetDrawGlueMemo(), 3u);
+    if (glue_mode_ == 2) {
+        LOG_INFO(Render_Vulkan, "draw_glue_memo 2 runs as 1: the scope serial leg has not landed");
+        glue_mode_ = 1;
+    }
+    if (glue_mode_ != 0) {
+        using VideoCore::Skipcache::CacheId;
+        using VideoCore::Skipcache::State;
+        const bool forced = EmulatorSettings.GetAdaptiveSkipCachesMode() ==
+                            AdaptiveSkipCachesMode::SkipCachesForced;
+        const bool caches_on = skipcache.GetState(CacheId::PrepareRt) == State::Enabled &&
+                               skipcache.GetState(CacheId::BeginRendering) == State::Enabled &&
+                               skipcache.GetState(CacheId::DynState) == State::Enabled;
+        if (!forced || !dyn_memo_enabled_ || br_readback_gate_ || !liverpool->IsGfxStampActive() ||
+            !caches_on) {
+            LOG_WARNING(Render_Vulkan,
+                        "draw_glue_memo needs adaptive_skipcaches_mode 2, dyn_state_memo, "
+                        "readback_linear_images off and an active register stamp; off");
+            glue_mode_ = 0;
+        }
+    }
     if (EmulatorSettings.IsPushVpMemo() && !push_vp_memo_) {
         LOG_WARNING(Render_Vulkan, "push_vp_memo needs adaptive_skipcaches_mode != 0; it is off");
     }
@@ -435,7 +456,7 @@ void Rasterizer::RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pi
     }
 }
 
-void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+bool Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     using VideoCore::Skipcache::CacheId;
     auto& skipcache = Skipcache::Framework::Instance();
     const bool probing = skipcache.Active() && skipcache.ShouldProbe(CacheId::PrepareRt);
@@ -464,7 +485,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             if (skipcache.MayConsume(CacheId::PrepareRt) &&
                 !skipcache.ShouldVerify(CacheId::PrepareRt)) {
                 RtMemoReplay();
-                return;
+                return glue_mode_ != 0;
             }
         }
     }
@@ -518,6 +539,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         }
         RtMemoVerifyPopulate(rt_would_hit, pipeline, rt_stamp, rt_tex_gen, rt_pipe_gen);
     }
+    // Computed only for the glue: a verified hit or a fresh populate leaves
+    // the memo describing this draw.
+    return glue_mode_ != 0 && probing && rt_memo_.valid && skipcache.MayConsume(CacheId::PrepareRt);
 }
 
 static std::pair<u32, u32> GetDrawOffsets(
@@ -586,11 +610,53 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         copy_scope.emplace(Core::Memory::Instance());
     }
 
-    PrepareRenderState(pipeline);
+    // draw_glue_memo entry term. The returns above leave a stale arm up
+    // soundly: the certificate is a state compare, and FilterDrawSlow's
+    // clears and resolves only move generations that are re-read live here.
+    const u64 gfx_stamp = liverpool->GetGfxStateStamp();
+    auto& gens = Skipcache::Framework::Instance().Gens();
+    bool glue = glue_.armed && gfx_stamp == glue_.gfx_stamp && pipeline == glue_.pipeline &&
+                rt_memo_.valid &&
+                gens.tex_gen.load(std::memory_order_acquire) == rt_memo_.tex_gen &&
+                gens.pipe_gen.load(std::memory_order_acquire) == rt_memo_.pipe_gen;
+    glue_.armed = false; // re-armed at the end; every early return leaves it down
+    const bool glue_shadow = glue_mode_ == 3;
+    glue_probes_ += glue_mode_ != 0;
+    bool rt_ok;
+    if (glue && !glue_shadow) {
+        RtMemoReplay();
+        rt_ok = true;
+    } else {
+        glue_entry_miss_ += glue_mode_ != 0 && !glue;
+        rt_ok = PrepareRenderState(pipeline);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
-    const RenderState& state = BeginRendering(pipeline);
+    // Post-bind term, read after BindResources: it can flush, register an
+    // image, transit a texture or observe a fault, and it resets the
+    // feedback-loop target flag at entry.
+    if (glue) {
+        const auto& c = br_cache_;
+        const bool bind_ok = c.valid && scheduler.CurrentTick() == c.token.tick &&
+                             gens.mem_gen.load(std::memory_order_acquire) == c.token.mem_gen &&
+                             gens.tex_gen.load(std::memory_order_acquire) == c.token.tex_gen &&
+                             gens.pipe_gen.load(std::memory_order_acquire) == c.token.pipe_gen &&
+                             gens.img_dirty_gen == c.token.img_dirty_gen &&
+                             gens.meta_gen == c.meta_gen && gens.layout_gen == c.layout_gen &&
+                             draw_samples_target_ == c.attachment_feedback_loop;
+        if (!bind_ok) {
+            ++glue_bind_miss_;
+            glue = false;
+        }
+    }
+    const RenderState* state;
+    if (glue && !glue_shadow) {
+        state = &BrReplay(pipeline);
+        glue_br_ok_ = true;
+    } else {
+        state = &BeginRendering(pipeline);
+    }
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     u32 first_index = 0;
@@ -600,8 +666,33 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     pipeline->BindResources({bind_writes_, bind_write_n_}, buffer_barriers, push_data,
                             bind_buffer_n_, bind_image_n_);
-    UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    // Dyn term, after the scope replay wrote attachment_feedback_loop.
+    if (glue) {
+        const u32 flags = 1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2);
+        const bool dyn_ok_term =
+            dyn_memo_.flags == flags &&
+            scheduler.GetDynamicState().InvalidateGen() == dyn_memo_.dyn_gen &&
+            gens.pipe_gen.load(std::memory_order_acquire) == dyn_memo_.pipe_gen;
+        if (!dyn_ok_term) {
+            ++glue_dyn_miss_;
+            glue = false;
+        }
+    }
+    bool dyn_ok;
+    if (glue && !glue_shadow) {
+        dyn_ok = true;
+    } else {
+        dyn_ok = UpdateDynamicState(pipeline, is_indexed);
+    }
+    scheduler.BeginRendering(*state);
+    if (glue_shadow && glue && !(rt_ok && glue_br_ok_ && dyn_ok)) {
+        ++glue_div_;
+    }
+    glue_.armed = glue_mode_ != 0 && rt_ok && glue_br_ok_ && dyn_ok;
+    glue_.gfx_stamp = gfx_stamp;
+    glue_.pipeline = pipeline;
+    glue_arms_ += glue_.armed;
+    glue_hits_ += glue;
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -707,6 +798,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         copy_scope.emplace(Core::Memory::Instance());
     }
 
+    // Its UpdateDynamicState can refill the memo with another is_indexed and
+    // pipeline, so the glue is disarmed rather than re-certified here.
+    glue_.armed = false;
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
         return;
@@ -1051,6 +1145,28 @@ void Rasterizer::OnSubmit() {
                              d(&Skipcache::CacheCounters::verify_diverged),
                              d(&Skipcache::CacheCounters::verify_aborted));
                     findimg_last_ = fc;
+                }
+                // draw_glue_memo: the glued draws count as probes and hits of
+                // the three caches they stood in for, folded once per window
+                // so probes= stays equal to draws; shadow mode ran the real
+                // probes and folds nothing.
+                if (glue_mode_ != 0) {
+                    if (glue_mode_ != 3) {
+                        for (const auto id :
+                             {Skipcache::CacheId::PrepareRt, Skipcache::CacheId::BeginRendering,
+                              Skipcache::CacheId::DynState}) {
+                            auto& ctr = skipcache.Counters(id);
+                            ctr.eligible += glue_hits_;
+                            ctr.hits += glue_hits_;
+                        }
+                    }
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] GLUE probes={} hits={} entry={} bind={} dyn={} arms={} "
+                             "div={} per300f",
+                             glue_probes_, glue_hits_, glue_entry_miss_, glue_bind_miss_,
+                             glue_dyn_miss_, glue_arms_, glue_div_);
+                    glue_probes_ = glue_hits_ = glue_entry_miss_ = glue_bind_miss_ =
+                        glue_dyn_miss_ = glue_arms_ = glue_div_ = 0;
                 }
                 // The render scope and render target caches have never had a
                 // reported hit rate; both are probed on the same draw entry.
@@ -2571,6 +2687,7 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
             ++ctr.hits;
             if (skipcache.MayConsume(CacheId::BeginRendering) &&
                 !skipcache.ShouldVerify(CacheId::BeginRendering)) {
+                glue_br_ok_ = true;
                 return BrReplay(pipeline);
             }
         }
@@ -2721,6 +2838,8 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
             BrPopulate(state, br_token, pipeline);
         }
     }
+    glue_br_ok_ = glue_mode_ != 0 && br_probing && br_cache_.valid &&
+                  skipcache.MayConsume(CacheId::BeginRendering);
     return state;
 }
 
@@ -2964,7 +3083,7 @@ bool Rasterizer::DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 r
     return true;
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) {
+bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) {
     using VideoCore::Skipcache::CacheId;
     // Null is the disabled path's stand-in: every dereference below sits under
     // probing or verifying, both false whenever it is null.
@@ -2997,7 +3116,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
             ++ctr.hits;
             verifying = skipcache->ShouldVerify(CacheId::DynState);
             if (skipcache->MayConsume(CacheId::DynState) && !verifying) {
-                return;
+                return glue_mode_ != 0;
             }
         }
     }
@@ -3034,6 +3153,8 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
                      pipeline,  flags,   pipeline->GetGraphicsKey().write_masks};
         skipcache->NotifyPopulated(CacheId::DynState);
     }
+    return glue_mode_ != 0 && probing && dyn_memo_.flags != 0 &&
+           skipcache->MayConsume(CacheId::DynState);
 }
 
 void Rasterizer::UpdateViewportScissorState() const {

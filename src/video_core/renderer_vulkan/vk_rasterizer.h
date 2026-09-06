@@ -123,13 +123,15 @@ public:
     }
 
 private:
-    void PrepareRenderState(const GraphicsPipeline* pipeline);
+    // Returns whether the memo it consumed or refilled may certify the next
+    // draw's glue (draw_glue_memo); false whenever the glue is off.
+    bool PrepareRenderState(const GraphicsPipeline* pipeline);
     const RenderState& BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
+    bool UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -193,7 +195,7 @@ private:
     };
     bool BrProbe(const VideoCore::Skipcache::DrawToken& token, const GraphicsPipeline* pipeline);
     bool BrGuardAttachment(const BrAttachmentGuard& g, VideoCore::Skipcache::CacheCounters& ctr);
-    const RenderState& BrReplay(const GraphicsPipeline* pipeline);
+    SHAD_FORCE_INLINE const RenderState& BrReplay(const GraphicsPipeline* pipeline);
     void BrVerify(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token);
     void BrPopulate(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token,
                     const GraphicsPipeline* pipeline);
@@ -322,7 +324,7 @@ private:
         u64 db_uid{};
     };
     bool RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u64 tex_gen, u64 pipe_gen);
-    void RtMemoReplay();
+    SHAD_FORCE_INLINE void RtMemoReplay();
     void RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pipeline, u64 reg_stamp,
                               u64 tex_gen, u64 pipe_gen);
     PrepareRtMemo rt_memo_{};
@@ -497,6 +499,29 @@ private:
     /// br_cache_.state or fresh_state_ (a flush inside the binds only clears
     /// valid), so a reference to either survives the binds.
     RenderState fresh_state_{};
+
+    // draw_glue_memo: one certificate over the three per-draw memos. Armed by
+    // a draw on which all three consumed or refilled their memo; the next
+    // draw with the same whole-file register stamp and pipeline, and the
+    // generations each memo keys on unchanged, replays all three without
+    // their probes. Every term is re-read live at the point the real probe
+    // would read it. Mode 3 is a shadow: the certificate is computed and
+    // compared against the real probes, which still run.
+    struct DrawGlueMemo {
+        u64 gfx_stamp{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        bool armed{};
+    };
+    DrawGlueMemo glue_{};
+    u32 glue_mode_{};
+    bool glue_br_ok_{};
+    u64 glue_probes_{};
+    u64 glue_hits_{};
+    u64 glue_entry_miss_{};
+    u64 glue_bind_miss_{};
+    u64 glue_dyn_miss_{};
+    u64 glue_arms_{};
+    u64 glue_div_{};
 };
 
 } // namespace Vulkan
