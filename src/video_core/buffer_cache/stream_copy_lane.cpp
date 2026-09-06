@@ -136,6 +136,10 @@ bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
     if (sleepers_.load(std::memory_order_relaxed) != 0) {
         published_.notify_all();
     }
+    // Workers read the next slot's seq on every wake, and a job's slot line
+    // is usually cold by the time the next Push lands (8192 slots x 32 B
+    // laps the L1). Pull it in for the write now, off the critical path.
+    __builtin_prefetch(std::addressof(slots_[(pos + 1) & (kRingSlots - 1)]), 1, 3);
     ++jobs_;
     bytes_ += size;
     return true;
