@@ -1229,6 +1229,8 @@ void Rasterizer::OnSubmit() {
                          "folded={} full={} direct={} lockskips={} per300f",
                          wr.binds, wr.fresh, wr.hits, wr.adds, wr.shrinks, wr.folds, wr.folded,
                          wr.full, wr.direct, wr.lockskips);
+                LOG_INFO(Render_Skipcache, "[SkipCache] GPURANGE live={} per300f",
+                         buffer_cache.GpuModifiedRangeCount());
             }
             const auto ds = buffer_cache.DrainDmaSyncStats();
             if (ds.calls) {

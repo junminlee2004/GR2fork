@@ -629,6 +629,11 @@ public:
         GpuRangeSetMutex::skips = 0;
         return out;
     }
+    /// GPU command thread: the interval count of the GPU-modified range set,
+    /// read by the GPURANGE line to bound the set before any container change.
+    u64 GpuModifiedRangeCount() const {
+        return gpu_modified_ranges.m_ranges_set.iterative_size();
+    }
 
 private:
     SplitRangeMap<BufferId> buffer_ranges;

@@ -776,13 +776,19 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
                 SubtractGpuModifiedRange(device_addr_out, range_size);
                 return;
             }
+            // A subtract from inside the walk erases the node the walk stands
+            // on; the pieces are collected and subtracted after it returns.
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 32> pieces;
             gpu_modified_ranges.ForEachInRange(
                 device_addr_out, range_size, [&](VAddr start, VAddr end) {
                     EmitUnownedPieces(start, end, owned, [&](VAddr piece_start, VAddr piece_end) {
                         add_download(piece_start, piece_end);
-                        SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
+                        pieces.emplace_back(piece_start, piece_end);
                     });
                 });
+            for (const auto& [piece_start, piece_end] : pieces) {
+                SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
+            }
         });
     if (total_size_bytes == 0) {
         join_empty_.fetch_add(1, std::memory_order_relaxed);
@@ -1002,13 +1008,19 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                 SubtractGpuModifiedRange(device_addr_out, range_size);
                 return;
             }
+            // A subtract from inside the walk erases the node the walk stands
+            // on; the pieces are collected and subtracted after it returns.
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 32> pieces;
             gpu_modified_ranges.ForEachInRange(
                 device_addr_out, range_size, [&](VAddr start, VAddr end) {
                     EmitUnownedPieces(start, end, owned, [&](VAddr piece_start, VAddr piece_end) {
                         add_download(piece_start, piece_end);
-                        SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
+                        pieces.emplace_back(piece_start, piece_end);
                     });
                 });
+            for (const auto& [piece_start, piece_end] : pieces) {
+                SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
+            }
         });
     if (total_size_bytes == 0) {
         return;
