@@ -308,6 +308,8 @@ public:
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
     u64 lru_id{};
+    // Written on the GPU thread by the consumed memo hit and the locked touch;
+    // read by TouchImageUnlocked from the guest-thread video-out registration too.
     mutable u64 lru_touch_tick{~u64{0}};
     u64 tick_accessed_last{};
     u64 hash{};

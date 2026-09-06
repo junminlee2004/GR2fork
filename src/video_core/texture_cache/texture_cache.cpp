@@ -51,6 +51,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       view_memo{EmulatorSettings.IsTextureViewMemo()},
       sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
+      findimg_touch_batch{EmulatorSettings.IsFindimgTouchBatch() && findimg_touch_lockfree},
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
       lru_log{EmulatorSettings.IsTextureLruLog()},
@@ -67,6 +68,11 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     if (EmulatorSettings.IsBindNoopMemo() && !bind_noop) {
         LOG_WARNING(Render_Vulkan,
                     "bind no-op memo needs texture_view_memo; the transit probe runs unchanged");
+    }
+    if (EmulatorSettings.IsFindimgTouchBatch() && !findimg_touch_batch) {
+        LOG_WARNING(Render_Vulkan,
+                    "batched image touches need findimg_touch_lockfree; the locked touch runs "
+                    "unchanged");
     }
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -689,9 +695,20 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 Image& image = slot_images[e.image_id];
                 image.tick_accessed_last = current_tick;
                 if (image.lru_touch_tick != gc_tick) {
-                    std::scoped_lock lock{mutex};
-                    TouchImage(image, e.image_id);
-                    ++findimg_touch_locks_;
+                    if (findimg_touch_batch) {
+                        // With batching the tick is stamped here and the log
+                        // entry lands in the flush.
+                        image.lru_touch_tick = gc_tick;
+                        touch_batch_[touch_batch_len_++] = e.image_id;
+                        ++findimg_touch_batched_;
+                        if (touch_batch_len_ == kTouchBatchCap) {
+                            FlushTouchBatch();
+                        }
+                    } else {
+                        std::scoped_lock lock{mutex};
+                        TouchImage(image, e.image_id);
+                        ++findimg_touch_locks_;
+                    }
                 }
                 ++findimg_consumed_;
             } else if (e.access_tick != current_tick || e.lru_tick != gc_tick) {
@@ -1779,6 +1796,9 @@ void TextureCache::RunGarbageCollector() {
         ++gc_tick;
     };
 
+    if (touch_batch_len_ != 0) {
+        FlushTouchBatch();
+    }
     if (lru_log) {
         // Compaction drops the tombstones and renumbers every live image;
         // the threshold keeps its cost to once per tens of frames.
@@ -1846,6 +1866,39 @@ SHAD_NO_INLINE void TextureCache::TouchImageSlowUnlocked(Image& image, ImageId i
     }
     std::scoped_lock lock{mutex};
     TouchImageSlow(image, id);
+}
+
+// Applies the touches a consumed hit deferred this tick. The tick is already
+// stamped on each image; an image freed by a guest unmap in between is
+// skipped, a reused slot gets a second same-tick entry the GC walk treats
+// alike. Same-tick memo-hit entries land after the FindImage-path entries;
+// eligibility is unchanged.
+SHAD_NO_INLINE void TextureCache::FlushTouchBatch() {
+    std::scoped_lock lock{mutex};
+    for (u32 i = 0; i < touch_batch_len_; ++i) {
+        const ImageId id = touch_batch_[i];
+        if (!slot_images.is_allocated(id)) {
+            continue;
+        }
+        Image& image = slot_images[id];
+        if (False(image.flags & ImageFlagBits::Registered)) {
+            continue;
+        }
+        if (lru_log) {
+            if (image.lru_log_pos == std::numeric_limits<u32>::max()) {
+                continue;
+            }
+            lru_log_[image.lru_log_pos].id = ImageId{};
+            ++lru_dead_;
+            image.lru_log_pos = static_cast<u32>(lru_log_.size());
+            lru_log_.push_back({id, gc_tick});
+            ++lru_log_pushes_;
+        } else {
+            lru_cache.Touch(image.lru_id, gc_tick);
+        }
+    }
+    touch_batch_len_ = 0;
+    ++findimg_touch_flushes_;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

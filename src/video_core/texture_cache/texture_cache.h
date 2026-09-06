@@ -503,6 +503,7 @@ private:
         TouchImageSlowUnlocked(image, id);
     }
     SHAD_NO_INLINE void TouchImageSlowUnlocked(Image& image, ImageId id);
+    SHAD_NO_INLINE void FlushTouchBatch();
 
     // Lock-free tier of UpdateImage: a clean, tracked image touched within the
     // interval proves the locked pass a no-op. Callers gate on image_fast_state.
@@ -610,6 +611,8 @@ public:
     struct FindTouchStats {
         u64 consumed;
         u64 locks;
+        u64 batched;
+        u64 flushes;
     };
     struct FindImageWayStats {
         u32 ways;
@@ -662,8 +665,10 @@ public:
         return out;
     }
     FindTouchStats DrainFindTouchStats() {
-        const FindTouchStats out{findimg_consumed_, findimg_touch_locks_};
-        findimg_consumed_ = findimg_touch_locks_ = 0;
+        const FindTouchStats out{findimg_consumed_, findimg_touch_locks_, findimg_touch_batched_,
+                                 findimg_touch_flushes_};
+        findimg_consumed_ = findimg_touch_locks_ = findimg_touch_batched_ = findimg_touch_flushes_ =
+            0;
         return out;
     }
     struct LruLogStats {
@@ -739,6 +744,7 @@ private:
     bool view_memo;              // latched once at construction
     bool sampler_lockfree;       // latched once at construction
     bool findimg_touch_lockfree; // latched once at construction
+    bool findimg_touch_batch;    // latched once at construction; needs findimg_touch_lockfree
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
     bool lru_log;                // latched once at construction
@@ -757,6 +763,14 @@ private:
     u64 findimg_touch_seq_{};
     u64 findimg_consumed_{};
     u64 findimg_touch_locks_{};
+    // Touches a consumed memo hit deferred this gc tick; recorded on the GPU
+    // thread, applied under the mutex by the flush before the image GC or
+    // when full.
+    static constexpr u32 kTouchBatchCap = 256;
+    std::array<ImageId, kTouchBatchCap> touch_batch_{};
+    u32 touch_batch_len_{};
+    u64 findimg_touch_batched_{};
+    u64 findimg_touch_flushes_{};
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;

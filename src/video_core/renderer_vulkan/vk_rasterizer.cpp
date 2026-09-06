@@ -1138,8 +1138,9 @@ void Rasterizer::OnSubmit() {
             }
             const auto ft = texture_cache.DrainFindTouchStats();
             if (ft.consumed) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] FINDTOUCH consumed={} locks={} per300f",
-                         ft.consumed, ft.locks);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] FINDTOUCH consumed={} locks={} batched={} flushes={} per300f",
+                         ft.consumed, ft.locks, ft.batched, ft.flushes);
             }
             if (const auto iu = texture_cache.DrainImageUpdateStats();
                 iu.fast || iu.relock || iu.full) {
