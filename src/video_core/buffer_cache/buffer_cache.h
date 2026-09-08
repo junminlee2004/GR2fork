@@ -4,7 +4,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -811,6 +813,34 @@ private:
     u64 dmasync_bytes_{};
     u64 dmasync_max_bytes_{};
     // Refault damping census, written by guest threads on the fault path.
+    // readback_wait_notify: a waiter blocks until a write-back clears the
+    // pages it faulted on. Polling cost the damping loop far more than the
+    // 50 us it asked for, because a sleep that short is not honoured on a
+    // loaded core; the generation plus condition variable wakes it exactly
+    // when the owner finishes.
+    bool wait_notify_{};
+    std::mutex writeback_cv_m_;
+    std::condition_variable writeback_cv_;
+    std::atomic<u64> writeback_gen_{};
+    void NotifyWriteBack() {
+        if (!wait_notify_) {
+            return;
+        }
+        {
+            std::lock_guard lk{writeback_cv_m_};
+            writeback_gen_.fetch_add(1, std::memory_order_release);
+        }
+        writeback_cv_.notify_all();
+    }
+    /// Blocks until a write-back moves the generation off gen_snapshot or the
+    /// timeout expires. The caller samples the generation before testing its
+    /// own predicate, so a write-back landing between the two cannot be lost.
+    void WaitWriteBack(u64 gen_snapshot, u64 timeout_us) {
+        std::unique_lock lk{writeback_cv_m_};
+        writeback_cv_.wait_for(lk, std::chrono::microseconds(timeout_us), [&] {
+            return writeback_gen_.load(std::memory_order_acquire) != gen_snapshot;
+        });
+    }
     alignas(64) std::atomic<u64> damp_entries_{};
     std::atomic<u64> damp_iters_{};
     std::atomic<u64> damp_stuck_{};

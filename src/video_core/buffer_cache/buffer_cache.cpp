@@ -61,6 +61,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
+    wait_notify_ = EmulatorSettings.IsReadbackWaitNotify();
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
@@ -431,9 +432,45 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                             share_fencewaits_.fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
-                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                        if (wait_notify_) {
+                            const u64 g = writeback_gen_.load(std::memory_order_acquire);
+                            if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
+                                break;
+                            }
+                            const u64 el2 = elapsed_ns();
+                            if (el2 >= kDampBudgetNs) {
+                                spin = 400;
+                                break;
+                            }
+                            WaitWriteBack(g, (kDampBudgetNs - el2) / 1000);
+                        } else {
+                            std::this_thread::sleep_for(std::chrono::microseconds(50));
+                        }
                         ++spin;
                     }
+                } else if (wait_notify_) {
+                    // Same 20 ms envelope as the poll loop below, charged from
+                    // the clock rather than counted in sleeps: the waiter wakes
+                    // when the owning write-back clears its pages.
+                    constexpr u64 kPollBudgetNs = 400 * 50'000;
+                    const auto t_poll = std::chrono::steady_clock::now();
+                    while (true) {
+                        const u64 g = writeback_gen_.load(std::memory_order_acquire);
+                        if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
+                            break;
+                        }
+                        const u64 el =
+                            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - t_poll)
+                                                 .count());
+                        if (el >= kPollBudgetNs) {
+                            spin = 400;
+                            break;
+                        }
+                        WaitWriteBack(g, (kPollBudgetNs - el) / 1000);
+                        ++spin;
+                    }
+                    spin = std::min<u64>(spin, 400);
                 } else {
                     for (;
                          spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size);
@@ -954,6 +991,8 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
     }
     ReleaseFaultStaging(std::move(job.staging));
+    // Every page this job cleared is one a damping waiter may be blocked on.
+    NotifyWriteBack();
 }
 
 std::unique_ptr<Buffer> BufferCache::AcquireFaultStaging(u64 size) {
