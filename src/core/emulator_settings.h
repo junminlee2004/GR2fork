@@ -732,6 +732,14 @@ struct GPUSettings {
     // write-back that clears its pages instead of polling every 50 us. The poll
     // overshoots several times over under load, which is what the stall cost.
     Setting<bool> readback_wait_notify{false};
+    // Size of the guest-memory window a read fault downloads, in KiB, rounded
+    // down to a power of two and clamped to 4..8192. Smaller means each fault
+    // copies and waits for less, at the cost of faulting more often.
+    Setting<u32> readback_window_kb{512};
+    // How long a faulting guest thread waits on the GPU fence before handing the
+    // job to the priority waiter, in microseconds. Only readback_offload_mode 1
+    // reads it. A short cap keeps the fence wait off the threads the game times.
+    Setting<u32> readback_bounded_wait_us{100000};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -877,6 +885,9 @@ struct GPUSettings {
             make_override<GPUSettings>("desc_delta_flat", &GPUSettings::desc_delta_flat),
             make_override<GPUSettings>("draw_glue_memo", &GPUSettings::draw_glue_memo),
             make_override<GPUSettings>("readback_wait_notify", &GPUSettings::readback_wait_notify),
+            make_override<GPUSettings>("readback_window_kb", &GPUSettings::readback_window_kb),
+            make_override<GPUSettings>("readback_bounded_wait_us",
+                                       &GPUSettings::readback_bounded_wait_us),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -908,7 +919,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, readback_wait_notify
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, readback_wait_notify, readback_window_kb, readback_bounded_wait_us
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1260,6 +1271,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaFlat, desc_delta_flat)
     SETTING_FORWARD(m_gpu, DrawGlueMemo, draw_glue_memo)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWaitNotify, readback_wait_notify)
+    SETTING_FORWARD(m_gpu, ReadbackWindowKb, readback_window_kb)
+    SETTING_FORWARD(m_gpu, ReadbackBoundedWaitUs, readback_bounded_wait_us)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

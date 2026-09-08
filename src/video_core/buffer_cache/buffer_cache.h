@@ -819,6 +819,10 @@ private:
     // loaded core; the generation plus condition variable wakes it exactly
     // when the owner finishes.
     bool wait_notify_{};
+    // Fault window, and the cap on the faulting thread's fence wait. Both are
+    // latched once: a fault reads them on the guest thread's critical path.
+    u64 readback_window_{};
+    u64 bounded_wait_ns_{};
     std::mutex writeback_cv_m_;
     std::condition_variable writeback_cv_;
     std::atomic<u64> writeback_gen_{};

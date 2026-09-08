@@ -62,6 +62,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
     wait_notify_ = EmulatorSettings.IsReadbackWaitNotify();
+    // AlignDown masks, so the window has to be a power of two.
+    readback_window_ = std::bit_floor(
+        std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
+    bounded_wait_ns_ = u64{EmulatorSettings.GetReadbackBoundedWaitUs()} * 1000;
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
@@ -508,8 +512,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             }
             const u64 t0 = Common::FencedRDTSC();
             if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
-                constexpr u64 BoundedWaitNs = 100'000'000;
-                if (!scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, BoundedWaitNs)) {
+                if (!scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, bounded_wait_ns_)) {
                     offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0,
                                                std::memory_order_relaxed);
                     auto deferred = std::make_unique<FaultDownloadJob>(std::move(job));
@@ -558,7 +561,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
         // is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
+        const u64 WindowSize = readback_window_;
         const VAddr buf_start = buffer.CpuAddr();
         const VAddr buf_end = buf_start + buffer.SizeBytes();
         VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
@@ -775,7 +778,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
                                        bool is_write) {
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
     // Window widening mirrors the synchronous form above.
-    constexpr u64 WindowSize = 512_KB;
+    const u64 WindowSize = readback_window_;
     const VAddr buf_start = buffer.CpuAddr();
     const VAddr buf_end = buf_start + buffer.SizeBytes();
     VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
