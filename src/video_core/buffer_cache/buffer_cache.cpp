@@ -392,29 +392,58 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     FoldPendingRanges(device_addr, size);
+    // The staging ring is a fixed size and Map returns null rather than growing,
+    // so collection stops at its capacity. Islands past that point keep their
+    // range-set entries and their tracker bits, and the next fault downloads
+    // them; covered_end is how far the unmark below may reach. Whole-buffer
+    // windows (readback_batching_enabled, and the buffer-join download) are
+    // what make this reachable.
+    bool ring_full = false;
+    VAddr covered_end = device_addr;
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+            if (ring_full) {
+                return;
+            }
             const VAddr buffer_addr = buffer.CpuAddr();
+            bool truncated = false;
             const auto add_download = [&](VAddr start, VAddr end) {
                 const u64 new_offset = start - buffer_addr;
                 const u64 new_size = end - start;
+                // Align up to avoid cache conflicts
+                constexpr u64 align = 64ULL;
+                constexpr u64 mask = ~(align - 1ULL);
+                const u64 padded = (new_size + align - 1) & mask;
+                if (ring_full || total_size_bytes + padded > DownloadBufferSize) {
+                    ring_full = true;
+                    truncated = true;
+                    return;
+                }
                 copies.push_back(vk::BufferCopy{
                     .srcOffset = new_offset,
                     .dstOffset = total_size_bytes,
                     .size = new_size,
                 });
-                // Align up to avoid cache conflicts
-                constexpr u64 align = 64ULL;
-                constexpr u64 mask = ~(align - 1ULL);
-                total_size_bytes += (new_size + align - 1) & mask;
+                total_size_bytes += padded;
+                covered_end = std::max<VAddr>(covered_end, end);
             };
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-            SubtractGpuModifiedRange(device_addr_out, range_size);
+            // A partially collected range stays dirty: re-downloading an island
+            // is harmless, dropping one is not.
+            if (!truncated) {
+                SubtractGpuModifiedRange(device_addr_out, range_size);
+            }
         });
     if (total_size_bytes == 0) {
         return;
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
+    if (download == nullptr) [[unlikely]] {
+        // Collection is capped at the ring, so this cannot fire; bail rather
+        // than record a copy past the end of the staging buffer.
+        LOG_ERROR(Render_Vulkan, "Readback staging map failed for {} bytes", total_size_bytes);
+        return;
+    }
     for (auto& copy : copies) {
         // Modify copies to have the staging offset in mind
         copy.dstOffset += offset;
@@ -454,7 +483,9 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
                                     copy.size);
         }
         hold.reset();
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        // Only as far as the copies reached: an island the ring could not take
+        // is still GPU-dirty and must keep its bits.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, covered_end - device_addr);
     };
     if constexpr (async) {
         scheduler.DeferOperation(write_data);
