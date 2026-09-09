@@ -367,7 +367,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             window_start = buf_start;
             window_end = buf_end;
         }
-        DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
+        DownloadBufferMemory(buffer, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -387,7 +387,6 @@ inline void SpinRelax() {
 }
 } // namespace
 
-template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -487,15 +486,10 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         // is still GPU-dirty and must keep its bits.
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, covered_end - device_addr);
     };
-    if constexpr (async) {
-        scheduler.DeferOperation(write_data);
-    } else {
-        const u64 t0 = Common::FencedRDTSC();
-        scheduler.Finish();
-        scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer,
-                             Common::FencedRDTSC() - t0);
-        write_data();
-    }
+    const u64 t0 = Common::FencedRDTSC();
+    scheduler.Finish();
+    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, Common::FencedRDTSC() - t0);
+    write_data();
 }
 
 void BufferCache::BindVertexBuffers(
@@ -2066,26 +2060,9 @@ void BufferCache::RunGarbageCollector() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
-    if (total_used_memory < trigger_gc_memory) {
-        return;
-    }
-    const bool aggressive = total_used_memory >= critical_gc_memory;
-    const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
-    int max_deletions = aggressive ? 64 : 32;
-    const auto clean_up = [&](BufferId buffer_id) {
-        if (max_deletions == 0) {
-            return;
-        }
-        --max_deletions;
-        Buffer& buffer = slot_buffers[buffer_id];
-        // InvalidateMemory(buffer.CpuAddr(), buffer.SizeBytes());
-        DownloadBufferMemory<true>(buffer, buffer.CpuAddr(), buffer.SizeBytes());
-        // Nothing invokes clean_up today. Wiring it up requires a skip cache
-        // mem_gen bump alongside this CPU-dirty marking, which the sync-noop
-        // and bind memos rely on.
-        memory_tracker->MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
-        DeleteBuffer(buffer_id);
-    };
+    // The buffer eviction that used to follow here was never wired up: it
+    // deleted a buffer whose deferred write-back still referenced it, so it
+    // is gone rather than left as a trap. Only the tick advances.
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
