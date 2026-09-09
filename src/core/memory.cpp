@@ -33,6 +33,7 @@ MemoryManager::MemoryManager() {
     }
     RefreshVmaBounds();
     backing_write_memo_ = EmulatorSettings.IsBackingWriteMemo();
+    backing_diff_mode_ = std::min<u32>(EmulatorSettings.GetReadbackWritebackDiff(), 2u);
 
     // Pre-initialize direct backing
     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
@@ -225,6 +226,67 @@ struct BackingWriteMemo {
 };
 static constinit thread_local BackingWriteMemo tls_backing_write_memo{};
 
+// readback_writeback_diff census, per thread like the write memo: the readback
+// write-back runs on the GPU command thread, which is also where it is drained.
+struct BackingDiffCensus {
+    u64 islands{};
+    u64 allsame{};
+    u64 chunks{};
+    u64 same{};
+    u64 same_bytes{};
+    u64 copy_bytes{};
+    u64 cmp_bytes{};
+};
+static constinit thread_local BackingDiffCensus tls_backing_diff{};
+
+// The store of a backing write. Under readback_writeback_diff, an island of at
+// least one chunk is compared against the backing a chunk at a time and the
+// chunks that already match are not stored; the first mismatch ends the
+// comparing and the remainder copies straight. Skipping is exact, not a
+// heuristic: a chunk is skipped only after memcmp found every byte equal to
+// what memcpy would have written, so the backing ends bit-identical either
+// way. The compare reads the private backing view, never the guest VA, so it
+// cannot trip a read watcher. Mode 1 keeps the identical store and only
+// counts, which measures the redundant fraction with no behaviour change. The
+// size gate keeps the 4-8 byte fence and label writes on the plain path.
+static void WriteBackingBytes(u8* dst, const u8* src, u64 size, u32 mode) {
+    constexpr u64 kChunk = 4096;
+    if (mode == 0 || size < kChunk) {
+        std::memcpy(dst, src, size);
+        return;
+    }
+    auto& c = tls_backing_diff;
+    ++c.islands;
+    bool all_same = true;
+    u64 off = 0;
+    while (off < size) {
+        const u64 n = std::min<u64>(kChunk, size - off);
+        ++c.chunks;
+        c.cmp_bytes += n;
+        if (std::memcmp(dst + off, src + off, n) == 0) {
+            ++c.same;
+            c.same_bytes += n;
+            off += n;
+            continue;
+        }
+        all_same = false;
+        if (mode == 2) {
+            // First mismatch: copy the rest straight and stop comparing.
+            std::memcpy(dst + off, src + off, size - off);
+            c.copy_bytes += size - off;
+            off = size;
+            break;
+        }
+        off += n;
+    }
+    c.allsame += all_same;
+    if (mode == 1) {
+        // Census only: the store this mode exists to measure still happens.
+        std::memcpy(dst, src, size);
+        c.copy_bytes += size;
+    }
+}
+
 static std::atomic<BackingWriteObserver> g_backing_observer{nullptr};
 static std::atomic<void*> g_backing_observer_user{nullptr};
 
@@ -360,7 +422,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 virtual_addr + size <= e.end) {
                 ++memo.hits;
                 memo.hit_bytes += size;
-                std::memcpy(e.backing + (virtual_addr - e.base), data, size);
+                WriteBackingBytes(e.backing + (virtual_addr - e.base), static_cast<const u8*>(data),
+                                  size, backing_diff_mode_);
                 return true;
             }
         }
@@ -415,12 +478,20 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                     ++memo.multi;
                 }
             }
-            memcpy(backing, data, copy_size);
+            WriteBackingBytes(backing, static_cast<const u8*>(data), copy_size, backing_diff_mode_);
             size -= copy_size;
         }
     }
 
     return true;
+}
+
+MemoryManager::BackingDiffStats MemoryManager::DrainBackingDiffStats() {
+    auto& c = tls_backing_diff;
+    const BackingDiffStats out{c.islands,    c.allsame,    c.chunks,   c.same,
+                               c.same_bytes, c.copy_bytes, c.cmp_bytes};
+    c = BackingDiffCensus{};
+    return out;
 }
 
 MemoryManager::BackingWriteStats MemoryManager::DrainBackingWriteStats() {

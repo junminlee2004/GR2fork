@@ -1086,6 +1086,15 @@ void Rasterizer::OnSubmit() {
                          "per300f",
                          bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
             }
+            if (const auto bd = Core::MemoryManager::DrainBackingDiffStats(); bd.islands) {
+                // same/chunks is the redundant fraction; mode 1 reports it with
+                // the store still in place, mode 2 skips it.
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] WBDIFF islands={} allsame={} chunks={} same={} sameKiB={} "
+                         "copyKiB={} cmpKiB={} per300f",
+                         bd.islands, bd.allsame, bd.chunks, bd.same, bd.same_bytes >> 10,
+                         bd.copy_bytes >> 10, bd.cmp_bytes >> 10);
+            }
             pipeline_cache.DumpColorMaskStats(
                 scheduler.GetDynamicState().DrainColorWriteMaskSkips());
             pipeline_cache.DumpKeyReuseStats();

@@ -310,6 +310,17 @@ public:
     };
     /// Returns and resets the calling thread's backing write memo counters.
     static BackingWriteStats DrainBackingWriteStats();
+    struct BackingDiffStats {
+        u64 islands;
+        u64 allsame;
+        u64 chunks;
+        u64 same;
+        u64 same_bytes;
+        u64 copy_bytes;
+        u64 cmp_bytes;
+    };
+    /// Returns and resets the calling thread's readback_writeback_diff census.
+    static BackingDiffStats DrainBackingDiffStats();
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -413,6 +424,7 @@ private:
     /// shared lock may cache lookups against it; see CopySparseMemory.
     u64 vma_generation{1};
     bool backing_write_memo_{};
+    u32 backing_diff_mode_{};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};
