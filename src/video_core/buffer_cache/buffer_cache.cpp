@@ -93,7 +93,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
-    memory_tracker->SetDeferReadRelease(EmulatorSettings.IsDeferredReadRelease());
+    defer_read_release_ = EmulatorSettings.IsDeferredReadRelease();
+    memory_tracker->SetDeferReadRelease(defer_read_release_);
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -621,7 +622,9 @@ void EmitUnownedPieces(VAddr start, VAddr end, std::span<const std::pair<VAddr, 
 // never grows beyond the union of the islands.
 class PendingUnmark {
 public:
-    explicit PendingUnmark(MemoryTracker& tracker_) : tracker{tracker_} {}
+    /// defer is only legal when the caller drains before it returns.
+    explicit PendingUnmark(MemoryTracker& tracker_, bool defer_ = false)
+        : tracker{tracker_}, defer{defer_} {}
 
     void Add(VAddr addr, u64 size) {
         const bool adjacent = end != start && addr >= end &&
@@ -636,7 +639,11 @@ public:
 
     void Flush() {
         if (end != start) {
-            tracker.UnmarkRegionAsGpuModified(start, end - start);
+            if (defer) {
+                tracker.UnmarkRegionAsGpuModifiedDeferred(start, end - start);
+            } else {
+                tracker.UnmarkRegionAsGpuModified(start, end - start);
+            }
             start = 0;
             end = 0;
         }
@@ -644,6 +651,7 @@ public:
 
 private:
     MemoryTracker& tracker;
+    bool defer = false;
     VAddr start = 0;
     VAddr end = 0;
 };
@@ -945,7 +953,8 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     // pages: the veto branch below, and the CPU mark at the end (marking with
     // GPU bits still set would ask for a write-only page, which Protect()
     // rejects).
-    PendingUnmark pending{*memory_tracker};
+    // Deferred: DrainPendingReadReleases below settles them before returning.
+    PendingUnmark pending{*memory_tracker, defer_read_release_};
     bool vetoed_any = false;
     for (const auto& copy : job.copies) {
         const VAddr copy_device_addr = job.buffer_base + copy.srcOffset;

@@ -851,6 +851,7 @@ private:
     // loaded core; the generation plus condition variable wakes it exactly
     // when the owner finishes.
     bool wait_notify_{};
+    bool defer_read_release_{};
     u64 rrel_drains_{};
     u64 rrel_regions_{};
     u64 rrel_pages_{};

@@ -208,10 +208,23 @@ public:
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::GPU, false>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
+    /// As above, but under deferred_read_release the read-watcher release is
+    /// left to ReleasePendingReadWatchers. ONLY for callers that drain before
+    /// returning: an undrained pending release leaves the page unreadable, and
+    /// the guest then refaults on it without end.
+    void UnmarkRegionAsGpuModifiedDeferred(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size,
                             [this](RegionManager* manager, u64 offset, size_t size) {
                                 std::scoped_lock lk{manager->lock};
                                 const bool was_pending = manager->read_release_pending_;
-                                manager->template ChangeRegionState<Type::GPU, false>(
+                                manager->template ChangeRegionState<Type::GPU, false, true>(
                                     manager->GetCpuAddr() + offset, size);
                                 if (manager->read_release_pending_ && !was_pending) {
                                     pending_read_releases_.push_back(manager);

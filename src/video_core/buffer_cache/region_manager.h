@@ -82,7 +82,11 @@ public:
      * @param dirty_addr    Base address to mark or unmark as modified
      * @param size          Size in bytes to mark or unmark as modified
      */
-    template <Type type, bool enable>
+    /// DeferRelease is opt-in per CALL SITE, never a global mode: only an
+    /// unmark whose caller drains afterwards may leave a release pending. A
+    /// pending release keeps the page unreadable, so an undrained one refaults
+    /// the guest forever.
+    template <Type type, bool enable, bool DeferRelease = false>
     /// Returns whether any bit changed.
     bool ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
         RENDERER_TRACE;
@@ -147,7 +151,7 @@ public:
                     u32 pages = 0;
                     ArmReadWatchers(pages);
                 }
-            } else if (defer_read_release_) {
+            } else if (DeferRelease && defer_read_release_) {
                 read_release_pending_ = true;
             } else {
                 u32 pages = 0;
