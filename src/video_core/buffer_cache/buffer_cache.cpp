@@ -636,8 +636,12 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         return;
     }
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), regions);
+    // Flush and wait rather than Finish, which would count this wait under
+    // the Finish site as well.
+    const u64 tick = scheduler.CurrentTick();
+    scheduler.Flush();
     const u64 t0 = Common::FencedRDTSC();
-    scheduler.Finish();
+    scheduler.Wait(tick);
     scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, Common::FencedRDTSC() - t0);
     write_islands(0, copies.size());
     // Only as far as the copies reached: an island the ring could not take
