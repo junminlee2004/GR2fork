@@ -87,6 +87,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
     memory_tracker->SetGpuSummary(EmulatorSettings.IsTrackerGpuSummary());
     copy_merge_gap_ = EmulatorSettings.GetReadbackCopyMergeGap();
+    drain_chunks_ = std::min<u32>(EmulatorSettings.GetReadbackDrainChunks(), 4u);
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -536,15 +537,17 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     // The transfer takes the merged extents; the write-back below still
     // iterates the exact islands (copies), never regions.
     DEBUG_ASSERT(copies.size() >= regions.size());
-    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), regions);
-    const auto write_data = [&]() {
-        auto* memory = Core::Memory::Instance();
+    auto* memory = Core::Memory::Instance();
+    // Writes back the islands [first, last) from staging. The hold is taken
+    // per call, never across a fence wait: a guest thread that needs the map
+    // must not queue behind the GPU.
+    const auto write_islands = [&](size_t first, size_t last) {
         std::optional<Core::MemoryManager::GuestCopyScope> hold;
         if (writeback_hold_) {
             hold.emplace(memory);
-            ++writeback_loops_;
         }
-        for (const auto& copy : copies) {
+        for (size_t i = first; i < last; ++i) {
+            const auto& copy = copies[i];
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
             ++writeback_islands_;
@@ -552,15 +555,94 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
         }
-        hold.reset();
+    };
+    if (writeback_hold_) {
+        ++writeback_loops_;
+    }
+    // readback_drain_chunks: the drain is serial today, one submit, one fence
+    // wait with the ring at zero, then the whole write-back. Nothing forces
+    // that order once the GPU has finished chunk c: its islands can be written
+    // back while the GPU copies chunk c+1. The copy list is split by staging
+    // bytes at region boundaries, each chunk gets its own submission and tick,
+    // and the waits interleave with the write-backs. The pre-barrier rides the
+    // first chunk only: its scopes span submission order on the queue, so the
+    // later chunks' transfers are already inside it. The tracker unmark still
+    // happens exactly once, after the last chunk's bytes are in guest backing,
+    // so no read watcher is released before its data has landed.
+    const u32 chunks = std::min<u32>(drain_chunks_, static_cast<u32>(regions.size()));
+    if (chunks >= 2) {
+        boost::container::small_vector<size_t, 5> region_at;
+        boost::container::small_vector<size_t, 5> island_at;
+        boost::container::small_vector<u64, 4> ticks;
+        region_at.push_back(0);
+        for (u32 c = 1; c < chunks; ++c) {
+            // The first region whose staging start crosses this chunk's share.
+            const u64 target = offset + total_size_bytes * c / chunks;
+            size_t r = region_at.back() + 1;
+            while (r < regions.size() && regions[r].dstOffset < target) {
+                ++r;
+            }
+            region_at.push_back(std::min<size_t>(r, regions.size()));
+        }
+        region_at.push_back(regions.size());
+        for (u32 c = 0; c <= chunks; ++c) {
+            const size_t r = region_at[c];
+            if (r >= regions.size()) {
+                island_at.push_back(copies.size());
+                continue;
+            }
+            // An island lies inside exactly one region and both lists ascend,
+            // so the split falls before the first island of that region.
+            size_t i = c == 0 ? 0 : island_at.back();
+            while (i < copies.size() && copies[i].dstOffset < regions[r].dstOffset) {
+                ++i;
+            }
+            island_at.push_back(i);
+        }
+        for (u32 c = 0; c < chunks; ++c) {
+            const size_t r0 = region_at[c];
+            const size_t r1 = region_at[c + 1];
+            if (r0 == r1) {
+                ticks.push_back(ticks.empty() ? scheduler.CurrentTick() : ticks.back());
+                continue;
+            }
+            const auto chunk_cmdbuf = scheduler.CommandBuffer();
+            chunk_cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(),
+                                    vk::ArrayProxy<const vk::BufferCopy>(static_cast<u32>(r1 - r0),
+                                                                         regions.data() + r0));
+            ticks.push_back(scheduler.CurrentTick());
+            scheduler.Flush();
+        }
+        // The staging range was stamped with the first chunk's tick at commit;
+        // hold it until the last chunk has written it.
+        download_buffer.DeferLastCommit(ticks.back());
+        ++dlpipe_loops_;
+        dlpipe_chunks_ += chunks;
+        for (u32 c = 0; c < chunks; ++c) {
+            const u64 blocked =
+                scheduler.WaitTagged(ticks[c], Vulkan::Scheduler::WaitSite::DownloadBuffer);
+            if (c == 0) {
+                dlpipe_wait_first_ += blocked;
+            } else {
+                dlpipe_wait_rest_ += blocked;
+            }
+            const u64 t0 = Common::FencedRDTSC();
+            write_islands(island_at[c], island_at[c + 1]);
+            dlpipe_copy_ += Common::FencedRDTSC() - t0;
+        }
         // Only as far as the copies reached: an island the ring could not take
         // is still GPU-dirty and must keep its bits.
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, covered_end - device_addr);
-    };
+        return;
+    }
+    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), regions);
     const u64 t0 = Common::FencedRDTSC();
     scheduler.Finish();
     scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, Common::FencedRDTSC() - t0);
-    write_data();
+    write_islands(0, copies.size());
+    // Only as far as the copies reached: an island the ring could not take
+    // is still GPU-dirty and must keep its bits.
+    memory_tracker->UnmarkRegionAsGpuModified(device_addr, covered_end - device_addr);
 }
 
 void BufferCache::BindVertexBuffers(

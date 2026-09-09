@@ -238,12 +238,28 @@ public:
             if (last.tick == scheduler->CurrentTick()) {
                 offset += mapped_size;
                 last.upper_bound = offset;
+                last_commit_bound_ = offset;
                 return;
             }
         }
         CommitSlow();
     }
     void CommitSlow();
+    /// Holds the range the last Commit covered until a later tick. A commit
+    /// whose GPU writes are split across several submissions is stamped with
+    /// the first one's tick, and the ring would hand the range out again as
+    /// soon as that tick retired while a later chunk was still writing it.
+    /// The watch is found by its bound, so a wrap in between cannot mislead it.
+    void DeferLastCommit(u64 tick) {
+        for (auto* list : {&current_watches, &previous_watches}) {
+            for (auto& w : *list) {
+                if (w.upper_bound == last_commit_bound_) {
+                    w.tick = std::max<u64>(w.tick, tick);
+                    return;
+                }
+            }
+        }
+    }
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
@@ -324,6 +340,7 @@ private:
     u64 mapped_size{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
+    u64 last_commit_bound_{};
     std::optional<size_t> invalidation_mark;
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
