@@ -62,6 +62,8 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
+    /// End-of-shader GDS store of one dword to guest memory.
+    void GdsStore(VAddr address, u32 gds_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
     void ProcessDownloadImages();
@@ -361,6 +363,11 @@ private:
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
     bool deferred_read_arm_{};
+    // gds_store_copy, and the census of the stores either way.
+    bool gds_store_copy_{};
+    u64 gdseos_events_{};
+    u64 gdseos_copies_{};
+    u64 gdseos_wait_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
