@@ -739,6 +739,13 @@ struct GPUSettings {
     // How long a faulting guest thread waits on the GPU fence before handing the
     // job to the priority waiter, in microseconds. Only readback_offload_mode 1
     // reads it. A short cap keeps the fence wait off the threads the game times.
+    // KNOWN BAD: 1500 crashes (2026-09-09). The default is high enough that the
+    // hand-off branch effectively never fires, so any low value runs a path that
+    // has had almost no exposure. ReleaseFaultStaging states its safety argument
+    // as "the faulting thread waited out the tick", which is exactly the
+    // invariant that branch breaks, and it frees the staging outright when the
+    // pool is full or the buffer exceeds 16 MB - which whole-buffer staging does
+    // under readback_batching_enabled. Fix the hand-off before lowering this.
     Setting<u32> readback_bounded_wait_us{100000};
     // Release the read watchers of a finished download once per region instead of
     // once per island. Each per-island release is its own mprotect, and every
