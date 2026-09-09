@@ -256,33 +256,43 @@ private:
     u64 bindpf_backing_{};
     // bind_write_plan: the mode, this bind's verdicts, and the write list the
     // pipeline is handed (the plan's on a hit, the rebuilt one otherwise).
+    vk::WriteDescriptorSet* bind_writes_{};
+    u32 bind_write_n_{};
+    // Bind prologue hot line. BindResources reads or writes every one of
+    // these in its first instructions, 9832 times a frame; scattered, they
+    // touched nine lines of this object, and the two counters sat at +0x978
+    // and +0x980 so the fused 16-byte update straddled a line boundary - the
+    // instruction after that store carried a quarter of the function's
+    // cycles. Declaration order is layout order: the counter pair leads, so
+    // it is 16-byte aligned, and the whole set fits one line with room over.
+    alignas(64) u64 bindplan_binds_{};
+    u64 bindplan_hits_{};
+    u16* image_hint_cur_{};
+    u16* image_hint_end_{};
+    u32 buffer_info_n_{};
     u32 bind_write_plan_{};
     bool plan_hit_{};
     bool plan_rejected_{};
-    vk::WriteDescriptorSet* bind_writes_{};
-    u32 bind_write_n_{};
+    bool findimg_hint_{};
+    bool bind_noop_{};
+    bool memo_first_{};
+    bool draw_samples_target_{};
+    bool bind_lean_{};
+    static_assert(alignof(u64) == 8);
     // The info array extents the bind filled, handed to the delta probe.
     u32 bind_buffer_n_{};
     u32 bind_image_n_{};
     bool desc_delta_flat_{};
     u64 bindplan_flat_{};
-    u64 bindplan_binds_{};
-    u64 bindplan_hits_{};
     u64 bindplan_builds_{};
     u64 bindplan_dyn_{};
     u64 bindplan_defer_{};
     u64 bindplan_mismatch_{};
-    bool bind_noop_{};
-    bool memo_first_{};
+    u64 bindlean_primes_{};
+    u64 bindlean_full_{};
     // findimg_slot_hint: the bound pipeline's hint cursor for BindTextures,
     // both null when off. Every binding ordinal consumes one slot, rejected
     // or not, so the ordinals stay stable from the first bind.
-    bool bind_lean_{};
-    u64 bindlean_primes_{};
-    u64 bindlean_full_{};
-    bool findimg_hint_{};
-    u16* image_hint_cur_{};
-    u16* image_hint_end_{};
     void SkipImageHints(size_t n) {
         image_hint_cur_ +=
             std::min<size_t>(n, static_cast<size_t>(image_hint_end_ - image_hint_cur_));
@@ -450,7 +460,6 @@ private:
     static_assert(Shader::NUM_BUFFERS <= 64, "the guest mask is one u64");
     std::array<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings{};
     std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos{};
-    u32 buffer_info_n_{};
 
     // Buffer bind scratch census. Five stores per stage, none per binding:
     // the per-stage binding count is the multiplier every estimate of this
@@ -478,7 +487,6 @@ private:
     u32 br_depth_bits_{};
     u32 br_color_bits_{};
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> br_color_samples_{};
-    bool draw_samples_target_{};
     // push_vp_memo census: probes, stamp hits and the summed high-water marks.
     u64 pushvp_probes_{};
     u64 pushvp_hits_{};
