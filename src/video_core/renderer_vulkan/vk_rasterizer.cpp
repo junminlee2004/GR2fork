@@ -123,7 +123,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
     deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
-    deferred_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
@@ -1043,33 +1042,10 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
-            const auto off = buffer_cache.DrainOffloadStats();
-            if (off.jobs || off.fallbacks) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} "
-                         "empty={} per300f",
-                         off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
-            }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,
                          wb.islands, wb.bytes >> 10);
-            }
-            if (const auto wo = buffer_cache.DrainWriteBackOffloadStats();
-                wo.guest + wo.prio + wo.gpucomm) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WBOFF guest={} prio={} gpucomm={} excluded={} copy_ms={} "
-                         "per300f",
-                         wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
-            }
-            if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "
-                         "helped_KiB={} owner_islands={} tail_us={} prio_posted={} "
-                         "prio_helped={} prio_KiB={} prio_late={} per300f",
-                         ws.shares, ws.joins, ws.fencewaits, ws.helped, ws.helped_bytes >> 10,
-                         ws.owner_islands, hz ? ws.tail_ns * 1000000 / hz : 0, ws.prio_posted,
-                         ws.prio_helped, ws.prio_bytes >> 10, ws.prio_late);
             }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
@@ -1380,15 +1356,6 @@ void Rasterizer::OnSubmit() {
                          "pages={} calls={} per300f",
                          ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
                          ra.regions, ra.pages, ra.calls);
-            }
-            if (const auto rr = buffer_cache.DrainReadReleaseStats(); rr.census_batches != 0) {
-                // calls is the mprotect count of the read-watcher release path,
-                // and each one broadcasts a TLB shootdown to every core.
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RREL batches={} calls={} runs={} pages={} drains={} "
-                         "regions={} drained={} per300f",
-                         rr.census_batches, rr.census_calls, rr.census_runs, rr.census_pages,
-                         rr.drains, rr.regions, rr.calls);
             }
             if (const auto tf = buffer_cache.DrainTrackerFastStats();
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
@@ -3048,7 +3015,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
-    if (deferred_read_arm_ || deferred_read_release_) {
+    if (deferred_read_arm_) {
         // Runs before the range leaves the map, so no later drain protects
         // memory the guest has given back.
         buffer_cache.DropPendingReadArms(addr, size);

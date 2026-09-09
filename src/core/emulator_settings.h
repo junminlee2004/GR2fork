@@ -47,16 +47,6 @@ enum GpuReadbacksMode : int {
     Precise,
 };
 
-// Guest read faults on GPU-written memory. OffloadFull moves the fence wait
-// onto the faulting guest thread. OffloadBounded caps that wait and hands the
-// write-back to the priority waiter on timeout, so a title whose GPU work
-// waits on writes the faulting thread makes after the read cannot deadlock.
-enum GpuReadbackOffloadMode : int {
-    OffloadDisabled,
-    OffloadBounded,
-    OffloadFull,
-};
-
 // Windows static guest red-zone protection
 NLOHMANN_JSON_SERIALIZE_ENUM(WindowsGuestRedZoneProtectionMode,
                              {{WindowsGuestRedZoneProtectionMode::Disabled, "Disabled"},
@@ -452,7 +442,6 @@ struct GPUSettings {
     // but the whole buffer is serviced by one GPU drain rather than one per
     // window, which is where the cost of readbacks actually is.
     Setting<bool> readback_batching_enabled{false};
-    Setting<u32> readback_offload_mode{GpuReadbackOffloadMode::OffloadDisabled};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -599,10 +588,6 @@ struct GPUSettings {
     // Compute runtime-info builds read; an equal snapshot restores the struct
     // and its fingerprint hash wherever the rebuild runs.
     Setting<bool> runtime_info_input_memo{false};
-    // Runs an offloaded readback's write-back on the thread that waited out its
-    // fence; the GPU command thread keeps the per-island verdict and the unmark.
-    // Islands another job still owns are left out of a new download.
-    Setting<bool> readback_writeback_offload{false};
     // Decides the stamp-keyed key reuse from a running XOR of the stage hashes
     // the resolve rewrites instead of re-reading the hash array it just stored.
     // Needs pipeline_key_stamp_reuse.
@@ -688,13 +673,6 @@ struct GPUSettings {
     // descriptors; the limit is inclusive, the older test kept such pipelines on the
     // descriptor heap.
     Setting<bool> push_desc_full_limit{false};
-    // Guest threads parked behind another thread's in-flight readback wait on its fence
-    // and copy its downloaded islands through a shared cursor instead of sleeping.
-    // Needs readback_writeback_offload.
-    Setting<bool> readback_writeback_share{false};
-    // The priority-ops thread joins every offloaded readback as a second copier once
-    // the fence signals; a late arrival copies nothing. Needs readback_writeback_share.
-    Setting<bool> readback_writeback_helper{false};
     // 0 off, 1 the per-pipeline descriptor write plan in place of the per-bind rebuild,
     // 2 or more the plan built and compared with the rebuilt list (shadow).
     Setting<u32> bind_write_plan{0};
@@ -728,29 +706,10 @@ struct GPUSettings {
     // leg lands), 3 shadow; values above 3 clamp to 3. Needs
     // adaptive_skipcaches_mode 2; the boot latch turns it off otherwise.
     Setting<u32> draw_glue_memo{0};
-    // A guest thread waiting on another thread's fault download blocks on the
-    // write-back that clears its pages instead of polling every 50 us. The poll
-    // overshoots several times over under load, which is what the stall cost.
-    Setting<bool> readback_wait_notify{false};
     // Size of the guest-memory window a read fault downloads, in KiB, rounded
     // down to a power of two and clamped to 4..8192. Smaller means each fault
     // copies and waits for less, at the cost of faulting more often.
     Setting<u32> readback_window_kb{512};
-    // How long a faulting guest thread waits on the GPU fence before handing the
-    // job to the priority waiter, in microseconds. Only readback_offload_mode 1
-    // reads it. A short cap keeps the fence wait off the threads the game times.
-    // KNOWN BAD: 1500 crashes (2026-09-09). The default is high enough that the
-    // hand-off branch effectively never fires, so any low value runs a path that
-    // has had almost no exposure. ReleaseFaultStaging states its safety argument
-    // as "the faulting thread waited out the tick", which is exactly the
-    // invariant that branch breaks, and it frees the staging outright when the
-    // pool is full or the buffer exceeds 16 MB - which whole-buffer staging does
-    // under readback_batching_enabled. Fix the hand-off before lowering this.
-    Setting<u32> readback_bounded_wait_us{100000};
-    // Release the read watchers of a finished download once per region instead of
-    // once per island. Each per-island release is its own mprotect, and every
-    // mprotect broadcasts a TLB shootdown to all cores. Needs readbacks_mode 2.
-    Setting<bool> deferred_read_release{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -799,8 +758,6 @@ struct GPUSettings {
                                        &GPUSettings::stream_buffer_size_mb),
             make_override<GPUSettings>("readback_batching_enabled",
                                        &GPUSettings::readback_batching_enabled),
-            make_override<GPUSettings>("readback_offload_mode",
-                                       &GPUSettings::readback_offload_mode),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -853,8 +810,6 @@ struct GPUSettings {
                                        &GPUSettings::vertex_input_lazy_desc),
             make_override<GPUSettings>("runtime_info_input_memo",
                                        &GPUSettings::runtime_info_input_memo),
-            make_override<GPUSettings>("readback_writeback_offload",
-                                       &GPUSettings::readback_writeback_offload),
             make_override<GPUSettings>("key_reuse_hash_diff", &GPUSettings::key_reuse_hash_diff),
             make_override<GPUSettings>("desc_delta_partial", &GPUSettings::desc_delta_partial),
             make_override<GPUSettings>("shader_params_memo_entries",
@@ -881,10 +836,6 @@ struct GPUSettings {
             make_override<GPUSettings>("br_mem_fast_state", &GPUSettings::br_mem_fast_state),
             make_override<GPUSettings>("desc_heap_recycle", &GPUSettings::desc_heap_recycle),
             make_override<GPUSettings>("push_desc_full_limit", &GPUSettings::push_desc_full_limit),
-            make_override<GPUSettings>("readback_writeback_share",
-                                       &GPUSettings::readback_writeback_share),
-            make_override<GPUSettings>("readback_writeback_helper",
-                                       &GPUSettings::readback_writeback_helper),
             make_override<GPUSettings>("bind_write_plan", &GPUSettings::bind_write_plan),
             make_override<GPUSettings>("findimg_memo_first", &GPUSettings::findimg_memo_first),
             make_override<GPUSettings>("vinput_fetch_key", &GPUSettings::vinput_fetch_key),
@@ -895,12 +846,7 @@ struct GPUSettings {
             make_override<GPUSettings>("bind_image_lean", &GPUSettings::bind_image_lean),
             make_override<GPUSettings>("desc_delta_flat", &GPUSettings::desc_delta_flat),
             make_override<GPUSettings>("draw_glue_memo", &GPUSettings::draw_glue_memo),
-            make_override<GPUSettings>("readback_wait_notify", &GPUSettings::readback_wait_notify),
             make_override<GPUSettings>("readback_window_kb", &GPUSettings::readback_window_kb),
-            make_override<GPUSettings>("readback_bounded_wait_us",
-                                       &GPUSettings::readback_bounded_wait_us),
-            make_override<GPUSettings>("deferred_read_release",
-                                       &GPUSettings::deferred_read_release),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -917,7 +863,7 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_A \
     window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload_mode, \
+    stream_buffer_size_mb, readback_batching_enabled, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -931,8 +877,8 @@ struct GPUSettings {
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front, \
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
-    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, readback_wait_notify, readback_window_kb, readback_bounded_wait_us, deferred_read_release
+    vertex_input_lazy_desc, runtime_info_input_memo, \
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, readback_window_kb
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1211,7 +1157,6 @@ public:
     SETTING_FORWARD(m_gpu, AdaptiveSkipCachesMode, adaptive_skipcaches_mode)
     SETTING_FORWARD(m_gpu, StreamBufferSizeMb, stream_buffer_size_mb)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
-    SETTING_FORWARD(m_gpu, ReadbackOffloadMode, readback_offload_mode)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
@@ -1250,7 +1195,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DescLayoutShare, desc_layout_share)
     SETTING_FORWARD_BOOL(m_gpu, VertexInputLazyDesc, vertex_input_lazy_desc)
     SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoInputMemo, runtime_info_input_memo)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackOffload, readback_writeback_offload)
     SETTING_FORWARD_BOOL(m_gpu, KeyReuseHashDiff, key_reuse_hash_diff)
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaPartial, desc_delta_partial)
     SETTING_FORWARD(m_gpu, ShaderParamsMemoEntries, shader_params_memo_entries)
@@ -1272,8 +1216,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BrMemFastState, br_mem_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, DescHeapRecycle, desc_heap_recycle)
     SETTING_FORWARD_BOOL(m_gpu, PushDescFullLimit, push_desc_full_limit)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackShare, readback_writeback_share)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackHelper, readback_writeback_helper)
     SETTING_FORWARD(m_gpu, BindWritePlan, bind_write_plan)
     SETTING_FORWARD_BOOL(m_gpu, FindimgMemoFirst, findimg_memo_first)
     SETTING_FORWARD_BOOL(m_gpu, VinputFetchKey, vinput_fetch_key)
@@ -1283,10 +1225,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BindImageLean, bind_image_lean)
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaFlat, desc_delta_flat)
     SETTING_FORWARD(m_gpu, DrawGlueMemo, draw_glue_memo)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackWaitNotify, readback_wait_notify)
     SETTING_FORWARD(m_gpu, ReadbackWindowKb, readback_window_kb)
-    SETTING_FORWARD(m_gpu, ReadbackBoundedWaitUs, readback_bounded_wait_us)
-    SETTING_FORWARD_BOOL(m_gpu, DeferredReadRelease, deferred_read_release)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

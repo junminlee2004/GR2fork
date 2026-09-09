@@ -37,53 +37,6 @@ public:
     void SetDeferReadArm(bool value) {
         defer_read_arm_ = value;
     }
-    void SetDeferReadRelease(bool value) {
-        defer_read_release_ = value;
-    }
-
-    struct ReadReleaseDrain {
-        u32 regions;
-        u32 pages;
-        u32 calls;
-    };
-
-    [[nodiscard]] bool HasPendingReadReleases() const noexcept {
-        return !pending_read_releases_.empty();
-    }
-
-    /// Releases the read watchers every unmark since the last drain left
-    /// pending, coalescing a download's islands into one masked update per
-    /// region. GPU command thread only, same constraint as the arm drain.
-    ReadReleaseDrain ReleasePendingReadWatchers() {
-        ReadReleaseDrain out{};
-        if (upload_walk_depth_ != 0) {
-            return out;
-        }
-        for (RegionManager* manager : pending_read_releases_) {
-            std::scoped_lock lk{manager->lock};
-            out.calls += manager->ReleaseReadWatchers(out.pages);
-            ++out.regions;
-        }
-        pending_read_releases_.clear();
-        return out;
-    }
-
-    struct ReadReleaseCensus {
-        u64 calls;
-        u64 pages;
-        u64 runs;
-        u64 batches;
-    };
-    /// The syscall count of the release path in either mode: the number this
-    /// whole mechanism exists to collapse.
-    static ReadReleaseCensus DrainReadReleaseCensus() {
-        return ReadReleaseCensus{
-            RegionManager::release_calls_.exchange(0, std::memory_order_relaxed),
-            RegionManager::release_pages_.exchange(0, std::memory_order_relaxed),
-            RegionManager::release_runs_.exchange(0, std::memory_order_relaxed),
-            RegionManager::release_batches_.exchange(0, std::memory_order_relaxed),
-        };
-    }
 
     struct ReadArmDrain {
         u32 regions;
@@ -212,23 +165,6 @@ public:
                                 std::scoped_lock lk{manager->lock};
                                 manager->template ChangeRegionState<Type::GPU, false>(
                                     manager->GetCpuAddr() + offset, size);
-                            });
-    }
-
-    /// As above, but under deferred_read_release the read-watcher release is
-    /// left to ReleasePendingReadWatchers. ONLY for callers that drain before
-    /// returning: an undrained pending release leaves the page unreadable, and
-    /// the guest then refaults on it without end.
-    void UnmarkRegionAsGpuModifiedDeferred(VAddr dirty_cpu_addr, u64 query_size) noexcept {
-        IteratePages<false>(dirty_cpu_addr, query_size,
-                            [this](RegionManager* manager, u64 offset, size_t size) {
-                                std::scoped_lock lk{manager->lock};
-                                const bool was_pending = manager->read_release_pending_;
-                                manager->template ChangeRegionState<Type::GPU, false, true>(
-                                    manager->GetCpuAddr() + offset, size);
-                                if (manager->read_release_pending_ && !was_pending) {
-                                    pending_read_releases_.push_back(manager);
-                                }
                             });
     }
 
@@ -931,7 +867,6 @@ private:
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         new_manager->defer_read_arm_ = defer_read_arm_;
-        new_manager->defer_read_release_ = defer_read_release_;
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
         // Returned directly: re-probing the lookup memo twenty instructions
@@ -941,11 +876,9 @@ private:
     }
 
     bool defer_read_arm_{};
-    bool defer_read_release_{};
     // Regions whose marks await their arm, and the depth of the walk that must
     // not be drained into. GPU-command-thread confined, like gpu_write_seq.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
-    boost::container::small_vector<RegionManager*, 16> pending_read_releases_;
     u32 upload_walk_depth_{};
     // Probe telemetry on a line of its own. Every bump here is the GPU
     // command thread's and is drained there, so these are plain adds.

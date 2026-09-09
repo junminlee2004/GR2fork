@@ -351,7 +351,6 @@ private:
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
     bool deferred_read_arm_{};
-    bool deferred_read_release_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
