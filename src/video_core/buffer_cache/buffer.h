@@ -174,6 +174,10 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
+    // Tick of the command buffer the last GPU write to this buffer was
+    // recorded into. A download whose tick is behind the open one has no
+    // writer pending in it.
+    u64 gpu_write_tick = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

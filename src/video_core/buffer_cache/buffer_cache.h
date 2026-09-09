@@ -463,6 +463,18 @@ public:
         dlpipe_loops_ = dlpipe_chunks_ = dlpipe_wait_first_ = dlpipe_wait_rest_ = dlpipe_copy_ = 0;
         return out;
     }
+    // Drains by where the drained buffer's last GPU write sits: 0 in the
+    // open command buffer, 1 submitted, 2 retired per the known GPU tick.
+    struct WriterSiteStats {
+        std::array<u64, 3> drains;
+        std::array<u64, 3> wait_ticks;
+    };
+    WriterSiteStats DrainWriterSiteStats() {
+        const WriterSiteStats out{rbsite_drains_, rbsite_wait_};
+        rbsite_drains_ = {};
+        rbsite_wait_ = {};
+        return out;
+    }
     struct CopyMergeStats {
         u64 downloads;
         u64 islands;
@@ -643,6 +655,8 @@ private:
     u64 dlpipe_wait_first_{};
     u64 dlpipe_wait_rest_{};
     u64 dlpipe_copy_{};
+    std::array<u64, 3> rbsite_drains_{};
+    std::array<u64, 3> rbsite_wait_{};
     // readback_copy_merge_gap, and its census. GPU command thread only.
     u64 copy_merge_gap_{};
     u64 dlmerge_downloads_{};

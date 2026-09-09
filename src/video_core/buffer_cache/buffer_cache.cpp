@@ -517,6 +517,15 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     dlmerge_regions_ += regions.size();
     dlmerge_gap_bytes_ += gap_bytes;
     download_buffer.Commit();
+    // Where this buffer's last GPU write sits when the drain starts: still in
+    // the open command buffer, so the fence has to cover the pending draws;
+    // submitted; or retired as far as the known tick says. The wait each
+    // class pays is what a copy submitted on its own could give back.
+    const u64 write_tick = buffer.gpu_write_tick;
+    const size_t writer_site = write_tick >= scheduler.CurrentTick()                ? 0
+                               : scheduler.GetMasterSemaphore()->IsFree(write_tick) ? 2
+                                                                                    : 1;
+    ++rbsite_drains_[writer_site];
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     // Synchronize prior GPU writes to this buffer before the transfer read
@@ -621,6 +630,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         for (u32 c = 0; c < chunks; ++c) {
             const u64 blocked =
                 scheduler.WaitTagged(ticks[c], Vulkan::Scheduler::WaitSite::DownloadBuffer);
+            rbsite_wait_[writer_site] += blocked;
             if (c == 0) {
                 dlpipe_wait_first_ += blocked;
             } else {
@@ -638,7 +648,9 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), regions);
     const u64 t0 = Common::FencedRDTSC();
     scheduler.Finish();
-    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, Common::FencedRDTSC() - t0);
+    const u64 blocked = Common::FencedRDTSC() - t0;
+    rbsite_wait_[writer_site] += blocked;
+    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, blocked);
     write_islands(0, copies.size());
     // Only as far as the copies reached: an island the ring could not take
     // is still GPU-dirty and must keep its bits.
@@ -1813,6 +1825,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                                     bool is_texel_buffer, bool* new_gpu_pages) {
     if (new_gpu_pages) {
         *new_gpu_pages = false;
+    }
+    if (is_written) {
+        buffer.gpu_write_tick = scheduler.CurrentTick();
     }
     bool fresh_pages = false;
     // Read-only binds dominate and almost never have anything to upload, but
