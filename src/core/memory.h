@@ -318,8 +318,10 @@ public:
         u64 same_bytes;
         u64 copy_bytes;
         u64 cmp_bytes;
+        u64 nt_bytes;
+        u64 copy_ticks;
     };
-    /// Returns and resets the calling thread's readback_writeback_diff census.
+    /// Returns and resets the calling thread's readback write-back census.
     static BackingDiffStats DrainBackingDiffStats();
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
@@ -425,6 +427,7 @@ private:
     u64 vma_generation{1};
     bool backing_write_memo_{};
     u32 backing_diff_mode_{};
+    bool backing_nt_{};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};

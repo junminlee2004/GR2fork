@@ -1098,11 +1098,14 @@ void Rasterizer::OnSubmit() {
             if (const auto bd = Core::MemoryManager::DrainBackingDiffStats(); bd.islands) {
                 // same/chunks is the redundant fraction; mode 1 reports it with
                 // the store still in place, mode 2 skips it.
+                // copyUs brackets every arm alike; it is the number that
+                // judges readback_writeback_nt and mode 2 against baseline.
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WBDIFF islands={} allsame={} chunks={} same={} sameKiB={} "
-                         "copyKiB={} cmpKiB={} per300f",
+                         "copyKiB={} cmpKiB={} ntKiB={} copyUs={} per300f",
                          bd.islands, bd.allsame, bd.chunks, bd.same, bd.same_bytes >> 10,
-                         bd.copy_bytes >> 10, bd.cmp_bytes >> 10);
+                         bd.copy_bytes >> 10, bd.cmp_bytes >> 10, bd.nt_bytes >> 10,
+                         bd.copy_ticks / std::max<u64>(tsc_hz_ / 1000000u, 1));
             }
             pipeline_cache.DumpColorMaskStats(
                 scheduler.GetDynamicState().DrainColorWriteMaskSkips());

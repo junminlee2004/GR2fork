@@ -561,6 +561,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU trackerGpuSummary: {}", EmulatorSettings.IsTrackerGpuSummary());
     LOG_INFO(Config, "GPU readbackWritebackDiff: {}", EmulatorSettings.GetReadbackWritebackDiff());
     LOG_INFO(Config, "GPU readbackCopyMergeGap: {}", EmulatorSettings.GetReadbackCopyMergeGap());
+    LOG_INFO(Config, "GPU readbackWritebackNt: {}", EmulatorSettings.IsReadbackWritebackNt());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
