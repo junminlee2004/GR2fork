@@ -1042,16 +1042,6 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
-            if (const auto dp = buffer_cache.DrainDrainPipeStats(); dp.loops) {
-                // waitRest is the whole point: near zero means the GPU finished
-                // the later chunks while the CPU was writing back the earlier ones.
-                const u64 us = std::max<u64>(tsc_hz_ / 1000000u, 1);
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] DLPIPE loops={} chunks={} waitFirstUs={} waitRestUs={} "
-                         "copyUs={} per300f",
-                         dp.loops, dp.chunks, dp.wait_first_ticks / us, dp.wait_rest_ticks / us,
-                         dp.copy_ticks / us);
-            }
             if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
                 // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
                 LOG_INFO(Render_Skipcache,

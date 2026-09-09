@@ -262,7 +262,6 @@ void StreamBuffer::CommitSlow() {
     }
 
     offset += mapped_size;
-    last_commit_bound_ = offset;
     const u64 tick = scheduler->CurrentTick();
     // Watches only order ring reuse against submissions, so commits within one
     // tick collapse into the last appended watch: waiting out that tick frees

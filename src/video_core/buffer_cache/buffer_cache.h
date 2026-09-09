@@ -450,19 +450,6 @@ public:
         idxwhole_binds_ = idxwhole_skips_ = idxwhole_veto_ = 0;
         return out;
     }
-    struct DrainPipeStats {
-        u64 loops;
-        u64 chunks;
-        u64 wait_first_ticks;
-        u64 wait_rest_ticks;
-        u64 copy_ticks;
-    };
-    DrainPipeStats DrainDrainPipeStats() {
-        const DrainPipeStats out{dlpipe_loops_, dlpipe_chunks_, dlpipe_wait_first_,
-                                 dlpipe_wait_rest_, dlpipe_copy_};
-        dlpipe_loops_ = dlpipe_chunks_ = dlpipe_wait_first_ = dlpipe_wait_rest_ = dlpipe_copy_ = 0;
-        return out;
-    }
     struct CopyMergeStats {
         u64 downloads;
         u64 islands;
@@ -636,13 +623,6 @@ private:
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
-    // readback_drain_chunks, and its census. GPU command thread only.
-    u32 drain_chunks_{};
-    u64 dlpipe_loops_{};
-    u64 dlpipe_chunks_{};
-    u64 dlpipe_wait_first_{};
-    u64 dlpipe_wait_rest_{};
-    u64 dlpipe_copy_{};
     // readback_copy_merge_gap, and its census. GPU command thread only.
     u64 copy_merge_gap_{};
     u64 dlmerge_downloads_{};
