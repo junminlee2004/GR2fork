@@ -1107,7 +1107,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                 ASSERT(event_eos->size == 1);
                 if (rasterizer) {
-                    rasterizer->GdsStore(event_eos->Address<u64>(), event_eos->gds_index);
+                    rasterizer->Finish();
+                    const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                    *event_eos->Address() = value;
                 }
             }
             break;

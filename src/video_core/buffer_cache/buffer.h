@@ -174,13 +174,6 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
-    // Tick of the command buffer the last GPU write to this buffer was
-    // recorded into, and the span those writes covered within that tick. A
-    // download outside the span, or whose tick is behind the open one, has no
-    // writer pending in the open command buffer.
-    u64 gpu_write_tick = 0;
-    VAddr gpu_write_lo = 0;
-    VAddr gpu_write_hi = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

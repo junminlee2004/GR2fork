@@ -126,8 +126,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
-    gds_store_copy_ = EmulatorSettings.IsGdsStoreCopy() &&
-                      EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -1053,30 +1051,6 @@ void Rasterizer::OnSubmit() {
                          "copyUs={} per300f",
                          dp.loops, dp.chunks, dp.wait_first_ticks / us, dp.wait_rest_ticks / us,
                          dp.copy_ticks / us);
-            }
-            if (gdseos_events_) {
-                // Every end-of-shader GDS store: copies rode the stream,
-                // the rest paid a Finish, whose time is waitUs.
-                const u64 us = std::max<u64>(tsc_hz_ / 1000000u, 1);
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] GDSEOS events={} copies={} waitUs={} per300f", gdseos_events_,
-                         gdseos_copies_, gdseos_wait_ / us);
-                gdseos_events_ = gdseos_copies_ = gdseos_wait_ = 0;
-            }
-            if (const auto ws = buffer_cache.DrainWriterSiteStats();
-                ws.drains[0] + ws.drains[1] + ws.drains[2]) {
-                // open: the writer is still in the open command buffer, so
-                // the drain fence covers the pending draws; openmiss of those
-                // wrote around the range, not into it. sub: submitted, with
-                // the time until the writer retired and the rest of the fence
-                // apart. done: retired per the known tick. Times are fence.
-                const u64 us = std::max<u64>(tsc_hz_ / 1000000u, 1);
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RBSITE open={}/{}us openmiss={} sub={}/{}us+{}us "
-                         "done={}/{}us per300f",
-                         ws.drains[0], ws.wait_ticks[0] / us, ws.open_miss, ws.drains[1],
-                         ws.writer_wait_ticks / us, ws.wait_ticks[1] / us, ws.drains[2],
-                         ws.wait_ticks[2] / us);
             }
             if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
                 // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
@@ -2965,27 +2939,6 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
-}
-
-void Rasterizer::GdsStore(VAddr address, u32 gds_offset) {
-    ++gdseos_events_;
-    if (gds_store_copy_) {
-        // The store rides the command stream: a transfer from the data-share
-        // buffer into the guest range, after the shaders that update the
-        // counter, and the range is marked GPU-written so the guest's read
-        // faults into a download of the finished value. The read watcher is
-        // armed here rather than at the next fence, or a read before that
-        // fence would see the stale backing.
-        CopyBuffer(address, gds_offset, sizeof(u32), false, true);
-        DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
-        ++gdseos_copies_;
-        return;
-    }
-    const u64 t0 = Common::FencedRDTSC();
-    Finish();
-    gdseos_wait_ += Common::FencedRDTSC() - t0;
-    const u32 value = ReadDataFromGds(gds_offset);
-    *std::bit_cast<u32*>(address) = value;
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
