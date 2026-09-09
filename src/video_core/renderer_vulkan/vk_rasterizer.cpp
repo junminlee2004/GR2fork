@@ -1055,13 +1055,17 @@ void Rasterizer::OnSubmit() {
             if (const auto ws = buffer_cache.DrainWriterSiteStats();
                 ws.drains[0] + ws.drains[1] + ws.drains[2]) {
                 // open: the writer is still in the open command buffer, so
-                // the drain fence covers the pending draws. sub: submitted.
-                // done: retired per the known tick. Each with its fence time.
+                // the drain fence covers the pending draws; openmiss of those
+                // wrote around the range, not into it. sub: submitted, with
+                // the time until the writer retired and the rest of the fence
+                // apart. done: retired per the known tick. Times are fence.
                 const u64 us = std::max<u64>(tsc_hz_ / 1000000u, 1);
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RBSITE open={}/{}us sub={}/{}us done={}/{}us per300f",
-                         ws.drains[0], ws.wait_ticks[0] / us, ws.drains[1], ws.wait_ticks[1] / us,
-                         ws.drains[2], ws.wait_ticks[2] / us);
+                         "[SkipCache] RBSITE open={}/{}us openmiss={} sub={}/{}us+{}us "
+                         "done={}/{}us per300f",
+                         ws.drains[0], ws.wait_ticks[0] / us, ws.open_miss, ws.drains[1],
+                         ws.writer_wait_ticks / us, ws.wait_ticks[1] / us, ws.drains[2],
+                         ws.wait_ticks[2] / us);
             }
             if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
                 // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.

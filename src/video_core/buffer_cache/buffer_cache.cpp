@@ -517,15 +517,32 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     dlmerge_regions_ += regions.size();
     dlmerge_gap_bytes_ += gap_bytes;
     download_buffer.Commit();
-    // Where this buffer's last GPU write sits when the drain starts: still in
+    // Where this range's last GPU write sits when the drain starts: still in
     // the open command buffer, so the fence has to cover the pending draws;
-    // submitted; or retired as far as the known tick says. The wait each
-    // class pays is what a copy submitted on its own could give back.
-    const u64 write_tick = buffer.gpu_write_tick;
-    const size_t writer_site = write_tick >= scheduler.CurrentTick()                ? 0
+    // submitted; or retired as far as the known tick says. When the open
+    // command buffer wrote this buffer only outside the range, the range's
+    // own writer is at most one tick back. A submitted writer is waited for
+    // on its own first, so its share of the fence time is known apart from
+    // the rest, which is what a copy that waits only on the writer gives back.
+    const u64 open_tick = scheduler.CurrentTick();
+    u64 write_tick = buffer.gpu_write_tick;
+    if (write_tick == open_tick &&
+        (device_addr + size <= buffer.gpu_write_lo || device_addr >= buffer.gpu_write_hi)) {
+        write_tick = open_tick - 1;
+        ++rbsite_open_miss_;
+    }
+    const size_t writer_site = write_tick >= open_tick                              ? 0
                                : scheduler.GetMasterSemaphore()->IsFree(write_tick) ? 2
                                                                                     : 1;
     ++rbsite_drains_[writer_site];
+    const auto wait_writer = [&] {
+        if (writer_site != 1) {
+            return;
+        }
+        const u64 t0 = Common::FencedRDTSC();
+        scheduler.Wait(write_tick);
+        rbsite_writer_wait_ += Common::FencedRDTSC() - t0;
+    };
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     // Synchronize prior GPU writes to this buffer before the transfer read
@@ -627,6 +644,7 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         download_buffer.DeferLastCommit(ticks.back());
         ++dlpipe_loops_;
         dlpipe_chunks_ += chunks;
+        wait_writer();
         for (u32 c = 0; c < chunks; ++c) {
             const u64 blocked =
                 scheduler.WaitTagged(ticks[c], Vulkan::Scheduler::WaitSite::DownloadBuffer);
@@ -646,8 +664,11 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         return;
     }
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), regions);
+    const u64 tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    wait_writer();
     const u64 t0 = Common::FencedRDTSC();
-    scheduler.Finish();
+    scheduler.Wait(tick);
     const u64 blocked = Common::FencedRDTSC() - t0;
     rbsite_wait_[writer_site] += blocked;
     scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, blocked);
@@ -1827,7 +1848,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         *new_gpu_pages = false;
     }
     if (is_written) {
-        buffer.gpu_write_tick = scheduler.CurrentTick();
+        const u64 tick = scheduler.CurrentTick();
+        if (buffer.gpu_write_tick != tick) {
+            buffer.gpu_write_tick = tick;
+            buffer.gpu_write_lo = device_addr;
+            buffer.gpu_write_hi = device_addr + size;
+        } else {
+            buffer.gpu_write_lo = std::min(buffer.gpu_write_lo, device_addr);
+            buffer.gpu_write_hi = std::max<VAddr>(buffer.gpu_write_hi, device_addr + size);
+        }
     }
     bool fresh_pages = false;
     // Read-only binds dominate and almost never have anything to upload, but
