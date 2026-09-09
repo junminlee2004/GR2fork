@@ -1357,6 +1357,12 @@ void Rasterizer::OnSubmit() {
                          ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
                          ra.regions, ra.pages, ra.calls);
             }
+            if (const auto gs = VideoCore::MemoryTracker::DrainGpuSummaryStats(); gs.probes) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] GPUSUM probes={} front={} fall={} sampled={} diverged={} "
+                         "per300f",
+                         gs.probes, gs.front, gs.probes - gs.front, gs.sampled, gs.diverged);
+            }
             if (const auto tf = buffer_cache.DrainTrackerFastStats();
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
                 LOG_INFO(Render_Skipcache,

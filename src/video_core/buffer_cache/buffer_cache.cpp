@@ -85,6 +85,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
+    memory_tracker->SetGpuSummary(EmulatorSettings.IsTrackerGpuSummary());
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 

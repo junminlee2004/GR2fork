@@ -37,6 +37,23 @@ public:
     void SetDeferReadArm(bool value) {
         defer_read_arm_ = value;
     }
+    void SetGpuSummary(bool value) {
+        gpu_summary_ = value;
+    }
+    struct GpuSummaryStats {
+        u64 probes;
+        u64 front;
+        u64 sampled;
+        u64 diverged;
+    };
+    static GpuSummaryStats DrainGpuSummaryStats() {
+        return GpuSummaryStats{
+            RegionManager::gpusum_probes_.exchange(0, std::memory_order_relaxed),
+            RegionManager::gpusum_front_.exchange(0, std::memory_order_relaxed),
+            RegionManager::gpusum_sampled_.exchange(0, std::memory_order_relaxed),
+            RegionManager::gpusum_diverged_.exchange(0, std::memory_order_relaxed),
+        };
+    }
 
     struct ReadArmDrain {
         u32 regions;
@@ -867,6 +884,14 @@ private:
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         new_manager->defer_read_arm_ = defer_read_arm_;
+        new_manager->gpu_summary_ = gpu_summary_;
+        if (gpu_summary_) {
+            // A fresh region has no GPU-dirty page, so the exact summary is
+            // zero; leaving the all-set start value would keep every probe
+            // on the scan until each word's first write.
+            new_manager->state.fetch_and(~RegionManager::GPU_SUMMARY_BITS,
+                                         std::memory_order_relaxed);
+        }
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
         // Returned directly: re-probing the lookup memo twenty instructions
@@ -876,6 +901,7 @@ private:
     }
 
     bool defer_read_arm_{};
+    bool gpu_summary_{};
     // Regions whose marks await their arm, and the depth of the walk that must
     // not be drained into. GPU-command-thread confined, like gpu_write_seq.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
