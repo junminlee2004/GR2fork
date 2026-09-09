@@ -578,9 +578,41 @@ public:
         rarm_pages_ += d.pages;
         rarm_calls_ += d.calls;
     }
+    /// Releases every read watcher a finished download left pending.
+    void DrainPendingReadReleases() {
+        if (!memory_tracker->HasPendingReadReleases()) {
+            return;
+        }
+        const auto d = memory_tracker->ReleasePendingReadWatchers();
+        ++rrel_drains_;
+        rrel_regions_ += d.regions;
+        rrel_pages_ += d.pages;
+        rrel_calls_ += d.calls;
+    }
+    struct ReadReleaseStats {
+        u64 drains;
+        u64 regions;
+        u64 pages;
+        u64 calls;
+        u64 census_calls;
+        u64 census_pages;
+        u64 census_runs;
+        u64 census_batches;
+    };
+    ReadReleaseStats DrainReadReleaseStats() {
+        const auto c = MemoryTracker::DrainReadReleaseCensus();
+        const ReadReleaseStats out{rrel_drains_, rrel_regions_, rrel_pages_, rrel_calls_,
+                                   c.calls,      c.pages,       c.runs,      c.batches};
+        rrel_drains_ = rrel_regions_ = rrel_pages_ = rrel_calls_ = 0;
+        return out;
+    }
     /// Clears the GPU bits of a range the guest is unmapping.
     void DropPendingReadArms(VAddr addr, u64 size) {
         memory_tracker->DropPendingReadArms(addr, size);
+        // That unmark defers its own release under deferred_read_release, and a
+        // release left pending here would protect memory the guest has already
+        // given back. Settle every pending region while the range is mapped.
+        DrainPendingReadReleases();
     }
     struct ReadArmStats {
         std::array<u64, static_cast<size_t>(ReadArmSite::Count)> drains;
@@ -819,6 +851,10 @@ private:
     // loaded core; the generation plus condition variable wakes it exactly
     // when the owner finishes.
     bool wait_notify_{};
+    u64 rrel_drains_{};
+    u64 rrel_regions_{};
+    u64 rrel_pages_{};
+    u64 rrel_calls_{};
     // Fault window, and the cap on the faulting thread's fence wait. Both are
     // latched once: a fault reads them on the guest thread's critical path.
     u64 readback_window_{};

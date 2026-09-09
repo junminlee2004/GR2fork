@@ -93,6 +93,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
+    memory_tracker->SetDeferReadRelease(EmulatorSettings.IsDeferredReadRelease());
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -987,6 +988,13 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         std::erase_if(inflight_downloads_,
                       [&](const InflightDownload& d) { return d.id == job.inflight_id; });
     }
+    // deferred_read_release: every island cleared above left its read watcher
+    // armed. Settle them here, once per region, so the download costs a
+    // handful of protection calls instead of one per island. It has to precede
+    // the CPU mark: dropping a write watcher on a page whose release is still
+    // pending would ask for a write-only mapping, and the mark's own guard
+    // would otherwise have to flush the whole region from this thread.
+    DrainPendingReadReleases();
     // Same write-only-protection hazard as the empty path in Prepare: the mark
     // is only legal once the faulted range's GPU bits are clear. When a veto
     // kept them set, the caller's retry loop resolves the fault instead.

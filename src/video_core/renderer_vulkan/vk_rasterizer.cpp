@@ -123,6 +123,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
     deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
+    deferred_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
@@ -1379,6 +1380,15 @@ void Rasterizer::OnSubmit() {
                          "pages={} calls={} per300f",
                          ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
                          ra.regions, ra.pages, ra.calls);
+            }
+            if (const auto rr = buffer_cache.DrainReadReleaseStats(); rr.census_batches != 0) {
+                // calls is the mprotect count of the read-watcher release path,
+                // and each one broadcasts a TLB shootdown to every core.
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] RREL batches={} calls={} runs={} pages={} drains={} "
+                         "regions={} drained={} per300f",
+                         rr.census_batches, rr.census_calls, rr.census_runs, rr.census_pages,
+                         rr.drains, rr.regions, rr.calls);
             }
             if (const auto tf = buffer_cache.DrainTrackerFastStats();
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
@@ -3038,7 +3048,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
-    if (deferred_read_arm_) {
+    if (deferred_read_arm_ || deferred_read_release_) {
         // Runs before the range leaves the map, so no later drain protects
         // memory the guest has given back.
         buffer_cache.DropPendingReadArms(addr, size);

@@ -566,6 +566,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbackWaitNotify: {}", EmulatorSettings.IsReadbackWaitNotify());
     LOG_INFO(Config, "GPU readbackWindowKb: {}", EmulatorSettings.GetReadbackWindowKb());
     LOG_INFO(Config, "GPU readbackBoundedWaitUs: {}", EmulatorSettings.GetReadbackBoundedWaitUs());
+    LOG_INFO(Config, "GPU deferredReadRelease: {}", EmulatorSettings.IsDeferredReadRelease());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

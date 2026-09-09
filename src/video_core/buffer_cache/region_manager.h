@@ -126,6 +126,17 @@ public:
             bits.UnsetRange(start_page, end_page);
         }
         if constexpr (type == Type::CPU) {
+            if constexpr (enable) {
+                // A page whose release is still pending is unreadable; dropping
+                // its write watcher below would ask for a write-only mapping,
+                // which Protect rejects. Settle the whole region's pending
+                // mask first - it is bounded by one region and the drain has
+                // usually cleared it already.
+                if (read_release_pending_) {
+                    u32 pages = 0;
+                    ReleaseReadWatchers(pages);
+                }
+            }
             RefreshCpuSummary(start_page, end_page);
             UpdateProtection<!enable>();
         } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
@@ -136,8 +147,11 @@ public:
                     u32 pages = 0;
                     ArmReadWatchers(pages);
                 }
+            } else if (defer_read_release_) {
+                read_release_pending_ = true;
             } else {
-                ReleaseReadWatchers();
+                u32 pages = 0;
+                ReleaseReadWatchers(pages);
             }
         }
         return true;
@@ -177,7 +191,11 @@ public:
                 RefreshCpuSummary(start_page, end_page);
                 UpdateProtection<true>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                ReleaseReadWatchers();
+                // The bind path, deliberately never deferred: it is gated on
+                // any readbacks mode, not Precise alone, and its caller is not
+                // the download completion the drain hangs off.
+                u32 pages = 0;
+                ReleaseReadWatchers(pages);
             }
         }
 
@@ -332,15 +350,38 @@ public:
         return tracker->UpdatePageWatchersForRegion<true, true>(cpu_addr, mask);
     }
 
-    /// Releases the read watcher of every page that is no longer GPU dirty.
-    void ReleaseReadWatchers() {
+    /// Releases the read watcher of every page that is no longer GPU dirty and
+    /// returns the protection calls issued. The mask is consumed by the
+    /// readable update, so one call per island sees one island: that is one
+    /// mprotect each, and every mprotect broadcasts a TLB shootdown to each
+    /// core running a thread of this process. Batching the releases lets the
+    /// gap-merge in UpdatePageWatchersForRegion fuse them into few calls.
+    u32 ReleaseReadWatchers(u32& pages) {
+        read_release_pending_ = false;
         RegionBits mask = ~gpu & ~readable;
         if (mask.None()) {
-            return;
+            return 0;
         }
         readable |= mask;
-        tracker->UpdatePageWatchersForRegion<false, true>(cpu_addr, mask);
+        u32 runs = 0;
+        for (const auto& [start, end] : mask) {
+            pages += static_cast<u32>(end - start);
+            ++runs;
+        }
+        const u32 calls = tracker->UpdatePageWatchersForRegion<false, true>(cpu_addr, mask);
+        release_calls_.fetch_add(calls, std::memory_order_relaxed);
+        release_pages_.fetch_add(pages, std::memory_order_relaxed);
+        release_runs_.fetch_add(runs, std::memory_order_relaxed);
+        ++release_batches_;
+        return calls;
     }
+
+    /// Read-watcher release census. Static because a release happens from any
+    /// region; drained once per telemetry window through the tracker.
+    static inline std::atomic<u64> release_calls_{};
+    static inline std::atomic<u64> release_pages_{};
+    static inline std::atomic<u64> release_runs_{};
+    static inline std::atomic<u64> release_batches_{};
 
     /// Scope guard marking a mutation of the tracked bits for readers.
     struct WriteScope {
@@ -373,6 +414,10 @@ public:
     // A mark that recorded its bits and left the arm to the next drain. Read
     // and written under the lock on GPU-command-thread paths only.
     bool read_arm_pending_{false};
+    // Copied from the tracker when the region is handed out.
+    bool defer_read_release_{false};
+    // An unmark that cleared its bits and left the release to the next drain.
+    bool read_release_pending_{false};
 
     // Word epochs advance whenever guest bytes in a span may change outside
     // the write watchers' sight: write protection loss, guest protection
