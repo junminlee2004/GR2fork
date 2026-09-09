@@ -712,7 +712,9 @@ struct GPUSettings {
     Setting<bool> tracker_gpu_summary{false};
     // Readback write-back skips 4 KiB chunks whose bytes already match the backing.
     // 0 off; 1 census only, the store still happens, so the WBDIFF line reports
-    // the redundant fraction with no behaviour change; 2 skip the matching chunks.
+    // the redundant fraction with no behaviour change; 2 skip the leading run of
+    // matching chunks and copy the rest straight; 3 skip every matching chunk,
+    // comparing all of them, for when the matches are interleaved with changes.
     Setting<u32> readback_writeback_diff{0};
     // Merge readback copy regions whose guest gap is at most this many bytes into
     // one GPU transfer; the gap bytes land in staging and are never written back.

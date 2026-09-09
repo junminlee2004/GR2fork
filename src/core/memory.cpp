@@ -38,7 +38,7 @@ MemoryManager::MemoryManager() {
     }
     RefreshVmaBounds();
     backing_write_memo_ = EmulatorSettings.IsBackingWriteMemo();
-    backing_diff_mode_ = std::min<u32>(EmulatorSettings.GetReadbackWritebackDiff(), 2u);
+    backing_diff_mode_ = std::min<u32>(EmulatorSettings.GetReadbackWritebackDiff(), 3u);
     backing_nt_ = EmulatorSettings.IsReadbackWritebackNt();
 
     // Pre-initialize direct backing
@@ -321,6 +321,15 @@ static void WriteBackingBytes(u8* dst, const u8* src, u64 size, u32 mode, bool n
             c.copy_bytes += size - off;
             off = size;
             break;
+        }
+        if (mode == 3) {
+            // Per-chunk: store this one and keep comparing. The census
+            // measured 85% of chunks already identical but only 11% of
+            // islands identical throughout, so the matching chunks are
+            // interleaved with changed ones and mode 2 would copy most of
+            // them anyway.
+            StoreBacking(dst + off, src + off, n, nt);
+            c.copy_bytes += n;
         }
         off += n;
     }
