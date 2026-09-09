@@ -416,7 +416,11 @@ void L::Draw() {
                 SetWindowPos("Video Info", {999999.0f, 0.0f}, ImGuiCond_Always);
                 visibility_toggled = false;
             }
-            if (BeginPopupContextWindow()) {
+            if (IsMouseReleased(ImGuiMouseButton_Right) &&
+                IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)) {
+                OpenPopup("fps_scale");
+            }
+            if (BeginPopup("fps_scale")) {
 #define M(label, value)                                                                            \
     if (MenuItem(label, nullptr, fps_scale == value))                                              \
     fps_scale = value
