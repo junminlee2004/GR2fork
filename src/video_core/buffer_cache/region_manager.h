@@ -94,15 +94,6 @@ public:
             return false;
         }
 
-        if constexpr (type == Type::GPU && enable) {
-            // GPU bits are only ever mutated on the GPU command thread, so this
-            // is a plain counter. It advances on marks alone: an unchanged
-            // value between two points on that thread proves no new GPU write
-            // was recorded for this region in between, which is the guard the
-            // offloaded readback path uses before clearing bits it earlier
-            // snapshotted.
-            ++gpu_write_seq;
-        }
         RegionBits& bits = GetRegionBits<type>();
         // A range already in the target state makes the write below an
         // identity: the bits cannot change, so the protection masks derived
@@ -427,10 +418,6 @@ public:
     static void Tally(std::atomic<u64>& c) noexcept {
         c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
-    // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
-    // GPU bits are set only there; an unmap clears them from a guest thread
-    // under the lock, which leaves this count untouched.
-    u64 gpu_write_seq{0};
     LockType lock;
     // Copied from the tracker when the region is handed out.
     bool defer_read_arm_{false};

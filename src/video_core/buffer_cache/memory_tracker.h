@@ -185,45 +185,6 @@ public:
                             });
     }
 
-    /// One region's identity and its gpu_write_seq value at snapshot time.
-    /// GPU-command-thread confined, like the counter it captures.
-    struct GpuSeqSnapshot {
-        RegionManager* manager;
-        u64 seq;
-    };
-    using GpuSeqSnapshots = boost::container::small_vector<GpuSeqSnapshot, 4>;
-
-    /**
-     * Captures each overlapped region's GPU write sequence. Call on the GPU
-     * command thread at the moment download copies are recorded; pass the
-     * result to GpuWriteSeqMatches when deciding whether the copied data may
-     * be written back.
-     */
-    void SnapshotGpuWriteSeq(VAddr cpu_addr, u64 size, GpuSeqSnapshots& out) {
-        IteratePages<false>(cpu_addr, size, [&out](RegionManager* manager, u64, size_t) {
-            out.push_back({manager, manager->gpu_write_seq});
-        });
-    }
-
-    /**
-     * True when every region overlapping the range still carries the GPU write
-     * sequence captured in the snapshot - that is, no new GPU write to those
-     * regions has been recorded since. A changed sequence means downloaded
-     * bytes for the range may be stale and must not be written back or have
-     * their bits cleared. GPU command thread only, so the comparison cannot
-     * race the writers it guards against.
-     */
-    bool GpuWriteSeqMatches(VAddr cpu_addr, u64 size, const GpuSeqSnapshots& snap) {
-        bool matches = true;
-        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64, size_t) {
-            const auto it = std::ranges::find(snap, manager, &GpuSeqSnapshot::manager);
-            if (it == snap.end() || it->seq != manager->gpu_write_seq) {
-                matches = false;
-            }
-        });
-        return matches;
-    }
-
     /// Advances the word epochs of every existing region overlapping the
     /// range. Missing regions have no consumers and are skipped.
     void BumpEpochsForRange(VAddr cpu_addr, u64 size, u8 cause) noexcept {
@@ -521,13 +482,6 @@ public:
                                    (!is_written || manager->template PeekRegionFullySet<Type::GPU>(
                                                        offset, query_size));
             if (skippable) {
-                if (is_written) {
-                    // The bits stay as they are, but this is still a new GPU
-                    // write to the region: the write sequence must advance or
-                    // a snapshot taken before this bind could not tell that
-                    // its downloaded bytes are now stale.
-                    ++manager->gpu_write_seq;
-                }
                 on_upload();
                 return false;
             }
@@ -671,12 +625,6 @@ public:
                 if (nothing_to_upload && i < 64 &&
                     manager->template PeekRegionFullySet<Type::GPU>(offset, size)) {
                     skipped |= u64{1} << i;
-                    // The bits stay as they are, but this is still a new GPU
-                    // write to the region: the write sequence must advance or
-                    // a snapshot taken before this bind could not tell that
-                    // its downloaded bytes are now stale. GPU-command-thread
-                    // confined, like the counter.
-                    ++manager->gpu_write_seq;
                     continue;
                 }
                 manager->lock.lock();
@@ -903,7 +851,7 @@ private:
     bool defer_read_arm_{};
     bool gpu_summary_{};
     // Regions whose marks await their arm, and the depth of the walk that must
-    // not be drained into. GPU-command-thread confined, like gpu_write_seq.
+    // not be drained into. GPU-command-thread confined.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
     u32 upload_walk_depth_{};
     // Probe telemetry on a line of its own. Every bump here is the GPU
