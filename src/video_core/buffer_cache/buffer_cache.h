@@ -450,6 +450,22 @@ public:
         idxwhole_binds_ = idxwhole_skips_ = idxwhole_veto_ = 0;
         return out;
     }
+    struct CopyMergeStats {
+        u64 downloads;
+        u64 islands;
+        u64 regions;
+        u64 gap_bytes;
+        u64 capped;
+        std::array<u64, 6> gap_hist;
+    };
+    CopyMergeStats DrainCopyMergeStats() {
+        const CopyMergeStats out{dlmerge_downloads_, dlmerge_islands_, dlmerge_regions_,
+                                 dlmerge_gap_bytes_, dlmerge_capped_,  dlmerge_gap_hist_};
+        dlmerge_downloads_ = dlmerge_islands_ = dlmerge_regions_ = dlmerge_gap_bytes_ =
+            dlmerge_capped_ = 0;
+        dlmerge_gap_hist_ = {};
+        return out;
+    }
     struct WritebackStats {
         u64 loops;
         u64 islands;
@@ -607,6 +623,14 @@ private:
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
+    // readback_copy_merge_gap, and its census. GPU command thread only.
+    u64 copy_merge_gap_{};
+    u64 dlmerge_downloads_{};
+    u64 dlmerge_islands_{};
+    u64 dlmerge_regions_{};
+    u64 dlmerge_gap_bytes_{};
+    u64 dlmerge_capped_{};
+    std::array<u64, 6> dlmerge_gap_hist_{};
     bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
     bool vinput_fetch_key_{};

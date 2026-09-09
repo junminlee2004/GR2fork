@@ -86,6 +86,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
     memory_tracker->SetGpuSummary(EmulatorSettings.IsTrackerGpuSummary());
+    copy_merge_gap_ = EmulatorSettings.GetReadbackCopyMergeGap();
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -389,8 +390,20 @@ inline void SpinRelax() {
 } // namespace
 
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
+    // Two lists with opposite cost models. copies is island-exact and is the
+    // ONLY list the write-back may read: a gap byte between islands is not
+    // GPU-dirty, the guest may own its current value, and writing the buffer's
+    // copy over it is silent corruption. regions is what the GPU transfer
+    // takes; under readback_copy_merge_gap it fuses islands whose gap is small
+    // enough that one transfer beats two, and the gap bytes simply land in
+    // staging and are never handed to TryWriteBacking.
     boost::container::small_vector<vk::BufferCopy, 1> copies;
+    boost::container::small_vector<vk::BufferCopy, 1> regions;
     u64 total_size_bytes = 0;
+    u64 payload_bytes = 0;
+    u64 gap_bytes = 0;
+    u64 last_island_end = 0;
+    ++dlmerge_downloads_;
     FoldPendingRanges(device_addr, size);
     // The staging ring is a fixed size and Map returns null rather than growing,
     // so collection stops at its capacity. Islands past that point keep their
@@ -410,21 +423,69 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             const auto add_download = [&](VAddr start, VAddr end) {
                 const u64 new_offset = start - buffer_addr;
                 const u64 new_size = end - start;
-                // Align up to avoid cache conflicts
                 constexpr u64 align = 64ULL;
                 constexpr u64 mask = ~(align - 1ULL);
-                const u64 padded = (new_size + align - 1) & mask;
-                if (ring_full || total_size_bytes + padded > DownloadBufferSize) {
+                if (ring_full) {
+                    truncated = true;
+                    return;
+                }
+                // Gap census, reported with the setting off too: it is what
+                // decides whether any threshold pays on this title.
+                if (!copies.empty() && new_offset >= last_island_end) {
+                    const u64 gap = new_offset - last_island_end;
+                    ++dlmerge_gap_hist_[gap <= 64      ? 0
+                                        : gap <= 256   ? 1
+                                        : gap <= 1024  ? 2
+                                        : gap <= 4096  ? 3
+                                        : gap <= 16384 ? 4
+                                                       : 5];
+                    // Merge only forward, only within the gap, and only while
+                    // the gap bytes stay under the payload: a pathological
+                    // island spacing must not double the transfer.
+                    if (copy_merge_gap_ != 0 && gap <= copy_merge_gap_) {
+                        if (gap_bytes + gap > payload_bytes + new_size) {
+                            ++dlmerge_capped_;
+                        } else {
+                            auto& last = regions.back();
+                            const u64 grow = (new_offset + new_size) - last_island_end;
+                            if (total_size_bytes + grow > DownloadBufferSize) {
+                                ring_full = true;
+                                truncated = true;
+                                return;
+                            }
+                            // The island's bytes sit inside the merged extent
+                            // at the same distance as in the guest buffer.
+                            copies.push_back(vk::BufferCopy{
+                                .srcOffset = new_offset,
+                                .dstOffset = last.dstOffset + (new_offset - last.srcOffset),
+                                .size = new_size,
+                            });
+                            last.size += grow;
+                            total_size_bytes += grow;
+                            gap_bytes += gap;
+                            payload_bytes += new_size;
+                            last_island_end = new_offset + new_size;
+                            covered_end = std::max<VAddr>(covered_end, end);
+                            return;
+                        }
+                    }
+                }
+                // A fresh region starts 64-byte aligned to avoid cache conflicts.
+                const u64 region_dst = (total_size_bytes + align - 1) & mask;
+                if (region_dst + new_size > DownloadBufferSize) {
                     ring_full = true;
                     truncated = true;
                     return;
                 }
                 copies.push_back(vk::BufferCopy{
                     .srcOffset = new_offset,
-                    .dstOffset = total_size_bytes,
+                    .dstOffset = region_dst,
                     .size = new_size,
                 });
-                total_size_bytes += padded;
+                regions.push_back(copies.back());
+                total_size_bytes = region_dst + new_size;
+                payload_bytes += new_size;
+                last_island_end = new_offset + new_size;
                 covered_end = std::max<VAddr>(covered_end, end);
             };
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
@@ -448,6 +509,12 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         // Modify copies to have the staging offset in mind
         copy.dstOffset += offset;
     }
+    for (auto& region : regions) {
+        region.dstOffset += offset;
+    }
+    dlmerge_islands_ += copies.size();
+    dlmerge_regions_ += regions.size();
+    dlmerge_gap_bytes_ += gap_bytes;
     download_buffer.Commit();
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -466,7 +533,10 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &pre_barrier,
     });
-    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
+    // The transfer takes the merged extents; the write-back below still
+    // iterates the exact islands (copies), never regions.
+    DEBUG_ASSERT(copies.size() >= regions.size());
+    cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), regions);
     const auto write_data = [&]() {
         auto* memory = Core::Memory::Instance();
         std::optional<Core::MemoryManager::GuestCopyScope> hold;

@@ -1042,6 +1042,15 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
+            if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
+                // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] DLMERGE downloads={} islands={} regions={} gapKiB={} "
+                         "capped={} g64={} g256={} g1k={} g4k={} g16k={} gbig={} per300f",
+                         dm.downloads, dm.islands, dm.regions, dm.gap_bytes >> 10, dm.capped,
+                         dm.gap_hist[0], dm.gap_hist[1], dm.gap_hist[2], dm.gap_hist[3],
+                         dm.gap_hist[4], dm.gap_hist[5]);
+            }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,

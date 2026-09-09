@@ -714,6 +714,10 @@ struct GPUSettings {
     // 0 off; 1 census only, the store still happens, so the WBDIFF line reports
     // the redundant fraction with no behaviour change; 2 skip the matching chunks.
     Setting<u32> readback_writeback_diff{0};
+    // Merge readback copy regions whose guest gap is at most this many bytes into
+    // one GPU transfer; the gap bytes land in staging and are never written back.
+    // 0 keeps one region per island. The DLMERGE gap histogram reports either way.
+    Setting<u32> readback_copy_merge_gap{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -853,6 +857,8 @@ struct GPUSettings {
             make_override<GPUSettings>("tracker_gpu_summary", &GPUSettings::tracker_gpu_summary),
             make_override<GPUSettings>("readback_writeback_diff",
                                        &GPUSettings::readback_writeback_diff),
+            make_override<GPUSettings>("readback_copy_merge_gap",
+                                       &GPUSettings::readback_copy_merge_gap),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -884,7 +890,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1233,6 +1239,7 @@ public:
     SETTING_FORWARD(m_gpu, DrawGlueMemo, draw_glue_memo)
     SETTING_FORWARD_BOOL(m_gpu, TrackerGpuSummary, tracker_gpu_summary)
     SETTING_FORWARD(m_gpu, ReadbackWritebackDiff, readback_writeback_diff)
+    SETTING_FORWARD(m_gpu, ReadbackCopyMergeGap, readback_copy_merge_gap)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)
