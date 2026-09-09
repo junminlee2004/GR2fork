@@ -643,9 +643,6 @@ private:
     u64 dmasync_buffers_{};
     u64 dmasync_bytes_{};
     u64 dmasync_max_bytes_{};
-    // readback_window_kb, latched once: a fault reads it on the guest thread's
-    // critical path.
-    u64 readback_window_{};
 };
 
 } // namespace VideoCore

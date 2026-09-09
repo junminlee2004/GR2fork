@@ -60,8 +60,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
-    readback_window_ = std::bit_floor(
-        std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     vinput_fetch_key_ = EmulatorSettings.IsVinputFetchKey() && vertex_lazy_desc_;
@@ -354,7 +352,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
         // is widened to a window around the request
-        const u64 WindowSize = readback_window_;
+        constexpr u64 WindowSize = 512_KB;
         const VAddr buf_start = buffer.CpuAddr();
         const VAddr buf_end = buf_start + buffer.SizeBytes();
         VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
