@@ -112,29 +112,37 @@ public:
                 return false;
             }
         }
-        WriteScope write_scope{*this};
-        if constexpr (enable) {
-            bits.SetRange(start_page, end_page);
-        } else {
-            bits.UnsetRange(start_page, end_page);
+        if constexpr (type == Type::CPU && enable) {
+            PublishMayBeDirty();
         }
-        if constexpr (type == Type::GPU) {
-            RefreshGpuSummary(start_page, end_page);
-        }
-        if constexpr (type == Type::CPU) {
-            RefreshCpuSummary(start_page, end_page);
-            UpdateProtection<!enable>(plan);
-        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        {
+            WriteScope write_scope{*this};
             if constexpr (enable) {
-                if (defer_read_arm_) {
-                    read_arm_pending_ = true;
-                } else {
-                    u32 pages = 0;
-                    ArmReadWatchers(pages);
-                }
+                bits.SetRange(start_page, end_page);
             } else {
-                ReleaseReadWatchers();
+                bits.UnsetRange(start_page, end_page);
             }
+            if constexpr (type == Type::GPU) {
+                RefreshGpuSummary(start_page, end_page);
+            }
+            if constexpr (type == Type::CPU) {
+                RefreshCpuSummary(start_page, end_page);
+                UpdateProtection<!enable>(plan);
+            } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+                if constexpr (enable) {
+                    if (defer_read_arm_) {
+                        read_arm_pending_ = true;
+                    } else {
+                        u32 pages = 0;
+                        ArmReadWatchers(pages);
+                    }
+                } else {
+                    ReleaseReadWatchers();
+                }
+            }
+        }
+        if constexpr (type == Type::CPU && !enable) {
+            RetireIfClean();
         }
         return true;
     }
@@ -180,8 +188,62 @@ public:
             }
         }
 
+        if constexpr (clear && type == Type::CPU) {
+            // The bits are final here; the callbacks below only read them.
+            write_scope.reset();
+            RetireIfClean();
+        }
+
         for (const auto& [start, end] : mask) {
             func(cpu_addr + start * TRACKER_BYTES_PER_PAGE, (end - start) * TRACKER_BYTES_PER_PAGE);
+        }
+    }
+
+    // tracker_clean_bitmap: one bit per region, set while the region may hold
+    // a CPU-dirty page or a CPU-bit writer is inside its scope, clear only
+    // once a cleaning scope has closed on an empty summary. A writer sets it
+    // before opening its scope, so a clear bit read with acquire proves what
+    // PeekFullRegionClean proves, without touching the region. Regions start
+    // dirty and are never recycled, so the map starts all set and an index
+    // without a region stays set. Words sit one per cache line: the hot set
+    // of a title is a handful of regions and every guest fault writes here.
+    struct alignas(64) CleanWord {
+        std::atomic<u64> bits{~u64{0}};
+    };
+    static inline CleanWord* clean_words_{nullptr};
+    static inline std::atomic<u64> clean_publish_{};
+    static inline std::atomic<u64> clean_retire_{};
+    [[nodiscard]] size_t RegionIndex() const noexcept {
+        return cpu_addr >> TRACKER_HIGHER_PAGE_BITS;
+    }
+    /// The bit as the scan reads it: set means the region may be dirty.
+    [[nodiscard]] bool MayBeDirty() const noexcept {
+        const size_t index = RegionIndex();
+        return (clean_words_[index >> 6].bits.load(std::memory_order_acquire) >> (index & 63)) & 1u;
+    }
+    void PublishMayBeDirty() noexcept {
+        if (clean_words_ == nullptr) {
+            return;
+        }
+        const size_t index = RegionIndex();
+        auto& word = clean_words_[index >> 6].bits;
+        const u64 bit = u64{1} << (index & 63);
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            word.fetch_or(bit, std::memory_order_release);
+            Tally(clean_publish_);
+        }
+    }
+    /// Caller holds the lock, and no scope of its own is open.
+    void RetireIfClean() noexcept {
+        if (clean_words_ == nullptr || Summary() != 0) {
+            return;
+        }
+        const size_t index = RegionIndex();
+        auto& word = clean_words_[index >> 6].bits;
+        const u64 bit = u64{1} << (index & 63);
+        if ((word.load(std::memory_order_relaxed) & bit) != 0) {
+            word.fetch_and(~bit, std::memory_order_release);
+            Tally(clean_retire_);
         }
     }
 

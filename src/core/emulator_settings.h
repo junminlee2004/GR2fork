@@ -736,6 +736,12 @@ struct GPUSettings {
     // no longer fall to the lock for the length of an mprotect. Judge it by
     // PEEKBASE falls (must drop) and PHANDOFF.
     Setting<bool> guest_protect_handoff{false};
+    // One bit per 4 MB region, set while the region may hold a CPU-dirty page
+    // and clear once it is proven clean, so the read-only multi-region upload
+    // walk skips clean regions from a dense map instead of touching each
+    // region's header line. Judge it by CLEANBM (diverged must stay 0) and
+    // SynchronizeBuffer's share of the profile.
+    Setting<bool> tracker_clean_bitmap{false};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -883,6 +889,7 @@ struct GPUSettings {
                                        &GPUSettings::late_flip_next_vblank),
             make_override<GPUSettings>("guest_protect_handoff",
                                        &GPUSettings::guest_protect_handoff),
+            make_override<GPUSettings>("tracker_clean_bitmap", &GPUSettings::tracker_clean_bitmap),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -914,7 +921,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, late_flip_next_vblank, guest_protect_handoff
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, late_flip_next_vblank, guest_protect_handoff, tracker_clean_bitmap
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1267,6 +1274,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackNt, readback_writeback_nt)
     SETTING_FORWARD_BOOL(m_gpu, LateFlipNextVblank, late_flip_next_vblank)
     SETTING_FORWARD_BOOL(m_gpu, GuestProtectHandoff, guest_protect_handoff)
+    SETTING_FORWARD_BOOL(m_gpu, TrackerCleanBitmap, tracker_clean_bitmap)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

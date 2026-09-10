@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <deque>
+#include <memory>
 #include <utility>
 
 #include <mutex>
@@ -39,6 +40,15 @@ public:
     }
     void SetProtectHandoff(bool value) {
         protect_handoff_ = value;
+    }
+    /// tracker_clean_bitmap: allocates the map, all set, and hands it to the
+    /// regions. Off leaves the regions' write side inert.
+    void SetCleanBitmap(bool value) {
+        if (!value || clean_words_) {
+            return;
+        }
+        clean_words_ = std::make_unique<RegionManager::CleanWord[]>(NUM_HIGH_PAGES / 64);
+        RegionManager::clean_words_ = clean_words_.get();
     }
     void SetGpuSummary(bool value) {
         gpu_summary_ = value;
@@ -456,6 +466,52 @@ public:
             });
     }
 
+    /// Number of leading regions from region_index, at most limit, whose
+    /// clean-map bit is clear. Runs of clear bits are counted a word at a
+    /// time from the region's own bit; a set bit inside a word ends the run.
+    [[nodiscard]] std::size_t LeadingCleanRegions(std::size_t region_index,
+                                                  std::size_t limit) const noexcept {
+        std::size_t n = 0;
+        while (n < limit) {
+            const std::size_t at = region_index + n;
+            const u64 shifted =
+                clean_words_[at >> 6].bits.load(std::memory_order_acquire) >> (at & 63);
+            const std::size_t avail = 64 - (at & 63);
+            const std::size_t run =
+                shifted == 0 ? avail : static_cast<std::size_t>(std::countr_zero(shifted));
+            if (run == 0) {
+                break;
+            }
+            n += std::min(run, limit - n);
+            if (run < avail) {
+                break;
+            }
+        }
+        return n;
+    }
+    struct CleanBitmapStats {
+        u64 walks;
+        u64 skipped;
+        u64 stopped;
+        u64 sampled;
+        u64 diverged;
+        u64 publish;
+        u64 retire;
+    };
+    CleanBitmapStats DrainCleanBitmapStats() {
+        const CleanBitmapStats out{
+            cleanbm_walks_,
+            cleanbm_skipped_,
+            cleanbm_stopped_,
+            cleanbm_sampled_,
+            cleanbm_diverged_,
+            RegionManager::clean_publish_.exchange(0, std::memory_order_relaxed),
+            RegionManager::clean_retire_.exchange(0, std::memory_order_relaxed)};
+        cleanbm_walks_ = cleanbm_skipped_ = cleanbm_stopped_ = cleanbm_sampled_ = 0;
+        cleanbm_diverged_ = 0;
+        return out;
+    }
+
     /// Issues a deferred protection plan; counts for PHANDOFF.
     void IssuePlan(PageManager::ProtectPlan& plan) noexcept {
         if (!plan.held) {
@@ -605,12 +661,35 @@ public:
                     // back to the general body at that region.
                     const std::size_t full = remaining_size >> TRACKER_HIGHER_PAGE_BITS;
                     std::size_t clean = 0;
-                    while (clean < full) {
-                        RegionManager* const ahead = top_tier[page_index + clean];
-                        if (ahead == nullptr || !ahead->PeekFullRegionClean()) {
-                            break;
+                    if (clean_words_) {
+                        // tracker_clean_bitmap: the same run, read from the
+                        // dense map instead of each region's header line. A
+                        // region without a manager keeps its bit set, so the
+                        // run stops there as the loop below would.
+                        clean = LeadingCleanRegions(page_index, full);
+                        ++cleanbm_walks_;
+                        cleanbm_skipped_ += clean;
+                        cleanbm_stopped_ += clean < full;
+                        if (clean != 0 && (++cleanbm_sample_ctr_ & 1023u) == 0) {
+                            // One skip in 1024 is re-asked under the lock.
+                            // With the lock held no writer is inside the
+                            // region, so a dirty summary behind a clear bit
+                            // is the map's own failure and nothing else.
+                            ++cleanbm_sampled_;
+                            RegionManager* const first = top_tier[page_index];
+                            std::scoped_lock lk{first->lock};
+                            if (first->Summary() != 0 && !first->MayBeDirty()) {
+                                ++cleanbm_diverged_;
+                            }
                         }
-                        ++clean;
+                    } else {
+                        while (clean < full) {
+                            RegionManager* const ahead = top_tier[page_index + clean];
+                            if (ahead == nullptr || !ahead->PeekFullRegionClean()) {
+                                break;
+                            }
+                            ++clean;
+                        }
                     }
                     if (clean != 0) {
                         page_index += clean;
@@ -889,6 +968,14 @@ private:
     bool defer_read_arm_{};
     bool gpu_summary_{};
     bool protect_handoff_{};
+    // tracker_clean_bitmap: the map, and its census on the GPU command thread.
+    std::unique_ptr<RegionManager::CleanWord[]> clean_words_;
+    u64 cleanbm_walks_{};
+    u64 cleanbm_skipped_{};
+    u64 cleanbm_stopped_{};
+    u64 cleanbm_sampled_{};
+    u64 cleanbm_diverged_{};
+    u32 cleanbm_sample_ctr_{};
     // guest_protect_handoff census; bumped on guest threads.
     std::atomic<u64> handoff_plans_{};
     std::atomic<u64> handoff_calls_{};
