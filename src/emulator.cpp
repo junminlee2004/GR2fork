@@ -563,8 +563,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbackCopyMergeGap: {}", EmulatorSettings.GetReadbackCopyMergeGap());
     LOG_INFO(Config, "GPU readbackWritebackNt: {}", EmulatorSettings.IsReadbackWritebackNt());
     LOG_INFO(Config, "GPU trackerCleanBitmap: {}", EmulatorSettings.IsTrackerCleanBitmap());
-    LOG_INFO(Config, "GPU readbackSkipCleanFaults: {}",
-             EmulatorSettings.IsReadbackSkipCleanFaults());
     LOG_INFO(Config, "GPU readbackWriteTick: {}", EmulatorSettings.IsReadbackWriteTick());
     LOG_INFO(Config, "GPU readbackPostDrainFlush: {}",
              EmulatorSettings.GetReadbackPostDrainFlush());

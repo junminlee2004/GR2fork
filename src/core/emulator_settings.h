@@ -730,13 +730,6 @@ struct GPUSettings {
     // region's header line. Judge it by CLEANBM (diverged must stay 0) and
     // SynchronizeBuffer's share of the profile.
     Setting<bool> tracker_clean_bitmap{false};
-    // A guest read fault whose own page holds no GPU-modified byte returns
-    // without the round trip to the GPU thread. The bits are cleared and the
-    // read watcher released under one region lock, so a lock-free peek that
-    // sees them clear proves the page is already readable. Four of every six
-    // round trips are these: convoy followers whose leader's batched download
-    // already covered them. Judge it by RBSKIP and the guest stall.
-    Setting<bool> readback_skip_clean_faults{false};
     // Census only, no behaviour change: every GPU write into a cached buffer
     // records the tick of the command buffer it was recorded into, and each
     // readback drain is classed by where its buffer's last writer sits -
@@ -896,8 +889,6 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_writeback_nt",
                                        &GPUSettings::readback_writeback_nt),
             make_override<GPUSettings>("tracker_clean_bitmap", &GPUSettings::tracker_clean_bitmap),
-            make_override<GPUSettings>("readback_skip_clean_faults",
-                                       &GPUSettings::readback_skip_clean_faults),
             make_override<GPUSettings>("readback_write_tick", &GPUSettings::readback_write_tick),
             make_override<GPUSettings>("readback_post_drain_flush",
                                        &GPUSettings::readback_post_drain_flush),
@@ -932,7 +923,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, tracker_clean_bitmap, readback_skip_clean_faults, readback_write_tick, readback_post_drain_flush
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, tracker_clean_bitmap, readback_write_tick, readback_post_drain_flush
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1284,7 +1275,6 @@ public:
     SETTING_FORWARD(m_gpu, ReadbackCopyMergeGap, readback_copy_merge_gap)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackNt, readback_writeback_nt)
     SETTING_FORWARD_BOOL(m_gpu, TrackerCleanBitmap, tracker_clean_bitmap)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackSkipCleanFaults, readback_skip_clean_faults)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWriteTick, readback_write_tick)
     SETTING_FORWARD(m_gpu, ReadbackPostDrainFlush, readback_post_drain_flush)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
