@@ -730,16 +730,6 @@ struct GPUSettings {
     // region's header line. Judge it by CLEANBM (diverged must stay 0) and
     // SynchronizeBuffer's share of the profile.
     Setting<bool> tracker_clean_bitmap{false};
-    // Draws after which a flush fires while the GPU ring is empty, instead
-    // of the full draw interval. A readback drain leaves the ring empty and
-    // it stays empty through the write-back and the whole PM4 parse that
-    // follows: 96% of a 3.8 ms window per drain, and 84% of all GPU idle in
-    // a capture. While the GPU has nothing left to run there is no reason to
-    // hold recorded work back. Self-limiting: the flush refills the ring, so
-    // the cadence returns to the draw interval until it drains again. 0 is
-    // off; 64 is the leg. Judge it by IDLEFLUSH, the drain wait and the
-    // submit count.
-    Setting<u32> gpu_idle_flush{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -884,7 +874,6 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_writeback_nt",
                                        &GPUSettings::readback_writeback_nt),
             make_override<GPUSettings>("tracker_clean_bitmap", &GPUSettings::tracker_clean_bitmap),
-            make_override<GPUSettings>("gpu_idle_flush", &GPUSettings::gpu_idle_flush),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -916,7 +905,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, tracker_clean_bitmap, gpu_idle_flush
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, tracker_clean_bitmap
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1268,7 +1257,6 @@ public:
     SETTING_FORWARD(m_gpu, ReadbackCopyMergeGap, readback_copy_merge_gap)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackNt, readback_writeback_nt)
     SETTING_FORWARD_BOOL(m_gpu, TrackerCleanBitmap, tracker_clean_bitmap)
-    SETTING_FORWARD(m_gpu, GpuIdleFlush, gpu_idle_flush)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

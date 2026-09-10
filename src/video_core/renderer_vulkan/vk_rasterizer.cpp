@@ -126,7 +126,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
-    idle_flush_draws_ = EmulatorSettings.GetGpuIdleFlush();
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -725,19 +724,7 @@ void Rasterizer::MaybeIntervalFlush() {
         flush_tick_ = tick;
         draws_since_flush_ = 0;
     }
-    // gpu_idle_flush: a readback drain leaves the ring empty and it stays
-    // empty through the write-back and the whole parse that follows, because
-    // nothing is submitted until a full interval of draws has been recorded.
-    // While the GPU has run out of work, submit what is recorded much sooner.
-    // The test is two relaxed loads and errs towards "busy": the known tick
-    // is refreshed on submits and waits, so a stale one only misses a flush,
-    // never forces one. Self-limiting - this flush refills the ring, so the
-    // next draw sees it busy and the cadence returns to the interval.
-    const bool ring_idle =
-        idle_flush_draws_ != 0 && scheduler.GetMasterSemaphore()->KnownGpuTick() + 1 >= tick;
-    const u32 interval =
-        ring_idle ? std::min(flush_draw_interval_, idle_flush_draws_) : flush_draw_interval_;
-    if (++draws_since_flush_ < interval) {
+    if (++draws_since_flush_ < flush_draw_interval_) {
         return;
     }
     // A pending depth or stencil clear belongs to the open render scope:
@@ -751,9 +738,6 @@ void Rasterizer::MaybeIntervalFlush() {
     scheduler.Flush();
     draws_since_flush_ = 0;
     ++interval_flushes_;
-    if (ring_idle) {
-        ++idle_flushes_;
-    }
 }
 
 void Rasterizer::BeginPacketRun() {
@@ -1058,12 +1042,6 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
-            if (idle_flush_draws_ != 0) {
-                // Flushes that fired because the ring had gone empty, out of
-                // the IFLUSH total.
-                LOG_INFO(Render_Skipcache, "[SkipCache] IDLEFLUSH early={} per300f", idle_flushes_);
-                idle_flushes_ = 0;
-            }
             if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
                 // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
                 LOG_INFO(Render_Skipcache,
