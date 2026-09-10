@@ -126,7 +126,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
-    protect_handoff_ = EmulatorSettings.IsGuestProtectHandoff();
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -3043,12 +3042,6 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
-    if (protect_handoff_) {
-        // A guest fault's deferred protection may still be in flight on
-        // these regions; it holds the page-manager lock until it lands, so
-        // this waits it out before the range leaves the map.
-        page_manager.SyncProtect(addr, size);
-    }
     if (deferred_read_arm_) {
         // Runs before the range leaves the map, so no later drain protects
         // memory the guest has given back.

@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <memory>
 #include "common/alignment.h"
@@ -44,33 +43,6 @@ public:
     /// mask; returns the number of protection calls issued.
     template <bool track, bool is_read = false>
     u32 UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
-
-    /// guest_protect_handoff: the protection calls of one region update,
-    /// planned under the region's locks and issued after the tracker's lock
-    /// is released. The page-manager lock stays held from the plan to the
-    /// last call, so the calls of one region still land in tracker order.
-    /// Fixed capacity and no allocation: the plan lives on a signal stack.
-    struct ProtectPlan {
-        static constexpr u32 Capacity = 8;
-        struct Range {
-            VAddr addr;
-            u64 size;
-            u32 perms;
-        };
-        std::array<Range, Capacity> ranges;
-        u32 count = 0;
-        u32 inline_calls = 0; // issued under both locks: the plan was full
-        size_t lock_index = 0;
-        bool held = false;
-    };
-    /// UpdatePageWatchersForRegion that fills a plan instead of protecting.
-    template <bool track, bool is_read = false>
-    u32 PlanPageWatchersForRegion(VAddr base_addr, RegionBits& mask, ProtectPlan& plan) const;
-    /// Issues a plan's calls and releases the lock it holds. Empty plans are
-    /// free.
-    void IssueProtectPlan(ProtectPlan& plan) const noexcept;
-    /// Waits out every plan in flight on the regions of a range.
-    void SyncProtect(VAddr addr, u64 size) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

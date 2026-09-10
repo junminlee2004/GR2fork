@@ -86,7 +86,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
     memory_tracker->SetGpuSummary(EmulatorSettings.IsTrackerGpuSummary());
-    memory_tracker->SetProtectHandoff(EmulatorSettings.IsGuestProtectHandoff());
     memory_tracker->SetCleanBitmap(EmulatorSettings.IsTrackerCleanBitmap());
     copy_merge_gap_ = EmulatorSettings.GetReadbackCopyMergeGap();
 
@@ -309,15 +308,11 @@ void BufferCache::EmitMirrorTelemetry() {
              texel_ro_regions_);
     texel_ro_walks_ = 0;
     texel_ro_regions_ = 0;
-    // falls: lock-free peeks that took the region lock, the number
-    // guest_protect_handoff exists to shrink.
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] PEEKBASE calls={} dirty={} mwalks={} mregions={} mclean={} falls={} "
-             "per300f",
+             "[SkipCache] PEEKBASE calls={} dirty={} mwalks={} mregions={} mclean={} per300f",
              memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty,
              memory_tracker->multi_walks, memory_tracker->multi_regions,
-             memory_tracker->multi_clean_regions,
-             RegionManager::peek_lock_falls_.exchange(0, std::memory_order_relaxed));
+             memory_tracker->multi_clean_regions);
     if (const auto cb = memory_tracker->DrainCleanBitmapStats(); cb.walks) {
         // diverged must stay zero; publish/retire are the region-level
         // clean<->dirty edges the map's writes follow.
@@ -325,10 +320,6 @@ void BufferCache::EmitMirrorTelemetry() {
                  "[SkipCache] CLEANBM walks={} skipped={} stopped={} sampled={} diverged={} "
                  "publish={} retire={} per300f",
                  cb.walks, cb.skipped, cb.stopped, cb.sampled, cb.diverged, cb.publish, cb.retire);
-    }
-    if (const auto hs = memory_tracker->DrainHandoffStats(); hs.plans) {
-        LOG_INFO(Render_Skipcache, "[SkipCache] PHANDOFF plans={} calls={} inline={} per300f",
-                 hs.plans, hs.calls, hs.inline_calls);
     }
     memory_tracker->peek_fastpath_calls = 0;
     memory_tracker->peek_fastpath_dirty = 0;

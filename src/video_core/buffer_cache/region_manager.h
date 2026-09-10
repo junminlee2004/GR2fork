@@ -83,10 +83,8 @@ public:
      * @param size          Size in bytes to mark or unmark as modified
      */
     template <Type type, bool enable>
-    /// Returns whether any bit changed. A plan defers the CPU protection
-    /// calls to the caller (guest_protect_handoff).
-    bool ChangeRegionState(u64 dirty_addr, u64 size,
-                           PageManager::ProtectPlan* plan = nullptr) noexcept(type == Type::GPU) {
+    /// Returns whether any bit changed.
+    bool ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
         RENDERER_TRACE;
         const size_t offset = dirty_addr - cpu_addr;
         const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
@@ -127,7 +125,7 @@ public:
             }
             if constexpr (type == Type::CPU) {
                 RefreshCpuSummary(start_page, end_page);
-                UpdateProtection<!enable>(plan);
+                UpdateProtection<!enable>();
             } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
                 if constexpr (enable) {
                     if (defer_read_arm_) {
@@ -377,7 +375,6 @@ public:
                 return result;
             }
         }
-        Tally(peek_lock_falls_);
         std::scoped_lock lk{lock};
         return IsRegionModified<type>(offset, size);
     }
@@ -480,9 +477,6 @@ public:
     static inline std::atomic<u64> gpusum_sampled_{};
     static inline std::atomic<u64> gpusum_diverged_{};
     static inline std::atomic<u32> gpusum_sample_ctr_{};
-    // Lock-free peeks that gave up on the sequence and took the lock: the
-    // number guest_protect_handoff exists to shrink.
-    static inline std::atomic<u64> peek_lock_falls_{};
     static void Tally(std::atomic<u64>& c) noexcept {
         c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
@@ -643,17 +637,13 @@ private:
      * @tparam track True when the tracker should start tracking the new pages
      */
     template <bool track>
-    void UpdateProtection(PageManager::ProtectPlan* plan = nullptr) {
+    void UpdateProtection() {
         RENDERER_TRACE;
         RegionBits mask = cpu ^ writeable;
         if (mask.None()) {
             return;
         }
         writeable = cpu;
-        if (plan) {
-            tracker->PlanPageWatchersForRegion<track, false>(cpu_addr, mask, *plan);
-            return;
-        }
         tracker->UpdatePageWatchersForRegion<track, false>(cpu_addr, mask);
     }
 
