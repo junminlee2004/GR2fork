@@ -632,6 +632,9 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         rbsite_wait_[writer_site] += blocked;
     }
     scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, blocked);
+    // The ring is empty here and stays empty through the write-back below and
+    // the parse that follows.
+    ++drain_epoch_;
     write_islands(0, copies.size());
     // Only as far as the copies reached: an island the ring could not take
     // is still GPU-dirty and must keep its bits.

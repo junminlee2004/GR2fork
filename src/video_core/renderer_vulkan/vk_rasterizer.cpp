@@ -126,6 +126,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
+    post_drain_draws_ = EmulatorSettings.GetReadbackPostDrainFlush();
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -724,7 +725,16 @@ void Rasterizer::MaybeIntervalFlush() {
         flush_tick_ = tick;
         draws_since_flush_ = 0;
     }
-    if (++draws_since_flush_ < flush_draw_interval_) {
+    // readback_post_drain_flush: a drain leaves the ring empty, and the
+    // epilogue and parse that follow hand it nothing until a full interval of
+    // draws has been recorded. The first batch after a drain goes out early
+    // instead; the epoch is consumed by that flush, so there is at most one
+    // per drain and the cadence is otherwise unchanged.
+    const bool post_drain =
+        post_drain_draws_ != 0 && buffer_cache.DrainEpoch() != post_drain_epoch_;
+    const u32 interval =
+        post_drain ? std::min(flush_draw_interval_, post_drain_draws_) : flush_draw_interval_;
+    if (++draws_since_flush_ < interval) {
         return;
     }
     // A pending depth or stencil clear belongs to the open render scope:
@@ -738,6 +748,10 @@ void Rasterizer::MaybeIntervalFlush() {
     scheduler.Flush();
     draws_since_flush_ = 0;
     ++interval_flushes_;
+    if (post_drain) {
+        post_drain_epoch_ = buffer_cache.DrainEpoch();
+        ++post_drain_flushes_;
+    }
 }
 
 void Rasterizer::BeginPacketRun() {
@@ -1042,6 +1056,11 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
+            if (post_drain_draws_ != 0) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] PDFLUSH early={} per300f",
+                         post_drain_flushes_);
+                post_drain_flushes_ = 0;
+            }
             if (const auto wt = buffer_cache.DrainWriteTickStats();
                 wt.drains[0] + wt.drains[1] + wt.drains[2]) {
                 // sub carries two times: the wait until the writer retired,

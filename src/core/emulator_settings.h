@@ -744,6 +744,14 @@ struct GPUSettings {
     // fence time of each class reported separately. Prices a copy that would
     // wait only on the writer. Read it as RBSITE2.
     Setting<bool> readback_write_tick{false};
+    // Draws after which the first flush following a readback drain fires,
+    // instead of the full draw interval. A drain leaves the ring empty and
+    // the GPU then idles through the whole epilogue and PM4 parse that
+    // follows - 96% of a 3.8 ms window per drain - because nothing is
+    // submitted until 512 more draws are recorded. At most one early flush
+    // per drain. 0 is off; 64 is the leg. Judge it by PDFLUSH and the drain
+    // wait, and watch the submit count.
+    Setting<u32> readback_post_drain_flush{0};
     // Collapses the clean steady state of per-binding texture updates to one
     // atomic load instead of a texture-cache mutex acquisition; every
     // dirtying path stamps the per-image word back to dirty.
@@ -891,6 +899,8 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_skip_clean_faults",
                                        &GPUSettings::readback_skip_clean_faults),
             make_override<GPUSettings>("readback_write_tick", &GPUSettings::readback_write_tick),
+            make_override<GPUSettings>("readback_post_drain_flush",
+                                       &GPUSettings::readback_post_drain_flush),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
             make_override<GPUSettings>("guest_copy_lock_batch",
                                        &GPUSettings::guest_copy_lock_batch),
@@ -922,7 +932,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, tracker_clean_bitmap, readback_skip_clean_faults, readback_write_tick
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, tracker_gpu_summary, readback_writeback_diff, readback_copy_merge_gap, readback_writeback_nt, tracker_clean_bitmap, readback_skip_clean_faults, readback_write_tick, readback_post_drain_flush
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1276,6 +1286,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, TrackerCleanBitmap, tracker_clean_bitmap)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackSkipCleanFaults, readback_skip_clean_faults)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWriteTick, readback_write_tick)
+    SETTING_FORWARD(m_gpu, ReadbackPostDrainFlush, readback_post_drain_flush)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
     SETTING_FORWARD_BOOL(m_gpu, SpecMruPermProbe, spec_mru_perm_probe)

@@ -472,6 +472,12 @@ public:
         rbsite_writer_wait_ = rbsite_open_up_ = rbsite_open_dma_ = 0;
         return out;
     }
+    /// Counts completed readback drains. A change means the ring was just
+    /// emptied by a fence wait, which is what readback_post_drain_flush acts
+    /// on. GPU command thread only.
+    [[nodiscard]] u64 DrainEpoch() const noexcept {
+        return drain_epoch_;
+    }
     /// readback_write_tick: records that the GPU was told to write this
     /// buffer in the command buffer now open. GPU command thread only.
     void StampGpuWrite(Buffer& buffer, bool upload) {
@@ -669,6 +675,7 @@ private:
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
     bool skip_clean_faults_{};
+    u64 drain_epoch_{};
     // readback_write_tick and its census. GPU command thread only.
     bool write_tick_{};
     u64 dma_seen_tick_{};
