@@ -367,6 +367,87 @@ struct PageManager::Impl {
         return calls;
     }
 
+    template <bool track, bool is_read>
+    u32 PlanPageWatchersForRegion(VAddr base_addr, RegionBits& mask,
+                                  PageManager::ProtectPlan& plan) {
+        RENDERER_TRACE;
+        u32 calls = 0;
+        const auto start_range = mask.FirstRange();
+        const auto end_range = mask.LastRange();
+        const size_t base_page = base_addr >> PM_PAGE_BITS;
+        ASSERT(base_page % PAGES_PER_LOCK == 0);
+        DEBUG_ASSERT(!plan.held);
+        plan.lock_index = base_page / PAGES_PER_LOCK;
+        locks[plan.lock_index].lock();
+        plan.held = true;
+        auto perms = cached_pages[base_page + start_range.first].Perms();
+        u64 range_begin = 0;
+        u64 range_bytes = 0;
+        u64 potential_range_bytes = 0;
+
+        // The same walk as UpdatePageWatchersForRegion; a pending call goes
+        // into the plan, or out at once under both locks when it is full.
+        const auto release_pending = [&] {
+            if (range_bytes > 0) {
+                if (plan.count < PageManager::ProtectPlan::Capacity) {
+                    plan.ranges[plan.count++] = {range_begin << PM_PAGE_BITS, range_bytes,
+                                                 static_cast<u32>(perms)};
+                } else {
+                    Protect((range_begin << PM_PAGE_BITS), range_bytes, perms);
+                    ++plan.inline_calls;
+                }
+                ++calls;
+                range_bytes = 0;
+                potential_range_bytes = 0;
+            }
+        };
+
+        for (size_t page = start_range.first; page < end_range.second; ++page) {
+            PageState& state = cached_pages[base_page + page];
+            const bool update = mask.Get(page);
+            const u8 new_count =
+                update ? state.AddDelta<track ? 1 : -1, is_read>() : state.AddDelta<0, is_read>();
+            if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
+                release_pending();
+                perms = new_perms;
+            } else if (range_bytes != 0) {
+                potential_range_bytes += PM_PAGE_SIZE;
+            }
+            if (!update) {
+                continue;
+            }
+            if ((new_count == 0 && !track) || (new_count == 1 && track)) {
+                if (range_bytes == 0) {
+                    range_begin = base_page + page;
+                    potential_range_bytes = PM_PAGE_SIZE;
+                }
+                range_bytes = potential_range_bytes;
+            }
+        }
+        release_pending();
+        return calls;
+    }
+
+    void IssueProtectPlan(PageManager::ProtectPlan& plan) noexcept {
+        for (u32 i = 0; i < plan.count; ++i) {
+            const auto& r = plan.ranges[i];
+            Protect(r.addr, r.size, static_cast<Core::MemoryPermission>(r.perms));
+        }
+        plan.count = 0;
+        if (plan.held) {
+            plan.held = false;
+            locks[plan.lock_index].unlock();
+        }
+    }
+
+    void SyncProtect(VAddr addr, u64 size) {
+        const size_t first = (addr >> PM_PAGE_BITS) / PAGES_PER_LOCK;
+        const size_t last = Common::DivCeil(addr + size, PM_PAGE_SIZE * PAGES_PER_LOCK);
+        for (size_t i = first; i < last; ++i) {
+            std::scoped_lock lk(locks[i]);
+        }
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -399,6 +480,20 @@ u32 PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) 
     return impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
 }
 
+template <bool track, bool is_read>
+u32 PageManager::PlanPageWatchersForRegion(VAddr base_addr, RegionBits& mask,
+                                           ProtectPlan& plan) const {
+    return impl->PlanPageWatchersForRegion<track, is_read>(base_addr, mask, plan);
+}
+
+void PageManager::IssueProtectPlan(ProtectPlan& plan) const noexcept {
+    impl->IssueProtectPlan(plan);
+}
+
+void PageManager::SyncProtect(VAddr addr, u64 size) const {
+    impl->SyncProtect(addr, size);
+}
+
 template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;
 template void PageManager::UpdatePageWatchers<false>(VAddr addr, u64 size) const;
 template u32 PageManager::UpdatePageWatchersForRegion<true, true>(VAddr base_addr,
@@ -409,5 +504,9 @@ template u32 PageManager::UpdatePageWatchersForRegion<false, true>(VAddr base_ad
                                                                    RegionBits& mask) const;
 template u32 PageManager::UpdatePageWatchersForRegion<false, false>(VAddr base_addr,
                                                                     RegionBits& mask) const;
+template u32 PageManager::PlanPageWatchersForRegion<false, false>(VAddr base_addr, RegionBits& mask,
+                                                                  ProtectPlan& plan) const;
+template u32 PageManager::PlanPageWatchersForRegion<true, false>(VAddr base_addr, RegionBits& mask,
+                                                                 ProtectPlan& plan) const;
 
 } // namespace VideoCore

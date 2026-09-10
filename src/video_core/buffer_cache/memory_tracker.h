@@ -37,6 +37,9 @@ public:
     void SetDeferReadArm(bool value) {
         defer_read_arm_ = value;
     }
+    void SetProtectHandoff(bool value) {
+        protect_handoff_ = value;
+    }
     void SetGpuSummary(bool value) {
         gpu_summary_ = value;
     }
@@ -377,26 +380,29 @@ public:
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
-        IteratePages<false>(
-            cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {
-                const bool should_flush = [&] {
-                    // Perform both the GPU modification check and CPU state change with the lock
-                    // in case we are racing with GPU thread trying to mark the page as GPU
-                    // modified. If we need to flush the flush function is going to perform CPU
-                    // state change.
-                    std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
-                        manager->template IsRegionModified<Type::GPU>(offset, size)) {
-                        return true;
-                    }
-                    manager->template ChangeRegionState<Type::CPU, true>(
-                        manager->GetCpuAddr() + offset, size);
-                    return false;
-                }();
-                if (should_flush) {
-                    on_flush();
+        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64 offset, size_t size) {
+            // guest_protect_handoff: the protection calls are planned
+            // under the lock and issued after it, see InvalidateRegionWidened.
+            PageManager::ProtectPlan plan;
+            const bool should_flush = [&] {
+                // Perform both the GPU modification check and CPU state change with the lock
+                // in case we are racing with GPU thread trying to mark the page as GPU
+                // modified. If we need to flush the flush function is going to perform CPU
+                // state change.
+                std::scoped_lock lk{manager->lock};
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                    manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                    return true;
                 }
-            });
+                manager->template ChangeRegionState<Type::CPU, true>(
+                    manager->GetCpuAddr() + offset, size, protect_handoff_ ? &plan : nullptr);
+                return false;
+            }();
+            IssuePlan(plan);
+            if (should_flush) {
+                on_flush();
+            }
+        });
     }
 
     /// InvalidateRegion with fault widening: the whole widened chunk goes
@@ -411,6 +417,15 @@ public:
         IteratePages<false>(
             wide_addr, wide_size, [&](RegionManager* manager, u64 offset, size_t size) {
                 const VAddr chunk_addr = manager->GetCpuAddr() + offset;
+                // guest_protect_handoff: the region lock and its write scope
+                // are held across the mprotect today, and every lock-free
+                // peek the GPU thread aims at this region meanwhile falls to
+                // the lock. With the setting the mark only plans the calls;
+                // they go out below, after the lock, under the page-manager
+                // lock the plan took and keeps, so no other protect of these
+                // pages can slip in between. At most one mark per region here.
+                PageManager::ProtectPlan plan;
+                PageManager::ProtectPlan* const deferred = protect_handoff_ ? &plan : nullptr;
                 bool flush = false;
                 {
                     std::scoped_lock lk{manager->lock};
@@ -418,25 +433,48 @@ public:
                         EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled;
                     if (!readbacks ||
                         !manager->template IsRegionModified<Type::GPU>(offset, size)) {
-                        manager->template ChangeRegionState<Type::CPU, true>(chunk_addr, size);
-                        return;
-                    }
-                    const VAddr lo = std::max(chunk_addr, orig_addr);
-                    const VAddr hi = std::min<VAddr>(chunk_addr + size, orig_addr + orig_size);
-                    if (lo >= hi) {
-                        return; // pure widening over GPU data: leave untouched
-                    }
-                    if (manager->template IsRegionModified<Type::GPU>(lo - manager->GetCpuAddr(),
-                                                                      hi - lo)) {
-                        flush = true;
+                        manager->template ChangeRegionState<Type::CPU, true>(chunk_addr, size,
+                                                                             deferred);
                     } else {
-                        manager->template ChangeRegionState<Type::CPU, true>(lo, hi - lo);
+                        const VAddr lo = std::max(chunk_addr, orig_addr);
+                        const VAddr hi = std::min<VAddr>(chunk_addr + size, orig_addr + orig_size);
+                        if (lo >= hi) {
+                            // pure widening over GPU data: leave untouched
+                        } else if (manager->template IsRegionModified<Type::GPU>(
+                                       lo - manager->GetCpuAddr(), hi - lo)) {
+                            flush = true;
+                        } else {
+                            manager->template ChangeRegionState<Type::CPU, true>(lo, hi - lo,
+                                                                                 deferred);
+                        }
                     }
                 }
+                IssuePlan(plan);
                 if (flush) {
                     on_flush();
                 }
             });
+    }
+
+    /// Issues a deferred protection plan; counts for PHANDOFF.
+    void IssuePlan(PageManager::ProtectPlan& plan) noexcept {
+        if (!plan.held) {
+            return;
+        }
+        handoff_plans_.fetch_add(1, std::memory_order_relaxed);
+        handoff_calls_.fetch_add(plan.count, std::memory_order_relaxed);
+        handoff_inline_.fetch_add(plan.inline_calls, std::memory_order_relaxed);
+        tracker->IssueProtectPlan(plan);
+    }
+    struct HandoffStats {
+        u64 plans;
+        u64 calls;
+        u64 inline_calls;
+    };
+    HandoffStats DrainHandoffStats() {
+        return {handoff_plans_.exchange(0, std::memory_order_relaxed),
+                handoff_calls_.exchange(0, std::memory_order_relaxed),
+                handoff_inline_.exchange(0, std::memory_order_relaxed)};
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
@@ -850,6 +888,11 @@ private:
 
     bool defer_read_arm_{};
     bool gpu_summary_{};
+    bool protect_handoff_{};
+    // guest_protect_handoff census; bumped on guest threads.
+    std::atomic<u64> handoff_plans_{};
+    std::atomic<u64> handoff_calls_{};
+    std::atomic<u64> handoff_inline_{};
     // Regions whose marks await their arm, and the depth of the walk that must
     // not be drained into. GPU-command-thread confined.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
