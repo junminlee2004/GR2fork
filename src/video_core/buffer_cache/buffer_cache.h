@@ -491,16 +491,6 @@ public:
             dma_seen_tick_ = scheduler.CurrentTick();
         }
     }
-    // readback_skip_clean_faults census. Bumped on guest threads, drained on
-    // the GPU command thread, so its line is its own.
-    struct SkipCleanStats {
-        u64 probes;
-        u64 skips;
-    };
-    SkipCleanStats DrainSkipCleanStats() {
-        return {rbskip_.probes.exchange(0, std::memory_order_relaxed),
-                rbskip_.skips.exchange(0, std::memory_order_relaxed)};
-    }
     struct CopyMergeStats {
         u64 downloads;
         u64 islands;
@@ -674,7 +664,6 @@ private:
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
-    bool skip_clean_faults_{};
     u64 drain_epoch_{};
     // readback_write_tick and its census. GPU command thread only.
     bool write_tick_{};
@@ -684,11 +673,6 @@ private:
     u64 rbsite_writer_wait_{};
     u64 rbsite_open_up_{};
     u64 rbsite_open_dma_{};
-    struct alignas(64) SkipCleanCounters {
-        std::atomic<u64> probes{};
-        std::atomic<u64> skips{};
-    };
-    SkipCleanCounters rbskip_;
     // readback_copy_merge_gap, and its census. GPU command thread only.
     u64 copy_merge_gap_{};
     u64 dlmerge_downloads_{};

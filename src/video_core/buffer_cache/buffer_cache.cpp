@@ -87,7 +87,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
     memory_tracker->SetGpuSummary(EmulatorSettings.IsTrackerGpuSummary());
     memory_tracker->SetCleanBitmap(EmulatorSettings.IsTrackerCleanBitmap());
-    skip_clean_faults_ = EmulatorSettings.IsReadbackSkipCleanFaults();
     write_tick_ = EmulatorSettings.IsReadbackWriteTick();
     copy_merge_gap_ = EmulatorSettings.GetReadbackCopyMergeGap();
 
@@ -315,12 +314,6 @@ void BufferCache::EmitMirrorTelemetry() {
              memory_tracker->peek_fastpath_calls, memory_tracker->peek_fastpath_dirty,
              memory_tracker->multi_walks, memory_tracker->multi_regions,
              memory_tracker->multi_clean_regions);
-    if (const auto rs = DrainSkipCleanStats(); rs.probes) {
-        // skips are round trips the guest thread never made; every one is a
-        // fence wait it did not queue behind.
-        LOG_INFO(Render_Skipcache, "[SkipCache] RBSKIP probes={} skips={} per300f", rs.probes,
-                 rs.skips);
-    }
     if (const auto cb = memory_tracker->DrainCleanBitmapStats(); cb.walks) {
         // diverged must stay zero; publish/retire are the region-level
         // clean<->dirty edges the map's writes follow.
@@ -365,27 +358,6 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    // readback_skip_clean_faults: four of every six guest round trips find
-    // nothing to download - they are convoy followers whose leader's batched
-    // download already covered their page, and they spend milliseconds queued
-    // behind the leader's fence wait to be told so. A read fault whose own
-    // range holds no GPU-modified byte is spurious: the bits are cleared and
-    // the read watcher released under one region lock, inside one write
-    // scope, so a seqlock read that sees an even sequence and no GPU bit saw
-    // a state in which the page's protection had already been restored. The
-    // faulting instruction therefore retries and completes. A range that goes
-    // GPU-dirty again after the peek arms a new watcher and faults again,
-    // which is a new fault with work to do, not a repeat of this one. Write
-    // faults are excluded: their caller established GPU-dirtiness under the
-    // lock and their round trip also carries the CPU mark that lifts the
-    // write protection, so skipping one would re-fault forever.
-    if (skip_clean_faults_ && !is_write) {
-        rbskip_.probes.fetch_add(1, std::memory_order_relaxed);
-        if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
-            rbskip_.skips.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-    }
     // Readback offload removed: the fault is serviced synchronously on the
     // GPU command thread, which is the only form that cannot be outrun.
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
