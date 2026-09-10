@@ -344,6 +344,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadRealtime(vblank_period);
 
     Common::AccurateTimer timer{vblank_period};
+    // late_flip_next_vblank: the flip rate gates flips by the interval since
+    // the last one rather than by the phase of the vblank counter, so a
+    // request that missed its slot waits one vblank, not a whole slot.
+    const bool late_flip_next_vblank = EmulatorSettings.IsLateFlipNextVblank();
+    u64 vblanks_since_flip = ~u64{0} >> 1;
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -366,7 +371,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const bool flip_slot = late_flip_next_vblank
+                                   ? vblanks_since_flip >= static_cast<u64>(main_port.flip_rate + 1)
+                                   : vblank_status.count % (main_port.flip_rate + 1) == 0;
+        if (flip_slot) {
             const auto request = receive_request();
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -379,6 +387,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             } else {
                 Flip(request);
                 FRAME_END;
+                vblanks_since_flip = 0;
             }
         }
 
@@ -401,6 +410,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
             // Update vblank status
             vblank_status.count++;
+            ++vblanks_since_flip;
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
