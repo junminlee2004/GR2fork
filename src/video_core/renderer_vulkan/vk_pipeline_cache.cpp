@@ -131,6 +131,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
     }
     case Stage::Vertex: {
         BuildCommon(regs.vs_program);
+        info.vs_info.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
         info.vs_info.step_rate_0 = regs.vgt_instance_step_rate_0;
         info.vs_info.step_rate_1 = regs.vgt_instance_step_rate_1;
         info.vs_info.num_outputs = MapOutputs(info.vs_info.outputs, regs.vs_output_control);
@@ -222,9 +223,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
             info.fs_info.color_buffers[i] = graphics_key.color_buffers[i];
         }
+        // Lowered user clip planes ride the same emulation path as guest-exported distances, so
+        // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
+        // locations in sync with the shifted vertex outputs.
+        const bool lowers_user_clip_planes =
+            regs.clipper_control.user_clip_plane_enable &&
+            !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Geometry));
         info.fs_info.clip_distance_emulation =
-            regs.vs_output_control.clip_distance_enable &&
-            !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Local)) &&
+            ((regs.vs_output_control.clip_distance_enable &&
+              !regs.stage_enable.IsStageEnabled(static_cast<u32>(Stage::Local))) ||
+             lowers_user_clip_planes) &&
             profile.needs_clip_distance_emulation;
         break;
     }
@@ -251,10 +259,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
-        // When binding a UBO, we calculate its size considering the offset in the larger buffer
-        // cache underlying resource. In some cases, it may produce sizes exceeding the system
-        // maximum allowed UBO range, so we need to reduce the threshold to prevent issues.
-        .max_ubo_size = instance.UniformMaxSize() - instance.UniformMinAlignment(),
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
         .max_shared_memory_size = instance.MaxComputeSharedMemorySize(),
@@ -297,6 +301,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_amd_shader_explicit_vertex_parameter =
             instance_.IsAmdShaderExplicitVertexParameterSupported(),
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+        .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
@@ -413,6 +418,14 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.num_conversion = col_buf.GetNumberConversion();
         color_buffer.export_format = regs.color_export_format.GetFormat(cb);
         color_buffer.swizzle = col_buf.Swizzle();
+
+        const auto& bc = regs.blend_control[cb];
+        color_buffer.blend_self_scale =
+            bc.enable && !col_buf.info.blend_bypass &&
+            (bc.color_func == AmdGpu::BlendControl::BlendFunc::Min ||
+             bc.color_func == AmdGpu::BlendControl::BlendFunc::Max) &&
+            bc.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcColor &&
+            bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
     }
 
     // Compile and bind shader stages
