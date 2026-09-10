@@ -450,47 +450,6 @@ public:
         idxwhole_binds_ = idxwhole_skips_ = idxwhole_veto_ = 0;
         return out;
     }
-    // readback_write_tick census: drains by where the drained buffer's last
-    // GPU writer sits. open = still in the open command buffer (a copy that
-    // waited only on the writer would gain nothing), sub = submitted and not
-    // retired (writer = the time until it retired, rest = everything after,
-    // which is what such a copy gives back), done = already retired.
-    // open_up / open_dma = open only through an upload or through a BDA
-    // shader, the two classes the earlier one-site probe could not see.
-    struct WriteTickStats {
-        std::array<u64, 3> drains;
-        std::array<u64, 3> wait_ticks;
-        u64 writer_wait_ticks;
-        u64 open_up;
-        u64 open_dma;
-    };
-    WriteTickStats DrainWriteTickStats() {
-        const WriteTickStats out{rbsite_drains_, rbsite_wait_, rbsite_writer_wait_, rbsite_open_up_,
-                                 rbsite_open_dma_};
-        rbsite_drains_ = {};
-        rbsite_wait_ = {};
-        rbsite_writer_wait_ = rbsite_open_up_ = rbsite_open_dma_ = 0;
-        return out;
-    }
-    /// Counts completed readback drains. A change means the ring was just
-    /// emptied by a fence wait, which is what readback_post_drain_flush acts
-    /// on. GPU command thread only.
-    [[nodiscard]] u64 DrainEpoch() const noexcept {
-        return drain_epoch_;
-    }
-    /// readback_write_tick: records that the GPU was told to write this
-    /// buffer in the command buffer now open. GPU command thread only.
-    void StampGpuWrite(Buffer& buffer, bool upload) {
-        if (!write_tick_) {
-            return;
-        }
-        (upload ? buffer.gpu_upload_tick : buffer.gpu_write_tick) = scheduler.CurrentTick();
-    }
-    void StampGpuDma() {
-        if (write_tick_) {
-            dma_seen_tick_ = scheduler.CurrentTick();
-        }
-    }
     struct CopyMergeStats {
         u64 downloads;
         u64 islands;
@@ -664,15 +623,6 @@ private:
     bool mirror_mode_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
-    u64 drain_epoch_{};
-    // readback_write_tick and its census. GPU command thread only.
-    bool write_tick_{};
-    u64 dma_seen_tick_{};
-    std::array<u64, 3> rbsite_drains_{};
-    std::array<u64, 3> rbsite_wait_{};
-    u64 rbsite_writer_wait_{};
-    u64 rbsite_open_up_{};
-    u64 rbsite_open_dma_{};
     // readback_copy_merge_gap, and its census. GPU command thread only.
     u64 copy_merge_gap_{};
     u64 dlmerge_downloads_{};

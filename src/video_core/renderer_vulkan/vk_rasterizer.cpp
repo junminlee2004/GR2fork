@@ -126,7 +126,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
-    post_drain_draws_ = EmulatorSettings.GetReadbackPostDrainFlush();
+    idle_flush_draws_ = EmulatorSettings.GetGpuIdleFlush();
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
@@ -725,15 +725,18 @@ void Rasterizer::MaybeIntervalFlush() {
         flush_tick_ = tick;
         draws_since_flush_ = 0;
     }
-    // readback_post_drain_flush: a drain leaves the ring empty, and the
-    // epilogue and parse that follow hand it nothing until a full interval of
-    // draws has been recorded. The first batch after a drain goes out early
-    // instead; the epoch is consumed by that flush, so there is at most one
-    // per drain and the cadence is otherwise unchanged.
-    const bool post_drain =
-        post_drain_draws_ != 0 && buffer_cache.DrainEpoch() != post_drain_epoch_;
+    // gpu_idle_flush: a readback drain leaves the ring empty and it stays
+    // empty through the write-back and the whole parse that follows, because
+    // nothing is submitted until a full interval of draws has been recorded.
+    // While the GPU has run out of work, submit what is recorded much sooner.
+    // The test is two relaxed loads and errs towards "busy": the known tick
+    // is refreshed on submits and waits, so a stale one only misses a flush,
+    // never forces one. Self-limiting - this flush refills the ring, so the
+    // next draw sees it busy and the cadence returns to the interval.
+    const bool ring_idle =
+        idle_flush_draws_ != 0 && scheduler.GetMasterSemaphore()->KnownGpuTick() + 1 >= tick;
     const u32 interval =
-        post_drain ? std::min(flush_draw_interval_, post_drain_draws_) : flush_draw_interval_;
+        ring_idle ? std::min(flush_draw_interval_, idle_flush_draws_) : flush_draw_interval_;
     if (++draws_since_flush_ < interval) {
         return;
     }
@@ -748,9 +751,8 @@ void Rasterizer::MaybeIntervalFlush() {
     scheduler.Flush();
     draws_since_flush_ = 0;
     ++interval_flushes_;
-    if (post_drain) {
-        post_drain_epoch_ = buffer_cache.DrainEpoch();
-        ++post_drain_flushes_;
+    if (ring_idle) {
+        ++idle_flushes_;
     }
 }
 
@@ -1056,23 +1058,11 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
-            if (post_drain_draws_ != 0) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] PDFLUSH early={} per300f",
-                         post_drain_flushes_);
-                post_drain_flushes_ = 0;
-            }
-            if (const auto wt = buffer_cache.DrainWriteTickStats();
-                wt.drains[0] + wt.drains[1] + wt.drains[2]) {
-                // sub carries two times: the wait until the writer retired,
-                // which a copy on the writer's tick would still pay, and the
-                // rest, which it would not.
-                const u64 us = std::max<u64>(tsc_hz_ / 1000000u, 1);
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RBSITE2 open={}/{}us openUp={} openDma={} sub={}/{}us+{}us "
-                         "done={}/{}us per300f",
-                         wt.drains[0], wt.wait_ticks[0] / us, wt.open_up, wt.open_dma, wt.drains[1],
-                         wt.writer_wait_ticks / us, wt.wait_ticks[1] / us, wt.drains[2],
-                         wt.wait_ticks[2] / us);
+            if (idle_flush_draws_ != 0) {
+                // Flushes that fired because the ring had gone empty, out of
+                // the IFLUSH total.
+                LOG_INFO(Render_Skipcache, "[SkipCache] IDLEFLUSH early={} per300f", idle_flushes_);
+                idle_flushes_ = 0;
             }
             if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
                 // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
@@ -1673,9 +1663,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
-        // A BDA shader can write any buffer without passing a stamp site, so
-        // the census treats every buffer as written from here on.
-        buffer_cache.StampGpuDma();
         // We only use fault buffer for DMA right now.
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
         for (auto& range : mapped_ranges) {

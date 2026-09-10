@@ -361,10 +361,9 @@ private:
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
     bool deferred_read_arm_{};
-    // readback_post_drain_flush and its census.
-    u32 post_drain_draws_{};
-    u64 post_drain_epoch_{};
-    u64 post_drain_flushes_{};
+    // gpu_idle_flush and its census.
+    u32 idle_flush_draws_{};
+    u64 idle_flushes_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
