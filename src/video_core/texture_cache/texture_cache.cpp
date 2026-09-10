@@ -62,6 +62,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       memo_set_shift{static_cast<u32>(
           64 - std::countr_zero(u64{find_image_memo_.size() / std::max<u32>(memo_ways, 1u)}))} {
 
+    memo_prefetch_ = std::min<u32>(EmulatorSettings.GetFindimgMemoPrefetch(), 3u);
     invalidate_cover_ = std::make_unique<std::atomic<u64>[]>(CoverWords);
     if (EmulatorSettings.IsImageUpdateDirect() && !image_update_direct) {
         LOG_WARNING(Render_Vulkan,

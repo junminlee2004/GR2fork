@@ -1557,6 +1557,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (findimg_hint_) {
         image_hint_cur_ = pipeline->image_memo_hint.data();
         image_hint_end_ = image_hint_cur_ + Pipeline::kImageMemoHints;
+        // The first ordinal's entry has the whole prologue as lead.
+        texture_cache.PrefetchMemoHint(*image_hint_cur_);
     } else {
         image_hint_cur_ = image_hint_end_ = nullptr;
     }
@@ -2159,6 +2161,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 hint = mip_fallback_mode == Shader::MipStorageFallbackMode::None ? image_hint_cur_
                                                                                  : nullptr;
                 ++image_hint_cur_;
+                // Warm the next ordinal's entry across this one's lookup,
+                // which is itself the memory-latency event being hidden.
+                if (image_hint_cur_ != image_hint_end_) {
+                    texture_cache.PrefetchMemoHint(*image_hint_cur_);
+                }
             }
             image_id = texture_cache.FindImageMemoized(desc, tsharp, hint);
             if (memo_first_ && !image_id) [[unlikely]] {
