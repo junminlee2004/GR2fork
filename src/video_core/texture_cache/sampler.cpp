@@ -42,8 +42,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
             return std::nullopt;
         }
     }();
-    const bool compare_enable = sampler.depth_compare_func != AmdGpu::DepthCompare::Never &&
-                                sampler.depth_compare_func != AmdGpu::DepthCompare::Always;
+
     const vk::SamplerCreateInfo sampler_ci = {
         .pNext = custom_color ? &*custom_color : nullptr,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
@@ -55,7 +54,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
-        .compareEnable = compare_enable,
+        .compareEnable = sampler.depth_compare_func != AmdGpu::DepthCompare::Never,
         .compareOp = LiverpoolToVK::DepthCompare(sampler.depth_compare_func),
         .minLod = sampler.MinLod(),
         .maxLod = sampler.MaxLod(),
