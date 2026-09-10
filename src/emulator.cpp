@@ -565,6 +565,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU trackerCleanBitmap: {}", EmulatorSettings.IsTrackerCleanBitmap());
     LOG_INFO(Config, "GPU readbackSkipCleanFaults: {}",
              EmulatorSettings.IsReadbackSkipCleanFaults());
+    LOG_INFO(Config, "GPU readbackWriteTick: {}", EmulatorSettings.IsReadbackWriteTick());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
     LOG_INFO(Config, "GPU dynStateMemo: {}", EmulatorSettings.IsDynStateMemo());
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());

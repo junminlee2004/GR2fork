@@ -174,6 +174,13 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
+    // readback_write_tick: the tick of the command buffer each kind of GPU
+    // write into this buffer was last recorded into. shader = draws,
+    // dispatches, fills and buffer-to-buffer copies; upload = the transfer
+    // writes an upload or an image sync records. Both are needed because a
+    // read-only bind that uploads is still a GPU write nobody stamped before.
+    u64 gpu_write_tick = 0;
+    u64 gpu_upload_tick = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

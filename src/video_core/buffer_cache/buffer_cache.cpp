@@ -88,6 +88,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker->SetGpuSummary(EmulatorSettings.IsTrackerGpuSummary());
     memory_tracker->SetCleanBitmap(EmulatorSettings.IsTrackerCleanBitmap());
     skip_clean_faults_ = EmulatorSettings.IsReadbackSkipCleanFaults();
+    write_tick_ = EmulatorSettings.IsReadbackWriteTick();
     copy_merge_gap_ = EmulatorSettings.GetReadbackCopyMergeGap();
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
@@ -553,6 +554,25 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     dlmerge_regions_ += regions.size();
     dlmerge_gap_bytes_ += gap_bytes;
     download_buffer.Commit();
+    // readback_write_tick: class this drain by where its buffer's last GPU
+    // writer sits. A submitted writer is waited for on its own below, so its
+    // share of the fence time is measured apart from the rest - the rest is
+    // what a copy that waited only on the writer would give back.
+    const u64 open_tick = scheduler.CurrentTick();
+    size_t writer_site = 0;
+    u64 write_tick = 0;
+    if (write_tick_) {
+        write_tick = std::max({buffer.gpu_write_tick, buffer.gpu_upload_tick, dma_seen_tick_});
+        writer_site = write_tick >= open_tick                              ? 0
+                      : scheduler.GetMasterSemaphore()->IsFree(write_tick) ? 2
+                                                                           : 1;
+        ++rbsite_drains_[writer_site];
+        if (writer_site == 0) {
+            rbsite_open_up_ += buffer.gpu_write_tick < open_tick && dma_seen_tick_ < open_tick;
+            rbsite_open_dma_ +=
+                buffer.gpu_write_tick < open_tick && buffer.gpu_upload_tick < open_tick;
+        }
+    }
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     // Synchronize prior GPU writes to this buffer before the transfer read
@@ -600,9 +620,18 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     // the Finish site as well.
     const u64 tick = scheduler.CurrentTick();
     scheduler.Flush();
+    if (writer_site == 1) {
+        const u64 tw = Common::FencedRDTSC();
+        scheduler.Wait(write_tick);
+        rbsite_writer_wait_ += Common::FencedRDTSC() - tw;
+    }
     const u64 t0 = Common::FencedRDTSC();
     scheduler.Wait(tick);
-    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, Common::FencedRDTSC() - t0);
+    const u64 blocked = Common::FencedRDTSC() - t0;
+    if (write_tick_) {
+        rbsite_wait_[writer_site] += blocked;
+    }
+    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadBuffer, blocked);
     write_islands(0, copies.size());
     // Only as far as the copies reached: an island the ring could not take
     // is still GPU-dirty and must keep its bits.
@@ -1708,6 +1737,9 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     for (const BufferId overlap_id : overlap.ids) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
+    if (!overlap.ids.empty()) {
+        StampGpuWrite(new_buffer, true);
+    }
     Register(new_buffer_id);
     return new_buffer_id;
 }
@@ -1777,6 +1809,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                                     bool is_texel_buffer, bool* new_gpu_pages) {
     if (new_gpu_pages) {
         *new_gpu_pages = false;
+    }
+    if (is_written) {
+        StampGpuWrite(buffer, false);
     }
     bool fresh_pages = false;
     // Read-only binds dominate and almost never have anything to upload, but
@@ -1971,6 +2006,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     if (staging == nullptr) [[unlikely]] {
         return UploadCopiesFallback(buffer, copies, total_size_bytes);
     }
+    StampGpuWrite(buffer, true);
     if (is_written) {
         ++upload_w_calls_;
         upload_w_bytes_ += total_size_bytes;
@@ -2048,6 +2084,7 @@ vk::Buffer BufferCache::UploadCopiesFallback(Buffer& buffer, std::span<const vk:
 }
 
 bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size) {
+    StampGpuWrite(buffer, true);
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
@@ -2115,6 +2152,7 @@ void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes) {
+    StampGpuWrite(buffer, true);
     vk::BufferCopy copy = {
         .srcOffset = 0,
         .dstOffset = buffer.Offset(address),

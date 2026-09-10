@@ -1042,6 +1042,19 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
+            if (const auto wt = buffer_cache.DrainWriteTickStats();
+                wt.drains[0] + wt.drains[1] + wt.drains[2]) {
+                // sub carries two times: the wait until the writer retired,
+                // which a copy on the writer's tick would still pay, and the
+                // rest, which it would not.
+                const u64 us = std::max<u64>(tsc_hz_ / 1000000u, 1);
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] RBSITE2 open={}/{}us openUp={} openDma={} sub={}/{}us+{}us "
+                         "done={}/{}us per300f",
+                         wt.drains[0], wt.wait_ticks[0] / us, wt.open_up, wt.open_dma, wt.drains[1],
+                         wt.writer_wait_ticks / us, wt.wait_ticks[1] / us, wt.drains[2],
+                         wt.wait_ticks[2] / us);
+            }
             if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
                 // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
                 LOG_INFO(Render_Skipcache,
@@ -1641,6 +1654,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        // A BDA shader can write any buffer without passing a stamp site, so
+        // the census treats every buffer as written from here on.
+        buffer_cache.StampGpuDma();
         // We only use fault buffer for DMA right now.
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
         for (auto& range : mapped_ranges) {
