@@ -419,12 +419,14 @@ void L::Draw() {
             // when it grows: going windowed to fullscreen left the counter
             // stranded where the smaller display had put it. Re-arm on a
             // resize, and only while the window is still against the edge it
-            // was anchored to, so one the user dragged elsewhere stays put.
-            // The sentinel width leaves a position restored from the ini alone
-            // on the first frame, when no toggle has run.
+            // was anchored to, so one the user dragged elsewhere - including
+            // one dragged down that same edge - stays put. The sentinel width
+            // leaves a position restored from the ini alone on the first
+            // frame, when no toggle has run.
             if (const float width = GetIO().DisplaySize.x; width != fps_anchor_width) {
-                visibility_toggled |= GetWindowPos().x + GetCurrentWindowRead()->SizeFull.x >=
-                                      fps_anchor_width - 1.0f;
+                const ImVec2 pos = GetWindowPos();
+                visibility_toggled |= pos.y <= 1.0f && pos.x + GetCurrentWindowRead()->SizeFull.x >=
+                                                           fps_anchor_width - 1.0f;
                 fps_anchor_width = width;
             }
             // Set window position to top left if it was toggled on
