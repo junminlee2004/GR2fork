@@ -4,17 +4,12 @@
 #include <array>
 #include <atomic>
 #include <thread>
-#if defined(ARCH_X86_64)
-#include <immintrin.h>
-#endif
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
-#include "common/arch.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
-#include "common/rdtsc.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -38,8 +33,6 @@ MemoryManager::MemoryManager() {
     }
     RefreshVmaBounds();
     backing_write_memo_ = EmulatorSettings.IsBackingWriteMemo();
-    backing_diff_mode_ = std::min<u32>(EmulatorSettings.GetReadbackWritebackDiff(), 3u);
-    backing_nt_ = EmulatorSettings.IsReadbackWritebackNt();
 
     // Pre-initialize direct backing
     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
@@ -232,116 +225,6 @@ struct BackingWriteMemo {
 };
 static constinit thread_local BackingWriteMemo tls_backing_write_memo{};
 
-// Readback write-back census, per thread like the write memo: the readback
-// write-back runs on the GPU command thread, which is also where it is drained.
-// Only islands of at least one chunk are counted, which keeps the 4-8 byte
-// fence and label writes out of it.
-struct BackingDiffCensus {
-    u64 islands{};
-    u64 allsame{};
-    u64 chunks{};
-    u64 same{};
-    u64 same_bytes{};
-    u64 copy_bytes{};
-    u64 cmp_bytes{};
-    u64 nt_bytes{};
-    u64 copy_ticks{};
-};
-static constinit thread_local BackingDiffCensus tls_backing_diff{};
-
-// One run of stores into backing. readback_writeback_nt streams them: the
-// destination is guest backing the CPU has not touched since the GPU dirtied
-// it, so the line fetch an ordinary store performs first is discarded work.
-// Streaming stores are weakly ordered and are NOT ordered by a later lock
-// release, so the fence sits here, inside the helper, before any caller can
-// clear a tracker bit or unpark a guest thread on the strength of the bytes.
-static void StoreBacking(u8* dst, const u8* src, u64 size, bool nt) {
-#if defined(ARCH_X86_64)
-    if (nt && size >= 256) {
-        u64 i = 0;
-        for (; i < size && (reinterpret_cast<uintptr_t>(dst + i) & 31) != 0; ++i) {
-            dst[i] = src[i];
-        }
-        for (; i + 32 <= size; i += 32) {
-            _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + i),
-                                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i)));
-        }
-        for (; i < size; ++i) {
-            dst[i] = src[i];
-        }
-        _mm_sfence();
-        tls_backing_diff.nt_bytes += size;
-        return;
-    }
-#endif
-    std::memcpy(dst, src, size);
-}
-
-// The store of a backing write. Under readback_writeback_diff, an island of at
-// least one chunk is compared against the backing a chunk at a time and the
-// chunks that already match are not stored; the first mismatch ends the
-// comparing and the remainder copies straight. Skipping is exact, not a
-// heuristic: a chunk is skipped only after memcmp found every byte equal to
-// what memcpy would have written, so the backing ends bit-identical either
-// way. The compare reads the private backing view, never the guest VA, so it
-// cannot trip a read watcher. Mode 1 keeps the identical store and only
-// counts, which measures the redundant fraction with no behaviour change.
-// The timing brackets every arm alike, so it cancels in an A/B.
-static void WriteBackingBytes(u8* dst, const u8* src, u64 size, u32 mode, bool nt) {
-    constexpr u64 kChunk = 4096;
-    if (size < kChunk) {
-        std::memcpy(dst, src, size);
-        return;
-    }
-    auto& c = tls_backing_diff;
-    const u64 t0 = Common::FencedRDTSC();
-    ++c.islands;
-    if (mode == 0) {
-        StoreBacking(dst, src, size, nt);
-        c.copy_bytes += size;
-        c.copy_ticks += Common::FencedRDTSC() - t0;
-        return;
-    }
-    bool all_same = true;
-    u64 off = 0;
-    while (off < size) {
-        const u64 n = std::min<u64>(kChunk, size - off);
-        ++c.chunks;
-        c.cmp_bytes += n;
-        if (std::memcmp(dst + off, src + off, n) == 0) {
-            ++c.same;
-            c.same_bytes += n;
-            off += n;
-            continue;
-        }
-        all_same = false;
-        if (mode == 2) {
-            // First mismatch: copy the rest straight and stop comparing.
-            StoreBacking(dst + off, src + off, size - off, nt);
-            c.copy_bytes += size - off;
-            off = size;
-            break;
-        }
-        if (mode == 3) {
-            // Per-chunk: store this one and keep comparing. The census
-            // measured 85% of chunks already identical but only 11% of
-            // islands identical throughout, so the matching chunks are
-            // interleaved with changed ones and mode 2 would copy most of
-            // them anyway.
-            StoreBacking(dst + off, src + off, n, nt);
-            c.copy_bytes += n;
-        }
-        off += n;
-    }
-    c.allsame += all_same;
-    if (mode == 1) {
-        // Census only: the store this mode exists to measure still happens.
-        StoreBacking(dst, src, size, nt);
-        c.copy_bytes += size;
-    }
-    c.copy_ticks += Common::FencedRDTSC() - t0;
-}
-
 static std::atomic<BackingWriteObserver> g_backing_observer{nullptr};
 static std::atomic<void*> g_backing_observer_user{nullptr};
 
@@ -477,8 +360,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 virtual_addr + size <= e.end) {
                 ++memo.hits;
                 memo.hit_bytes += size;
-                WriteBackingBytes(e.backing + (virtual_addr - e.base), static_cast<const u8*>(data),
-                                  size, backing_diff_mode_, backing_nt_);
+                std::memcpy(e.backing + (virtual_addr - e.base), data, size);
                 return true;
             }
         }
@@ -533,21 +415,12 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                     ++memo.multi;
                 }
             }
-            WriteBackingBytes(backing, static_cast<const u8*>(data), copy_size, backing_diff_mode_,
-                              backing_nt_);
+            memcpy(backing, data, copy_size);
             size -= copy_size;
         }
     }
 
     return true;
-}
-
-MemoryManager::BackingDiffStats MemoryManager::DrainBackingDiffStats() {
-    auto& c = tls_backing_diff;
-    const BackingDiffStats out{c.islands,    c.allsame,   c.chunks,   c.same,      c.same_bytes,
-                               c.copy_bytes, c.cmp_bytes, c.nt_bytes, c.copy_ticks};
-    c = BackingDiffCensus{};
-    return out;
 }
 
 MemoryManager::BackingWriteStats MemoryManager::DrainBackingWriteStats() {

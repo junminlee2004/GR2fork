@@ -210,29 +210,6 @@ public:
     /// FindImage with the adaptive memo skip cache in front, for the shader
     /// texture binding path. A hit skips the page-table walk and match loops
     /// but still touches the LRU and re-applies any overlap view rebase.
-    /// findimg_memo_prefetch: warms the memo entry a binding ordinal is
-    /// predicted to match, issued while the previous ordinal is still being
-    /// resolved. The hinted entry is 64-byte aligned and its whole key
-    /// compare - the four T# words, the type, the view key and the valid
-    /// flag - lies in the first line, so one line covers the hit path's
-    /// dependent chain and the later lines only the consumed view.
-    /// A prefetch cannot fault, change a value or be reordered into one; the
-    /// only rule is not to form an out-of-range pointer, which the bound
-    /// below enforces and which ImageDesc::NoMemoSlot fails naturally.
-    void PrefetchMemoHint(u16 h) const noexcept {
-        if (memo_prefetch_ == 0 || h >= find_image_memo_.size()) {
-            return;
-        }
-        const char* const p = reinterpret_cast<const char*>(find_image_memo_.data() + h);
-        __builtin_prefetch(p, 0, 3);
-        if (memo_prefetch_ >= 2) {
-            __builtin_prefetch(p + 64, 0, 3);
-        }
-        if (memo_prefetch_ >= 3) {
-            __builtin_prefetch(p + 128, 0, 3);
-        }
-    }
-
     [[nodiscard]] ImageId FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp,
                                             u16* hint = nullptr);
 
@@ -634,8 +611,6 @@ private:
     // Sized once at construction from findimg_memo_entries; a power of two,
     // so the set index is the mixed key's top bits.
     std::vector<FindImageMemoEntry> find_image_memo_;
-    // findimg_memo_prefetch, clamped to the entry's three lines.
-    u32 memo_prefetch_{};
     u32 MemoVictim(const FindImageMemoEntry* set, u32 ways) const;
     // The authoritative arm of FindImageMemoized: the real lookup, the verify
     // and the populate. packed = ways | matched << 8 | would_hit << 9 |

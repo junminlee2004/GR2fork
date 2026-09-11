@@ -123,6 +123,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
     deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
+    deferred_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
@@ -1042,19 +1043,33 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
-            if (const auto dm = buffer_cache.DrainCopyMergeStats(); dm.downloads) {
-                // Gap buckets: <=64, <=256, <=1K, <=4K, <=16K, larger.
+            const auto off = buffer_cache.DrainOffloadStats();
+            if (off.jobs || off.fallbacks) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] DLMERGE downloads={} islands={} regions={} gapKiB={} "
-                         "capped={} g64={} g256={} g1k={} g4k={} g16k={} gbig={} per300f",
-                         dm.downloads, dm.islands, dm.regions, dm.gap_bytes >> 10, dm.capped,
-                         dm.gap_hist[0], dm.gap_hist[1], dm.gap_hist[2], dm.gap_hist[3],
-                         dm.gap_hist[4], dm.gap_hist[5]);
+                         "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} "
+                         "empty={} per300f",
+                         off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
             }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,
                          wb.islands, wb.bytes >> 10);
+            }
+            if (const auto wo = buffer_cache.DrainWriteBackOffloadStats();
+                wo.guest + wo.prio + wo.gpucomm) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] WBOFF guest={} prio={} gpucomm={} excluded={} copy_ms={} "
+                         "per300f",
+                         wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
+            }
+            if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "
+                         "helped_KiB={} owner_islands={} tail_us={} prio_posted={} "
+                         "prio_helped={} prio_KiB={} prio_late={} per300f",
+                         ws.shares, ws.joins, ws.fencewaits, ws.helped, ws.helped_bytes >> 10,
+                         ws.owner_islands, hz ? ws.tail_ns * 1000000 / hz : 0, ws.prio_posted,
+                         ws.prio_helped, ws.prio_bytes >> 10, ws.prio_late);
             }
             const auto sc = buffer_cache.DrainStreamCopyStats();
             if (sc.probes) {
@@ -1094,18 +1109,6 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] BACKWRITE calls={} hits={} hitKiB={} missKiB={} multi={} "
                          "per300f",
                          bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
-            }
-            if (const auto bd = Core::MemoryManager::DrainBackingDiffStats(); bd.islands) {
-                // same/chunks is the redundant fraction; mode 1 reports it with
-                // the store still in place, mode 2 skips it.
-                // copyUs brackets every arm alike; it is the number that
-                // judges readback_writeback_nt and mode 2 against baseline.
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WBDIFF islands={} allsame={} chunks={} same={} sameKiB={} "
-                         "copyKiB={} cmpKiB={} ntKiB={} copyUs={} per300f",
-                         bd.islands, bd.allsame, bd.chunks, bd.same, bd.same_bytes >> 10,
-                         bd.copy_bytes >> 10, bd.cmp_bytes >> 10, bd.nt_bytes >> 10,
-                         bd.copy_ticks / std::max<u64>(tsc_hz_ / 1000000u, 1));
             }
             pipeline_cache.DumpColorMaskStats(
                 scheduler.GetDynamicState().DrainColorWriteMaskSkips());
@@ -1378,11 +1381,14 @@ void Rasterizer::OnSubmit() {
                          ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
                          ra.regions, ra.pages, ra.calls);
             }
-            if (const auto gs = VideoCore::MemoryTracker::DrainGpuSummaryStats(); gs.probes) {
+            if (const auto rr = buffer_cache.DrainReadReleaseStats(); rr.census_batches != 0) {
+                // calls is the mprotect count of the read-watcher release path,
+                // and each one broadcasts a TLB shootdown to every core.
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] GPUSUM probes={} front={} fall={} sampled={} diverged={} "
-                         "per300f",
-                         gs.probes, gs.front, gs.probes - gs.front, gs.sampled, gs.diverged);
+                         "[SkipCache] RREL batches={} calls={} runs={} pages={} drains={} "
+                         "regions={} drained={} per300f",
+                         rr.census_batches, rr.census_calls, rr.census_runs, rr.census_pages,
+                         rr.drains, rr.regions, rr.calls);
             }
             if (const auto tf = buffer_cache.DrainTrackerFastStats();
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
@@ -1557,8 +1563,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (findimg_hint_) {
         image_hint_cur_ = pipeline->image_memo_hint.data();
         image_hint_end_ = image_hint_cur_ + Pipeline::kImageMemoHints;
-        // The first ordinal's entry has the whole prologue as lead.
-        texture_cache.PrefetchMemoHint(*image_hint_cur_);
     } else {
         image_hint_cur_ = image_hint_end_ = nullptr;
     }
@@ -2161,11 +2165,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 hint = mip_fallback_mode == Shader::MipStorageFallbackMode::None ? image_hint_cur_
                                                                                  : nullptr;
                 ++image_hint_cur_;
-                // Warm the next ordinal's entry across this one's lookup,
-                // which is itself the memory-latency event being hidden.
-                if (image_hint_cur_ != image_hint_end_) {
-                    texture_cache.PrefetchMemoHint(*image_hint_cur_);
-                }
             }
             image_id = texture_cache.FindImageMemoized(desc, tsharp, hint);
             if (memo_first_ && !image_id) [[unlikely]] {
@@ -3049,7 +3048,7 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
-    if (deferred_read_arm_) {
+    if (deferred_read_arm_ || deferred_read_release_) {
         // Runs before the range leaves the map, so no later drain protects
         // memory the guest has given back.
         buffer_cache.DropPendingReadArms(addr, size);

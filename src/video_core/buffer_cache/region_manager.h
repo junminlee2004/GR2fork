@@ -82,7 +82,11 @@ public:
      * @param dirty_addr    Base address to mark or unmark as modified
      * @param size          Size in bytes to mark or unmark as modified
      */
-    template <Type type, bool enable>
+    /// DeferRelease is opt-in per CALL SITE, never a global mode: only an
+    /// unmark whose caller drains afterwards may leave a release pending. A
+    /// pending release keeps the page unreadable, so an undrained one refaults
+    /// the guest forever.
+    template <Type type, bool enable, bool DeferRelease = false>
     /// Returns whether any bit changed.
     bool ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
         RENDERER_TRACE;
@@ -94,6 +98,15 @@ public:
             return false;
         }
 
+        if constexpr (type == Type::GPU && enable) {
+            // GPU bits are only ever mutated on the GPU command thread, so this
+            // is a plain counter. It advances on marks alone: an unchanged
+            // value between two points on that thread proves no new GPU write
+            // was recorded for this region in between, which is the guard the
+            // offloaded readback path uses before clearing bits it earlier
+            // snapshotted.
+            ++gpu_write_seq;
+        }
         RegionBits& bits = GetRegionBits<type>();
         // A range already in the target state makes the write below an
         // identity: the bits cannot change, so the protection masks derived
@@ -110,37 +123,40 @@ public:
                 return false;
             }
         }
-        if constexpr (type == Type::CPU && enable) {
-            PublishMayBeDirty();
+        WriteScope write_scope{*this};
+        if constexpr (enable) {
+            bits.SetRange(start_page, end_page);
+        } else {
+            bits.UnsetRange(start_page, end_page);
         }
-        {
-            WriteScope write_scope{*this};
+        if constexpr (type == Type::CPU) {
             if constexpr (enable) {
-                bits.SetRange(start_page, end_page);
-            } else {
-                bits.UnsetRange(start_page, end_page);
-            }
-            if constexpr (type == Type::GPU) {
-                RefreshGpuSummary(start_page, end_page);
-            }
-            if constexpr (type == Type::CPU) {
-                RefreshCpuSummary(start_page, end_page);
-                UpdateProtection<!enable>();
-            } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
-                if constexpr (enable) {
-                    if (defer_read_arm_) {
-                        read_arm_pending_ = true;
-                    } else {
-                        u32 pages = 0;
-                        ArmReadWatchers(pages);
-                    }
-                } else {
-                    ReleaseReadWatchers();
+                // A page whose release is still pending is unreadable; dropping
+                // its write watcher below would ask for a write-only mapping,
+                // which Protect rejects. Settle the whole region's pending
+                // mask first - it is bounded by one region and the drain has
+                // usually cleared it already.
+                if (read_release_pending_) {
+                    u32 pages = 0;
+                    ReleaseReadWatchers(pages);
                 }
             }
-        }
-        if constexpr (type == Type::CPU && !enable) {
-            RetireIfClean();
+            RefreshCpuSummary(start_page, end_page);
+            UpdateProtection<!enable>();
+        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+            if constexpr (enable) {
+                if (defer_read_arm_) {
+                    read_arm_pending_ = true;
+                } else {
+                    u32 pages = 0;
+                    ArmReadWatchers(pages);
+                }
+            } else if (DeferRelease && defer_read_release_) {
+                read_release_pending_ = true;
+            } else {
+                u32 pages = 0;
+                ReleaseReadWatchers(pages);
+            }
         }
         return true;
     }
@@ -175,73 +191,20 @@ public:
 
         if constexpr (clear) {
             bits.UnsetRange(start_page, end_page);
-            if constexpr (type == Type::GPU) {
-                RefreshGpuSummary(start_page, end_page);
-            }
             if constexpr (type == Type::CPU) {
                 RefreshCpuSummary(start_page, end_page);
                 UpdateProtection<true>();
             } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                ReleaseReadWatchers();
+                // The bind path, deliberately never deferred: it is gated on
+                // any readbacks mode, not Precise alone, and its caller is not
+                // the download completion the drain hangs off.
+                u32 pages = 0;
+                ReleaseReadWatchers(pages);
             }
-        }
-
-        if constexpr (clear && type == Type::CPU) {
-            // The bits are final here; the callbacks below only read them.
-            write_scope.reset();
-            RetireIfClean();
         }
 
         for (const auto& [start, end] : mask) {
             func(cpu_addr + start * TRACKER_BYTES_PER_PAGE, (end - start) * TRACKER_BYTES_PER_PAGE);
-        }
-    }
-
-    // tracker_clean_bitmap: one bit per region, set while the region may hold
-    // a CPU-dirty page or a CPU-bit writer is inside its scope, clear only
-    // once a cleaning scope has closed on an empty summary. A writer sets it
-    // before opening its scope, so a clear bit read with acquire proves what
-    // PeekFullRegionClean proves, without touching the region. Regions start
-    // dirty and are never recycled, so the map starts all set and an index
-    // without a region stays set. Words sit one per cache line: the hot set
-    // of a title is a handful of regions and every guest fault writes here.
-    struct alignas(64) CleanWord {
-        std::atomic<u64> bits{~u64{0}};
-    };
-    static inline CleanWord* clean_words_{nullptr};
-    static inline std::atomic<u64> clean_publish_{};
-    static inline std::atomic<u64> clean_retire_{};
-    [[nodiscard]] size_t RegionIndex() const noexcept {
-        return cpu_addr >> TRACKER_HIGHER_PAGE_BITS;
-    }
-    /// The bit as the scan reads it: set means the region may be dirty.
-    [[nodiscard]] bool MayBeDirty() const noexcept {
-        const size_t index = RegionIndex();
-        return (clean_words_[index >> 6].bits.load(std::memory_order_acquire) >> (index & 63)) & 1u;
-    }
-    void PublishMayBeDirty() noexcept {
-        if (clean_words_ == nullptr) {
-            return;
-        }
-        const size_t index = RegionIndex();
-        auto& word = clean_words_[index >> 6].bits;
-        const u64 bit = u64{1} << (index & 63);
-        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
-            word.fetch_or(bit, std::memory_order_release);
-            Tally(clean_publish_);
-        }
-    }
-    /// Caller holds the lock, and no scope of its own is open.
-    void RetireIfClean() noexcept {
-        if (clean_words_ == nullptr || Summary() != 0) {
-            return;
-        }
-        const size_t index = RegionIndex();
-        auto& word = clean_words_[index >> 6].bits;
-        const u64 bit = u64{1} << (index & 63);
-        if ((word.load(std::memory_order_relaxed) & bit) != 0) {
-            word.fetch_and(~bit, std::memory_order_release);
-            Tally(clean_retire_);
         }
     }
 
@@ -280,10 +243,6 @@ public:
         // worth scanning, so stale-set bits fall through to the exact answer.
         if constexpr (type == Type::CPU) {
             if ((Summary() & SummaryMask(start_page, end_page)) == 0) {
-                return false;
-            }
-        } else {
-            if ((GpuSummary() & SummaryMask(start_page, end_page)) == 0) {
                 return false;
             }
         }
@@ -328,34 +287,6 @@ public:
             }
             const u64 w = state.load(std::memory_order_acquire);
             if ((w & (SEQ_ONE | SummaryMask(start_page, end_page))) == 0) {
-                return false;
-            }
-        } else if (gpu_summary_) {
-            // tracker_gpu_summary: the same front for the GPU bits. Off is
-            // one byte test; the summary bits also stay all-set then, so even
-            // the slow path's own test cannot answer early.
-            const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
-            const size_t end_page =
-                Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
-            if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
-                return false;
-            }
-            const u64 w = state.load(std::memory_order_acquire);
-            const u64 mask = u64{SummaryMask(start_page, end_page)} << GPU_SUMMARY_SHIFT;
-            Tally(gpusum_probes_);
-            if ((w & (SEQ_ONE | mask)) == 0) {
-                Tally(gpusum_front_);
-                // One probe in 1024 re-asks the exact scan: a front that says
-                // clean while the bits say dirty is the one failure this
-                // design can have, and it would otherwise be silent.
-                const u32 n = gpusum_sample_ctr_.load(std::memory_order_relaxed) + 1;
-                gpusum_sample_ctr_.store(n, std::memory_order_relaxed);
-                if ((n & 1023u) == 0) {
-                    Tally(gpusum_sampled_);
-                    if (PeekRegionModifiedSlow<type>(offset, size)) {
-                        Tally(gpusum_diverged_);
-                    }
-                }
                 return false;
             }
         }
@@ -423,15 +354,38 @@ public:
         return tracker->UpdatePageWatchersForRegion<true, true>(cpu_addr, mask);
     }
 
-    /// Releases the read watcher of every page that is no longer GPU dirty.
-    void ReleaseReadWatchers() {
+    /// Releases the read watcher of every page that is no longer GPU dirty and
+    /// returns the protection calls issued. The mask is consumed by the
+    /// readable update, so one call per island sees one island: that is one
+    /// mprotect each, and every mprotect broadcasts a TLB shootdown to each
+    /// core running a thread of this process. Batching the releases lets the
+    /// gap-merge in UpdatePageWatchersForRegion fuse them into few calls.
+    u32 ReleaseReadWatchers(u32& pages) {
+        read_release_pending_ = false;
         RegionBits mask = ~gpu & ~readable;
         if (mask.None()) {
-            return;
+            return 0;
         }
         readable |= mask;
-        tracker->UpdatePageWatchersForRegion<false, true>(cpu_addr, mask);
+        u32 runs = 0;
+        for (const auto& [start, end] : mask) {
+            pages += static_cast<u32>(end - start);
+            ++runs;
+        }
+        const u32 calls = tracker->UpdatePageWatchersForRegion<false, true>(cpu_addr, mask);
+        release_calls_.fetch_add(calls, std::memory_order_relaxed);
+        release_pages_.fetch_add(pages, std::memory_order_relaxed);
+        release_runs_.fetch_add(runs, std::memory_order_relaxed);
+        ++release_batches_;
+        return calls;
     }
+
+    /// Read-watcher release census. Static because a release happens from any
+    /// region; drained once per telemetry window through the tracker.
+    static inline std::atomic<u64> release_calls_{};
+    static inline std::atomic<u64> release_pages_{};
+    static inline std::atomic<u64> release_runs_{};
+    static inline std::atomic<u64> release_batches_{};
 
     /// Scope guard marking a mutation of the tracked bits for readers.
     struct WriteScope {
@@ -444,42 +398,20 @@ public:
         RegionManager& mgr;
     };
 
-    // The CPU dirty summary (bits 0-15), the GPU dirty summary (bits 16-31,
-    // tracker_gpu_summary) and the write sequence (bits 32 and up) share one
-    // word: a single load is a consistent snapshot of all three, and an even
-    // sequence in it proves no writer was inside its scope then. The sequence
-    // stays the top field so its increments cannot carry into a summary, and
-    // the summaries are updated by xor, which cannot carry at all.
+    // The CPU dirty summary (low 16 bits) and the write sequence (bits 16 and
+    // up) share one word: a single load is a consistent snapshot of both, and
+    // an even sequence in it proves no writer was inside its scope then.
     static constexpr u64 SUMMARY_BITS = 0xFFFF;
-    static constexpr u64 GPU_SUMMARY_SHIFT = 16;
-    static constexpr u64 GPU_SUMMARY_BITS = u64{0xFFFF} << GPU_SUMMARY_SHIFT;
-    static constexpr u64 SEQ_ONE = u64{1} << 32;
-    // CPU bits only, deliberately: PeekFullRegionClean means "no CPU-dirty
-    // word", and the GPU summary must not change that answer.
+    static constexpr u64 SEQ_ONE = u64{1} << 16;
     static constexpr u64 CLEAN_MASK = SUMMARY_BITS | SEQ_ONE; // no dirty word, even sequence
-    // cpu.Fill() in the ctor => fully set. The GPU summary starts fully set
-    // too: stale-set is the safe direction, and with tracker_gpu_summary off
-    // it stays that way for the region's life, which makes the front inert.
-    std::atomic<u64> state{SUMMARY_BITS | GPU_SUMMARY_BITS};
+    std::atomic<u64> state{SUMMARY_BITS};                     // cpu.Fill() in the ctor => fully set
     [[nodiscard]] u16 Summary() const noexcept {
         return static_cast<u16>(state.load(std::memory_order_relaxed));
     }
-    [[nodiscard]] u16 GpuSummary() const noexcept {
-        return static_cast<u16>(state.load(std::memory_order_relaxed) >> GPU_SUMMARY_SHIFT);
-    }
-    // Copied from the tracker when the region is handed out.
-    bool gpu_summary_{false};
-    // tracker_gpu_summary census: diagnostic counts, lossy by design so the
-    // probe path carries no locked instruction. Sampled front-vs-scan
-    // divergence is the one number that must stay at zero.
-    static inline std::atomic<u64> gpusum_probes_{};
-    static inline std::atomic<u64> gpusum_front_{};
-    static inline std::atomic<u64> gpusum_sampled_{};
-    static inline std::atomic<u64> gpusum_diverged_{};
-    static inline std::atomic<u32> gpusum_sample_ctr_{};
-    static void Tally(std::atomic<u64>& c) noexcept {
-        c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-    }
+    // Counts GPU-bit marks. GPU-command-thread confined; see ChangeRegionState.
+    // GPU bits are set only there; an unmap clears them from a guest thread
+    // under the lock, which leaves this count untouched.
+    u64 gpu_write_seq{0};
     LockType lock;
     // Copied from the tracker when the region is handed out.
     bool defer_read_arm_{false};
@@ -487,7 +419,9 @@ public:
     // and written under the lock on GPU-command-thread paths only.
     bool read_arm_pending_{false};
     // Copied from the tracker when the region is handed out.
+    bool defer_read_release_{false};
     // An unmark that cleared its bits and left the release to the next drain.
+    bool read_release_pending_{false};
 
     // Word epochs advance whenever guest bytes in a span may change outside
     // the write watchers' sight: write protection loss, guest protection
@@ -592,31 +526,6 @@ public:
             }
         }
         if (const u64 delta = old ^ summary; delta != 0) {
-            state.fetch_xor(delta, std::memory_order_relaxed);
-        }
-    }
-
-    // The GPU twin of RefreshCpuSummary. Runs inside a WriteScope at both
-    // writers of the gpu bitset, so a reader that sees an even sequence in
-    // the same load it reads the summary from saw the bits it describes.
-    void RefreshGpuSummary(size_t start_page, size_t end_page) noexcept {
-        if (!gpu_summary_) {
-            return;
-        }
-        const size_t w0 = start_page / PAGES_PER_SUMMARY_BIT;
-        const size_t w1 = (end_page - 1) / PAGES_PER_SUMMARY_BIT;
-        const u16 old = GpuSummary();
-        u16 summary = old;
-        for (size_t w = w0; w <= w1; ++w) {
-            const size_t p0 = w * PAGES_PER_SUMMARY_BIT;
-            if (gpu.AnyInRange(p0, p0 + PAGES_PER_SUMMARY_BIT)) {
-                summary |= static_cast<u16>(1u << w);
-            } else {
-                summary &= static_cast<u16>(~(1u << w));
-            }
-        }
-        if (const u64 delta = u64{static_cast<u16>(old ^ summary)} << GPU_SUMMARY_SHIFT;
-            delta != 0) {
             state.fetch_xor(delta, std::memory_order_relaxed);
         }
     }

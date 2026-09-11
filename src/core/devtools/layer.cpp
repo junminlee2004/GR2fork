@@ -30,7 +30,6 @@ using L = ::Core::Devtools::Layer;
 
 static bool show_simple_fps = false;
 static bool visibility_toggled = false;
-static float fps_anchor_width = FLT_MAX;
 static bool show_quit_window = false;
 
 static bool show_volume = false;
@@ -412,33 +411,12 @@ void L::Draw() {
         if (Begin("Video Info", nullptr,
                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
-            // The counter is anchored to the top right by being placed far off
-            // screen and pulled back by KeepWindowInside below, which only
-            // happens on a toggle. That clamp moves a window that is outside
-            // the display, so it re-anchors when the display shrinks but not
-            // when it grows: going windowed to fullscreen left the counter
-            // stranded where the smaller display had put it. Re-arm on a
-            // resize, and only while the window is still against the edge it
-            // was anchored to, so one the user dragged elsewhere - including
-            // one dragged down that same edge - stays put. The sentinel width
-            // leaves a position restored from the ini alone on the first
-            // frame, when no toggle has run.
-            if (const float width = GetIO().DisplaySize.x; width != fps_anchor_width) {
-                const ImVec2 pos = GetWindowPos();
-                visibility_toggled |= pos.y <= 1.0f && pos.x + GetCurrentWindowRead()->SizeFull.x >=
-                                                           fps_anchor_width - 1.0f;
-                fps_anchor_width = width;
-            }
             // Set window position to top left if it was toggled on
             if (visibility_toggled) {
                 SetWindowPos("Video Info", {999999.0f, 0.0f}, ImGuiCond_Always);
                 visibility_toggled = false;
             }
-            if (IsMouseReleased(ImGuiMouseButton_Right) &&
-                IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)) {
-                OpenPopup("fps_scale");
-            }
-            if (BeginPopup("fps_scale")) {
+            if (BeginPopupContextWindow()) {
 #define M(label, value)                                                                            \
     if (MenuItem(label, nullptr, fps_scale == value))                                              \
     fps_scale = value

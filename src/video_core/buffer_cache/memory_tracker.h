@@ -7,7 +7,6 @@
 #include <atomic>
 #include <bit>
 #include <deque>
-#include <memory>
 #include <utility>
 
 #include <mutex>
@@ -38,30 +37,51 @@ public:
     void SetDeferReadArm(bool value) {
         defer_read_arm_ = value;
     }
-    /// tracker_clean_bitmap: allocates the map, all set, and hands it to the
-    /// regions. Off leaves the regions' write side inert.
-    void SetCleanBitmap(bool value) {
-        if (!value || clean_words_) {
-            return;
-        }
-        clean_words_ = std::make_unique<RegionManager::CleanWord[]>(NUM_HIGH_PAGES / 64);
-        RegionManager::clean_words_ = clean_words_.get();
+    void SetDeferReadRelease(bool value) {
+        defer_read_release_ = value;
     }
-    void SetGpuSummary(bool value) {
-        gpu_summary_ = value;
-    }
-    struct GpuSummaryStats {
-        u64 probes;
-        u64 front;
-        u64 sampled;
-        u64 diverged;
+
+    struct ReadReleaseDrain {
+        u32 regions;
+        u32 pages;
+        u32 calls;
     };
-    static GpuSummaryStats DrainGpuSummaryStats() {
-        return GpuSummaryStats{
-            RegionManager::gpusum_probes_.exchange(0, std::memory_order_relaxed),
-            RegionManager::gpusum_front_.exchange(0, std::memory_order_relaxed),
-            RegionManager::gpusum_sampled_.exchange(0, std::memory_order_relaxed),
-            RegionManager::gpusum_diverged_.exchange(0, std::memory_order_relaxed),
+
+    [[nodiscard]] bool HasPendingReadReleases() const noexcept {
+        return !pending_read_releases_.empty();
+    }
+
+    /// Releases the read watchers every unmark since the last drain left
+    /// pending, coalescing a download's islands into one masked update per
+    /// region. GPU command thread only, same constraint as the arm drain.
+    ReadReleaseDrain ReleasePendingReadWatchers() {
+        ReadReleaseDrain out{};
+        if (upload_walk_depth_ != 0) {
+            return out;
+        }
+        for (RegionManager* manager : pending_read_releases_) {
+            std::scoped_lock lk{manager->lock};
+            out.calls += manager->ReleaseReadWatchers(out.pages);
+            ++out.regions;
+        }
+        pending_read_releases_.clear();
+        return out;
+    }
+
+    struct ReadReleaseCensus {
+        u64 calls;
+        u64 pages;
+        u64 runs;
+        u64 batches;
+    };
+    /// The syscall count of the release path in either mode: the number this
+    /// whole mechanism exists to collapse.
+    static ReadReleaseCensus DrainReadReleaseCensus() {
+        return ReadReleaseCensus{
+            RegionManager::release_calls_.exchange(0, std::memory_order_relaxed),
+            RegionManager::release_pages_.exchange(0, std::memory_order_relaxed),
+            RegionManager::release_runs_.exchange(0, std::memory_order_relaxed),
+            RegionManager::release_batches_.exchange(0, std::memory_order_relaxed),
         };
     }
 
@@ -193,6 +213,62 @@ public:
                                 manager->template ChangeRegionState<Type::GPU, false>(
                                     manager->GetCpuAddr() + offset, size);
                             });
+    }
+
+    /// As above, but under deferred_read_release the read-watcher release is
+    /// left to ReleasePendingReadWatchers. ONLY for callers that drain before
+    /// returning: an undrained pending release leaves the page unreadable, and
+    /// the guest then refaults on it without end.
+    void UnmarkRegionAsGpuModifiedDeferred(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [this](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                const bool was_pending = manager->read_release_pending_;
+                                manager->template ChangeRegionState<Type::GPU, false, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                                if (manager->read_release_pending_ && !was_pending) {
+                                    pending_read_releases_.push_back(manager);
+                                }
+                            });
+    }
+
+    /// One region's identity and its gpu_write_seq value at snapshot time.
+    /// GPU-command-thread confined, like the counter it captures.
+    struct GpuSeqSnapshot {
+        RegionManager* manager;
+        u64 seq;
+    };
+    using GpuSeqSnapshots = boost::container::small_vector<GpuSeqSnapshot, 4>;
+
+    /**
+     * Captures each overlapped region's GPU write sequence. Call on the GPU
+     * command thread at the moment download copies are recorded; pass the
+     * result to GpuWriteSeqMatches when deciding whether the copied data may
+     * be written back.
+     */
+    void SnapshotGpuWriteSeq(VAddr cpu_addr, u64 size, GpuSeqSnapshots& out) {
+        IteratePages<false>(cpu_addr, size, [&out](RegionManager* manager, u64, size_t) {
+            out.push_back({manager, manager->gpu_write_seq});
+        });
+    }
+
+    /**
+     * True when every region overlapping the range still carries the GPU write
+     * sequence captured in the snapshot - that is, no new GPU write to those
+     * regions has been recorded since. A changed sequence means downloaded
+     * bytes for the range may be stale and must not be written back or have
+     * their bits cleared. GPU command thread only, so the comparison cannot
+     * race the writers it guards against.
+     */
+    bool GpuWriteSeqMatches(VAddr cpu_addr, u64 size, const GpuSeqSnapshots& snap) {
+        bool matches = true;
+        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64, size_t) {
+            const auto it = std::ranges::find(snap, manager, &GpuSeqSnapshot::manager);
+            if (it == snap.end() || it->seq != manager->gpu_write_seq) {
+                matches = false;
+            }
+        });
+        return matches;
     }
 
     /// Advances the word epochs of every existing region overlapping the
@@ -449,52 +525,6 @@ public:
             });
     }
 
-    /// Number of leading regions from region_index, at most limit, whose
-    /// clean-map bit is clear. Runs of clear bits are counted a word at a
-    /// time from the region's own bit; a set bit inside a word ends the run.
-    [[nodiscard]] std::size_t LeadingCleanRegions(std::size_t region_index,
-                                                  std::size_t limit) const noexcept {
-        std::size_t n = 0;
-        while (n < limit) {
-            const std::size_t at = region_index + n;
-            const u64 shifted =
-                clean_words_[at >> 6].bits.load(std::memory_order_acquire) >> (at & 63);
-            const std::size_t avail = 64 - (at & 63);
-            const std::size_t run =
-                shifted == 0 ? avail : static_cast<std::size_t>(std::countr_zero(shifted));
-            if (run == 0) {
-                break;
-            }
-            n += std::min(run, limit - n);
-            if (run < avail) {
-                break;
-            }
-        }
-        return n;
-    }
-    struct CleanBitmapStats {
-        u64 walks;
-        u64 skipped;
-        u64 stopped;
-        u64 sampled;
-        u64 diverged;
-        u64 publish;
-        u64 retire;
-    };
-    CleanBitmapStats DrainCleanBitmapStats() {
-        const CleanBitmapStats out{
-            cleanbm_walks_,
-            cleanbm_skipped_,
-            cleanbm_stopped_,
-            cleanbm_sampled_,
-            cleanbm_diverged_,
-            RegionManager::clean_publish_.exchange(0, std::memory_order_relaxed),
-            RegionManager::clean_retire_.exchange(0, std::memory_order_relaxed)};
-        cleanbm_walks_ = cleanbm_skipped_ = cleanbm_stopped_ = cleanbm_sampled_ = 0;
-        cleanbm_diverged_ = 0;
-        return out;
-    }
-
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     /// Returns whether the written marking set any GPU-clean page.
     /// window_size > 0 names the bound buffer, inside which the single-region
@@ -538,6 +568,13 @@ public:
                                    (!is_written || manager->template PeekRegionFullySet<Type::GPU>(
                                                        offset, query_size));
             if (skippable) {
+                if (is_written) {
+                    // The bits stay as they are, but this is still a new GPU
+                    // write to the region: the write sequence must advance or
+                    // a snapshot taken before this bind could not tell that
+                    // its downloaded bytes are now stale.
+                    ++manager->gpu_write_seq;
+                }
                 on_upload();
                 return false;
             }
@@ -623,35 +660,12 @@ public:
                     // back to the general body at that region.
                     const std::size_t full = remaining_size >> TRACKER_HIGHER_PAGE_BITS;
                     std::size_t clean = 0;
-                    if (clean_words_) {
-                        // tracker_clean_bitmap: the same run, read from the
-                        // dense map instead of each region's header line. A
-                        // region without a manager keeps its bit set, so the
-                        // run stops there as the loop below would.
-                        clean = LeadingCleanRegions(page_index, full);
-                        ++cleanbm_walks_;
-                        cleanbm_skipped_ += clean;
-                        cleanbm_stopped_ += clean < full;
-                        if (clean != 0 && (++cleanbm_sample_ctr_ & 1023u) == 0) {
-                            // One skip in 1024 is re-asked under the lock.
-                            // With the lock held no writer is inside the
-                            // region, so a dirty summary behind a clear bit
-                            // is the map's own failure and nothing else.
-                            ++cleanbm_sampled_;
-                            RegionManager* const first = top_tier[page_index];
-                            std::scoped_lock lk{first->lock};
-                            if (first->Summary() != 0 && !first->MayBeDirty()) {
-                                ++cleanbm_diverged_;
-                            }
+                    while (clean < full) {
+                        RegionManager* const ahead = top_tier[page_index + clean];
+                        if (ahead == nullptr || !ahead->PeekFullRegionClean()) {
+                            break;
                         }
-                    } else {
-                        while (clean < full) {
-                            RegionManager* const ahead = top_tier[page_index + clean];
-                            if (ahead == nullptr || !ahead->PeekFullRegionClean()) {
-                                break;
-                            }
-                            ++clean;
-                        }
+                        ++clean;
                     }
                     if (clean != 0) {
                         page_index += clean;
@@ -704,6 +718,12 @@ public:
                 if (nothing_to_upload && i < 64 &&
                     manager->template PeekRegionFullySet<Type::GPU>(offset, size)) {
                     skipped |= u64{1} << i;
+                    // The bits stay as they are, but this is still a new GPU
+                    // write to the region: the write sequence must advance or
+                    // a snapshot taken before this bind could not tell that
+                    // its downloaded bytes are now stale. GPU-command-thread
+                    // confined, like the counter.
+                    ++manager->gpu_write_seq;
                     continue;
                 }
                 manager->lock.lock();
@@ -911,14 +931,7 @@ private:
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         new_manager->defer_read_arm_ = defer_read_arm_;
-        new_manager->gpu_summary_ = gpu_summary_;
-        if (gpu_summary_) {
-            // A fresh region has no GPU-dirty page, so the exact summary is
-            // zero; leaving the all-set start value would keep every probe
-            // on the scan until each word's first write.
-            new_manager->state.fetch_and(~RegionManager::GPU_SUMMARY_BITS,
-                                         std::memory_order_relaxed);
-        }
+        new_manager->defer_read_release_ = defer_read_release_;
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
         // Returned directly: re-probing the lookup memo twenty instructions
@@ -928,18 +941,11 @@ private:
     }
 
     bool defer_read_arm_{};
-    bool gpu_summary_{};
-    // tracker_clean_bitmap: the map, and its census on the GPU command thread.
-    std::unique_ptr<RegionManager::CleanWord[]> clean_words_;
-    u64 cleanbm_walks_{};
-    u64 cleanbm_skipped_{};
-    u64 cleanbm_stopped_{};
-    u64 cleanbm_sampled_{};
-    u64 cleanbm_diverged_{};
-    u32 cleanbm_sample_ctr_{};
+    bool defer_read_release_{};
     // Regions whose marks await their arm, and the depth of the walk that must
-    // not be drained into. GPU-command-thread confined.
+    // not be drained into. GPU-command-thread confined, like gpu_write_seq.
     boost::container::small_vector<RegionManager*, 16> pending_read_arms_;
+    boost::container::small_vector<RegionManager*, 16> pending_read_releases_;
     u32 upload_walk_depth_{};
     // Probe telemetry on a line of its own. Every bump here is the GPU
     // command thread's and is drained there, so these are plain adds.
