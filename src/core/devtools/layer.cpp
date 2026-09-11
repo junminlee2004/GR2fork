@@ -30,6 +30,7 @@ using L = ::Core::Devtools::Layer;
 
 static bool show_simple_fps = false;
 static bool visibility_toggled = false;
+static ImVec2 fps_anchor_display{};
 static bool show_quit_window = false;
 
 static bool show_volume = false;
@@ -411,6 +412,22 @@ void L::Draw() {
         if (Begin("Video Info", nullptr,
                   ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
+            // The counter is anchored to the top right by being placed far off
+            // screen and pulled back by KeepWindowInside below, which only
+            // happens on a toggle. That clamp moves a window that is outside
+            // the display, so it re-anchors when the display shrinks but not
+            // when it grows: going windowed to fullscreen left the counter
+            // stranded where the smaller display had put it. Re-arm on a
+            // resize, and only while the window is still against the edge it
+            // was anchored to, so one the user dragged elsewhere stays put.
+            const ImVec2 display = GetIO().DisplaySize;
+            if (display.x != fps_anchor_display.x || display.y != fps_anchor_display.y) {
+                const ImVec2 right = GetWindowPos() + GetCurrentWindowRead()->SizeFull;
+                visibility_toggled |= fps_anchor_display.x > 0.0f &&
+                                      right.x >= fps_anchor_display.x - 1.0f &&
+                                      right.y <= fps_anchor_display.y;
+                fps_anchor_display = display;
+            }
             // Set window position to top left if it was toggled on
             if (visibility_toggled) {
                 SetWindowPos("Video Info", {999999.0f, 0.0f}, ImGuiCond_Always);
