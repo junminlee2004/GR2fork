@@ -30,7 +30,7 @@ using L = ::Core::Devtools::Layer;
 
 static bool show_simple_fps = false;
 static bool visibility_toggled = false;
-static ImVec2 fps_anchor_display{};
+static float fps_anchor_width = FLT_MAX;
 static bool show_quit_window = false;
 
 static bool show_volume = false;
@@ -420,13 +420,12 @@ void L::Draw() {
             // stranded where the smaller display had put it. Re-arm on a
             // resize, and only while the window is still against the edge it
             // was anchored to, so one the user dragged elsewhere stays put.
-            const ImVec2 display = GetIO().DisplaySize;
-            if (display.x != fps_anchor_display.x || display.y != fps_anchor_display.y) {
-                const ImVec2 right = GetWindowPos() + GetCurrentWindowRead()->SizeFull;
-                visibility_toggled |= fps_anchor_display.x > 0.0f &&
-                                      right.x >= fps_anchor_display.x - 1.0f &&
-                                      right.y <= fps_anchor_display.y;
-                fps_anchor_display = display;
+            // The sentinel width leaves a position restored from the ini alone
+            // on the first frame, when no toggle has run.
+            if (const float width = GetIO().DisplaySize.x; width != fps_anchor_width) {
+                visibility_toggled |= GetWindowPos().x + GetCurrentWindowRead()->SizeFull.x >=
+                                      fps_anchor_width - 1.0f;
+                fps_anchor_width = width;
             }
             // Set window position to top left if it was toggled on
             if (visibility_toggled) {
