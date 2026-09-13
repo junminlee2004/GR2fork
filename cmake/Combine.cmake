@@ -47,8 +47,25 @@ function(combine_build_fontembed)
     if(TARGET Dear_ImGui_FontEmbed)
         return()
     endif()
-    add_executable(Dear_ImGui_FontEmbed
-        ${COMBINED_EXTERNALS}/dear_imgui/misc/fonts/binary_to_compressed_c.cpp)
+    # The vendored Dear ImGui submodule has shipped under two directory names
+    # (externals/imgui and externals/dear_imgui); probe both so the tool builds either
+    # way, and fail here with a readable message rather than at generate time with a
+    # bare "Cannot find source file" if a future rename lands.
+    set(_fontembed_src "")
+    foreach(_dir imgui dear_imgui)
+        set(_cand ${COMBINED_EXTERNALS}/${_dir}/misc/fonts/binary_to_compressed_c.cpp)
+        if(EXISTS ${_cand})
+            set(_fontembed_src ${_cand})
+            break()
+        endif()
+    endforeach()
+    if(NOT _fontembed_src)
+        message(FATAL_ERROR
+            "Dear ImGui font-embed tool not found under ${COMBINED_EXTERNALS} "
+            "(looked for imgui/ and dear_imgui/ misc/fonts/binary_to_compressed_c.cpp). "
+            "Sync submodules, or update this path if upstream renamed the submodule.")
+    endif()
+    add_executable(Dear_ImGui_FontEmbed ${_fontembed_src})
 endfunction()
 
 # host_shaders_<name>: regenerate shader headers into a per-core include dir.
