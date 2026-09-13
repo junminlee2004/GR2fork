@@ -83,8 +83,6 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::BufferAtomicSwap32:
     case Opcode::BufferAtomicCmpSwap32:
     case Opcode::BufferAtomicFCmpSwap32:
-    case Opcode::DataAppend:
-    case Opcode::DataConsume:
     case Opcode::WriteSharedU16:
     case Opcode::WriteSharedU32:
     case Opcode::WriteSharedU64:
@@ -143,6 +141,14 @@ bool Inst::AreAllArgsImmediates() const {
 }
 
 IR::Type Inst::Type() const {
+    if (op == Opcode::Phi) {
+        // The type of a phi node is stored in its flags
+        return Flags<IR::Type>();
+    }
+    if (op == Opcode::GetVirtualRegister) {
+        // The type of a virtual register load depends on the register id
+        return Arg(0).VirtualReg().type;
+    }
     return TypeOf(op);
 }
 

@@ -216,7 +216,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
-    const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
+    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
@@ -327,7 +327,7 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
@@ -451,7 +451,7 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     // we can skip the whole dispatch and update the tracked state instead. Also, it is not
     // intended to be consumed and in such rare cases (e.g. HTile introspection, CRAA) we
     // will need its full emulation anyways.
-    const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
 
     // Assume if a shader reads metadata, it is a copy shader.
     for (const auto& desc : info.buffers) {
@@ -486,7 +486,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
 
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
     }
@@ -548,7 +548,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
     }
@@ -609,6 +609,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+            if (size != vsharp.GetSize()) {
+                LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}", vsharp.GetSize(),
+                          size, stage.pgm_hash);
+            }
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
         } else {
@@ -846,12 +850,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
-        if (sampler.disable_aniso) {
-            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
-            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
-                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
-            }
-        }
         const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
