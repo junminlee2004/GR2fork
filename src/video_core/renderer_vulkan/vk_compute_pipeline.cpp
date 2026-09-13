@@ -18,7 +18,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  bool preloading /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, layouts, true},
       compute_key{compute_key_} {
-    auto& info = stages[int(Shader::LogicalStage::Compute)];
+    auto& info = stages[int(Shader::SwStage::Compute)];
     info = &info_;
     const auto debug_str = GetDebugString();
 

@@ -1230,7 +1230,7 @@ void BufferCache::BindVertexBuffers(
         if (const auto& fetch = pipeline.GetFetchShader(); fetch && !fetch->attributes.empty()) {
             ASSERT_MSG(fetch->attributes.size() <= Vulkan::MaxVertexBufferCount,
                        "fetch shader binds {} attributes", fetch->attributes.size());
-            const auto& vs_info = pipeline.GetStage(Shader::LogicalStage::Vertex);
+            const auto& vs_info = pipeline.GetStage(Shader::SwStage::Vertex);
             for (const auto& attrib : fetch->attributes) {
                 const AmdGpu::Buffer sharp = attrib.GetSharp(vs_info);
                 guest_buffers.emplace_back(sharp);

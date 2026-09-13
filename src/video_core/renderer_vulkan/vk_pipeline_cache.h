@@ -137,7 +137,7 @@ struct Program {
     }
 
     Program() = default;
-    Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
+    Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
@@ -218,14 +218,14 @@ public:
     /// for graphics stages, the fetch shader reference (read by the vertex
     /// format walk and the graphics pipeline constructor). Returns the
     /// permutation hash. Compute publishes into slot 0.
-    [[nodiscard]] u64 GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+    [[nodiscard]] u64 GetProgram(Shader::HwStage stage, Shader::SwStage l_stage,
                                  const Shader::ShaderParams& params,
                                  Shader::Backend::Bindings& binding, u32 out_slot);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
 
-    static std::string GetShaderName(Shader::Stage stage, u64 hash,
+    static std::string GetShaderName(Shader::HwStage stage, u64 hash,
                                      std::optional<size_t> perm = {});
 
     auto& GetProfile() const {
@@ -263,14 +263,14 @@ private:
     bool ReuseGraphicsKey(u64 pipe_gen);
     bool RefreshComputeKey();
 
-    void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
+    void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
-    std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::Stage stage, size_t perm_idx,
+    std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -370,9 +370,9 @@ private:
     // Fuse: cmp names the candidate's words and *diff receives the OR of every
     // differing word; without it the body is the plain snapshot.
     template <bool Fuse>
-    SHAD_NO_INLINE u32 SnapshotRuntimeInputs(Shader::Stage stage, u32* __restrict out,
+    SHAD_NO_INLINE u32 SnapshotRuntimeInputs(Shader::HwStage stage, u32* __restrict out,
                                              const u32* __restrict cmp, u64* diff) const;
-    bool MemoRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage, RuntimeInfoStamp& slot);
+    bool MemoRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage, RuntimeInfoStamp& slot);
     // Per logical stage: the last resolved program. Programs are added to
     // program_cache and never removed or re-seated (unique_ptr values survive
     // rehash), so a remembered (hash, Program*) pair is exactly what
@@ -393,14 +393,14 @@ private:
     // StageSpecialization nor a compile path: the first-ever build of a
     // program, and the permutation resolve that runs when every fast tier
     // missed. Publish is every exit's hand-off to the pipeline lookups.
-    SHAD_FORCE_INLINE u64 Publish(u32 out_slot, Shader::LogicalStage l_stage,
+    SHAD_FORCE_INLINE u64 Publish(u32 out_slot, Shader::SwStage l_stage,
                                   const Shader::Info* out_info, vk::ShaderModule module,
                                   const Program* pgm, u32 perm_idx, u64 hash);
-    SHAD_NO_INLINE u64 CreateProgramSlow(Shader::Stage stage, Shader::LogicalStage l_stage,
+    SHAD_NO_INLINE u64 CreateProgramSlow(Shader::HwStage stage, Shader::SwStage l_stage,
                                          const Shader::ShaderParams& params,
                                          Shader::Backend::Bindings& binding, u32 out_slot,
                                          std::unique_ptr<Program>& created_slot, StageIdentity& id);
-    SHAD_NO_INLINE u64 ResolvePermutationSlow(Shader::Stage stage, Shader::LogicalStage l_stage,
+    SHAD_NO_INLINE u64 ResolvePermutationSlow(Shader::HwStage stage, Shader::SwStage l_stage,
                                               const Shader::ShaderParams& params,
                                               Shader::Backend::Bindings& binding, u32 out_slot,
                                               Program* program, u64 spec_fp, bool spec_fp_eligible,
@@ -427,7 +427,7 @@ private:
     u64 params_hits{};
     u64 params_misses{};
     template <typename Pgm>
-    Shader::ShaderParams ResolveParams(Shader::LogicalStage l_stage, const Pgm& pgm);
+    Shader::ShaderParams ResolveParams(Shader::SwStage l_stage, const Pgm& pgm);
     // Canonical specialization key: the sharp bytes the specialization reads,
     // masked, plus the runtime-info hash, the start bindings and the fetch
     // shader address. Value 2 keeps the last key per stage so a repeat is a

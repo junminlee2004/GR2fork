@@ -13,7 +13,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 5u;
-static constexpr u32 ShaderMetaVersion = 4u;
+static constexpr u32 ShaderMetaVersion = 5u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
@@ -296,7 +296,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                 LOG_WARNING(Render_Vulkan,
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
                             "preload",
-                            perm_idx, program->info.stage, program->info.pgm_hash, idx);
+                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
                 return false;
             }
             module = it->module;
