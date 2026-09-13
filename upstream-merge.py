@@ -62,8 +62,11 @@ Usage:
   ./upstream-merge.py --selftest <ref>   # parse a commit's CMakeLists and print
                                          # the computed surface (no changes)
 
-Recovery if a run is interrupted or fails:
-  git restore --source=HEAD --staged --worktree -- src cmake externals .gitmodules
+Recovery if a run is interrupted or fails (the sync stages upstream-patches/ too, and an
+advanced UPSTREAM_BASE would make the next run think it has nothing to do):
+  git restore --source=HEAD --staged --worktree -- src cmake externals .gitmodules \\
+      upstream-patches fiber_core_main_replacment.cpp
+  git clean -ffd -- externals
   git submodule update --init --recursive
 """
 
@@ -92,6 +95,18 @@ SURFACE_FILE = "cmake/CoreMainSurface.cmake"  # generated build surface
 FIBER_COMPANION = "fiber_core_main_replacment.cpp"  # set-version.sh's replacement file
 FIBER_SRC = "src/core/libraries/fiber/fiber.cpp"
 BRAND_SRC = "src/emulator.cpp"
+
+# Everything the sync writes or stages. The dirty precondition and the rollback recipe both
+# derive from this list: a path the sync touches but the rollback misses leaves the tree
+# half-synced, and an advanced UPSTREAM_BASE makes the next run believe it has nothing to do.
+OWNED_PATHS = [SRC_DIR, "cmake", "externals", ".gitmodules", PATCH_DIR, FIBER_COMPANION]
+
+
+def rollback_recipe():
+    """Copy-paste rollback for a run that stopped before committing."""
+    return ("  git restore --source=HEAD --staged --worktree -- " + " ".join(OWNED_PATHS) +
+            "\n  git clean -ffd -- externals   # -ff: a leftover submodule checkout is a nested repo\n"
+            "  git submodule update --init --recursive")
 
 # cmake/ files owned by the umbrella (never overwritten from upstream)
 UMBRELLA_CMAKE = {
@@ -1391,11 +1406,11 @@ class Sync:
         say(f"upstream base: {self.old_base_short}  ->  target: {self.target_short}")
 
         # owned paths must be clean vs HEAD (worktree + index)
-        dirty = git_out("status", "--porcelain", "--", SRC_DIR, "cmake",
-                        "externals", ".gitmodules", SURFACE_FILE)
+        dirty = git_out("status", "--porcelain", "--", *OWNED_PATHS, SURFACE_FILE)
         if dirty:
-            die("uncommitted changes under the sync-owned paths — commit or stash first:",
-                dirty)
+            die("uncommitted changes under the sync-owned paths - commit, stash, or roll "
+                "back a half-finished sync first:\n" + dirty + "\n\nrollback:\n" +
+                rollback_recipe())
 
         log = git_out("log", "--oneline", "--no-decorate",
                       f"{self.old_base}..{self.target}")
@@ -2040,10 +2055,9 @@ class Sync:
         self.commit()
         if REPORT.problems:
             print()
-            die(f"{len(REPORT.problems)} blocking problem(s) — see the report above. "
-                "Worktree left in the synced state for inspection; to roll back:\n"
-                "  git restore --source=HEAD --staged --worktree -- src cmake externals .gitmodules\n"
-                "  git submodule update --init --recursive")
+            die(f"{len(REPORT.problems)} blocking problem(s) - see the report above. "
+                "Worktree left in the synced state for inspection; to roll back:\n" +
+                rollback_recipe())
         say("done.")
 
     def dry_run_report(self):
