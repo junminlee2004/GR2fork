@@ -62,8 +62,8 @@ Usage:
   ./upstream-merge.py --selftest <ref>   # parse a commit's CMakeLists and print
                                          # the computed surface (no changes)
 
-Recovery if a run is interrupted or fails (the sync stages upstream-patches/ too, and an
-advanced UPSTREAM_BASE would make the next run think it has nothing to do):
+Recovery if a run is interrupted or fails (the sync stages the refreshed carried patches
+under upstream-patches/ as well; UPSTREAM_BASE itself advances only on a clean run):
   git restore --source=HEAD --staged --worktree -- src cmake externals .gitmodules \\
       upstream-patches fiber_core_main_replacment.cpp
   git clean -ffd -- externals
@@ -96,9 +96,9 @@ FIBER_COMPANION = "fiber_core_main_replacment.cpp"  # set-version.sh's replaceme
 FIBER_SRC = "src/core/libraries/fiber/fiber.cpp"
 BRAND_SRC = "src/emulator.cpp"
 
-# Everything the sync writes or stages. The dirty precondition and the rollback recipe both
-# derive from this list: a path the sync touches but the rollback misses leaves the tree
-# half-synced, and an advanced UPSTREAM_BASE makes the next run believe it has nothing to do.
+# Everything the sync writes or stages, including the refreshed carried patches under
+# PATCH_DIR. The dirty precondition and the rollback recipe both derive from this list: a path
+# the sync touches but the rollback misses leaves the tree half-synced on the next run.
 OWNED_PATHS = [SRC_DIR, "cmake", "externals", ".gitmodules", PATCH_DIR, FIBER_COMPANION]
 
 
@@ -1620,6 +1620,22 @@ class Sync:
                                    f"{path}:{lineno} references externals/{rel}, "
                                    f"which does not exist{hint}")
 
+    def finalize_state(self):
+        """Advance UPSTREAM_BASE, but only for a run that found no blocking problems.
+
+        The recorded base is what the next run diffs against, so writing it while the sync
+        is still unproven strands the tree: the content gets rolled back, the base does not,
+        and the retry sees base == target and concludes there is nothing to do.
+        """
+        if REPORT.problems:
+            REPORT.add("state", f"{STATE_FILE} held at {self.old_base_short} "
+                                "(advances only on a clean run)")
+            return
+        with open(STATE_FILE, "w") as f:
+            f.write(f"{self.target} shadPS4 upstream base (synced by upstream-merge.py)\n")
+        git("add", "--", STATE_FILE)
+        REPORT.add("state", f"{STATE_FILE}: {self.old_base_short} -> {self.target_short}")
+
     def reapply_patches(self):
         target_files = tree_file_set(self.target)
         for patch in self.patches:
@@ -1782,8 +1798,6 @@ class Sync:
                       f"# file: {fpath}\n# original base: {self.target}\n")
             with open(os.path.join(PATCH_DIR, patch), "w") as f:
                 f.write(header + diff + ("\n" if diff and not diff.endswith("\n") else ""))
-        with open(STATE_FILE, "w") as f:
-            f.write(f"{self.target} shadPS4 upstream base (synced by upstream-merge.py)\n")
         git("add", "-A", "--", PATCH_DIR)
 
         if any(s.startswith("applied") for p, s, _ in self.patch_results
@@ -2051,6 +2065,7 @@ class Sync:
         self.reapply_patches()
         self.regenerate_surface()
         self.verify()
+        self.finalize_state()
         REPORT.dump()
         self.commit()
         if REPORT.problems:
