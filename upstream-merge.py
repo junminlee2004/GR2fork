@@ -167,6 +167,37 @@ def die(msg, extra=None):
     sys.exit(1)
 
 
+def cmake_failure_digest(stdout, stderr, limit=3000):
+    """The reportable part of a failed cmake run.
+
+    cmake prints progress on stdout and diagnostics on stderr, and "Cannot find source
+    file" style errors are emitted during generation, after "Configuring done" has
+    already scrolled past. A plain tail of the combined output therefore shows a healthy
+    looking log and hides the failure, so pull the diagnostic blocks out by name and only
+    fall back to tails when there are none.
+    """
+    text = (stdout or "") + "\n" + (stderr or "")
+    blocks, lines = [], text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith(("CMake Error", "CMake Deprecation Error")):
+            block = [lines[i]]
+            i += 1
+            # A diagnostic runs until the next blank line followed by a non-indented line.
+            while i < len(lines) and not (not lines[i].strip() and
+                                          (i + 1 >= len(lines) or
+                                           not lines[i + 1].startswith((" ", "\t")))):
+                block.append(lines[i])
+                i += 1
+            blocks.append("\n".join(block).rstrip())
+        else:
+            i += 1
+    if blocks:
+        return "\n\n".join(blocks)[-limit:]
+    tail = (stderr or "").strip()[-limit:]
+    return tail or (stdout or "").strip()[-limit:]
+
+
 class Report:
     """Collects everything the human needs to see at the end."""
 
@@ -1532,6 +1563,48 @@ class Sync:
             REPORT.add("externals", f"submodule moved: {p}  {old} -> {new}  "
                                     "(shared with core_gr2 — watch its build)")
 
+        self.check_externals_paths()
+
+    def check_externals_paths(self):
+        """Flag umbrella build files that name an externals/ path upstream has moved.
+
+        The umbrella CMakeLists and cmake/Combine.cmake reach into externals/ by literal
+        path (font-embed tool, protobuf includes, ...). Those paths are invisible to the
+        mirror sync, so a submodule rename upstream leaves them dangling, and cmake only
+        complains during generation - after "Configuring done" - where the message is easy
+        to miss. Resolve them here instead, and name the likely new location.
+        """
+        scan = ["CMakeLists.txt"]
+        if os.path.isdir("cmake"):
+            scan += sorted(os.path.join("cmake", f) for f in os.listdir("cmake")
+                           if f.endswith(".cmake"))
+        ref_re = re.compile(r'(?:\$\{COMBINED_EXTERNALS\}|(?<![\w/$}])externals)'
+                            r'/([A-Za-z0-9_.\-/]+)')
+        for path in scan:
+            try:
+                lines = open(path, encoding="utf-8", errors="surrogateescape").read().splitlines()
+            except OSError:
+                continue
+            for lineno, line in enumerate(lines, 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                for m in ref_re.finditer(line.split("#", 1)[0]):
+                    rel = m.group(1).rstrip("/")
+                    if os.path.exists(os.path.join("externals", rel)):
+                        continue
+                    hint = ""
+                    parts = rel.split("/")
+                    if len(parts) > 1 and os.path.isdir("externals"):
+                        tail = "/".join(parts[1:])
+                        moved = [d for d in sorted(os.listdir("externals"))
+                                 if os.path.exists(os.path.join("externals", d, tail))]
+                        if moved:
+                            hint = f" - same file now under externals/{moved[0]}/ " \
+                                   f"(submodule renamed {parts[0]} -> {moved[0]}?)"
+                    REPORT.problem("externals",
+                                   f"{path}:{lineno} references externals/{rel}, "
+                                   f"which does not exist{hint}")
+
     def reapply_patches(self):
         target_files = tree_file_set(self.target)
         for patch in self.patches:
@@ -1863,8 +1936,8 @@ class Sync:
                                     *CONFIGURE_ARGS],
                                    stdout=lf, stderr=subprocess.STDOUT, text=True)
                 if r.returncode != 0:
-                    REPORT.problem("build", f"configure FAILED — tail of {logf}:\n" +
-                                   open(logf).read()[-2500:])
+                    REPORT.problem("build", f"configure FAILED (full log: {logf}):\n" +
+                                   cmake_failure_digest(open(logf).read(), ""))
                     return
                 say(f"building {bdir}/ (this takes a while) ...")
                 r = subprocess.run([*tc, "cmake", "--build", bdir, "--parallel",
@@ -1885,7 +1958,7 @@ class Sync:
                     check=False)
             if r.returncode != 0:
                 REPORT.problem("verify", "cmake configure FAILED:\n" +
-                               ((r.stderr or "") + (r.stdout or ""))[-2500:])
+                               cmake_failure_digest(r.stdout, r.stderr))
             else:
                 REPORT.add("verify", "cmake configure OK (full build not run; use --build)")
             shutil.rmtree(scratch, ignore_errors=True)
