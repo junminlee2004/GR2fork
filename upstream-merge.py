@@ -259,23 +259,39 @@ def git(*args, **kw):
 _toolchain = None
 
 
+# Every tool CONFIGURE_ARGS demands. Probing for cmake alone is not enough: a host can carry
+# an unrelated cmake/clang (linuxbrew, vitasdk) with no lld, and -fuse-ld=lld then fails the
+# compiler test with an error that looks like a broken repo rather than a wrong toolchain.
+HOST_TOOLS = ("cmake", "clang++", "ld.lld")
+
+
 def toolchain(container_opt):
-    """argv prefix that provides cmake/clang: [] on a host with a toolchain,
-    else `distrobox enter <name> --` (build box). Cached after first resolve."""
+    """argv prefix that provides the configure toolchain: [] when the host carries all of
+    HOST_TOOLS, else `distrobox enter <name> --` (build box). An explicit --container always
+    wins over the host probe. Cached after first resolve."""
     global _toolchain
     if _toolchain is None:
-        if container_opt == "host" or shutil.which("cmake"):
+        missing = [t for t in HOST_TOOLS if not shutil.which(t)]
+        if container_opt == "host":
+            if missing:
+                warn(f"--container host, but the host is missing {', '.join(missing)} - "
+                     "the configure is likely to fail")
+            _toolchain = []
+        elif container_opt is None and not missing:
             _toolchain = []
         else:
             name = container_opt or BUILD_CONTAINER
+            if missing:
+                say(f"host toolchain incomplete (no {', '.join(missing)})")
             probe = subprocess.run(["distrobox", "enter", name, "--", "true"],
                                    capture_output=True)
             if probe.returncode == 0:
                 _toolchain = ["distrobox", "enter", name, "--"]
                 say(f"toolchain: distrobox container '{name}'")
             else:
-                die(f"no cmake on the host and distrobox '{name}' is unavailable — "
-                    f"pass --container <name> (or --container host).",
+                die(f"distrobox '{name}' is unavailable and the host toolchain is "
+                    f"unusable (missing {', '.join(missing) or 'nothing'}) - pass "
+                    f"--container <name>, or --container host to force the host.",
                     probe.stderr.decode(errors="replace")[:300])
     return _toolchain
 
