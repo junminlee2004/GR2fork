@@ -7,6 +7,8 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <array>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -92,6 +94,10 @@ public:
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
+    /// flip_cadence_log: the guest's frame boundary, sampled on the thread that
+    /// requests the flip, before the request reaches the GPU or present threads.
+    void NoteGuestFlip();
+
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -111,10 +117,24 @@ private:
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
 
+    // flip_cadence_log: interval statistics of one cadence. Each instance is
+    // fed by a single thread, so it needs no synchronisation.
+    struct CadenceStats {
+        static constexpr u32 Window = 300;
+        std::array<float, Window> ms{};
+        u32 n{};
+        std::chrono::steady_clock::time_point last{};
+
+        void Sample(const char* name);
+    };
+
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    bool flip_cadence_log_{};
+    CadenceStats guest_cadence_{};
+    CadenceStats present_cadence_{};
 };
 
 } // namespace Libraries::VideoOut

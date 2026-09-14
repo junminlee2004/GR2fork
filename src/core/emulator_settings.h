@@ -494,6 +494,13 @@ struct GPUSettings {
     // visible. Titles that gate effects on visibility (inFAMOUS lens flares)
     // then cull those draws themselves before submission.
     Setting<bool> occlude_all{false};
+    // Log interval statistics for the guest's flip requests and for the host's
+    // presents of new frames, per 300 of each. Presents sit on the vblank grid;
+    // the guest's requests follow its own frame loop, which the readback
+    // offload decouples from the GPU thread. A narrow present spread beside a
+    // wide guest spread is simulation-time jitter the frametime graph, which
+    // only times presents, cannot show.
+    Setting<bool> flip_cadence_log{false};
     // Drain read-only staging upload copies through the stream copy lane
     // workers instead of copying inline on the GPU command thread. Written
     // binds always copy inline under their region locks.
@@ -824,6 +831,7 @@ struct GPUSettings {
             make_override<GPUSettings>("runtime_info_stamp_gate",
                                        &GPUSettings::runtime_info_stamp_gate),
             make_override<GPUSettings>("occlude_all", &GPUSettings::occlude_all),
+            make_override<GPUSettings>("flip_cadence_log", &GPUSettings::flip_cadence_log),
             make_override<GPUSettings>("stream_copy_upload_drain",
                                        &GPUSettings::stream_copy_upload_drain),
             make_override<GPUSettings>("flush_draw_interval", &GPUSettings::flush_draw_interval),
@@ -934,7 +942,7 @@ struct GPUSettings {
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, \
     fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
-    runtime_info_stamp_gate, occlude_all, stream_copy_upload_drain, flush_draw_interval, \
+    runtime_info_stamp_gate, occlude_all, flip_cadence_log, stream_copy_upload_drain, flush_draw_interval, \
     pipeline_key_stamp_reuse, shader_params_memo
 #define GPU_SETTINGS_JSON_FIELDS_B \
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
@@ -1233,6 +1241,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DynStateMemo, dyn_state_memo)
     SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoStampGate, runtime_info_stamp_gate)
     SETTING_FORWARD_BOOL(m_gpu, OccludeAll, occlude_all)
+    SETTING_FORWARD_BOOL(m_gpu, FlipCadenceLog, flip_cadence_log)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyUploadDrain, stream_copy_upload_drain)
     SETTING_FORWARD(m_gpu, FlushDrawInterval, flush_draw_interval)
     SETTING_FORWARD_BOOL(m_gpu, PipelineKeyStampReuse, pipeline_key_stamp_reuse)

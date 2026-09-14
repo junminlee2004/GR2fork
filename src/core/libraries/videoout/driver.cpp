@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -45,7 +47,35 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
+    flip_cadence_log_ = EmulatorSettings.IsFlipCadenceLog();
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
+}
+
+void VideoOutDriver::CadenceStats::Sample(const char* name) {
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{}) {
+        ms[n++] = std::chrono::duration<float, std::milli>(now - last).count();
+        if (n == Window) {
+            std::sort(ms.begin(), ms.end());
+            float sum = 0.0f;
+            for (const float v : ms) {
+                sum += v;
+            }
+            LOG_INFO(Lib_VideoOut,
+                     "FLIPCAD {} n={} avg={:.2f}ms min={:.2f} p10={:.2f} p50={:.2f} p90={:.2f} "
+                     "max={:.2f}",
+                     name, Window, sum / Window, ms[0], ms[Window / 10], ms[Window / 2],
+                     ms[Window * 9 / 10], ms[Window - 1]);
+            n = 0;
+        }
+    }
+    last = now;
+}
+
+void VideoOutDriver::NoteGuestFlip() {
+    if (flip_cadence_log_) {
+        guest_cadence_.Sample("guest");
+    }
 }
 
 VideoOutDriver::~VideoOutDriver() = default;
@@ -234,6 +264,10 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    if (flip_cadence_log_) {
+        present_cadence_.Sample("present");
+    }
+
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
