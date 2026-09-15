@@ -16,6 +16,7 @@
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "common/scope_exit.h"
+#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -361,6 +362,14 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    // flip_cadence_log: charge this thread's time in the fault to its frame.
+    using StallClock = std::chrono::steady_clock;
+    auto& gstall = DebugStateType::guest_stall;
+    ++gstall.faults;
+    const auto since = [](StallClock::time_point t) {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(StallClock::now() - t).count());
+    };
     // Offloaded form: the faulting thread is blocked until its data arrives no
     // matter what, so it - not the GPU command thread - should absorb the
     // semaphore wait. The GPU command thread only records the download and
@@ -385,9 +394,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             if (writeback_share_) {
                 job.share = std::make_shared<WriteBackShare>();
             }
+            const auto t_prepare = StallClock::now();
             liverpool->SendCommand<true>(
                 [&] { PrepareFaultDownload(job, device_addr, size, is_write); });
+            gstall.hop_ns += since(t_prepare);
             if (!job.has_download) {
+                const auto t_damp = StallClock::now();
                 // Nothing pending for this window usually means the fault is
                 // resolved, but it also happens when another thread's download
                 // owns the ranges and has not written back yet. Waiting here
@@ -486,6 +498,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 }
                 damp_iters_.fetch_add(spin, std::memory_order_relaxed);
                 damp_stuck_.fetch_add(spin >= 400, std::memory_order_relaxed);
+                gstall.damp_ns += since(t_damp);
                 return;
             }
             if (job.share) {
@@ -513,10 +526,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 }
             }
             const u64 t0 = Common::FencedRDTSC();
+            const auto t_fence = StallClock::now();
             if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
                 if (!scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, bounded_wait_ns_)) {
                     offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0,
                                                std::memory_order_relaxed);
+                    gstall.fence_ns += since(t_fence);
                     auto deferred = std::make_unique<FaultDownloadJob>(std::move(job));
                     scheduler.DeferPriorityOperationAt(
                         deferred->wait_tick,
@@ -541,11 +556,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
             }
             offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+            gstall.fence_ns += since(t_fence);
             if (writeback_offload_) {
+                const auto t_wb = StallClock::now();
                 WriteBackFaultDownload(job, liverpool->OnGpuThread() ? 2 : 0);
+                gstall.writeback_ns += since(t_wb);
             }
+            const auto t_finish = StallClock::now();
             liverpool->SendCommand<true>(
                 [&] { FinishFaultDownload(job, device_addr, size, is_write); });
+            gstall.hop_ns += since(t_finish);
             // The faulted range itself may sit outside the vetoed regions, in
             // which case its pages are clear and the fault is resolved even if
             // part of the window was not.
@@ -559,6 +579,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         // thread and therefore cannot be outrun.
         offload_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
+    const auto t_sync = StallClock::now();
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
@@ -583,6 +604,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     });
+    gstall.sync_ns += since(t_sync);
 }
 
 namespace {

@@ -82,7 +82,36 @@ void VideoOutDriver::NoteGuestFlip() {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
+    const float frame_ms =
+        guest_cadence_.last == std::chrono::steady_clock::time_point{}
+            ? -1.0f
+            : std::chrono::duration<float, std::milli>(now - guest_cadence_.last).count();
     guest_cadence_.Sample(now, "guest");
+    // The submitter's stall since its previous flip belongs to the frame that
+    // just ended.
+    const auto st = DebugStateType::guest_stall;
+    if (stall_primed_ && frame_ms >= 0.0f) {
+        const auto delta = [&](u64 DebugStateType::GuestStall::* f) {
+            return st.*f - stall_prev_.*f;
+        };
+        using GS = DebugStateType::GuestStall;
+        stall_window_.faults += delta(&GS::faults);
+        stall_window_.hop_ns += delta(&GS::hop_ns);
+        stall_window_.damp_ns += delta(&GS::damp_ns);
+        stall_window_.fence_ns += delta(&GS::fence_ns);
+        stall_window_.writeback_ns += delta(&GS::writeback_ns);
+        stall_window_.sync_ns += delta(&GS::sync_ns);
+        const double stall_ms =
+            static_cast<double>(delta(&GS::hop_ns) + delta(&GS::damp_ns) + delta(&GS::fence_ns) +
+                                delta(&GS::writeback_ns) + delta(&GS::sync_ns)) /
+            1e6;
+        const size_t b = frame_ms < 26.0f ? 0 : frame_ms > 40.0f ? 2 : 1;
+        ++bucket_n_[b];
+        bucket_frame_ms_[b] += frame_ms;
+        bucket_stall_ms_[b] += stall_ms;
+    }
+    stall_prev_ = st;
+    stall_primed_ = true;
     if (!submitter_logged_) {
         submitter_logged_ = true;
         LOG_INFO(Lib_VideoOut, "FLIPCAD flips are submitted by thread {}",
@@ -123,6 +152,28 @@ void VideoOutDriver::NoteGuestFlip() {
         pace_prev_ = cur;
         pace_frames_ = 0;
         pace_nowait_ = 0;
+        const auto per_frame_ms = [&](u64 ns) {
+            return static_cast<double>(ns) / 1e6 / CadenceStats::Window;
+        };
+        const auto mean = [&](const std::array<double, 3>& sum, size_t b) {
+            return bucket_n_[b] ? sum[b] / bucket_n_[b] : 0.0;
+        };
+        LOG_INFO(Lib_VideoOut,
+                 "FLIPCAD mainstall per frame: faults={:.2f} hop={:.2f}ms damp={:.2f} "
+                 "fence={:.2f} wb={:.2f} sync={:.2f} | short<26ms n={} frame={:.1f} "
+                 "stall={:.2f} | mid n={} frame={:.1f} stall={:.2f} | long>40ms n={} "
+                 "frame={:.1f} stall={:.2f}",
+                 static_cast<double>(stall_window_.faults) / CadenceStats::Window,
+                 per_frame_ms(stall_window_.hop_ns), per_frame_ms(stall_window_.damp_ns),
+                 per_frame_ms(stall_window_.fence_ns), per_frame_ms(stall_window_.writeback_ns),
+                 per_frame_ms(stall_window_.sync_ns), bucket_n_[0], mean(bucket_frame_ms_, 0),
+                 mean(bucket_stall_ms_, 0), bucket_n_[1], mean(bucket_frame_ms_, 1),
+                 mean(bucket_stall_ms_, 1), bucket_n_[2], mean(bucket_frame_ms_, 2),
+                 mean(bucket_stall_ms_, 2));
+        stall_window_ = {};
+        bucket_n_ = {};
+        bucket_frame_ms_ = {};
+        bucket_stall_ms_ = {};
     }
 }
 

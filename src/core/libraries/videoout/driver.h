@@ -5,6 +5,7 @@
 
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
+#include "core/debug_state.h"
 #include "core/libraries/videoout/video_out.h"
 
 #include <array>
@@ -145,6 +146,14 @@ private:
     u32 pace_frames_{};
     u32 pace_nowait_{};
     bool submitter_logged_{};
+    // The submitter's readback stall, charged to the frame that just ended
+    // and bucketed by that frame's length: short (<26 ms), mid, long (>40).
+    DebugStateType::GuestStall stall_prev_{};
+    DebugStateType::GuestStall stall_window_{};
+    bool stall_primed_{};
+    std::array<u32, 3> bucket_n_{};
+    std::array<double, 3> bucket_frame_ms_{};
+    std::array<double, 3> bucket_stall_ms_{};
 };
 
 } // namespace Libraries::VideoOut

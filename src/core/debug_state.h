@@ -136,6 +136,18 @@ struct ShaderDump {
 // the flip submitter can measure its own frame from that point.
 inline thread_local std::chrono::steady_clock::time_point last_videoout_wait_return{};
 
+// flip_cadence_log: this thread's time inside readback faults, in
+// nanoseconds, so the flip submitter can charge its own frames.
+struct GuestStall {
+    u64 faults{};
+    u64 hop_ns{};       // GPU-thread round trips: prepare and finish
+    u64 damp_ns{};      // waiting for another thread's download to land
+    u64 fence_ns{};     // the fault's own fence wait
+    u64 writeback_ns{}; // the write-back run on this thread
+    u64 sync_ns{};      // the synchronous fallback, whole
+};
+inline thread_local GuestStall guest_stall{};
+
 class DebugStateImpl {
     friend class Core::Devtools::Layer;
     friend class Core::Devtools::Widget::FrameGraph;
