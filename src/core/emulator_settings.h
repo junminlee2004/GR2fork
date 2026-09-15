@@ -47,16 +47,6 @@ enum GpuReadbacksMode : int {
     Precise,
 };
 
-// Guest read faults on GPU-written memory. OffloadFull moves the fence wait
-// onto the faulting guest thread. OffloadBounded caps that wait and hands the
-// write-back to the priority waiter on timeout, so a title whose GPU work
-// waits on writes the faulting thread makes after the read cannot deadlock.
-enum GpuReadbackOffloadMode : int {
-    OffloadDisabled,
-    OffloadBounded,
-    OffloadFull,
-};
-
 // Windows static guest red-zone protection
 NLOHMANN_JSON_SERIALIZE_ENUM(WindowsGuestRedZoneProtectionMode,
                              {{WindowsGuestRedZoneProtectionMode::Disabled, "Disabled"},
@@ -452,7 +442,18 @@ struct GPUSettings {
     // but the whole buffer is serviced by one GPU drain rather than one per
     // window, which is where the cost of readbacks actually is.
     Setting<bool> readback_batching_enabled{false};
-    Setting<u32> readback_offload_mode{GpuReadbackOffloadMode::OffloadDisabled};
+    // Service guest read faults off the GPU command thread: it only records
+    // the download and, later, clears the tracker; the faulting thread waits
+    // the fence and writes the bytes back itself, under the writeback
+    // sub-settings below. Every buffer a readback has read is flagged, a run
+    // of draws writing one is submitted as soon as it ends, and the download
+    // copy runs on a second queue that waits only for that batch, so the
+    // guest read waits for its writer rather than for everything the GPU
+    // thread has run ahead and recorded since. The copy falls back to the
+    // open command buffer when the writer is still unsubmitted, when a
+    // device-address shader could have written it, or when the device has no
+    // transfer-capable family beside graphics.
+    Setting<bool> readback_offload{false};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -736,30 +737,6 @@ struct GPUSettings {
     // down to a power of two and clamped to 4..8192. Smaller means each fault
     // copies and waits for less, at the cost of faulting more often.
     Setting<u32> readback_window_kb{512};
-    // How long a faulting guest thread waits on the GPU fence before handing the
-    // job to the priority waiter, in microseconds. Only readback_offload_mode 1
-    // reads it. A short cap keeps the fence wait off the threads the game times.
-    // KNOWN BAD: 1500 crashes (2026-09-09). The default is high enough that the
-    // hand-off branch effectively never fires, so any low value runs a path that
-    // has had almost no exposure. ReleaseFaultStaging states its safety argument
-    // as "the faulting thread waited out the tick", which is exactly the
-    // invariant that branch breaks, and it frees the staging outright when the
-    // pool is full or the buffer exceeds 16 MB - which whole-buffer staging does
-    // under readback_batching_enabled. Fix the hand-off before lowering this.
-    Setting<u32> readback_bounded_wait_us{100000};
-    // Run an offloaded readback's copy on a second queue that waits only for
-    // the master tick that last wrote the buffer, instead of recording it into
-    // the open command buffer behind everything the GPU thread has run ahead
-    // and submitted since. Falls back to the open-buffer copy when the writer
-    // is still unsubmitted, when a device-address shader could have written
-    // it, or when the device has no transfer-capable family beside graphics.
-    Setting<bool> readback_copy_queue{false};
-    // Submit a run of draws that write a buffer a readback has already read,
-    // once the run ends or every 64 draws inside it, so the guest read that
-    // follows finds its writer on the ring instead of in the open command
-    // buffer. Pairs with readback_copy_queue, whose copy can then wait for
-    // that small batch alone.
-    Setting<bool> readback_flush_writer{false};
     // Cache lines of the image memo entry an upcoming binding ordinal is
     // predicted to match, warmed while the previous ordinal is still being
     // resolved. The per-ordinal hint already picks the right entry 90.7% of
@@ -821,8 +798,7 @@ struct GPUSettings {
                                        &GPUSettings::stream_buffer_size_mb),
             make_override<GPUSettings>("readback_batching_enabled",
                                        &GPUSettings::readback_batching_enabled),
-            make_override<GPUSettings>("readback_offload_mode",
-                                       &GPUSettings::readback_offload_mode),
+            make_override<GPUSettings>("readback_offload", &GPUSettings::readback_offload),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -919,11 +895,6 @@ struct GPUSettings {
             make_override<GPUSettings>("draw_glue_memo", &GPUSettings::draw_glue_memo),
             make_override<GPUSettings>("readback_wait_notify", &GPUSettings::readback_wait_notify),
             make_override<GPUSettings>("readback_window_kb", &GPUSettings::readback_window_kb),
-            make_override<GPUSettings>("readback_bounded_wait_us",
-                                       &GPUSettings::readback_bounded_wait_us),
-            make_override<GPUSettings>("readback_copy_queue", &GPUSettings::readback_copy_queue),
-            make_override<GPUSettings>("readback_flush_writer",
-                                       &GPUSettings::readback_flush_writer),
             make_override<GPUSettings>("findimg_memo_prefetch",
                                        &GPUSettings::findimg_memo_prefetch),
             make_override<GPUSettings>("deferred_read_release",
@@ -944,7 +915,7 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_A \
     window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload_mode, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -969,8 +940,8 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_C \
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
     desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
-    draw_glue_memo, readback_wait_notify, readback_window_kb, readback_bounded_wait_us, \
-    readback_copy_queue, readback_flush_writer, findimg_memo_prefetch, deferred_read_release
+    draw_glue_memo, readback_wait_notify, readback_window_kb, findimg_memo_prefetch, \
+    deferred_read_release
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1251,7 +1222,7 @@ public:
     SETTING_FORWARD(m_gpu, AdaptiveSkipCachesMode, adaptive_skipcaches_mode)
     SETTING_FORWARD(m_gpu, StreamBufferSizeMb, stream_buffer_size_mb)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
-    SETTING_FORWARD(m_gpu, ReadbackOffloadMode, readback_offload_mode)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
@@ -1325,9 +1296,6 @@ public:
     SETTING_FORWARD(m_gpu, DrawGlueMemo, draw_glue_memo)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWaitNotify, readback_wait_notify)
     SETTING_FORWARD(m_gpu, ReadbackWindowKb, readback_window_kb)
-    SETTING_FORWARD(m_gpu, ReadbackBoundedWaitUs, readback_bounded_wait_us)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackCopyQueue, readback_copy_queue)
-    SETTING_FORWARD_BOOL(m_gpu, ReadbackFlushWriter, readback_flush_writer)
     SETTING_FORWARD(m_gpu, FindimgMemoPrefetch, findimg_memo_prefetch)
     SETTING_FORWARD_BOOL(m_gpu, DeferredReadRelease, deferred_read_release)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)

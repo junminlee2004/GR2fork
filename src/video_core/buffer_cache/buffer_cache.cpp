@@ -66,12 +66,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // AlignDown masks, so the window has to be a power of two.
     readback_window_ = std::bit_floor(
         std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
-    bounded_wait_ns_ = u64{EmulatorSettings.GetReadbackBoundedWaitUs()} * 1000;
-    if (EmulatorSettings.IsReadbackCopyQueue() && instance.HasTransferQueue()) {
+    readback_offload_ = EmulatorSettings.IsReadbackOffload();
+    if (readback_offload_ && instance.HasTransferQueue()) {
         copy_queue_ =
             std::make_unique<Vulkan::TransferQueue>(instance, *scheduler.GetMasterSemaphore());
     }
-    flush_writer_ = EmulatorSettings.IsReadbackFlushWriter();
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
@@ -377,15 +376,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     // clock. When this function is reached from the GPU command thread itself
     // (its own guest-memory read faulting), SendCommand runs the hops inline
     // and the wait lands where it always did - never worse than the sync form.
-    //
-    // The bounded mode caps the faulting thread's fence wait. Some titles gate
-    // further GPU progress on memory the faulting thread writes only after its
-    // read returns; an unbounded wait then deadlocks guest against GPU. On
-    // timeout the job moves to the priority waiter thread, the write-back runs
-    // on the GPU command thread once the fence signals, and the refault loop
-    // above resolves the access through the in-flight-window spin.
-    const u32 offload_mode = EmulatorSettings.GetReadbackOffloadMode();
-    if (offload_mode != GpuReadbackOffloadMode::OffloadDisabled) {
+    if (readback_offload_) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             FaultDownloadJob job;
             if (writeback_share_) {
@@ -527,40 +518,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 }
             }
             const u64 t0 = Common::FencedRDTSC();
-            if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
-                const bool reached =
-                    job.on_copy_queue
-                        ? copy_queue_->WaitFor(job.copy_queue_tick, bounded_wait_ns_)
-                        : scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, bounded_wait_ns_);
-                if (!reached) {
-                    offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0,
-                                               std::memory_order_relaxed);
-                    auto deferred = std::make_unique<FaultDownloadJob>(std::move(job));
-                    scheduler.DeferPriorityOperationAt(
-                        deferred->wait_tick,
-                        [this, device_addr, size, is_write, job = std::move(deferred)]() mutable {
-                            if (job->on_copy_queue) {
-                                // Keyed on the writer's master tick; the copy
-                                // itself retires on its own timeline.
-                                copy_queue_->Wait(job->copy_queue_tick);
-                            }
-                            if (writeback_offload_) {
-                                WriteBackFaultDownload(*job, 1);
-                            }
-                            liverpool->SendCommand<false>(
-                                [this, device_addr, size, is_write, job = std::move(job)] {
-                                    FinishFaultDownload(*job, device_addr, size, is_write);
-                                    // The timed-out path bumped the generation
-                                    // when it returned, before this deferred
-                                    // finish marked the pages CPU-dirty; a
-                                    // generation-keyed memo recorded in between
-                                    // would hit after the mark.
-                                    VideoCore::Skipcache::Framework::Instance().BumpMemGen();
-                                });
-                        });
-                    return;
-                }
-            } else if (job.on_copy_queue) {
+            if (job.on_copy_queue) {
                 copy_queue_->Wait(job.copy_queue_tick);
             } else {
                 scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
@@ -918,7 +876,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     job.window_start = window_start;
     job.window_size = window_end - window_start;
 
-    // readback_copy_queue: with the writer already submitted, the copy waits
+    // readback_offload: with the writer already submitted, the copy waits
     // for its master tick on the second queue instead of riding in the open
     // batch behind the run-ahead. The writer tick is stamped where every GPU
     // write to a buffer is recorded, 0 meaning none reached this buffer, and
@@ -933,8 +891,8 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
             std::span<const vk::BufferCopy>(job.copies.data(), job.copies.size()));
         job.on_copy_queue = true;
         buffer.copy_queue_read_tick = job.copy_queue_tick;
-        // Deferred paths key on a submitted master tick; the writer's is one.
-        // The share carries the copy-queue tick for its joiners and helper.
+        // The share's joiners and the helper wake on a submitted master tick;
+        // the writer's is one, and the share carries the copy-queue tick too.
         job.wait_tick = writer_tick;
         q2_copies_.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -2096,7 +2054,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 siz
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, &fresh);
     if (is_written) {
         buffer.gpu_write_tick = scheduler.CurrentTick();
-        if (flush_writer_ && buffer.readback_prone) {
+        if (readback_offload_ && buffer.readback_prone) {
             prone_write_pending_ = true;
         }
         // Bump the GPU-clean epoch only on new coverage; steady-state
@@ -2826,7 +2784,7 @@ void BufferCache::NoteDmaWrite() {
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
-    // readback_copy_queue: a copy still reading this buffer on the second
+    // readback_offload: a copy still reading this buffer on the second
     // queue retires on its own timeline, which the deferred erase below does
     // not wait for.
     if (copy_queue_ && buffer.copy_queue_read_tick != 0) {

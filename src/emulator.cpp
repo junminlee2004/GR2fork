@@ -568,9 +568,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU drawGlueMemo: {}", EmulatorSettings.GetDrawGlueMemo());
     LOG_INFO(Config, "GPU readbackWaitNotify: {}", EmulatorSettings.IsReadbackWaitNotify());
     LOG_INFO(Config, "GPU readbackWindowKb: {}", EmulatorSettings.GetReadbackWindowKb());
-    LOG_INFO(Config, "GPU readbackBoundedWaitUs: {}", EmulatorSettings.GetReadbackBoundedWaitUs());
-    LOG_INFO(Config, "GPU readbackCopyQueue: {}", EmulatorSettings.IsReadbackCopyQueue());
-    LOG_INFO(Config, "GPU readbackFlushWriter: {}", EmulatorSettings.IsReadbackFlushWriter());
     LOG_INFO(Config, "GPU findimgMemoPrefetch: {}", EmulatorSettings.GetFindimgMemoPrefetch());
     LOG_INFO(Config, "GPU deferredReadRelease: {}", EmulatorSettings.IsDeferredReadRelease());
     LOG_INFO(Config, "GPU specFpCache: {}", EmulatorSettings.IsSpecFpCache());
@@ -578,7 +575,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU imageFastState: {}", EmulatorSettings.IsImageFastState());
     LOG_INFO(Config, "GPU guestCopyLockBatch: {}", EmulatorSettings.IsGuestCopyLockBatch());
     LOG_INFO(Config, "GPU specMruPermProbe: {}", EmulatorSettings.IsSpecMruPermProbe());
-    LOG_INFO(Config, "GPU readbackOffloadMode: {}", EmulatorSettings.GetReadbackOffloadMode());
+    LOG_INFO(Config, "GPU readbackOffload: {}", EmulatorSettings.IsReadbackOffload());
     LOG_INFO(Config, "GPU readbackBatching: {}", EmulatorSettings.IsReadbackBatchingEnabled());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());

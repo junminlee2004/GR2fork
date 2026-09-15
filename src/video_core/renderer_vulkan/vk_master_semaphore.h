@@ -58,7 +58,7 @@ protected:
     std::atomic<u64> current_tick{1}; ///< Current logical tick.
 };
 
-/// readback_copy_queue: a second queue with its own timeline. A readback copy
+/// readback_offload: a second queue with its own timeline. A readback copy
 /// submitted here waits only for the master tick that wrote its source, so it
 /// runs beside the batches the GPU thread has since run ahead and submitted
 /// instead of behind them. The GPU command thread submits; any thread waits.

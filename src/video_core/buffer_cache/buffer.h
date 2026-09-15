@@ -174,12 +174,12 @@ public:
     int stream_score = 0;
     size_t size_bytes = 0;
     u64 lru_id = 0;
-    // readback_copy_queue: master tick of the open batch when a GPU write to
+    // readback_offload: master tick of the open batch when a GPU write to
     // this buffer was last recorded, 0 for never; and the copy-queue tick of
     // the last readback copy that read it, which deletion waits out.
     u64 gpu_write_tick = 0;
     u64 copy_queue_read_tick = 0;
-    // readback_flush_writer: a fault download has read this buffer, so its
+    // readback_offload: a fault download has read this buffer, so its
     // later GPU writes are what a guest read will wait for.
     bool readback_prone = false;
     std::span<u8> mapped_data;

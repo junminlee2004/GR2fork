@@ -130,7 +130,7 @@ public:
         // Fault windows that found nothing to download. Counted whatever the
         // settings say, so an owner-join design can be sized before it exists.
         u64 empty;
-        // readback_copy_queue: copies taken by the second queue, the fallbacks
+        // readback_offload: copies taken by the second queue, the fallbacks
         // by reason, and the faulting threads' wait on that queue.
         u64 q2_copies;
         u64 q2_open;
@@ -153,11 +153,11 @@ public:
                 q2_wait_ns_.exchange(0, std::memory_order_relaxed)};
     }
 
-    /// readback_copy_queue: a device-address shader is being recorded, which
+    /// readback_offload: a device-address shader is being recorded, which
     /// can write any buffer; readbacks treat the open batch as its writer.
     void NoteDmaWrite();
 
-    /// readback_flush_writer: whether the draw being recorded wrote a buffer a
+    /// readback_offload: whether the draw being recorded wrote a buffer a
     /// readback has already read. Cleared by the call.
     bool TakeProneWrite() {
         const bool pending = prone_write_pending_;
@@ -328,7 +328,7 @@ private:
         std::vector<Piece> pieces;
         const u8* download = nullptr;
         u64 tick = 0;
-        // readback_copy_queue: the copy retires on the second queue at this
+        // readback_offload: the copy retires on the second queue at this
         // tick; the master tick above is then the writer's batch.
         u64 copy_queue_tick = 0;
         bool coherent = false;
@@ -356,7 +356,7 @@ private:
         VAddr window_start = 0; // range whose tracker bits the writeback clears
         u64 window_size = 0;
         u64 wait_tick = 0;
-        // readback_copy_queue: the copy retires on the second queue's own
+        // readback_offload: the copy retires on the second queue's own
         // timeline at this tick; wait_tick then names the writer's batch.
         u64 copy_queue_tick = 0;
         bool on_copy_queue = false;
@@ -742,13 +742,13 @@ private:
     PageTable page_table;
     // Staging pool for offloaded fault readbacks. GPU command thread only.
     std::vector<std::unique_ptr<Buffer>> fault_staging_pool_;
-    // readback_copy_queue: the second queue, when the setting and the device
+    // readback_offload: the second queue, when the setting and the device
     // provide one, and the open tick of the last device-address shader.
     std::unique_ptr<Vulkan::TransferQueue> copy_queue_;
     u64 dma_write_tick_{};
-    // readback_flush_writer: set when a written bind touches a buffer a
-    // readback has read; the rasterizer takes it after recording the draw.
-    bool flush_writer_{};
+    // readback_offload: set when a written bind touches a buffer a readback
+    // has read; the rasterizer takes it after recording the draw.
+    bool readback_offload_{};
     bool prone_write_pending_{};
     // Islands owned by in-flight readbacks; a later download skips them. GPU
     // command thread only.
@@ -905,7 +905,6 @@ private:
     // Fault window, and the cap on the faulting thread's fence wait. Both are
     // latched once: a fault reads them on the guest thread's critical path.
     u64 readback_window_{};
-    u64 bounded_wait_ns_{};
     std::mutex writeback_cv_m_;
     std::condition_variable writeback_cv_;
     std::atomic<u64> writeback_gen_{};

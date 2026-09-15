@@ -382,9 +382,9 @@ bool Instance::CreateDevice() {
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
     };
-    // readback_copy_queue: a transfer-capable family beside the graphics one,
+    // readback_offload: a transfer-capable family beside the graphics one,
     // a dedicated transfer family before a compute one.
-    if (EmulatorSettings.IsReadbackCopyQueue()) {
+    if (EmulatorSettings.IsReadbackOffload()) {
         int best = -1;
         for (std::size_t i = 0; i < family_properties.size(); i++) {
             const auto flags = family_properties[i].queueFlags;

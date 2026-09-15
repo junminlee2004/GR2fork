@@ -130,7 +130,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
-    flush_writer_ = EmulatorSettings.IsReadbackFlushWriter();
+    readback_offload_ = EmulatorSettings.IsReadbackOffload();
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
     // pinned, and a frozen stamp compares every draw register-identical.
@@ -713,8 +713,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
 
     ResetBindings();
-    const bool prone_write = flush_writer_ && buffer_cache.TakeProneWrite();
-    if (flush_draw_interval_ != 0 || flush_writer_) {
+    const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
+    if (flush_draw_interval_ != 0 || readback_offload_) {
         // The flush submits; it must not run under the guest-copy shared lock.
         copy_scope.reset();
         MaybeIntervalFlush(WriterFlushDue(prone_write));
@@ -929,8 +929,8 @@ void Rasterizer::DispatchDirect() {
     DebugState.IncDispatch();
 
     ResetBindings();
-    const bool prone_write = flush_writer_ && buffer_cache.TakeProneWrite();
-    if (flush_draw_interval_ != 0 || flush_writer_) {
+    const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
+    if (flush_draw_interval_ != 0 || readback_offload_) {
         copy_scope.reset();
         MaybeIntervalFlush(WriterFlushDue(prone_write));
     }

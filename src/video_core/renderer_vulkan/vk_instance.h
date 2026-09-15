@@ -75,7 +75,7 @@ public:
         return present_queue;
     }
 
-    /// readback_copy_queue: a transfer-capable queue outside the graphics family.
+    /// readback_offload: a transfer-capable queue outside the graphics family.
     bool HasTransferQueue() const {
         return has_transfer_queue;
     }

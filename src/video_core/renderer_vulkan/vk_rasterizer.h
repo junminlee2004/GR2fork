@@ -210,9 +210,9 @@ private:
     u32 flush_draw_interval_{};
     u32 draws_since_flush_{};
     u64 flush_tick_{};
-    // readback_flush_writer: inside a run of draws writing readback-prone
+    // readback_offload: inside a run of draws writing readback-prone
     // buffers, and the run's length; flushes it adds, for the log.
-    bool flush_writer_{};
+    bool readback_offload_{};
     bool prone_run_{};
     u32 prone_run_draws_{};
     u64 writer_flushes_{};
@@ -238,7 +238,7 @@ private:
     u64 gfx_stamp_last_{};
     /// Flushes at the draw interval, or now when forced; true when it did.
     bool MaybeIntervalFlush(bool force = false);
-    /// readback_flush_writer: whether the run of prone-buffer writes the draw
+    /// readback_offload: whether the run of prone-buffer writes the draw
     /// just recorded belongs to is due for its flush.
     bool WriterFlushDue(bool prone_write);
     bool elide_findbuffer_{};
