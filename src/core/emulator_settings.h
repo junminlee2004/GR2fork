@@ -454,6 +454,15 @@ struct GPUSettings {
     // device-address shader could have written it, or when the device has no
     // transfer-capable family beside graphics.
     Setting<bool> readback_offload{false};
+    // Bisect switch, temporary: the writer flush half of readback_offload.
+    // Off leaves the second-queue copy on and never submits a prone-buffer
+    // write run early.
+    Setting<bool> readback_offload_flush_writer{true};
+    // Diagnostic, temporary: beside every second-queue readback copy, record
+    // the ordered copy the open-buffer path would have made and compare the
+    // two byte for byte when the readback finishes. Costs a fence wait on the
+    // GPU thread per readback; RBQ2 reports verify/bad/badKiB.
+    Setting<bool> readback_offload_verify{false};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -799,6 +808,10 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_batching_enabled",
                                        &GPUSettings::readback_batching_enabled),
             make_override<GPUSettings>("readback_offload", &GPUSettings::readback_offload),
+            make_override<GPUSettings>("readback_offload_flush_writer",
+                                       &GPUSettings::readback_offload_flush_writer),
+            make_override<GPUSettings>("readback_offload_verify",
+                                       &GPUSettings::readback_offload_verify),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -915,7 +928,7 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_A \
     window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_offload_flush_writer, readback_offload_verify, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -1223,6 +1236,8 @@ public:
     SETTING_FORWARD(m_gpu, StreamBufferSizeMb, stream_buffer_size_mb)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackOffloadFlushWriter, readback_offload_flush_writer)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackOffloadVerify, readback_offload_verify)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)

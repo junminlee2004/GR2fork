@@ -1081,9 +1081,10 @@ void Rasterizer::OnSubmit() {
             if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma || writer_flushes_) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} "
-                         "wflush={} per300f",
+                         "wflush={} verify={} bad={} badKiB={} per300f",
                          off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma, ms(off.q2_wait_ns),
-                         std::exchange(writer_flushes_, u64{0}));
+                         std::exchange(writer_flushes_, u64{0}), off.q2_verify, off.q2_verify_bad,
+                         off.q2_verify_bad_bytes >> 10);
             }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
