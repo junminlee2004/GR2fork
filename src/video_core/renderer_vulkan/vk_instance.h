@@ -75,6 +75,19 @@ public:
         return present_queue;
     }
 
+    /// readback_copy_queue: a transfer-capable queue outside the graphics family.
+    bool HasTransferQueue() const {
+        return has_transfer_queue;
+    }
+
+    u32 GetTransferQueueFamilyIndex() const {
+        return transfer_queue_family_index;
+    }
+
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -504,11 +517,14 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue transfer_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 transfer_queue_family_index{0};
+    bool has_transfer_queue{};
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};

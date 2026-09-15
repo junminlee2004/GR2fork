@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -66,6 +67,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     readback_window_ = std::bit_floor(
         std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
     bounded_wait_ns_ = u64{EmulatorSettings.GetReadbackBoundedWaitUs()} * 1000;
+    if (EmulatorSettings.IsReadbackCopyQueue() && instance.HasTransferQueue()) {
+        copy_queue_ =
+            std::make_unique<Vulkan::TransferQueue>(instance, *scheduler.GetMasterSemaphore());
+    }
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
@@ -514,13 +519,22 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             }
             const u64 t0 = Common::FencedRDTSC();
             if (offload_mode == GpuReadbackOffloadMode::OffloadBounded) {
-                if (!scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, bounded_wait_ns_)) {
+                const bool reached =
+                    job.on_copy_queue
+                        ? copy_queue_->WaitFor(job.copy_queue_tick, bounded_wait_ns_)
+                        : scheduler.GetMasterSemaphore()->WaitFor(job.wait_tick, bounded_wait_ns_);
+                if (!reached) {
                     offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0,
                                                std::memory_order_relaxed);
                     auto deferred = std::make_unique<FaultDownloadJob>(std::move(job));
                     scheduler.DeferPriorityOperationAt(
                         deferred->wait_tick,
                         [this, device_addr, size, is_write, job = std::move(deferred)]() mutable {
+                            if (job->on_copy_queue) {
+                                // Keyed on the writer's master tick; the copy
+                                // itself retires on its own timeline.
+                                copy_queue_->Wait(job->copy_queue_tick);
+                            }
                             if (writeback_offload_) {
                                 WriteBackFaultDownload(*job, 1);
                             }
@@ -537,10 +551,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                         });
                     return;
                 }
+            } else if (job.on_copy_queue) {
+                copy_queue_->Wait(job.copy_queue_tick);
             } else {
                 scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
             }
             offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+            if (job.on_copy_queue) {
+                q2_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+            }
             if (writeback_offload_) {
                 WriteBackFaultDownload(job, liverpool->OnGpuThread() ? 2 : 0);
             }
@@ -882,26 +901,55 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     job.window_start = window_start;
     job.window_size = window_end - window_start;
 
-    scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-    // Synchronize prior GPU writes to this buffer before the transfer read
-    const vk::BufferMemoryBarrier2 pre_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-        .buffer = buffer.buffer,
-        .offset = 0,
-        .size = buffer.SizeBytes(),
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &pre_barrier,
-    });
-    cmdbuf.copyBuffer(buffer.buffer, job.staging->Handle(), job.copies);
-    job.wait_tick = scheduler.CurrentTick();
-    scheduler.Flush();
+    // readback_copy_queue: with the writer already submitted, the copy waits
+    // for its master tick on the second queue instead of riding in the open
+    // batch behind the run-ahead. The writer tick is stamped where every GPU
+    // write to a buffer is recorded, 0 meaning none reached this buffer, and
+    // a device-address shader can write any buffer, so its batch counts as
+    // the writer for all of them.
+    const u64 writer_tick = std::max(buffer.gpu_write_tick, dma_write_tick_);
+    const bool copy_queue_ok =
+        copy_queue_ && writer_tick != 0 && writer_tick < scheduler.CurrentTick();
+    if (copy_queue_ok) {
+        job.copy_queue_tick = copy_queue_->SubmitCopy(
+            writer_tick, buffer.Handle(), job.staging->Handle(),
+            std::span<const vk::BufferCopy>(job.copies.data(), job.copies.size()));
+        job.on_copy_queue = true;
+        buffer.copy_queue_read_tick = job.copy_queue_tick;
+        // Deferred paths key on a submitted master tick; the writer's is one.
+        job.wait_tick = writer_tick;
+        // The share and its helper wait the master timeline, which does not
+        // cover this copy.
+        job.share.reset();
+        q2_copies_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (copy_queue_) {
+            auto& reason = writer_tick == 0                          ? q2_unknown_
+                           : dma_write_tick_ > buffer.gpu_write_tick ? q2_dma_
+                                                                     : q2_open_;
+            reason.fetch_add(1, std::memory_order_relaxed);
+        }
+        scheduler.EndRendering();
+        const auto cmdbuf = scheduler.CommandBuffer();
+        // Synchronize prior GPU writes to this buffer before the transfer read
+        const vk::BufferMemoryBarrier2 pre_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = buffer.buffer,
+            .offset = 0,
+            .size = buffer.SizeBytes(),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &pre_barrier,
+        });
+        cmdbuf.copyBuffer(buffer.buffer, job.staging->Handle(), job.copies);
+        job.wait_tick = scheduler.CurrentTick();
+        scheduler.Flush();
+    }
     job.has_download = true;
     if (writeback_offload_) {
         job.inflight_id = next_inflight_id_++;
@@ -1681,6 +1729,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         const auto buffer_id = FindBuffer(dst, num_bytes);
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
+        buffer.gpu_write_tick = scheduler.CurrentTick();
         if (!GpuModifiedRangesContain(dst, num_bytes)) {
             ++gpu_dirty_generation_;
             AddWrittenRange(dst, num_bytes);
@@ -2029,6 +2078,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 siz
     bool fresh = false;
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, &fresh);
     if (is_written) {
+        buffer.gpu_write_tick = scheduler.CurrentTick();
         // Bump the GPU-clean epoch only on new coverage; steady-state
         // re-writes of the same ranges skip both the bump and the no-op
         // interval merge. A page of the range that was GPU-clean until this
@@ -2218,6 +2268,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     });
 
     cmdbuf.copyBuffer(overlap.Handle(), new_buffer.Handle(), copy);
+    new_buffer.gpu_write_tick = scheduler.CurrentTick();
 
     boost::container::static_vector<vk::BufferMemoryBarrier2, 2> post_barriers{};
     if (auto src_barrier =
@@ -2497,6 +2548,7 @@ void BufferCache::EmitBufferUpload(Buffer& buffer, vk::Buffer src_buffer,
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
+    buffer.gpu_write_tick = scheduler.CurrentTick();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
@@ -2639,6 +2691,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     }
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
+    buffer.gpu_write_tick = scheduler.CurrentTick();
     return true;
 }
 
@@ -2706,6 +2759,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, VAddr address, const void* val
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.copyBuffer(src_buffer, buffer.Handle(), copy);
+    buffer.gpu_write_tick = scheduler.CurrentTick();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
@@ -2746,8 +2800,18 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
     lru_cache.Touch(buffer.LRUId(), gc_tick);
 }
 
+void BufferCache::NoteDmaWrite() {
+    dma_write_tick_ = scheduler.CurrentTick();
+}
+
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
+    // readback_copy_queue: a copy still reading this buffer on the second
+    // queue retires on its own timeline, which the deferred erase below does
+    // not wait for.
+    if (copy_queue_ && buffer.copy_queue_read_tick != 0) {
+        copy_queue_->Wait(buffer.copy_queue_read_tick);
+    }
     Unregister(buffer_id);
     scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
     buffer.is_deleted = true;

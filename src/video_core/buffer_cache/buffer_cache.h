@@ -31,8 +31,9 @@ class MemoryManager;
 }
 
 namespace Vulkan {
+class TransferQueue;
 class GraphicsPipeline;
-}
+} // namespace Vulkan
 
 namespace VideoCore {
 
@@ -129,6 +130,13 @@ public:
         // Fault windows that found nothing to download. Counted whatever the
         // settings say, so an owner-join design can be sized before it exists.
         u64 empty;
+        // readback_copy_queue: copies taken by the second queue, the fallbacks
+        // by reason, and the faulting threads' wait on that queue.
+        u64 q2_copies;
+        u64 q2_open;
+        u64 q2_unknown;
+        u64 q2_dma;
+        u64 q2_wait_ns;
     };
 
     /// Snapshot and reset the offloaded-readback counters (for periodic logs).
@@ -137,8 +145,17 @@ public:
                 offload_vetoes_.exchange(0, std::memory_order_relaxed),
                 offload_fallbacks_.exchange(0, std::memory_order_relaxed),
                 offload_wait_ns_.exchange(0, std::memory_order_relaxed),
-                join_empty_.exchange(0, std::memory_order_relaxed)};
+                join_empty_.exchange(0, std::memory_order_relaxed),
+                q2_copies_.exchange(0, std::memory_order_relaxed),
+                q2_open_.exchange(0, std::memory_order_relaxed),
+                q2_unknown_.exchange(0, std::memory_order_relaxed),
+                q2_dma_.exchange(0, std::memory_order_relaxed),
+                q2_wait_ns_.exchange(0, std::memory_order_relaxed)};
     }
+
+    /// readback_copy_queue: a device-address shader is being recorded, which
+    /// can write any buffer; readbacks treat the open batch as its writer.
+    void NoteDmaWrite();
 
     struct StreamCopyStats {
         u64 hits;
@@ -328,6 +345,10 @@ private:
         VAddr window_start = 0; // range whose tracker bits the writeback clears
         u64 window_size = 0;
         u64 wait_tick = 0;
+        // readback_copy_queue: the copy retires on the second queue's own
+        // timeline at this tick; wait_tick then names the writer's batch.
+        u64 copy_queue_tick = 0;
+        bool on_copy_queue = false;
         u64 inflight_id = 0;     // registry entry owning the copied islands
         u64 written_islands = 0; // filled by the offloaded write-back
         u64 written_bytes = 0;
@@ -709,6 +730,10 @@ private:
     PageTable page_table;
     // Staging pool for offloaded fault readbacks. GPU command thread only.
     std::vector<std::unique_ptr<Buffer>> fault_staging_pool_;
+    // readback_copy_queue: the second queue, when the setting and the device
+    // provide one, and the open tick of the last device-address shader.
+    std::unique_ptr<Vulkan::TransferQueue> copy_queue_;
+    u64 dma_write_tick_{};
     // Islands owned by in-flight readbacks; a later download skips them. GPU
     // command thread only.
     struct InflightDownload {
@@ -726,6 +751,11 @@ private:
     std::atomic<u64> offload_fallbacks_{};
     std::atomic<u64> offload_wait_ns_{};
     std::atomic<u64> join_empty_{};
+    std::atomic<u64> q2_copies_{};
+    std::atomic<u64> q2_open_{};
+    std::atomic<u64> q2_unknown_{};
+    std::atomic<u64> q2_dma_{};
+    std::atomic<u64> q2_wait_ns_{};
     // Stream copy cache counters; hits count probes that return a cached
     // offset. The probes and the telemetry drain both run on the GPU command
     // thread, so plain counters suffice.

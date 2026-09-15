@@ -747,6 +747,13 @@ struct GPUSettings {
     // pool is full or the buffer exceeds 16 MB - which whole-buffer staging does
     // under readback_batching_enabled. Fix the hand-off before lowering this.
     Setting<u32> readback_bounded_wait_us{100000};
+    // Run an offloaded readback's copy on a second queue that waits only for
+    // the master tick that last wrote the buffer, instead of recording it into
+    // the open command buffer behind everything the GPU thread has run ahead
+    // and submitted since. Falls back to the open-buffer copy when the writer
+    // is still unsubmitted, when a device-address shader could have written
+    // it, or when the device has no transfer-capable family beside graphics.
+    Setting<bool> readback_copy_queue{false};
     // Cache lines of the image memo entry an upcoming binding ordinal is
     // predicted to match, warmed while the previous ordinal is still being
     // resolved. The per-ordinal hint already picks the right entry 90.7% of
@@ -908,6 +915,7 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_window_kb", &GPUSettings::readback_window_kb),
             make_override<GPUSettings>("readback_bounded_wait_us",
                                        &GPUSettings::readback_bounded_wait_us),
+            make_override<GPUSettings>("readback_copy_queue", &GPUSettings::readback_copy_queue),
             make_override<GPUSettings>("findimg_memo_prefetch",
                                        &GPUSettings::findimg_memo_prefetch),
             make_override<GPUSettings>("deferred_read_release",
@@ -943,7 +951,7 @@ struct GPUSettings {
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
     vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
-    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, readback_wait_notify, readback_window_kb, readback_bounded_wait_us, findimg_memo_prefetch, deferred_read_release
+    key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, readback_writeback_helper, bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, readback_wait_notify, readback_window_kb, readback_bounded_wait_us, readback_copy_queue, findimg_memo_prefetch, deferred_read_release
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1297,6 +1305,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWaitNotify, readback_wait_notify)
     SETTING_FORWARD(m_gpu, ReadbackWindowKb, readback_window_kb)
     SETTING_FORWARD(m_gpu, ReadbackBoundedWaitUs, readback_bounded_wait_us)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackCopyQueue, readback_copy_queue)
     SETTING_FORWARD(m_gpu, FindimgMemoPrefetch, findimg_memo_prefetch)
     SETTING_FORWARD_BOOL(m_gpu, DeferredReadRelease, deferred_read_release)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)

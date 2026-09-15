@@ -118,10 +118,17 @@ Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
       usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
-    // Create buffer object.
+    // Create buffer object. A readback copy queue reads buffers from a second
+    // family, so they are shared between both.
+    const std::array<u32, 2> families = {instance->GetGraphicsQueueFamilyIndex(),
+                                         instance->GetTransferQueueFamilyIndex()};
+    const bool shared = instance->HasTransferQueue();
     const vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = flags,
+        .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = shared ? 2u : 0u,
+        .pQueueFamilyIndices = shared ? families.data() : nullptr,
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, usage, &alloc_info);

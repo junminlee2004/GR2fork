@@ -1050,6 +1050,12 @@ void Rasterizer::OnSubmit() {
                          "empty={} per300f",
                          off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
             }
+            if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} per300f",
+                         off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma,
+                         ms(off.q2_wait_ns));
+            }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,
@@ -1649,6 +1655,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        buffer_cache.NoteDmaWrite();
         // We only use fault buffer for DMA right now.
         Common::RecursiveSharedLock lock{mapped_ranges_mutex};
         for (auto& range : mapped_ranges) {
