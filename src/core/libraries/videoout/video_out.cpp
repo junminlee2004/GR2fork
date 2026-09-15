@@ -4,7 +4,6 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
-#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
@@ -177,7 +176,6 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
     LOG_DEBUG(Lib_VideoOut, "bufferIndex = {}, flipMode = {}, flipArg = {}", bufferIndex, flipMode,
               flipArg);
 
-    driver->NoteGuestFlip();
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
@@ -350,7 +348,6 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
-    driver->NoteGuestFlip();
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
@@ -383,10 +380,6 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
-    if (DebugState.flip_cadence_log) {
-        DebugState.vo_wait_vblank_calls.fetch_add(1, std::memory_order_relaxed);
-        DebugStateType::last_videoout_wait_return = std::chrono::steady_clock::now();
-    }
     return ORBIS_OK;
 }
 

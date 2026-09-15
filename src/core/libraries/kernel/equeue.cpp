@@ -8,7 +8,6 @@
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
-#include "core/debug_state.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/kernel.h"
@@ -16,7 +15,6 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
-#include "core/libraries/videoout/video_out.h"
 
 namespace Libraries::Kernel {
 
@@ -174,46 +172,17 @@ bool EqueueInternal::RemoveEvent(u64 id, s16 filter) {
     return has_found;
 }
 
-// flip_cadence_log: stamp a VideoOut wait return on the waiting thread and
-// count which event it carried.
-static void NoteVideoOutEvents(const OrbisKernelEvent* ev, int count) {
-    if (!DebugState.flip_cadence_log) {
-        return;
-    }
-    using Libraries::VideoOut::OrbisVideoOutInternalEventId;
-    bool seen = false;
-    for (int i = 0; i < count; ++i) {
-        if (ev[i].filter != OrbisKernelEvent::Filter::VideoOut) {
-            continue;
-        }
-        seen = true;
-        const auto id = static_cast<OrbisVideoOutInternalEventId>(ev[i].ident);
-        if (id == OrbisVideoOutInternalEventId::Flip) {
-            DebugState.vo_event_flip.fetch_add(1, std::memory_order_relaxed);
-        } else if (id == OrbisVideoOutInternalEventId::Vblank) {
-            DebugState.vo_event_vblank.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    if (seen) {
-        DebugStateType::last_videoout_wait_return = std::chrono::steady_clock::now();
-    }
-}
-
 int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKernelUseconds* timo) {
     if (timo != nullptr && *timo == 0) {
         // Effectively acts as a poll; only events that have already
         // arrived at the time of this function call can be received
-        const int polled = GetTriggeredEvents(ev, num);
-        NoteVideoOutEvents(ev, polled);
-        return polled;
+        return GetTriggeredEvents(ev, num);
     }
     const auto micros = timo ? *timo : 0u;
 
     if (HasSmallTimer()) {
         // If a small timer is set, just wait for it to expire.
-        const int timed = WaitForSmallTimer(ev, num, micros);
-        NoteVideoOutEvents(ev, timed);
-        return timed;
+        return WaitForSmallTimer(ev, num, micros);
     }
 
     int count = 0;
@@ -233,7 +202,6 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         m_cond.wait_for(lock, std::chrono::microseconds(micros), predicate);
     }
 
-    NoteVideoOutEvents(ev, count);
     return count;
 }
 

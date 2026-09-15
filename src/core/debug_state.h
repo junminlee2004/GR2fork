@@ -3,9 +3,7 @@
 
 #pragma once
 
-#include <array>
 #include <atomic>
-#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -132,32 +130,6 @@ struct ShaderDump {
     }
 };
 
-// flip_cadence_log: the last return from a VideoOut wait on this thread, so
-// the flip submitter can measure its own frame from that point.
-inline thread_local std::chrono::steady_clock::time_point last_videoout_wait_return{};
-
-// flip_cadence_log: this thread's time inside readback faults, in
-// nanoseconds, so the flip submitter can charge its own frames.
-struct GuestStall {
-    u64 faults{};
-    u64 hop_ns{};       // GPU-thread round trips: prepare and finish
-    u64 damp_ns{};      // waiting for another thread's download to land
-    u64 fence_ns{};     // the fault's own fence wait
-    u64 writeback_ns{}; // the write-back run on this thread
-    u64 sync_ns{};      // the synchronous fallback, whole
-    // Synchronous GPU-thread commands, split into the wait for pickup and
-    // the command's own run, with what the GPU thread was doing when the
-    // command was posted: running earlier commands or parsing packets.
-    u64 cmds{};
-    u64 cmd_queue_ns{};
-    u64 cmd_exec_ns{};
-    u64 cmd_behind_cmds{};
-    u64 cmd_behind_parser{};
-};
-inline thread_local GuestStall guest_stall{};
-// True while the GPU thread is inside DrainCommands.
-inline std::atomic<bool> gpu_in_drain{false};
-
 class DebugStateImpl {
     friend class Core::Devtools::Layer;
     friend class Core::Devtools::Widget::FrameGraph;
@@ -195,15 +167,6 @@ class DebugStateImpl {
     std::vector<ShaderDump> shader_dump_list{};
 
 public:
-    // flip_cadence_log: process-wide counts of the guest's pacing and clock
-    // calls, read as per-frame rates by the flip cadence log.
-    bool flip_cadence_log = false;
-    std::atomic<u64> vo_wait_vblank_calls{0};
-    std::atomic<u64> vo_event_vblank{0};
-    std::atomic<u64> vo_event_flip{0};
-    // GetProcessTime, GetProcessTimeCounter, ReadTsc, clock_gettime, gettimeofday
-    std::array<std::atomic<u64>, 5> clock_calls{};
-
     float Framerate = 1.0f / 60.0f;
     float FrameDeltaTime;
 

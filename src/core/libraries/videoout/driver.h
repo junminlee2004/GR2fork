@@ -5,11 +5,8 @@
 
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
-#include "core/debug_state.h"
 #include "core/libraries/videoout/video_out.h"
 
-#include <array>
-#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -95,10 +92,6 @@ public:
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
-    /// flip_cadence_log: the guest's frame boundary, sampled on the thread that
-    /// requests the flip, before the request reaches the GPU or present threads.
-    void NoteGuestFlip();
-
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -118,42 +111,10 @@ private:
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
 
-    // flip_cadence_log: interval statistics of one cadence. Each instance is
-    // fed by a single thread, so it needs no synchronisation.
-    struct CadenceStats {
-        static constexpr u32 Window = 300;
-        std::array<float, Window> ms{};
-        u32 n{};
-        std::chrono::steady_clock::time_point last{};
-
-        void Sample(std::chrono::steady_clock::time_point now, const char* name);
-        void Add(float sample_ms, const char* name);
-    };
-
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
-    bool flip_cadence_log_{};
-    CadenceStats guest_cadence_{};
-    CadenceStats present_cadence_{};
-    // Frame start = the submitter's last VideoOut wait return; work = start
-    // to flip. Call counts are process-wide deltas per window.
-    CadenceStats start_cadence_{};
-    CadenceStats work_cadence_{};
-    std::chrono::steady_clock::time_point last_wait_seen_{};
-    std::array<u64, 8> pace_prev_{};
-    u32 pace_frames_{};
-    u32 pace_nowait_{};
-    bool submitter_logged_{};
-    // The submitter's readback stall, charged to the frame that just ended
-    // and bucketed by that frame's length: short (<26 ms), mid, long (>40).
-    DebugStateType::GuestStall stall_prev_{};
-    DebugStateType::GuestStall stall_window_{};
-    bool stall_primed_{};
-    std::array<u32, 3> bucket_n_{};
-    std::array<double, 3> bucket_frame_ms_{};
-    std::array<double, 3> bucket_stall_ms_{};
 };
 
 } // namespace Libraries::VideoOut

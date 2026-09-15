@@ -500,7 +500,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU streamFindBufferElide: {}", EmulatorSettings.IsStreamFindBufferElide());
     LOG_INFO(Config, "GPU runtimeInfoStampGate: {}", EmulatorSettings.IsRuntimeInfoStampGate());
     LOG_INFO(Config, "GPU occludeAll: {}", EmulatorSettings.IsOccludeAll());
-    LOG_INFO(Config, "GPU flipCadenceLog: {}", EmulatorSettings.IsFlipCadenceLog());
     LOG_INFO(Config, "GPU streamCopyUploadDrain: {}", EmulatorSettings.IsStreamCopyUploadDrain());
     LOG_INFO(Config, "GPU flushDrawInterval: {}", EmulatorSettings.GetFlushDrawInterval());
     LOG_INFO(Config, "GPU pipelineKeyStampReuse: {}", EmulatorSettings.IsPipelineKeyStampReuse());

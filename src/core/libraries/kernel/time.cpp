@@ -7,7 +7,6 @@
 #include "common/assert.h"
 #include "common/native_clock.h"
 #include "common/thread.h"
-#include "core/debug_state.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -36,21 +35,12 @@ u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
     return clock->GetTscFrequency();
 }
 
-// flip_cadence_log: which clocks the guest reads, counted per API.
-static void CountClockCall(size_t api) {
-    if (DebugState.flip_cadence_log) {
-        DebugState.clock_calls[api].fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
-    CountClockCall(0);
     // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
     return clock->GetTimeUS(initial_ptc);
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
-    CountClockCall(1);
     return clock->GetUptime() - initial_ptc;
 }
 
@@ -59,7 +49,6 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
 }
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
-    CountClockCall(2);
     return clock->GetUptime();
 }
 
@@ -127,7 +116,6 @@ s32 PS4_SYSV_ABI sceKernelSleep(u32 seconds) {
 }
 
 s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
-    CountClockCall(3);
     if (ts == nullptr) {
         SetPosixErrno(EFAULT);
         return -1;
@@ -405,7 +393,6 @@ s32 PS4_SYSV_ABI sceKernelClockGetres(const u32 clock_id, OrbisKernelTimespec* r
 }
 
 s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
-    CountClockCall(4);
 #ifdef _WIN64
     if (tp) {
         FILETIME filetime;
