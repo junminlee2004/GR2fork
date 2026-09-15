@@ -323,6 +323,7 @@ Liverpool::~Liverpool() {
 
 void Liverpool::DrainCommands() {
     // Process incoming commands with high priority
+    DebugStateType::gpu_in_drain.store(true, std::memory_order_relaxed);
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
         {
@@ -333,6 +334,7 @@ void Liverpool::DrainCommands() {
         }
         callback();
     }
+    DebugStateType::gpu_in_drain.store(false, std::memory_order_relaxed);
 }
 
 void Liverpool::Process(std::stop_token stoken) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -17,6 +18,7 @@
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
+#include "core/debug_state.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/gfx_state_stamp.h"
 #include "video_core/amdgpu/regs.h"
@@ -135,10 +137,32 @@ public:
         }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
+            // flip_cadence_log: the poster's wait splits into pickup and the
+            // command's own run, charged to the poster's thread.
+            auto* const stall =
+                DebugState.flip_cadence_log ? &DebugStateType::guest_stall : nullptr;
+            const auto t_post = std::chrono::steady_clock::now();
             {
                 std::scoped_lock lk{submit_mutex};
-                command_queue.emplace([&sem, &func] {
+                if (stall) {
+                    ++stall->cmds;
+                    const bool behind_cmds =
+                        num_commands.load(std::memory_order_relaxed) != 0 ||
+                        DebugStateType::gpu_in_drain.load(std::memory_order_relaxed);
+                    ++(behind_cmds ? stall->cmd_behind_cmds : stall->cmd_behind_parser);
+                }
+                command_queue.emplace([&sem, &func, stall, t_post] {
+                    const auto t_pick = std::chrono::steady_clock::now();
                     func();
+                    if (stall) {
+                        const auto t_done = std::chrono::steady_clock::now();
+                        stall->cmd_queue_ns += static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_pick - t_post)
+                                .count());
+                        stall->cmd_exec_ns += static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_done - t_pick)
+                                .count());
+                    }
                     sem.release();
                 });
                 ++num_commands;

@@ -145,8 +145,18 @@ struct GuestStall {
     u64 fence_ns{};     // the fault's own fence wait
     u64 writeback_ns{}; // the write-back run on this thread
     u64 sync_ns{};      // the synchronous fallback, whole
+    // Synchronous GPU-thread commands, split into the wait for pickup and
+    // the command's own run, with what the GPU thread was doing when the
+    // command was posted: running earlier commands or parsing packets.
+    u64 cmds{};
+    u64 cmd_queue_ns{};
+    u64 cmd_exec_ns{};
+    u64 cmd_behind_cmds{};
+    u64 cmd_behind_parser{};
 };
 inline thread_local GuestStall guest_stall{};
+// True while the GPU thread is inside DrainCommands.
+inline std::atomic<bool> gpu_in_drain{false};
 
 class DebugStateImpl {
     friend class Core::Devtools::Layer;

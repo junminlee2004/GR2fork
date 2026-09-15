@@ -101,6 +101,11 @@ void VideoOutDriver::NoteGuestFlip() {
         stall_window_.fence_ns += delta(&GS::fence_ns);
         stall_window_.writeback_ns += delta(&GS::writeback_ns);
         stall_window_.sync_ns += delta(&GS::sync_ns);
+        stall_window_.cmds += delta(&GS::cmds);
+        stall_window_.cmd_queue_ns += delta(&GS::cmd_queue_ns);
+        stall_window_.cmd_exec_ns += delta(&GS::cmd_exec_ns);
+        stall_window_.cmd_behind_cmds += delta(&GS::cmd_behind_cmds);
+        stall_window_.cmd_behind_parser += delta(&GS::cmd_behind_parser);
         const double stall_ms =
             static_cast<double>(delta(&GS::hop_ns) + delta(&GS::damp_ns) + delta(&GS::fence_ns) +
                                 delta(&GS::writeback_ns) + delta(&GS::sync_ns)) /
@@ -162,14 +167,18 @@ void VideoOutDriver::NoteGuestFlip() {
                  "FLIPCAD mainstall per frame: faults={:.2f} hop={:.2f}ms damp={:.2f} "
                  "fence={:.2f} wb={:.2f} sync={:.2f} | short<26ms n={} frame={:.1f} "
                  "stall={:.2f} | mid n={} frame={:.1f} stall={:.2f} | long>40ms n={} "
-                 "frame={:.1f} stall={:.2f}",
+                 "frame={:.1f} stall={:.2f} | cmd n={:.2f} queue={:.2f}ms exec={:.2f} "
+                 "behind cmds={} parser={}",
                  static_cast<double>(stall_window_.faults) / CadenceStats::Window,
                  per_frame_ms(stall_window_.hop_ns), per_frame_ms(stall_window_.damp_ns),
                  per_frame_ms(stall_window_.fence_ns), per_frame_ms(stall_window_.writeback_ns),
                  per_frame_ms(stall_window_.sync_ns), bucket_n_[0], mean(bucket_frame_ms_, 0),
                  mean(bucket_stall_ms_, 0), bucket_n_[1], mean(bucket_frame_ms_, 1),
                  mean(bucket_stall_ms_, 1), bucket_n_[2], mean(bucket_frame_ms_, 2),
-                 mean(bucket_stall_ms_, 2));
+                 mean(bucket_stall_ms_, 2),
+                 static_cast<double>(stall_window_.cmds) / CadenceStats::Window,
+                 per_frame_ms(stall_window_.cmd_queue_ns), per_frame_ms(stall_window_.cmd_exec_ns),
+                 stall_window_.cmd_behind_cmds, stall_window_.cmd_behind_parser);
         stall_window_ = {};
         bucket_n_ = {};
         bucket_frame_ms_ = {};
