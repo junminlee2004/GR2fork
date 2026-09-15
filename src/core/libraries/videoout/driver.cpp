@@ -48,33 +48,81 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
     flip_cadence_log_ = EmulatorSettings.IsFlipCadenceLog();
+    DebugState.flip_cadence_log = flip_cadence_log_;
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
-void VideoOutDriver::CadenceStats::Sample(const char* name) {
-    const auto now = std::chrono::steady_clock::now();
+void VideoOutDriver::CadenceStats::Sample(std::chrono::steady_clock::time_point now,
+                                          const char* name) {
     if (last != std::chrono::steady_clock::time_point{}) {
-        ms[n++] = std::chrono::duration<float, std::milli>(now - last).count();
-        if (n == Window) {
-            std::sort(ms.begin(), ms.end());
-            float sum = 0.0f;
-            for (const float v : ms) {
-                sum += v;
-            }
-            LOG_INFO(Lib_VideoOut,
-                     "FLIPCAD {} n={} avg={:.2f}ms min={:.2f} p10={:.2f} p50={:.2f} p90={:.2f} "
-                     "max={:.2f}",
-                     name, Window, sum / Window, ms[0], ms[Window / 10], ms[Window / 2],
-                     ms[Window * 9 / 10], ms[Window - 1]);
-            n = 0;
-        }
+        Add(std::chrono::duration<float, std::milli>(now - last).count(), name);
     }
     last = now;
 }
 
+void VideoOutDriver::CadenceStats::Add(float sample_ms, const char* name) {
+    ms[n++] = sample_ms;
+    if (n == Window) {
+        std::sort(ms.begin(), ms.end());
+        float sum = 0.0f;
+        for (const float v : ms) {
+            sum += v;
+        }
+        LOG_INFO(Lib_VideoOut,
+                 "FLIPCAD {} n={} avg={:.2f}ms min={:.2f} p10={:.2f} p50={:.2f} p90={:.2f} "
+                 "max={:.2f}",
+                 name, Window, sum / Window, ms[0], ms[Window / 10], ms[Window / 2],
+                 ms[Window * 9 / 10], ms[Window - 1]);
+        n = 0;
+    }
+}
+
 void VideoOutDriver::NoteGuestFlip() {
-    if (flip_cadence_log_) {
-        guest_cadence_.Sample("guest");
+    if (!flip_cadence_log_) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    guest_cadence_.Sample(now, "guest");
+    if (!submitter_logged_) {
+        submitter_logged_ = true;
+        LOG_INFO(Lib_VideoOut, "FLIPCAD flips are submitted by thread {}",
+                 Common::GetCurrentThreadName());
+    }
+    // The frame's start is the last VideoOut wait this thread returned from
+    // since its previous flip; a frame with none ran straight into the next.
+    const auto wait_ret = DebugStateType::last_videoout_wait_return;
+    if (wait_ret > last_wait_seen_) {
+        work_cadence_.Add(std::chrono::duration<float, std::milli>(now - wait_ret).count(), "work");
+        if (last_wait_seen_ != std::chrono::steady_clock::time_point{}) {
+            start_cadence_.Add(
+                std::chrono::duration<float, std::milli>(wait_ret - last_wait_seen_).count(),
+                "start");
+        }
+        last_wait_seen_ = wait_ret;
+    } else {
+        ++pace_nowait_;
+    }
+    if (++pace_frames_ == CadenceStats::Window) {
+        const auto load = [](const std::atomic<u64>& c) {
+            return c.load(std::memory_order_relaxed);
+        };
+        const std::array<u64, 8> cur{
+            load(DebugState.vo_wait_vblank_calls), load(DebugState.vo_event_vblank),
+            load(DebugState.vo_event_flip),        load(DebugState.clock_calls[0]),
+            load(DebugState.clock_calls[1]),       load(DebugState.clock_calls[2]),
+            load(DebugState.clock_calls[3]),       load(DebugState.clock_calls[4])};
+        const auto rate = [&](size_t i) {
+            return static_cast<float>(cur[i] - pace_prev_[i]) / CadenceStats::Window;
+        };
+        LOG_INFO(Lib_VideoOut,
+                 "FLIPCAD calls per frame: waitvblank={:.2f} eqvblank={:.2f} eqflip={:.2f} "
+                 "proctime={:.2f} proccnt={:.2f} tsc={:.2f} clockgettime={:.2f} "
+                 "gettimeofday={:.2f} nowait={}",
+                 rate(0), rate(1), rate(2), rate(3), rate(4), rate(5), rate(6), rate(7),
+                 pace_nowait_);
+        pace_prev_ = cur;
+        pace_frames_ = 0;
+        pace_nowait_ = 0;
     }
 }
 
@@ -265,7 +313,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 void VideoOutDriver::Flip(const Request& req) {
     if (flip_cadence_log_) {
-        present_cadence_.Sample("present");
+        present_cadence_.Sample(std::chrono::steady_clock::now(), "present");
     }
 
     // Update HDR status before presenting.

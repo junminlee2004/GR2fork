@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -130,6 +132,10 @@ struct ShaderDump {
     }
 };
 
+// flip_cadence_log: the last return from a VideoOut wait on this thread, so
+// the flip submitter can measure its own frame from that point.
+inline thread_local std::chrono::steady_clock::time_point last_videoout_wait_return{};
+
 class DebugStateImpl {
     friend class Core::Devtools::Layer;
     friend class Core::Devtools::Widget::FrameGraph;
@@ -167,6 +173,15 @@ class DebugStateImpl {
     std::vector<ShaderDump> shader_dump_list{};
 
 public:
+    // flip_cadence_log: process-wide counts of the guest's pacing and clock
+    // calls, read as per-frame rates by the flip cadence log.
+    bool flip_cadence_log = false;
+    std::atomic<u64> vo_wait_vblank_calls{0};
+    std::atomic<u64> vo_event_vblank{0};
+    std::atomic<u64> vo_event_flip{0};
+    // GetProcessTime, GetProcessTimeCounter, ReadTsc, clock_gettime, gettimeofday
+    std::array<std::atomic<u64>, 5> clock_calls{};
+
     float Framerate = 1.0f / 60.0f;
     float FrameDeltaTime;
 

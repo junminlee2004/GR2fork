@@ -125,7 +125,8 @@ private:
         u32 n{};
         std::chrono::steady_clock::time_point last{};
 
-        void Sample(const char* name);
+        void Sample(std::chrono::steady_clock::time_point now, const char* name);
+        void Add(float sample_ms, const char* name);
     };
 
     std::mutex mutex;
@@ -135,6 +136,15 @@ private:
     bool flip_cadence_log_{};
     CadenceStats guest_cadence_{};
     CadenceStats present_cadence_{};
+    // Frame start = the submitter's last VideoOut wait return; work = start
+    // to flip. Call counts are process-wide deltas per window.
+    CadenceStats start_cadence_{};
+    CadenceStats work_cadence_{};
+    std::chrono::steady_clock::time_point last_wait_seen_{};
+    std::array<u64, 8> pace_prev_{};
+    u32 pace_frames_{};
+    u32 pace_nowait_{};
+    bool submitter_logged_{};
 };
 
 } // namespace Libraries::VideoOut

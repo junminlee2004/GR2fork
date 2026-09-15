@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
@@ -382,6 +383,10 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
+    if (DebugState.flip_cadence_log) {
+        DebugState.vo_wait_vblank_calls.fetch_add(1, std::memory_order_relaxed);
+        DebugStateType::last_videoout_wait_return = std::chrono::steady_clock::now();
+    }
     return ORBIS_OK;
 }
 
