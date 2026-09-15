@@ -686,6 +686,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     case SwStage::Vertex:
         info.sw.vs.step_rate_0 = regs.vgt_instance_step_rate_0;
         info.sw.vs.step_rate_1 = regs.vgt_instance_step_rate_1;
+        info.sw.vs.vertex_sgpr_offset = draw_indirect_params.vertex_sgpr_offset;
+        info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
         info.sw.vs.tess_emulated_primitive =
             regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
             regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
@@ -762,6 +764,7 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
         put(regs.vs_output_control);
         put(regs.primitive_type);
         put(regs.tess_config);
+        put(indirect_key_);
         break;
     case HwStage::Fragment: {
         put(regs.ps_program.settings);
@@ -1031,13 +1034,23 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     ++graphics_lookups;
+    // The indirect draw's SGPR offsets reach the vertex stage's runtime info
+    // without passing through a register, so a change must defeat every
+    // reuse keyed on the register stamp: the key reuse below, and the
+    // runtime-info stamp gate and input memo, which fold them into their keys.
+    const bool params_changed =
+        params.vertex_sgpr_offset != draw_indirect_params.vertex_sgpr_offset ||
+        params.instance_sgpr_offset != draw_indirect_params.instance_sgpr_offset;
+    draw_indirect_params = params;
+    indirect_key_ = static_cast<u32>(params.vertex_sgpr_offset) |
+                    (static_cast<u32>(params.instance_sgpr_offset) << 16);
     // pipe_gen invalidates the cached pair when ReplaceShader erases entries.
     const u64 pipe_gen =
         Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
     lookup_pipe_gen_ = pipe_gen;
-    if (key_stamp_reuse && ReuseGraphicsKey(pipe_gen)) {
+    if (key_stamp_reuse && !params_changed && ReuseGraphicsKey(pipe_gen)) {
         return last_graphics_pipeline;
     }
     if (!RefreshGraphicsKey()) {
@@ -1736,7 +1749,8 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
         ri_stamp_gate && (stage == HwStage::Vertex || stage == HwStage::Fragment);
     const u64 reg_stamp = stampable ? liverpool->GetGfxStateStamp() : 0;
     if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
-        ri_slot.stage != static_cast<u8>(stage)) {
+        ri_slot.stage != static_cast<u8>(stage) ||
+        (stage == HwStage::Vertex && ri_slot.indirect_key != indirect_key_)) {
         if (!ri_input_memo || !MemoRuntimeInfo(stage, l_stage, ri_slot)) {
             BuildRuntimeInfo(stage, l_stage);
             ri_memo_last[static_cast<u32>(l_stage)] = nullptr;
@@ -1744,6 +1758,7 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
         }
         ri_slot.stamp = reg_stamp;
         ri_slot.stage = static_cast<u8>(stage);
+        ri_slot.indirect_key = indirect_key_;
         ri_slot.valid = stampable;
     }
     const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];

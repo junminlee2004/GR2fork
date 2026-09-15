@@ -885,10 +885,14 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:DrawIndirect", cmd_address));
-                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
+                                             draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0);
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
+                                             draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
                 }
             }
             break;
@@ -907,11 +911,15 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("gfx:{}:DrawIndirectMulti", cmd_address));
                     rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                             draw_indirect->stride, draw_indirect->count, 0);
+                                             draw_indirect->stride, draw_indirect->count, 0,
+                                             draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
                     rasterizer->ScopeMarkerEnd();
                 } else {
                     rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                             draw_indirect->stride, draw_indirect->count, 0);
+                                             draw_indirect->stride, draw_indirect->count, 0,
+                                             draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
                 }
             }
             break;
@@ -931,10 +939,14 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("gfx:{}:DrawIndexIndirect", cmd_address));
-                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
+                                             draw_index_indirect->base_vtx_loc,
+                                             draw_index_indirect->start_inst_loc);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0);
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
+                                             draw_index_indirect->base_vtx_loc,
+                                             draw_index_indirect->start_inst_loc);
                 }
             }
             break;
@@ -953,14 +965,16 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("gfx:{}:DrawIndexIndirectMulti", cmd_address));
-                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                             draw_index_indirect->stride,
-                                             draw_index_indirect->count, 0);
+                    rasterizer->DrawIndirect(
+                        true, indirect_args_addr, offset, draw_index_indirect->stride,
+                        draw_index_indirect->count, 0, draw_index_indirect->base_vtx_loc,
+                        draw_index_indirect->start_inst_loc);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                             draw_index_indirect->stride,
-                                             draw_index_indirect->count, 0);
+                    rasterizer->DrawIndirect(
+                        true, indirect_args_addr, offset, draw_index_indirect->stride,
+                        draw_index_indirect->count, 0, draw_index_indirect->base_vtx_loc,
+                        draw_index_indirect->start_inst_loc);
                 }
             }
             break;
@@ -979,20 +993,22 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("gfx:{}:DrawIndexIndirectCountMulti", cmd_address));
-                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                             draw_index_indirect->stride,
-                                             draw_index_indirect->count,
-                                             draw_index_indirect->count_indirect_enable.Value()
-                                                 ? draw_index_indirect->count_addr
-                                                 : 0);
+                    rasterizer->DrawIndirect(
+                        true, indirect_args_addr, offset, draw_index_indirect->stride,
+                        draw_index_indirect->count,
+                        draw_index_indirect->count_indirect_enable.Value()
+                            ? draw_index_indirect->count_addr
+                            : 0,
+                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DrawIndirect(true, indirect_args_addr, offset,
-                                             draw_index_indirect->stride,
-                                             draw_index_indirect->count,
-                                             draw_index_indirect->count_indirect_enable.Value()
-                                                 ? draw_index_indirect->count_addr
-                                                 : 0);
+                    rasterizer->DrawIndirect(
+                        true, indirect_args_addr, offset, draw_index_indirect->stride,
+                        draw_index_indirect->count,
+                        draw_index_indirect->count_indirect_enable.Value()
+                            ? draw_index_indirect->count_addr
+                            : 0,
+                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
                 }
             }
             break;
@@ -1351,7 +1367,6 @@ template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
-    const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
 
     struct IndirectPatch {
         const PM4Header* header;
@@ -1527,17 +1542,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                cs_program);
             }
-            if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                if (host_markers_enabled) {
-                    rasterizer->ScopeMarkerBegin(
-                        fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
-                    rasterizer->DispatchDirect();
-                    rasterizer->ScopeMarkerEnd();
-                } else {
-                    rasterizer->DispatchDirect();
-                }
+            if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
+                break;
             }
+            const auto cmd_address = reinterpret_cast<const void*>(header);
+            rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
+                                    fmt::make_format_args(vqid, cmd_address),
+                                    [&] { rasterizer->DispatchDirect(); });
             break;
         }
         case PM4ItOpcode::DispatchIndirect: {
@@ -1550,17 +1561,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
                                                cs_program);
             }
-            if (rasterizer && (cs_program.dispatch_initiator & 1)) {
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                if (host_markers_enabled) {
-                    rasterizer->ScopeMarkerBegin(
-                        fmt::format("asc[{}]:{}:DispatchIndirect", vqid, cmd_address));
-                    rasterizer->DispatchIndirect(ib_address, 0, size);
-                    rasterizer->ScopeMarkerEnd();
-                } else {
-                    rasterizer->DispatchIndirect(ib_address, 0, size);
-                }
+            if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
+                break;
             }
+            const auto cmd_address = reinterpret_cast<const void*>(header);
+            rasterizer->ScopeMarker("asc[{}]:{}:DispatchIndirect",
+                                    fmt::make_format_args(vqid, cmd_address),
+                                    [&] { rasterizer->DispatchIndirect(ib_address, 0, size); });
             break;
         }
         case PM4ItOpcode::WriteData: {

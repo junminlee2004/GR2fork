@@ -190,6 +190,11 @@ struct FetchShaderRef {
     }
 };
 
+struct DrawIndirectParams {
+    u16 vertex_sgpr_offset;
+    u32 instance_sgpr_offset;
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -204,7 +209,7 @@ public:
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                            std::optional<Shader::Gcn::FetchShaderData>& fetch_out);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
     /// The key refreshed by the latest GetGraphicsPipeline call.
     const GraphicsPipelineKey& CurrentGraphicsKey() const noexcept {
@@ -287,6 +292,10 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
+    DrawIndirectParams draw_indirect_params{};
+    // draw_indirect_params packed into one word for the stamp gate and the
+    // runtime-input memo.
+    u32 indirect_key_{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
@@ -333,6 +342,9 @@ private:
     struct RuntimeInfoStamp {
         u64 stamp{};
         u64 ri_fp_hash{};
+        // The indirect draw's SGPR offsets the Vertex arm read: not a
+        // register, so not covered by the stamp.
+        u32 indirect_key{};
         u8 stage{};
         bool valid{};
         bool hash_valid{};

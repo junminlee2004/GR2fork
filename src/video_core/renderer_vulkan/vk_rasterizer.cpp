@@ -19,6 +19,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -95,7 +96,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       buffer_cache{instance, scheduler, liverpool_, texture_cache, page_manager},
       texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
-      pipeline_cache{instance, scheduler, liverpool} {
+      pipeline_cache{instance, scheduler, liverpool},
+      host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -793,7 +796,8 @@ void Rasterizer::DropCopyHold(u64& counter) {
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
-                              u32 max_count, VAddr count_address) {
+                              u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                              u16 instance_sgpr_offset) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -802,7 +806,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const DrawIndirectParams params = {
+        .vertex_sgpr_offset = vertex_sgpr_offset,
+        .instance_sgpr_offset = instance_sgpr_offset,
+    };
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
         return;
     }
