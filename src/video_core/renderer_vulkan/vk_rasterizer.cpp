@@ -130,6 +130,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (deferred_read_arm_) {
         scheduler.SetSubmitHook(&Rasterizer::PreSubmitThunk, this);
     }
+    if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
+        flush_draw_interval_ = std::max<u32>(interval, 64);
+    }
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
@@ -714,10 +717,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     ResetBindings();
     const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
-    if (readback_offload_ && WriterFlushDue(prone_write)) {
+    if (flush_draw_interval_ != 0 || readback_offload_) {
         // The flush submits; it must not run under the guest-copy shared lock.
         copy_scope.reset();
-        WriterFlush();
+        MaybeIntervalFlush(WriterFlushDue(prone_write));
     }
 }
 
@@ -732,21 +735,32 @@ bool Rasterizer::WriterFlushDue(bool prone_write) {
     return prone_run_ && (!prone_write || prone_run_draws_ >= 64);
 }
 
-bool Rasterizer::WriterFlush() {
+bool Rasterizer::MaybeIntervalFlush(bool force) {
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != flush_tick_) {
+        flush_tick_ = tick;
+        draws_since_flush_ = 0;
+    }
+    if (!force && (flush_draw_interval_ == 0 || ++draws_since_flush_ < flush_draw_interval_)) {
+        return false;
+    }
     // A pending depth or stencil clear belongs to the open render scope:
     // BeginRendering re-derives the clear load op, so a scope re-begun after
-    // a flush would clear the attachment a second time. Colour clears need
-    // no guard: they are consumed when the state is derived and never cached.
+    // a flush would clear the attachment a second time.
     const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
     if (ds.depth_clear || ds.stencil_clear) {
         return false;
     }
     DropCopyHold(hold_drops_flush_);
     scheduler.Flush();
-    prone_run_ = false;
-    prone_run_draws_ = 0;
-    ++writer_flushes_;
+    draws_since_flush_ = 0;
+    if (force) {
+        prone_run_ = false;
+        prone_run_draws_ = 0;
+        ++writer_flushes_;
+    }
     return true;
+    ++interval_flushes_;
 }
 
 void Rasterizer::BeginPacketRun() {
@@ -924,9 +938,9 @@ void Rasterizer::DispatchDirect() {
 
     ResetBindings();
     const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
-    if (readback_offload_ && WriterFlushDue(prone_write)) {
+    if (flush_draw_interval_ != 0 || readback_offload_) {
         copy_scope.reset();
-        WriterFlush();
+        MaybeIntervalFlush(WriterFlushDue(prone_write));
     }
 }
 
@@ -1110,6 +1124,11 @@ void Rasterizer::OnSubmit() {
                 iw.binds + iw.skips + iw.veto) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IDXWHOLE binds={} skips={} veto={} per300f",
                          iw.binds, iw.skips, iw.veto);
+            }
+            if (flush_draw_interval_ != 0) {
+                LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
+                         interval_flushes_);
+                interval_flushes_ = 0;
             }
             if (segment_copy_hold_) {
                 LOG_INFO(Render_Skipcache,
