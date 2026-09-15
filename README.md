@@ -20,15 +20,12 @@ https://www.youtube.com/watch?v=O8z6QPOaGDg&list=PLOgHncbXc__M&pp=sAgC
 
 **System Requirements**
 
-@ 1080p 30fps(locked) @ 1080p 30fps(locked) @ 4k 60fps(locked) @ 4k 120fps(locked)
-
-ryzen 5 3600-------------ryzen 5 3600------------ryzen 7 5800x---------ryzen 9 9950x3D2
-
-gtx 1650 4GB ------------- rx 570 4gb----------- rtx 3060 8gb----------- rtx 3080ti 12gb
-
-12 gb ram------------------12 gb ram--------------12 gb ram------------12 gb ram
-
-SSD-------------------------SSD----------------------SSD-------------------SSD
+| | 1080p 30 (locked) | 1080p 30 (locked) | 4K 60 (locked) | 4K 120 (locked) |
+|---|---|---|---|---|
+| CPU | Ryzen 5 3600 | Ryzen 5 3600 | Ryzen 7 5800X | Ryzen 9 9950X3D |
+| GPU | GTX 1650 4 GB | RX 570 4 GB | RTX 3060 8 GB | RTX 3080 Ti 12 GB |
+| RAM | 12 GB | 12 GB | 12 GB | 12 GB |
+| Storage | SSD | SSD | SSD | SSD |
 
 <h1 align="center">
   <br>
