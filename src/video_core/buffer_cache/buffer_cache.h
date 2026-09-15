@@ -157,6 +157,14 @@ public:
     /// can write any buffer; readbacks treat the open batch as its writer.
     void NoteDmaWrite();
 
+    /// readback_flush_writer: whether the draw being recorded wrote a buffer a
+    /// readback has already read. Cleared by the call.
+    bool TakeProneWrite() {
+        const bool pending = prone_write_pending_;
+        prone_write_pending_ = false;
+        return pending;
+    }
+
     struct StreamCopyStats {
         u64 hits;
         u64 probes;
@@ -320,6 +328,9 @@ private:
         std::vector<Piece> pieces;
         const u8* download = nullptr;
         u64 tick = 0;
+        // readback_copy_queue: the copy retires on the second queue at this
+        // tick; the master tick above is then the writer's batch.
+        u64 copy_queue_tick = 0;
         bool coherent = false;
         u64 total_bytes = 0;
         u32 total = 0;
@@ -361,7 +372,8 @@ private:
         // owners of the faulted range an empty job may help instead of sleeping.
         std::shared_ptr<WriteBackShare> share;
         boost::container::small_vector<std::shared_ptr<WriteBackShare>, 4> joins;
-        u64 join_tick = 0; // newest fence among the joined owners
+        u64 join_tick = 0;            // newest fence among the joined owners
+        u64 join_copy_queue_tick = 0; // newest copy-queue tick among them
     };
 
     /// Records download copies for an offloaded fault readback and flushes the
@@ -734,6 +746,10 @@ private:
     // provide one, and the open tick of the last device-address shader.
     std::unique_ptr<Vulkan::TransferQueue> copy_queue_;
     u64 dma_write_tick_{};
+    // readback_flush_writer: set when a written bind touches a buffer a
+    // readback has read; the rasterizer takes it after recording the draw.
+    bool flush_writer_{};
+    bool prone_write_pending_{};
     // Islands owned by in-flight readbacks; a later download skips them. GPU
     // command thread only.
     struct InflightDownload {

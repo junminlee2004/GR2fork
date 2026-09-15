@@ -71,6 +71,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         copy_queue_ =
             std::make_unique<Vulkan::TransferQueue>(instance, *scheduler.GetMasterSemaphore());
     }
+    flush_writer_ = EmulatorSettings.IsReadbackFlushWriter();
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
@@ -437,6 +438,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                             }
                             scheduler.GetMasterSemaphore()->WaitFor(job.join_tick,
                                                                     kDampBudgetNs - el);
+                            if (job.join_copy_queue_tick != 0) {
+                                // The owners' copies retire on the second queue.
+                                const u64 el_copy = elapsed_ns();
+                                if (el_copy < kDampBudgetNs) {
+                                    copy_queue_->WaitFor(job.join_copy_queue_tick,
+                                                         kDampBudgetNs - el_copy);
+                                }
+                            }
                             // A timeout means the budget is gone as well.
                             fence_seen = true;
                             spin = std::min<u64>(400, elapsed_ns() / 50'000);
@@ -781,6 +790,11 @@ inline void SpinRelax() {
 } // namespace
 
 void BufferCache::HelpAsPriority(WriteBackShare& s) {
+    if (s.copy_queue_tick != 0) {
+        // Woken at the writer's master tick; the copy retires on the second
+        // queue.
+        copy_queue_->Wait(s.copy_queue_tick);
+    }
     if (!s.coherent) {
         // Non-coherent staging needs the owner's InvalidateForRead first: a
         // short pause-spin on ready, then late (the owner copies everything).
@@ -805,6 +819,7 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                        bool is_write) {
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    buffer.readback_prone = true;
     // Window widening mirrors the synchronous form above.
     const u64 WindowSize = readback_window_;
     const VAddr buf_start = buffer.CpuAddr();
@@ -876,6 +891,8 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
                 if (e.share && e.lo < device_addr + size && e.hi > device_addr) {
                     job.joins.push_back(e.share);
                     job.join_tick = std::max<u64>(job.join_tick, e.share->tick);
+                    job.join_copy_queue_tick =
+                        std::max<u64>(job.join_copy_queue_tick, e.share->copy_queue_tick);
                 }
             }
             if (!job.joins.empty()) {
@@ -917,10 +934,8 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
         job.on_copy_queue = true;
         buffer.copy_queue_read_tick = job.copy_queue_tick;
         // Deferred paths key on a submitted master tick; the writer's is one.
+        // The share carries the copy-queue tick for its joiners and helper.
         job.wait_tick = writer_tick;
-        // The share and its helper wait the master timeline, which does not
-        // cover this copy.
-        job.share.reset();
         q2_copies_.fetch_add(1, std::memory_order_relaxed);
     } else {
         if (copy_queue_) {
@@ -961,6 +976,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
         }
         if (job.share) {
             job.share->tick = job.wait_tick;
+            job.share->copy_queue_tick = job.copy_queue_tick;
             job.share->coherent = job.staging->is_coherent;
             entry.share = job.share;
             share_shares_.fetch_add(1, std::memory_order_relaxed);
@@ -1091,6 +1107,7 @@ void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
 
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
+    buffer.readback_prone = true;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     FoldPendingRanges(device_addr, size);
@@ -2079,6 +2096,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 siz
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, &fresh);
     if (is_written) {
         buffer.gpu_write_tick = scheduler.CurrentTick();
+        if (flush_writer_ && buffer.readback_prone) {
+            prone_write_pending_ = true;
+        }
         // Bump the GPU-clean epoch only on new coverage; steady-state
         // re-writes of the same ranges skip both the bump and the no-op
         // interval merge. A page of the range that was GPU-clean until this

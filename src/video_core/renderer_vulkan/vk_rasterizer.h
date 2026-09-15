@@ -210,6 +210,12 @@ private:
     u32 flush_draw_interval_{};
     u32 draws_since_flush_{};
     u64 flush_tick_{};
+    // readback_flush_writer: inside a run of draws writing readback-prone
+    // buffers, and the run's length; flushes it adds, for the log.
+    bool flush_writer_{};
+    bool prone_run_{};
+    u32 prone_run_draws_{};
+    u64 writer_flushes_{};
     u64 interval_flushes_{};
     // Snapshot of the framework's FindImage counters at the last report; the
     // per-window line prints the deltas (Forced mode never resets them).
@@ -230,7 +236,11 @@ private:
     VideoCore::Skipcache::CacheCounters dynstate_last_{};
     u64 dyn_stamp_last_{};
     u64 gfx_stamp_last_{};
-    void MaybeIntervalFlush();
+    /// Flushes at the draw interval, or now when forced; true when it did.
+    bool MaybeIntervalFlush(bool force = false);
+    /// readback_flush_writer: whether the run of prone-buffer writes the draw
+    /// just recorded belongs to is due for its flush.
+    bool WriterFlushDue(bool prone_write);
     bool elide_findbuffer_{};
     bool bind_prefetch_{};
     // One guest-copy shared hold per packet run (guest_copy_hold_segment).
