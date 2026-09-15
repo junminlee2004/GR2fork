@@ -67,8 +67,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     readback_window_ = std::bit_floor(
         std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
-    flush_writer_ = EmulatorSettings.IsReadbackOffloadFlushWriter();
-    verify_ = EmulatorSettings.IsReadbackOffloadVerify();
     if (readback_offload_ && instance.HasTransferQueue()) {
         copy_queue_ =
             std::make_unique<Vulkan::TransferQueue>(instance, *scheduler.GetMasterSemaphore());
@@ -779,7 +777,6 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                        bool is_write) {
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-    buffer.readback_prone = true;
     // Window widening mirrors the synchronous form above.
     const u64 WindowSize = readback_window_;
     const VAddr buf_start = buffer.CpuAddr();
@@ -897,31 +894,6 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
         // the writer's is one, and the share carries the copy-queue tick too.
         job.wait_tick = writer_tick;
         q2_copies_.fetch_add(1, std::memory_order_relaxed);
-        if (verify_) {
-            // Diagnostic: also make the ordered copy the fallback would have,
-            // into a second staging, for FinishFaultDownload to compare.
-            job.verify_staging = AcquireFaultStaging(total_size_bytes);
-            scheduler.EndRendering();
-            const auto cmdbuf = scheduler.CommandBuffer();
-            const vk::BufferMemoryBarrier2 verify_barrier = {
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask =
-                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-                .buffer = buffer.buffer,
-                .offset = 0,
-                .size = buffer.SizeBytes(),
-            };
-            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-                .bufferMemoryBarrierCount = 1,
-                .pBufferMemoryBarriers = &verify_barrier,
-            });
-            cmdbuf.copyBuffer(buffer.buffer, job.verify_staging->Handle(), job.copies);
-            job.verify_tick = scheduler.CurrentTick();
-            scheduler.Flush();
-        }
     } else {
         if (copy_queue_) {
             auto& reason = writer_tick == 0                          ? q2_unknown_
@@ -975,26 +947,6 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
                                       bool is_write) {
     auto* memory = Core::Memory::Instance();
     const u8* download = job.staging->mapped_data.data();
-    if (job.verify_staging) {
-        // Diagnostic: retire the ordered copy and compare it island by island
-        // against what the second queue delivered.
-        scheduler.GetMasterSemaphore()->Wait(job.verify_tick);
-        job.verify_staging->InvalidateForRead(0, VK_WHOLE_SIZE);
-        job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
-        const u8* ordered = job.verify_staging->mapped_data.data();
-        u64 bad = 0;
-        u64 bad_bytes = 0;
-        for (const auto& copy : job.copies) {
-            if (std::memcmp(download + copy.dstOffset, ordered + copy.dstOffset, copy.size) != 0) {
-                ++bad;
-                bad_bytes += copy.size;
-            }
-        }
-        q2_verify_.fetch_add(1, std::memory_order_relaxed);
-        q2_verify_bad_.fetch_add(bad, std::memory_order_relaxed);
-        q2_verify_bad_bytes_.fetch_add(bad_bytes, std::memory_order_relaxed);
-        ReleaseFaultStaging(std::move(job.verify_staging));
-    }
     if (!writeback_offload_) {
         job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
     }
@@ -1112,7 +1064,6 @@ void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
 
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
-    buffer.readback_prone = true;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     FoldPendingRanges(device_addr, size);
@@ -2101,9 +2052,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 siz
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, &fresh);
     if (is_written) {
         buffer.gpu_write_tick = scheduler.CurrentTick();
-        if (readback_offload_ && flush_writer_ && buffer.readback_prone) {
-            prone_write_pending_ = true;
-        }
         // Bump the GPU-clean epoch only on new coverage; steady-state
         // re-writes of the same ranges skip both the bump and the no-op
         // interval merge. A page of the range that was GPU-clean until this

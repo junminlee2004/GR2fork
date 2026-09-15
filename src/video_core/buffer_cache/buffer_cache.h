@@ -137,9 +137,6 @@ public:
         u64 q2_unknown;
         u64 q2_dma;
         u64 q2_wait_ns;
-        u64 q2_verify;
-        u64 q2_verify_bad;
-        u64 q2_verify_bad_bytes;
     };
 
     /// Snapshot and reset the offloaded-readback counters (for periodic logs).
@@ -153,23 +150,12 @@ public:
                 q2_open_.exchange(0, std::memory_order_relaxed),
                 q2_unknown_.exchange(0, std::memory_order_relaxed),
                 q2_dma_.exchange(0, std::memory_order_relaxed),
-                q2_wait_ns_.exchange(0, std::memory_order_relaxed),
-                q2_verify_.exchange(0, std::memory_order_relaxed),
-                q2_verify_bad_.exchange(0, std::memory_order_relaxed),
-                q2_verify_bad_bytes_.exchange(0, std::memory_order_relaxed)};
+                q2_wait_ns_.exchange(0, std::memory_order_relaxed)};
     }
 
     /// readback_offload: a device-address shader is being recorded, which
     /// can write any buffer; readbacks treat the open batch as its writer.
     void NoteDmaWrite();
-
-    /// readback_offload: whether the draw being recorded wrote a buffer a
-    /// readback has already read. Cleared by the call.
-    bool TakeProneWrite() {
-        const bool pending = prone_write_pending_;
-        prone_write_pending_ = false;
-        return pending;
-    }
 
     struct StreamCopyStats {
         u64 hits;
@@ -366,9 +352,6 @@ private:
         // timeline at this tick; wait_tick then names the writer's batch.
         u64 copy_queue_tick = 0;
         bool on_copy_queue = false;
-        // readback_offload_verify: the ordered copy's staging and batch.
-        std::unique_ptr<Buffer> verify_staging;
-        u64 verify_tick = 0;
         u64 inflight_id = 0;     // registry entry owning the copied islands
         u64 written_islands = 0; // filled by the offloaded write-back
         u64 written_bytes = 0;
@@ -755,12 +738,7 @@ private:
     // provide one, and the open tick of the last device-address shader.
     std::unique_ptr<Vulkan::TransferQueue> copy_queue_;
     u64 dma_write_tick_{};
-    // readback_offload: set when a written bind touches a buffer a readback
-    // has read; the rasterizer takes it after recording the draw.
     bool readback_offload_{};
-    bool flush_writer_{}; // readback_offload_flush_writer, bisect
-    bool verify_{};       // readback_offload_verify, diagnostic
-    bool prone_write_pending_{};
     // Islands owned by in-flight readbacks; a later download skips them. GPU
     // command thread only.
     struct InflightDownload {
@@ -783,9 +761,6 @@ private:
     std::atomic<u64> q2_unknown_{};
     std::atomic<u64> q2_dma_{};
     std::atomic<u64> q2_wait_ns_{};
-    std::atomic<u64> q2_verify_{};
-    std::atomic<u64> q2_verify_bad_{};
-    std::atomic<u64> q2_verify_bad_bytes_{};
     // Stream copy cache counters; hits count probes that return a cached
     // offset. The probes and the telemetry drain both run on the GPU command
     // thread, so plain counters suffice.
