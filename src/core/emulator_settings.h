@@ -499,11 +499,6 @@ struct GPUSettings {
     // workers instead of copying inline on the GPU command thread. Written
     // binds always copy inline under their region locks.
     Setting<bool> stream_copy_upload_drain{false};
-    // Flush the graphics command buffer every this many draws (0 = only at
-    // submit-done and faults). A guest readback then waits on a command
-    // buffer holding at most this many draws instead of the whole recorded
-    // body. Values below 64 are raised to 64 (each flush costs a submit).
-    Setting<u32> flush_draw_interval{0};
     // Reuse the previous graphics pipeline key while the register stamp
     // repeats: only the stage resolve reruns. Needs runtime_info_stamp_gate
     // and dynamic vertex input; otherwise the lookup runs unchanged.
@@ -815,7 +810,6 @@ struct GPUSettings {
             make_override<GPUSettings>("occlude_all", &GPUSettings::occlude_all),
             make_override<GPUSettings>("stream_copy_upload_drain",
                                        &GPUSettings::stream_copy_upload_drain),
-            make_override<GPUSettings>("flush_draw_interval", &GPUSettings::flush_draw_interval),
             make_override<GPUSettings>("pipeline_key_stamp_reuse",
                                        &GPUSettings::pipeline_key_stamp_reuse),
             make_override<GPUSettings>("shader_params_memo", &GPUSettings::shader_params_memo),
@@ -921,8 +915,8 @@ struct GPUSettings {
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
     image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, \
     fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
-    runtime_info_stamp_gate, occlude_all, stream_copy_upload_drain, flush_draw_interval, \
-    pipeline_key_stamp_reuse, shader_params_memo
+    runtime_info_stamp_gate, occlude_all, stream_copy_upload_drain, pipeline_key_stamp_reuse, \
+    shader_params_memo
 #define GPU_SETTINGS_JSON_FIELDS_B \
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
     bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, findimg_touch_batch, \
@@ -1234,7 +1228,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RuntimeInfoStampGate, runtime_info_stamp_gate)
     SETTING_FORWARD_BOOL(m_gpu, OccludeAll, occlude_all)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyUploadDrain, stream_copy_upload_drain)
-    SETTING_FORWARD(m_gpu, FlushDrawInterval, flush_draw_interval)
     SETTING_FORWARD_BOOL(m_gpu, PipelineKeyStampReuse, pipeline_key_stamp_reuse)
     SETTING_FORWARD_BOOL(m_gpu, ShaderParamsMemo, shader_params_memo)
     SETTING_FORWARD(m_gpu, SpecFpCanonical, spec_fp_canonical)
