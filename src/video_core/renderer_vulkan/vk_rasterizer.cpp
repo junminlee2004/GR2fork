@@ -133,7 +133,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
-    readback_offload_ = EmulatorSettings.IsReadbackOffload();
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
     // pinned, and a frozen stamp compares every draw register-identical.
@@ -716,57 +715,33 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
 
     ResetBindings();
-    const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
-    if (flush_draw_interval_ != 0 || readback_offload_) {
+    if (flush_draw_interval_ != 0) {
         // The flush submits; it must not run under the guest-copy shared lock.
         copy_scope.reset();
-        MaybeIntervalFlush(WriterFlushDue(prone_write));
+        MaybeIntervalFlush();
     }
 }
 
-bool Rasterizer::WriterFlushDue(bool prone_write) {
-    if (prone_write) {
-        prone_run_ = true;
-        ++prone_run_draws_;
-    }
-    // The run is submitted once a draw that does not write a prone buffer
-    // ends it, or every 64 draws inside it; a flush the depth-clear guard
-    // refuses leaves the run pending for the next draw.
-    return prone_run_ && (!prone_write || prone_run_draws_ >= 64);
-}
-
-bool Rasterizer::MaybeIntervalFlush(bool force) {
+void Rasterizer::MaybeIntervalFlush() {
     const u64 tick = scheduler.CurrentTick();
     if (tick != flush_tick_) {
         flush_tick_ = tick;
         draws_since_flush_ = 0;
     }
-    if (!force && (flush_draw_interval_ == 0 || ++draws_since_flush_ < flush_draw_interval_)) {
-        return false;
+    if (++draws_since_flush_ < flush_draw_interval_) {
+        return;
     }
     // A pending depth or stencil clear belongs to the open render scope:
     // BeginRendering re-derives the clear load op, so a scope re-begun after
     // a flush would clear the attachment a second time.
     const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
     if (ds.depth_clear || ds.stencil_clear) {
-        return false;
+        return;
     }
     DropCopyHold(hold_drops_flush_);
-    // A writer flush only puts the batch on the ring for the second-queue
-    // copy; arming the read watchers here as well, right after the writes,
-    // let the guest fault into mid-frame state it used to read complete.
-    flush_skips_arm_ = force;
     scheduler.Flush();
-    flush_skips_arm_ = false;
     draws_since_flush_ = 0;
-    if (force) {
-        prone_run_ = false;
-        prone_run_draws_ = 0;
-        ++writer_flushes_;
-    } else {
-        ++interval_flushes_;
-    }
-    return true;
+    ++interval_flushes_;
 }
 
 void Rasterizer::BeginPacketRun() {
@@ -943,10 +918,9 @@ void Rasterizer::DispatchDirect() {
     DebugState.IncDispatch();
 
     ResetBindings();
-    const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
-    if (flush_draw_interval_ != 0 || readback_offload_) {
+    if (flush_draw_interval_ != 0) {
         copy_scope.reset();
-        MaybeIntervalFlush(WriterFlushDue(prone_write));
+        MaybeIntervalFlush();
     }
 }
 
@@ -1084,12 +1058,11 @@ void Rasterizer::OnSubmit() {
                          "empty={} per300f",
                          off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
             }
-            if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma || writer_flushes_) {
+            if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma) {
                 LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} "
-                         "wflush={} per300f",
-                         off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma, ms(off.q2_wait_ns),
-                         std::exchange(writer_flushes_, u64{0}));
+                         "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} per300f",
+                         off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma,
+                         ms(off.q2_wait_ns));
             }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
