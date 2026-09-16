@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
@@ -115,6 +117,14 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
             static_cast<int>(Fonts::kHelveticaBlkCondFontSize), 128.0f,
             &helv_cfg);
     }
+
+    // Let the atlas size grow to the largest image the device can create, floored to the power
+    // of two the packer requires. Glyphs are baked on demand per size, so the atlas can outgrow
+    // the default cap and would otherwise ask for a texture the device cannot allocate.
+    const u32 max_dim = instance.GetPhysicalDevice().getProperties().limits.maxImageDimension2D;
+    const int atlas_max = static_cast<int>(std::bit_floor(std::max<u32>(max_dim, 512u)));
+    io.Fonts->TexMaxWidth = atlas_max;
+    io.Fonts->TexMaxHeight = atlas_max;
 
     // Build once, after every face is registered: the stack above merges several fonts into the
     // primary face, and the atlas flags must be settled before rasterization. Idempotent - the
