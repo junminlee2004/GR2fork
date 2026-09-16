@@ -157,6 +157,14 @@ public:
     /// can write any buffer; readbacks treat the open batch as its writer.
     void NoteDmaWrite();
 
+    /// readback_offload: whether the draw being recorded wrote a buffer a
+    /// readback has already read. Cleared by the call.
+    bool TakeProneWrite() {
+        const bool pending = prone_write_pending_;
+        prone_write_pending_ = false;
+        return pending;
+    }
+
     struct StreamCopyStats {
         u64 hits;
         u64 probes;
@@ -739,6 +747,9 @@ private:
     std::unique_ptr<Vulkan::TransferQueue> copy_queue_;
     u64 dma_write_tick_{};
     bool readback_offload_{};
+    // readback_offload: set when a written bind touches a buffer a readback
+    // has read; the rasterizer takes it after recording the draw.
+    bool prone_write_pending_{};
     // Islands owned by in-flight readbacks; a later download skips them. GPU
     // command thread only.
     struct InflightDownload {
