@@ -312,6 +312,11 @@ public:
     // read by TouchImageUnlocked from the guest-thread video-out registration too.
     mutable u64 lru_touch_tick{~u64{0}};
     u64 tick_accessed_last{};
+    // The garbage collector period of the last access. ResolveOverlap ages an
+    // image by this, not by the scheduler tick: a tick here is a flush, and at
+    // one flush per few hundred draws NumFramesBeforeRemoval ticks is about a
+    // frame, so a live target aliased by a later pass was being freed.
+    u64 gc_tick_accessed_last{};
     u64 hash{};
 
     struct {

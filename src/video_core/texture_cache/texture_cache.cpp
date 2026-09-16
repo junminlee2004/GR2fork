@@ -347,7 +347,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId merged_image_id) {
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
-        scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+        gc_tick - cache_image.gc_tick_accessed_last > NumFramesBeforeRemoval;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -478,7 +478,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   cache_image.info.resources.levels, cache_image.info.resources.layers,
                   cache_image.info.num_samples, static_cast<u32>(cache_image.info.tile_mode),
                   cache_image.info.num_bits, +cache_image.info.props.is_block,
-                  cache_image.info.guest_size, cache_image.tick_accessed_last, safe_to_delete,
+                  cache_image.info.guest_size, cache_image.gc_tick_accessed_last, safe_to_delete,
                   bool(cache_image.info.props.is_pow2), cache_image.info.alt_tile,
 
                   // New image details
@@ -514,8 +514,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   static_cast<s64>(image_info.guest_size) - static_cast<s64>(expected_size),
                   (static_cast<double>(image_info.guest_size) / expected_size - 1.0) * 100.0,
 
-                  merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
-                  scheduler.CurrentTick() - cache_image.tick_accessed_last);
+                  merged_image_id.index, static_cast<int>(binding), gc_tick,
+                  gc_tick - cache_image.gc_tick_accessed_last);
 
         UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
     }
@@ -743,6 +743,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 // mutex and runs once per image per gc tick.
                 Image& image = slot_images[e.image_id];
                 image.tick_accessed_last = current_tick;
+                image.gc_tick_accessed_last = gc_tick;
                 if (image.lru_touch_tick != gc_tick) {
                     if (findimg_touch_batch) {
                         // With batching the tick is stamped here and the log
@@ -764,6 +765,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 std::scoped_lock lock{mutex};
                 Image& image = slot_images[e.image_id];
                 image.tick_accessed_last = current_tick;
+                image.gc_tick_accessed_last = gc_tick;
                 TouchImage(image, e.image_id);
                 e.access_tick = current_tick;
                 e.lru_tick = gc_tick;
@@ -950,6 +952,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                              image.info.size == match_rec.size);
                 ++addr_filter_fast_;
                 image.tick_accessed_last = scheduler.CurrentTick();
+                image.gc_tick_accessed_last = gc_tick;
                 TouchImage(image, match);
                 return match;
             }
@@ -997,6 +1000,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
+    image.gc_tick_accessed_last = gc_tick;
     TouchImage(image, image_id);
 
     // If the image requested is a subresource of the image from cache record its location.
@@ -1260,6 +1264,7 @@ void TextureCache::UpdateImageSlow(ImageId image_id, u64 now_tick) {
     TouchImage(image, image_id);
     RefreshImage(image);
     image.tick_accessed_last = now_tick;
+    image.gc_tick_accessed_last = gc_tick;
     if (False(image.flags & ImageFlagBits::Dirty) && tracked_ok()) {
         image.UpdateFastState(now_tick, true);
     }
