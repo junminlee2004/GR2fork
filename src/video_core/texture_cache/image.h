@@ -242,6 +242,25 @@ public:
     }
     ImageId depth_id{};
     u64 depth_uid{};
+    // Grouped with the depth link so a bind touches one or two record lines:
+    // the LRU touch, the identity checks and the binding bits.
+    u64 image_uid{};
+    u64 lru_id{};
+    // Written on the GPU thread by the consumed memo hit and the locked touch;
+    // read by TouchImageUnlocked from the guest-thread video-out registration too.
+    mutable u64 lru_touch_tick{~u64{0}};
+    u64 tick_accessed_last{};
+    // The garbage collector period of the last access. ResolveOverlap ages an
+    // image by this, not by the scheduler tick: a tick here is a flush, and at
+    // one flush per few hundred draws NumFramesBeforeRemoval ticks is about a
+    // frame, so a live target aliased by a later pass was being freed.
+    u64 gc_tick_accessed_last{};
+    struct {
+        u32 is_bound : 1;
+        u32 is_target : 1;
+        u32 needs_rebind : 1;
+        u32 force_general : 1;
+    } binding{};
 
     // Resource state tracking
     vk::ImageUsageFlags usage_flags;
@@ -306,17 +325,6 @@ public:
     // Index of this image's live entry in the texture cache's touch log.
     u32 lru_log_pos{std::numeric_limits<u32>::max()};
     boost::container::static_vector<u64, 16> mip_hashes{};
-    u64 image_uid{};
-    u64 lru_id{};
-    // Written on the GPU thread by the consumed memo hit and the locked touch;
-    // read by TouchImageUnlocked from the guest-thread video-out registration too.
-    mutable u64 lru_touch_tick{~u64{0}};
-    u64 tick_accessed_last{};
-    // The garbage collector period of the last access. ResolveOverlap ages an
-    // image by this, not by the scheduler tick: a tick here is a flush, and at
-    // one flush per few hundred draws NumFramesBeforeRemoval ticks is about a
-    // frame, so a live target aliased by a later pass was being freed.
-    u64 gc_tick_accessed_last{};
     u64 hash{};
 
     struct {
@@ -326,13 +334,6 @@ public:
         u32 depth_target : 1;
         u32 vo_surface : 1;
     } usage{};
-
-    struct {
-        u32 is_bound : 1;
-        u32 is_target : 1;
-        u32 needs_rebind : 1;
-        u32 force_general : 1;
-    } binding{};
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;
