@@ -748,7 +748,9 @@ private:
     u64 dma_write_tick_{};
     bool readback_offload_{};
     // readback_offload: set when a written bind touches a buffer a readback
-    // has read; the rasterizer takes it after recording the draw.
+    // has read within the last kProneWindow garbage collector periods, one
+    // per guest submit; the rasterizer takes it after recording the draw.
+    static constexpr u64 kProneWindow = 4;
     bool prone_write_pending_{};
     // Islands owned by in-flight readbacks; a later download skips them. GPU
     // command thread only.

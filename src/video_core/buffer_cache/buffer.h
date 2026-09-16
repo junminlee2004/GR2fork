@@ -179,9 +179,12 @@ public:
     // the last readback copy that read it, which deletion waits out.
     u64 gpu_write_tick = 0;
     u64 copy_queue_read_tick = 0;
-    // readback_offload: a fault download has read this buffer, so its later
-    // GPU writes are what a guest read will wait for.
-    bool readback_prone = false;
+    // readback_offload: the buffer cache's garbage collector period of the
+    // last fault download of this buffer, 0 for never. Its later GPU writes
+    // are what a guest read will wait for, but only while the reads keep
+    // coming: a buffer read back once at a load should not have every write
+    // run it takes for the rest of the session submitted early.
+    u64 readback_prone_tick = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
     Vulkan::Scheduler* scheduler;

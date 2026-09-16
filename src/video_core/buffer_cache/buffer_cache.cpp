@@ -777,7 +777,7 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                        bool is_write) {
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-    buffer.readback_prone = true;
+    buffer.readback_prone_tick = gc_tick;
     // Window widening mirrors the synchronous form above.
     const u64 WindowSize = readback_window_;
     const VAddr buf_start = buffer.CpuAddr();
@@ -1065,7 +1065,7 @@ void BufferCache::ReleaseFaultStaging(std::unique_ptr<Buffer> staging) {
 
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
-    buffer.readback_prone = true;
+    buffer.readback_prone_tick = gc_tick;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     FoldPendingRanges(device_addr, size);
@@ -2054,7 +2054,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 siz
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer, &fresh);
     if (is_written) {
         buffer.gpu_write_tick = scheduler.CurrentTick();
-        if (readback_offload_ && buffer.readback_prone) {
+        if (readback_offload_ && buffer.readback_prone_tick != 0 &&
+            gc_tick - buffer.readback_prone_tick <= kProneWindow) {
             prone_write_pending_ = true;
         }
         // Bump the GPU-clean epoch only on new coverage; steady-state
