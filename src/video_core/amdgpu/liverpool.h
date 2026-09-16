@@ -128,12 +128,6 @@ public:
         return std::this_thread::get_id() == gpu_id;
     }
 
-    /// Runs the commands other threads have queued. GPU command thread only,
-    /// at a packet boundary; the rasterizer's run-ahead pause calls it.
-    void ServiceGuestCommands() {
-        ProcessCommands();
-    }
-
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if (std::this_thread::get_id() == gpu_id) {

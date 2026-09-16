@@ -575,7 +575,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU guestCopyLockBatch: {}", EmulatorSettings.IsGuestCopyLockBatch());
     LOG_INFO(Config, "GPU specMruPermProbe: {}", EmulatorSettings.IsSpecMruPermProbe());
     LOG_INFO(Config, "GPU readbackOffload: {}", EmulatorSettings.IsReadbackOffload());
-    LOG_INFO(Config, "GPU gpuQueueCapUs: {}", EmulatorSettings.GetGpuQueueCapUs());
     LOG_INFO(Config, "GPU readbackBatching: {}", EmulatorSettings.IsReadbackBatchingEnabled());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());

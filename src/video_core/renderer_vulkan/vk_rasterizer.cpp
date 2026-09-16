@@ -134,7 +134,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
-    queue_cap_ns_ = u64{EmulatorSettings.GetGpuQueueCapUs()} * 1000;
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
     // pinned, and a frozen stamp compares every draw register-identical.
@@ -723,40 +722,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         copy_scope.reset();
         MaybeIntervalFlush(WriterFlushDue(prone_write));
     }
-    if (queue_cap_ns_ != 0) {
-        copy_scope.reset();
-        ThrottleRunAhead();
-    }
-}
-
-void Rasterizer::ThrottleRunAhead() {
-    auto* sem = scheduler.GetMasterSemaphore();
-    // Nothing can be queued behind the running batch with fewer than two
-    // submitted and unretired, and the stale known tick only overstates the
-    // wait, so the syscall that refreshes it runs only once the cheap look
-    // says a pause is due.
-    if (scheduler.CurrentTick() - 1 < sem->KnownGpuTick() + 2 ||
-        scheduler.QueuedBatchWaitNs(false) <= queue_cap_ns_ ||
-        scheduler.QueuedBatchWaitNs(true) <= queue_cap_ns_) {
-        return;
-    }
-    ++qcap_pauses_;
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto elapsed_ns = [&] {
-        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - t0)
-                                    .count());
-    };
-    // Serving commands here is what the parser does at every packet boundary;
-    // a flush their hops make must not run under the copy hold. The pause is
-    // bounded so a batch the GPU never retires cannot pin the thread.
-    DropCopyHold(hold_drops_wait_);
-    constexpr u64 kMaxPauseNs = 20'000'000;
-    do {
-        liverpool->ServiceGuestCommands();
-        sem->WaitFor(sem->KnownGpuTick() + 1, 200'000);
-    } while (scheduler.QueuedBatchWaitNs(true) > queue_cap_ns_ && elapsed_ns() < kMaxPauseNs);
-    qcap_pause_ns_ += elapsed_ns();
 }
 
 bool Rasterizer::WriterFlushDue(bool prone_write) {
@@ -978,10 +943,6 @@ void Rasterizer::DispatchDirect() {
         copy_scope.reset();
         MaybeIntervalFlush(WriterFlushDue(prone_write));
     }
-    if (queue_cap_ns_ != 0) {
-        copy_scope.reset();
-        ThrottleRunAhead();
-    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -1117,11 +1078,6 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} "
                          "empty={} per300f",
                          off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
-            }
-            if (queue_cap_ns_ != 0) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] QCAP pauses={} ms={} per300f",
-                         std::exchange(qcap_pauses_, u64{0}),
-                         std::exchange(qcap_pause_ns_, u64{0}) / 1'000'000);
             }
             if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma || writer_flushes_) {
                 LOG_INFO(Render_Skipcache,

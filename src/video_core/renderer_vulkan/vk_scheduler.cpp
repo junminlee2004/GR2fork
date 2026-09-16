@@ -105,21 +105,6 @@ void Scheduler::EndRendering() {
     current_cmdbuf.endRendering();
 }
 
-u64 Scheduler::QueuedBatchWaitNs(bool refresh) {
-    if (refresh) {
-        master_semaphore.Refresh();
-    }
-    const u64 known = master_semaphore.KnownGpuTick();
-    const u64 last_submitted = CurrentTick() - 1;
-    if (last_submitted < known + 2) {
-        return 0;
-    }
-    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         std::chrono::steady_clock::now().time_since_epoch())
-                                         .count());
-    return now - submit_ns_[(known + 2) % submit_ns_.size()];
-}
-
 void Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
@@ -218,10 +203,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     // before the queue submit.
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     const u64 signal_value = master_semaphore.NextTick();
-    submit_ns_[signal_value % submit_ns_.size()] =
-        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count());
     // Cmdbuf rollover: mid-draw submits (stream wraparound flushes) must
     // synchronously invalidate all skip caches - a draw-entry token snapshot
     // cannot see this flush.
