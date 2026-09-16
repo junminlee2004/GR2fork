@@ -736,15 +736,6 @@ struct GPUSettings {
     // down to a power of two and clamped to 4..8192. Smaller means each fault
     // copies and waits for less, at the cost of faulting more often.
     Setting<u32> readback_window_kb{512};
-    // Cache lines of the image memo entry an upcoming binding ordinal is
-    // predicted to match, warmed while the previous ordinal is still being
-    // resolved. The per-ordinal hint already picks the right entry 90.7% of
-    // the time and nothing exploited it; the entry's key compare is the
-    // single hottest instruction in FindImageMemoized and the table is
-    // 768 KiB against a 512 KiB L2. 1 = the key line, 2 = + the view line,
-    // 3 = all three. A prefetch changes no value, so every FINDIMG counter
-    // must come out identical; judge it by cycles per frame.
-    Setting<u32> findimg_memo_prefetch{0};
     // Release the read watchers of a finished download once per region instead of
     // once per island. Each per-island release is its own mprotect, and every
     // mprotect broadcasts a TLB shootdown to all cores. Needs readbacks_mode 2.
@@ -894,8 +885,6 @@ struct GPUSettings {
             make_override<GPUSettings>("draw_glue_memo", &GPUSettings::draw_glue_memo),
             make_override<GPUSettings>("readback_wait_notify", &GPUSettings::readback_wait_notify),
             make_override<GPUSettings>("readback_window_kb", &GPUSettings::readback_window_kb),
-            make_override<GPUSettings>("findimg_memo_prefetch",
-                                       &GPUSettings::findimg_memo_prefetch),
             make_override<GPUSettings>("deferred_read_release",
                                        &GPUSettings::deferred_read_release),
             make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
@@ -939,8 +928,7 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_C \
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
     desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
-    draw_glue_memo, readback_wait_notify, readback_window_kb, findimg_memo_prefetch, \
-    deferred_read_release
+    draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1295,7 +1283,6 @@ public:
     SETTING_FORWARD(m_gpu, DrawGlueMemo, draw_glue_memo)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWaitNotify, readback_wait_notify)
     SETTING_FORWARD(m_gpu, ReadbackWindowKb, readback_window_kb)
-    SETTING_FORWARD(m_gpu, FindimgMemoPrefetch, findimg_memo_prefetch)
     SETTING_FORWARD_BOOL(m_gpu, DeferredReadRelease, deferred_read_release)
     SETTING_FORWARD_BOOL(m_gpu, ImageFastState, image_fast_state)
     SETTING_FORWARD_BOOL(m_gpu, GuestCopyLockBatch, guest_copy_lock_batch)
