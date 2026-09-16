@@ -53,6 +53,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       sampler_lockfree{EmulatorSettings.IsSamplerMemoLockfree()},
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
       findimg_touch_batch{EmulatorSettings.IsFindimgTouchBatch() && findimg_touch_lockfree},
+      findimg_trust_gen{EmulatorSettings.IsFindimgTrustGen()},
       memo_first{EmulatorSettings.IsFindimgMemoFirst()},
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
@@ -699,6 +700,10 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
         ++ctr.veto[1];
     } else if (set[way].tex_gen != tex_gen) {
         ++ctr.miss_gen[LaneTex];
+    } else if (findimg_trust_gen) {
+        // Register, unregister and slot delete all bump the generation, so an
+        // equal one certifies the entry's image identity without the record.
+        would_hit = true;
     } else {
         const Image& image = slot_images[set[way].image_id];
         if (image.image_uid != set[way].image_uid ||
@@ -740,23 +745,26 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                 // so the stamp needs no lock; the LRU list is shared with
                 // UnmapMemory on guest threads, so its touch stays under the
                 // mutex and runs once per image per gc tick.
-                Image& image = slot_images[e.image_id];
-                image.tick_accessed_last = current_tick;
-                image.gc_tick_accessed_last = gc_tick;
-                if (image.lru_touch_tick != gc_tick) {
-                    if (findimg_touch_batch) {
-                        // With batching the tick is stamped here and the log
-                        // entry lands in the flush.
-                        image.lru_touch_tick = gc_tick;
-                        touch_batch_[touch_batch_len_++] = e.image_id;
-                        ++findimg_touch_batched_;
-                        if (touch_batch_len_ == kTouchBatchCap) {
-                            FlushTouchBatch();
+                if (!findimg_trust_gen || e.lru_tick != gc_tick) {
+                    e.lru_tick = gc_tick;
+                    Image& image = slot_images[e.image_id];
+                    image.tick_accessed_last = current_tick;
+                    image.gc_tick_accessed_last = gc_tick;
+                    if (image.lru_touch_tick != gc_tick) {
+                        if (findimg_touch_batch) {
+                            // With batching the tick is stamped here and the log
+                            // entry lands in the flush.
+                            image.lru_touch_tick = gc_tick;
+                            touch_batch_[touch_batch_len_++] = e.image_id;
+                            ++findimg_touch_batched_;
+                            if (touch_batch_len_ == kTouchBatchCap) {
+                                FlushTouchBatch();
+                            }
+                        } else {
+                            std::scoped_lock lock{mutex};
+                            TouchImage(image, e.image_id);
+                            ++findimg_touch_locks_;
                         }
-                    } else {
-                        std::scoped_lock lock{mutex};
-                        TouchImage(image, e.image_id);
-                        ++findimg_touch_locks_;
                     }
                 }
                 ++findimg_consumed_;
@@ -878,6 +886,7 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
         e.type = static_cast<u8>(desc.type);
         e.view_key = view_key;
         e.image_id = real;
+        e.lru_tick = 0;
         e.view_info = desc.view_info;
         e.view_handle = vk::ImageView{};
         e.view_backing = nullptr;

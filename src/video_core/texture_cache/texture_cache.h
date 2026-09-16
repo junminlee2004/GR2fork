@@ -793,6 +793,7 @@ private:
     bool sampler_lockfree;       // latched once at construction
     bool findimg_touch_lockfree; // latched once at construction
     bool findimg_touch_batch;    // latched once at construction; needs findimg_touch_lockfree
+    bool findimg_trust_gen;      // latched once at construction
     bool memo_first;             // latched once at construction
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
