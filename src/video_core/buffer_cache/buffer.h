@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <optional>
 #include <utility>
@@ -138,11 +139,44 @@ public:
         return buffer.bda_addr;
     }
 
+    // The access bits that only read. Everything else (ShaderWrite,
+    // TransferWrite, MemoryWrite and the write-bearing initial state) is a
+    // write for the purposes of the merge below, so the enumeration is
+    // positive and a new bit is a write until it is listed here.
+    static constexpr vk::AccessFlags2 kReadOnlyAccess =
+        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eVertexAttributeRead |
+        vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eIndirectCommandRead |
+        vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eUniformRead |
+        vk::AccessFlagBits2::eMemoryRead;
+
+    static constexpr bool IsReadOnlyAccess(vk::AccessFlags2 mask) noexcept {
+        return !!mask && !(mask & ~kReadOnlyAccess);
+    }
+
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
         if (dst_acess_mask == access_mask && stage == dst_stage) {
             return {};
+        }
+
+        // buffer_barrier_read_merge: Vulkan defines no read-after-read hazard,
+        // so a read-only -> read-only transition needs no barrier at all. The
+        // readers are accumulated instead, which makes the next write
+        // transition source the union of every reader since the last write --
+        // a superset of what the single tracked reader gives today.
+        // Only a reader whose access bits the last barrier already made visible
+        // merges: the driver invalidates different caches per access type, so
+        // a new read type still gets its own barrier.
+        if (barrier_read_merge && IsReadOnlyAccess(access_mask) &&
+            IsReadOnlyAccess(dst_acess_mask) && !(dst_acess_mask & ~access_mask)) {
+            access_mask |= dst_acess_mask;
+            stage |= dst_stage;
+            barrier_rr_merged.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+        if (barrier_read_merge) {
+            barrier_emitted.fetch_add(1, std::memory_order_relaxed);
         }
 
         DEBUG_ASSERT(offset < size_bytes);
@@ -193,7 +227,18 @@ public:
     vk::Flags<vk::AccessFlagBits2> access_mask{
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
-    vk::PipelineStageFlagBits2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    // A set, not one bit: with buffer_barrier_read_merge on it accumulates the
+    // stages that have read since the last write transition. Same 8 bytes.
+    vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eAllCommands};
+    // buffer_barrier_read_merge: latched once by the BufferCache constructor,
+    // before any command recording. The counters it gates are process-global
+    // (texture_cache's RefreshImage GetBarrier site was not traced to a single
+    // thread), so they are relaxed atomics; off, none of them is touched.
+    static inline bool barrier_read_merge{false};
+    static inline std::atomic<u64> barrier_rr_merged{};
+    static inline std::atomic<u64> barrier_emitted{};
+    static inline std::atomic<u64> barrier_rr_mark{};
+    static inline std::atomic<u64> barrier_rr_saved{};
     // Memos of recent read-only upload queries that found nothing to upload.
     // While the key is unchanged the guest bytes still equal the device-buffer
     // bytes for a recorded range, so eliding the upload is byte-identical; a

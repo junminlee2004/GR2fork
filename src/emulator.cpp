@@ -514,6 +514,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU findimgTouchBatch: {}", EmulatorSettings.IsFindimgTouchBatch());
     LOG_INFO(Config, "GPU findimgTrustGen: {}", EmulatorSettings.IsFindimgTrustGen());
     LOG_INFO(Config, "GPU findimgRangeInvalidate: {}", EmulatorSettings.IsFindimgRangeInvalidate());
+    LOG_INFO(Config, "GPU bufferBarrierReadMerge: {}", EmulatorSettings.IsBufferBarrierReadMerge());
     LOG_INFO(Config, "GPU streamCopyResolvedEpoch: {}",
              EmulatorSettings.IsStreamCopyResolvedEpoch());
     LOG_INFO(Config, "GPU writtenRangeFast: {}", EmulatorSettings.GetWrittenRangeFast());

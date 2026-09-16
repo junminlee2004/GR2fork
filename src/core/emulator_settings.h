@@ -556,6 +556,11 @@ struct GPUSettings {
     // unmap route and the two rebind arms keep a global invalidation.
     // Needs findimg_trust_gen.
     Setting<bool> findimg_range_invalidate{false};
+    // Treat a read-only -> read-only buffer access transition as barrier-free and accumulate the
+    // reading stages instead of emitting a VkBufferMemoryBarrier2 that also closes the open
+    // render pass. Vulkan defines no read-after-read hazard; the next write transition then
+    // sources the union of every reader since the last write.
+    Setting<bool> buffer_barrier_read_merge{false};
     // Stream-copy and index-bind memo entries remember the tracker region that
     // covered their range, so a hit re-certifies the word-epoch sum with that
     // region's own loads instead of the tracker walk.
@@ -843,6 +848,8 @@ struct GPUSettings {
             make_override<GPUSettings>("findimg_trust_gen", &GPUSettings::findimg_trust_gen),
             make_override<GPUSettings>("findimg_range_invalidate",
                                        &GPUSettings::findimg_range_invalidate),
+            make_override<GPUSettings>("buffer_barrier_read_merge",
+                                       &GPUSettings::buffer_barrier_read_merge),
             make_override<GPUSettings>("stream_copy_resolved_epoch",
                                        &GPUSettings::stream_copy_resolved_epoch),
             make_override<GPUSettings>("written_range_fast", &GPUSettings::written_range_fast),
@@ -936,7 +943,7 @@ struct GPUSettings {
     pipeline_key_stamp_reuse, shader_params_memo
 #define GPU_SETTINGS_JSON_FIELDS_B \
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
-    bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, findimg_touch_batch, findimg_trust_gen, findimg_range_invalidate, \
+    bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, findimg_touch_batch, findimg_trust_gen, findimg_range_invalidate, buffer_barrier_read_merge, \
     stream_copy_resolved_epoch, written_range_fast, spec_fp_slot_inplace, spec_fp_front, \
     findimg_memo_ways, findimg_memo_entries, bind_noop_memo, spec_key_fast, \
     gpu_range_set_lockfree, gpu_range_set_flat, readback_writeback_hold, backing_write_memo, \
@@ -1258,6 +1265,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FindimgTouchBatch, findimg_touch_batch)
     SETTING_FORWARD_BOOL(m_gpu, FindimgTrustGen, findimg_trust_gen)
     SETTING_FORWARD_BOOL(m_gpu, FindimgRangeInvalidate, findimg_range_invalidate)
+    SETTING_FORWARD_BOOL(m_gpu, BufferBarrierReadMerge, buffer_barrier_read_merge)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyResolvedEpoch, stream_copy_resolved_epoch)
     SETTING_FORWARD(m_gpu, WrittenRangeFast, written_range_fast)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpSlotInplace, spec_fp_slot_inplace)

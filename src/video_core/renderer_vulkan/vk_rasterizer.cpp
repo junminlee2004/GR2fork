@@ -1064,6 +1064,16 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] RPASS calls={} restarts={} interrupted={} per300f", rp.calls,
                          rp.restarts, rp.interrupted);
             }
+            if (VideoCore::Buffer::barrier_read_merge) {
+                LOG_INFO(
+                    Render_Skipcache,
+                    "[SkipCache] BUFBAR emitted={} merged={} saved={} "
+                    "per300f",
+                    VideoCore::Buffer::barrier_emitted.exchange(0, std::memory_order_relaxed),
+                    VideoCore::Buffer::barrier_rr_merged.exchange(0, std::memory_order_relaxed),
+                    VideoCore::Buffer::barrier_rr_saved.exchange(0, std::memory_order_relaxed));
+                VideoCore::Buffer::barrier_rr_mark.store(0, std::memory_order_relaxed);
+            }
             auto& ws = scheduler.WaitStats();
             const auto ms = [hz](u64 ns) { return hz ? ns * 1000 / hz : 0; };
             LOG_INFO(Render_Skipcache,
@@ -1592,6 +1602,15 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     set_writes.clear();
     buffer_barriers.clear();
+    // buffer_barrier_read_merge telemetry: the earliest point of a draw, so a
+    // later merge count above this mark means this draw merged at least one
+    // read-after-read transition. Pipeline::BindResources turns that into a
+    // saved render-pass restart only when the list it is handed is empty.
+    if (VideoCore::Buffer::barrier_read_merge) {
+        VideoCore::Buffer::barrier_rr_mark.store(
+            VideoCore::Buffer::barrier_rr_merged.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+    }
     buffer_info_n_ = 0;
     image_infos.clear();
     // A ready plan stands in for the write list this bind would rebuild; the

@@ -60,6 +60,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
+    Buffer::barrier_read_merge = EmulatorSettings.IsBufferBarrierReadMerge();
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
     wait_notify_ = EmulatorSettings.IsReadbackWaitNotify();

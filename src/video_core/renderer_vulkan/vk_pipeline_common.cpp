@@ -16,6 +16,7 @@
 
 #include "core/emulator_settings.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -553,6 +554,19 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
         };
         scheduler.EndRendering();
         cmdbuf.pipelineBarrier2(dependencies);
+    } else if (VideoCore::Buffer::barrier_read_merge && scheduler.IsRendering() &&
+               VideoCore::Buffer::barrier_rr_merged.load(std::memory_order_relaxed) !=
+                   VideoCore::Buffer::barrier_rr_mark.load(std::memory_order_relaxed)) {
+        // buffer_barrier_read_merge telemetry: this bind merged at least one
+        // read-after-read transition and still ended up with an empty barrier
+        // list, and a render pass is open, so the EndRendering the non-empty
+        // branch would have run -- and the restart it costs -- is what the
+        // merge removed. The IsRendering test is what excludes every merge
+        // that cannot save a restart: the compute dispatch paths
+        // (vk_rasterizer.cpp:931, :972), RefreshImage (texture_cache.cpp:1412)
+        // and JoinOverlap (buffer_cache.cpp:2231) all call EndRendering
+        // themselves before reaching here, so the pass is already closed.
+        VideoCore::Buffer::barrier_rr_saved.fetch_add(1, std::memory_order_relaxed);
     }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
