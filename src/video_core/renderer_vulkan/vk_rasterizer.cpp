@@ -1351,6 +1351,11 @@ void Rasterizer::OnSubmit() {
                          "[SkipCache] FINDIMGHINT probes={} hits={} none={} per300f", fh.probes,
                          fh.hits, fh.none);
             }
+            if (const auto rv = texture_cache.DrainMemoRangeStats(); rv.enabled) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] FINDIMGRV walks={} inval={} bumps={} per300f", rv.walks,
+                         rv.inval, rv.bumps);
+            }
             const auto ss = texture_cache.DrainSamplerStats();
             if (ss.calls) {
                 LOG_INFO(Render_Skipcache,

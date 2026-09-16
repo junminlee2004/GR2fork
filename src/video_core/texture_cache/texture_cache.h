@@ -480,6 +480,33 @@ private:
     /// Unregister image from the page table
     void UnregisterImage(ImageId image);
 
+    // findimg_range_invalidate: the T# range a populated image memo slot
+    // answers for, packed to eight bytes as page numbers. An all-zero pair is
+    // the empty range and matches nothing.
+    struct MemoRange {
+        u32 lo_page;
+        u32 hi_page;
+    };
+    static_assert(sizeof(MemoRange) == 8);
+
+    /// findimg_range_invalidate: the page-packed range a byte range occupies,
+    /// lo rounded down and hi up (and both saturated), so a stored pair is
+    /// never narrower than the bytes it stands for.
+    static MemoRange MemoRangeOf(VAddr addr, u64 size) noexcept;
+
+    /// findimg_range_invalidate: clear the image memo entries whose recorded T#
+    /// range intersects [addr, addr + size). GPU command thread only; while a
+    /// batch is open the range is queued instead and the pass runs once.
+    SHAD_NO_INLINE void InvalidateMemoRange(VAddr addr, u64 size);
+
+    /// findimg_range_invalidate: invalidate the memo for one image's range,
+    /// walking it when the caller is the GPU command thread and falling back to
+    /// a global generation bump when it is not.
+    void InvalidateMemoForImage(const ImageInfo& info);
+
+    /// Apply every queued range in one pass over the side array.
+    SHAD_NO_INLINE void FlushMemoRangeBatch();
+
     /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
     void TrackImageHead(ImageId image_id);
@@ -663,6 +690,21 @@ public:
         findimg_evictions_ = 0;
         return out;
     }
+    struct MemoRangeStats {
+        bool enabled;
+        u64 walks;
+        u64 inval;
+        u64 bumps;
+    };
+    MemoRangeStats DrainMemoRangeStats() {
+        // The bump counter is written off the GPU command thread, so it is
+        // drained with one exchange: a load/store pair would drop a concurrent
+        // bump from the counter the go/no-go read rests on.
+        const MemoRangeStats out{findimg_range_inval, memo_range_walks_, memo_range_inval_,
+                                 memo_gen_bumps_.exchange(0, std::memory_order_relaxed)};
+        memo_range_walks_ = memo_range_inval_ = 0;
+        return out;
+    }
     bool BindNoopMemo() const noexcept {
         return bind_noop;
     }
@@ -794,6 +836,7 @@ private:
     bool findimg_touch_lockfree; // latched once at construction
     bool findimg_touch_batch;    // latched once at construction; needs findimg_touch_lockfree
     bool findimg_trust_gen;      // latched once at construction
+    bool findimg_range_inval;    // latched once at construction; needs findimg_trust_gen
     bool memo_first;             // latched once at construction
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
@@ -954,6 +997,31 @@ private:
     alignas(64) std::atomic<u64> invfilter_probes_{};
     std::atomic<u64> invfilter_skips_{};
     std::atomic<u64> invfilter_unsound_{};
+    // findimg_range_invalidate, declared last so the default-off arm keeps the
+    // layout of every member the hot paths reach above.
+    // Parallel to find_image_memo_: the range each populated slot answers for,
+    // sized only when the setting is on, so the default arm allocates nothing.
+    std::vector<MemoRange> memo_range_;
+    // The generation the memo certifies with under the setting. Bumped only
+    // where the walk cannot run or is not provably on the GPU command thread:
+    // the guest-thread unmap route, the video-out registration route and the
+    // two rebind arms.
+    std::atomic<u64> img_memo_gen_{1};
+    // Set while TextureCache::UnmapMemory holds `mutex`: that route already
+    // bumped the generation, so the unregisters it drives skip their walk.
+    // Written and read under `mutex` only.
+    bool unmap_walk_suppressed_{};
+    // Garbage collection frees up to forty images under one lock; their ranges
+    // are queued here and applied in a single pass before the lock drops.
+    static constexpr u32 MemoRangeBatchMax = 64;
+    std::array<MemoRange, MemoRangeBatchMax> memo_range_batch_{};
+    u32 memo_range_batch_count_{};
+    bool memo_range_batching_{};
+    u64 memo_range_walks_{};
+    u64 memo_range_inval_{};
+    // Bumped off the GPU command thread on the unmap and video-out routes,
+    // drained on the GPU command thread: atomic for that read alone.
+    std::atomic<u64> memo_gen_bumps_{};
 };
 
 } // namespace VideoCore

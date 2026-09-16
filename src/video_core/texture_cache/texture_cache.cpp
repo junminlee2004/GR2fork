@@ -16,6 +16,7 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -54,6 +55,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       findimg_touch_lockfree{EmulatorSettings.IsFindimgTouchLockfree()},
       findimg_touch_batch{EmulatorSettings.IsFindimgTouchBatch() && findimg_touch_lockfree},
       findimg_trust_gen{EmulatorSettings.IsFindimgTrustGen()},
+      findimg_range_inval{EmulatorSettings.IsFindimgRangeInvalidate() && findimg_trust_gen},
       memo_first{EmulatorSettings.IsFindimgMemoFirst()},
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
@@ -61,12 +63,19 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       invalidate_filter{EmulatorSettings.IsTextureInvalidateFilter()},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
-          64 - std::countr_zero(u64{find_image_memo_.size() / std::max<u32>(memo_ways, 1u)}))} {
+          64 - std::countr_zero(u64{find_image_memo_.size() / std::max<u32>(memo_ways, 1u)}))},
+      // The side array exists only under the setting: with it off nothing is
+      // allocated and no populate ever stores a range.
+      memo_range_(findimg_range_inval ? find_image_memo_.size() : 0) {
 
     invalidate_cover_ = std::make_unique<std::atomic<u64>[]>(CoverWords);
     if (EmulatorSettings.IsImageUpdateDirect() && !image_update_direct) {
         LOG_WARNING(Render_Vulkan,
                     "direct image updates need image_fast_state; the dedup probe runs unchanged");
+    }
+    if (EmulatorSettings.IsFindimgRangeInvalidate() && !findimg_range_inval) {
+        LOG_WARNING(Render_Vulkan, "range-scoped memo invalidation needs findimg_trust_gen; the "
+                                   "global texture generation keeps invalidating the whole memo");
     }
     if (EmulatorSettings.IsBindNoopMemo() && !bind_noop) {
         LOG_WARNING(Render_Vulkan,
@@ -241,6 +250,18 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
+    // Guest thread: it must not walk the memo the GPU command thread owns, so
+    // this route keeps the global invalidation the texture generation gives it
+    // today, and the unregisters it drives skip their walk. Bumping before the
+    // frees narrows the probe window, never widens it.
+    if (findimg_range_inval) {
+        img_memo_gen_.fetch_add(1, std::memory_order_release);
+        memo_gen_bumps_.fetch_add(1, std::memory_order_relaxed);
+        unmap_walk_suppressed_ = true;
+    }
+    SCOPE_EXIT {
+        unmap_walk_suppressed_ = false;
+    };
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -543,6 +564,13 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 if (cache_image.binding.is_target) {
                     cache_image.binding.needs_rebind = 1u;
                     Skipcache::Framework::Instance().BumpTexGen();
+                    if (findimg_range_inval) {
+                        // Conservative: a rebind changes what a binding must
+                        // resolve to beyond the T# range, so this arm keeps a
+                        // global invalidation.
+                        img_memo_gen_.fetch_add(1, std::memory_order_release);
+                        memo_gen_bumps_.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (merged_image_id) {
                         Image& merged = slot_images[merged_image_id];
                         TouchImage(merged, merged_image_id);
@@ -580,6 +608,11 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
         Skipcache::Framework::Instance().BumpTexGen();
+        if (findimg_range_inval) {
+            // Same conservative rebind rule as ResolveOverlap's arm.
+            img_memo_gen_.fetch_add(1, std::memory_order_release);
+            memo_gen_bumps_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     FreeImage(image_id);
@@ -594,6 +627,17 @@ static SHAD_NO_INLINE void RecordGuardSample(VideoCore::Skipcache::Framework& sc
                                              VideoCore::Skipcache::CacheCounters& ctr, u64 t0) {
     ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
     ++ctr.guard_samples;
+}
+
+// The generation the image memo certifies with: the range-scoped one under
+// findimg_range_invalidate, where register and unregister clear the slots they
+// intersect instead of bumping it, the global texture generation otherwise.
+// The probe, the verify abort and the populate commit must all read the same
+// one, or a wave misfiles divergences as aborts.
+[[nodiscard]] static inline u64 MemoGenNow(VideoCore::Skipcache::Framework& sc,
+                                           const std::atomic<u64>& img_memo_gen, bool range_inval) {
+    return range_inval ? img_memo_gen.load(std::memory_order_acquire)
+                       : sc.Gens().tex_gen.load(std::memory_order_acquire);
 }
 
 ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp, u16* hint) {
@@ -617,7 +661,7 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
     ++ctr.eligible;
     const bool timed = sc.SampleTimer(kCache);
     const u64 t0 = timed ? sc.Now() : 0;
-    const u64 tex_gen = sc.Gens().tex_gen.load(std::memory_order_acquire);
+    const u64 tex_gen = MemoGenNow(sc, img_memo_gen_, findimg_range_inval);
     // The key words are read straight from the T#, all four: the way scan
     // compares them one at a time, so the function keeps no 32-byte copy of
     // the sharp on its frame and the compare cannot lower to a library call.
@@ -866,7 +910,12 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
     if (would_hit && sc.GetState(kCache) != State::Learning) {
         if (predicted == real && e.view_info == desc.view_info) {
             sc.RecordVerifyClean(kCache);
-        } else if (sc.Gens().tex_gen.load(std::memory_order_acquire) != tex_gen) {
+            // An entry that lost its valid bit is the range-scoped form of a
+            // generation change: FindImage above can register or free an image
+            // intersecting this T# range, and that walk clears the entry where
+            // a global bump used to abort the verify. Always false with the
+            // setting off, where only a probe writes the bit.
+        } else if (!e.valid || MemoGenNow(sc, img_memo_gen_, findimg_range_inval) != tex_gen) {
             sc.RecordVerifyAborted(kCache);
             e.valid = false;
         } else {
@@ -897,7 +946,15 @@ ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image
             e.image_uid = image.image_uid;
         }
         e.tex_gen = tex_gen;
-        if (sc.Gens().tex_gen.load(std::memory_order_acquire) == tex_gen) {
+        if (findimg_range_inval) {
+            // The range this entry answers for: every register or unregister
+            // intersecting it clears the entry, which is what the equal
+            // generation certifies under the setting. FindImage engaged the
+            // info above, and a registered image's range never moves.
+            const auto& info = desc.Info();
+            memo_range_[slot] = MemoRangeOf(info.guest_address, info.guest_size);
+        }
+        if (MemoGenNow(sc, img_memo_gen_, findimg_range_inval) == tex_gen) {
             e.valid = true;
             sc.NotifyPopulated(kCache);
         }
@@ -1622,6 +1679,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
         .size = image.info.size,
     };
     images_by_addr[image.info.guest_address].push_back(image_id);
+    if (findimg_range_inval) {
+        InvalidateMemoForImage(image.info);
+    }
     Skipcache::Framework::Instance().BumpTexGen();
 }
 
@@ -1661,7 +1721,98 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             images_by_addr.erase(it);
         }
     }
+    if (findimg_range_inval && !unmap_walk_suppressed_) {
+        InvalidateMemoForImage(image.info);
+    }
     Skipcache::Framework::Instance().BumpTexGen();
+}
+
+TextureCache::MemoRange TextureCache::MemoRangeOf(VAddr addr, u64 size) noexcept {
+    // Rounding is outward on both ends and saturating at the u32 ceiling, so a
+    // packed pair always covers at least the bytes it stands for: the walk can
+    // over-invalidate, never miss an entry an image intersects. A zero-size
+    // image still owns one page, matching FindImage's max(size, 1) view of it.
+    constexpr u64 MaxPage = std::numeric_limits<u32>::max();
+    const u64 lo = static_cast<u64>(addr) >> PageShift;
+    const u64 hi =
+        (static_cast<u64>(addr) + std::max<u64>(size, 1) + ((1ULL << PageShift) - 1)) >> PageShift;
+    const u32 lo_page = static_cast<u32>(std::min<u64>(lo, MaxPage - 1));
+    return MemoRange{lo_page, static_cast<u32>(std::clamp<u64>(hi, lo_page + 1, MaxPage))};
+}
+
+SHAD_NO_INLINE void TextureCache::InvalidateMemoRange(VAddr addr, u64 size) {
+    // The side array and the memo's valid bits are written by this walk and by
+    // the populate, both on the GPU command thread; every register and
+    // unregister call site is reached from there under `mutex`.
+    DEBUG_ASSERT_MSG(liverpool == nullptr || liverpool->OnGpuThread(),
+                     "image memo range invalidation off the GPU command thread");
+    const MemoRange r = MemoRangeOf(addr, size);
+    if (memo_range_batching_ && memo_range_batch_count_ < MemoRangeBatchMax) {
+        // Queued: the batch is flushed before the lock that opened it drops,
+        // and no memo probe can run in between.
+        memo_range_batch_[memo_range_batch_count_++] = r;
+        return;
+    }
+    ++memo_range_walks_;
+    const size_t entries = memo_range_.size();
+    for (size_t i = 0; i < entries; ++i) {
+        const MemoRange e = memo_range_[i];
+        if (e.lo_page < r.hi_page && r.lo_page < e.hi_page) {
+            // Only entries that were live count: the measured disjoint
+            // fraction is inval versus the generation misses it replaces.
+            memo_range_inval_ += find_image_memo_[i].valid ? 1 : 0;
+            find_image_memo_[i].valid = false;
+            memo_range_[i] = MemoRange{};
+        }
+    }
+}
+
+void TextureCache::InvalidateMemoForImage(const ImageInfo& info) {
+    // Registration is not GPU-command-thread-only: sceVideoOutRegisterBuffers
+    // reaches RegisterVideoOutSurface -> FindImage -> RegisterImage on the
+    // guest thread that registers the buffers. That thread must not touch the
+    // side array the memo probe reads, so it falls back to the global bump the
+    // texture generation gives the site today; the walk stays for the GPU
+    // command thread, which is every other register and unregister.
+    if (liverpool != nullptr && liverpool->OnGpuThread()) {
+        InvalidateMemoRange(info.guest_address, info.guest_size);
+    } else {
+        img_memo_gen_.fetch_add(1, std::memory_order_release);
+        memo_gen_bumps_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+SHAD_NO_INLINE void TextureCache::FlushMemoRangeBatch() {
+    const u32 count = memo_range_batch_count_;
+    if (count == 0) {
+        return;
+    }
+    memo_range_batch_count_ = 0;
+    ++memo_range_walks_;
+    // One pass for the whole burst: the union bound rejects the entries no
+    // freed image can touch with a single compare.
+    u32 lo_min = memo_range_batch_[0].lo_page;
+    u32 hi_max = memo_range_batch_[0].hi_page;
+    for (u32 b = 1; b < count; ++b) {
+        lo_min = std::min(lo_min, memo_range_batch_[b].lo_page);
+        hi_max = std::max(hi_max, memo_range_batch_[b].hi_page);
+    }
+    const size_t entries = memo_range_.size();
+    for (size_t i = 0; i < entries; ++i) {
+        const MemoRange e = memo_range_[i];
+        if (e.lo_page >= hi_max || lo_min >= e.hi_page) {
+            continue;
+        }
+        for (u32 b = 0; b < count; ++b) {
+            const MemoRange& r = memo_range_batch_[b];
+            if (e.lo_page < r.hi_page && r.lo_page < e.hi_page) {
+                memo_range_inval_ += find_image_memo_[i].valid ? 1 : 0;
+                find_image_memo_[i].valid = false;
+                memo_range_[i] = MemoRange{};
+                break;
+            }
+        }
+    }
 }
 
 void TextureCache::TrackImage(ImageId image_id) {
@@ -1783,6 +1934,18 @@ void TextureCache::GarbageCollectImages() {
         return;
     }
     std::scoped_lock lock{mutex};
+    // Up to forty frees under one lock: queue their ranges and clear the memo
+    // in a single pass instead of one pass per image. The flush runs before
+    // the lock drops, and every memo probe is outside it.
+    if (findimg_range_inval) {
+        memo_range_batching_ = true;
+    }
+    SCOPE_EXIT {
+        if (findimg_range_inval) {
+            FlushMemoRangeBatch();
+            memo_range_batching_ = false;
+        }
+    };
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
