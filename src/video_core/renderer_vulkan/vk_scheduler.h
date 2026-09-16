@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -526,6 +527,12 @@ public:
         return &master_semaphore;
     }
 
+    /// gpu_queue_cap_us: how long the batch queued behind the one the GPU is
+    /// running has waited, in nanoseconds; 0 when nothing is queued behind
+    /// it. The known GPU tick is refreshed first only when asked, since the
+    /// query is a syscall; a stale tick can only overstate the wait.
+    u64 QueuedBatchWaitNs(bool refresh);
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
@@ -595,6 +602,9 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    // Submit time of each tick, for QueuedBatchWaitNs; deep enough for the
+    // batches that can be pending at once.
+    std::array<u64, 64> submit_ns_{};
     // The first direct measurement of the render scope rate: everything the
     // campaign has quoted for it so far came from branch-edge inference.
     u64 rs_calls_{};

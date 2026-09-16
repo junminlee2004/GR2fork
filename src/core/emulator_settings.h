@@ -453,6 +453,13 @@ struct GPUSettings {
     // device-address shader could have written it, or when the device has no
     // transfer-capable family beside graphics.
     Setting<bool> readback_offload{false};
+    // Pause the GPU command thread's parsing, at draw and dispatch
+    // boundaries, while the batch queued behind the one the GPU is running
+    // has waited longer than this, in microseconds; 0 = off. With the
+    // readback offload the thread runs ahead of the GPU in bursts, and every
+    // guest read then waits behind the burst for its writer. The guest's
+    // commands are still served during the pause.
+    Setting<u32> gpu_queue_cap_us{0};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -789,6 +796,7 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_batching_enabled",
                                        &GPUSettings::readback_batching_enabled),
             make_override<GPUSettings>("readback_offload", &GPUSettings::readback_offload),
+            make_override<GPUSettings>("gpu_queue_cap_us", &GPUSettings::gpu_queue_cap_us),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -903,7 +911,7 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_A \
     window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, gpu_queue_cap_us, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -1210,6 +1218,7 @@ public:
     SETTING_FORWARD(m_gpu, StreamBufferSizeMb, stream_buffer_size_mb)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
+    SETTING_FORWARD(m_gpu, GpuQueueCapUs, gpu_queue_cap_us)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)

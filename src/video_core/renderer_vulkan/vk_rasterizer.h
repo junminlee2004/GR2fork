@@ -223,6 +223,11 @@ private:
     // readback_offload: inside a run of draws writing readback-prone
     // buffers, and the run's length; flushes it adds, for the log.
     bool readback_offload_{};
+    // gpu_queue_cap_us: the cap in nanoseconds, 0 = off, and the pauses it
+    // took, for the log.
+    u64 queue_cap_ns_{};
+    u64 qcap_pauses_{};
+    u64 qcap_pause_ns_{};
     bool prone_run_{};
     u32 prone_run_draws_{};
     u64 writer_flushes_{};
@@ -251,6 +256,9 @@ private:
     /// readback_offload: whether the run of prone-buffer writes the draw
     /// just recorded belongs to is due for its flush.
     bool WriterFlushDue(bool prone_write);
+    /// gpu_queue_cap_us: waits, serving guest commands, until the batch queued
+    /// behind the running one has waited less than the cap.
+    void ThrottleRunAhead();
     bool elide_findbuffer_{};
     bool bind_prefetch_{};
     // One guest-copy shared hold per packet run (guest_copy_hold_segment).
