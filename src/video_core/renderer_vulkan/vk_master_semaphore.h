@@ -62,9 +62,12 @@ protected:
 /// submitted here waits only for the master tick that wrote its source, so it
 /// runs beside the batches the GPU thread has since run ahead and submitted
 /// instead of behind them. The GPU command thread submits; any thread waits.
+/// readback_copy_gfx_queue routes the copy to the graphics queue instead, where
+/// submission order puts it right behind its writer batch and ahead of every
+/// batch recorded after the fault, rather than beside them on a starved ring.
 class TransferQueue {
 public:
-    explicit TransferQueue(const Instance& instance, MasterSemaphore& master);
+    explicit TransferQueue(const Instance& instance, MasterSemaphore& master, bool on_graphics);
     ~TransferQueue();
 
     /// Submits one buffer copy after master tick `wait_master_tick`, which must
@@ -85,6 +88,7 @@ private:
     static constexpr size_t NumSlots = 8;
     const Instance& instance;
     MasterSemaphore& master;
+    const bool on_graphics_; ///< Copies ride the graphics queue, in order.
     vk::UniqueCommandPool command_pool;
     std::array<vk::CommandBuffer, NumSlots> cmdbufs{};
     std::array<u64, NumSlots> slot_ticks{}; ///< Tick each slot's last submit signals.

@@ -4,6 +4,7 @@
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include "common/assert.h"
 
@@ -89,8 +90,8 @@ bool MasterSemaphore::WaitFor(u64 tick, u64 timeout_ns) {
     return true;
 }
 
-TransferQueue::TransferQueue(const Instance& instance_, MasterSemaphore& master_)
-    : instance{instance_}, master{master_} {
+TransferQueue::TransferQueue(const Instance& instance_, MasterSemaphore& master_, bool on_graphics)
+    : instance{instance_}, master{master_}, on_graphics_{on_graphics} {
     const auto device = instance.GetDevice();
     const vk::StructureChain semaphore_chain = {
         vk::SemaphoreCreateInfo{},
@@ -106,7 +107,9 @@ TransferQueue::TransferQueue(const Instance& instance_, MasterSemaphore& master_
 
     const vk::CommandPoolCreateInfo pool_info = {
         .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-        .queueFamilyIndex = instance.GetTransferQueueFamilyIndex(),
+        // The pool's family has to match the queue the copies are submitted to.
+        .queueFamilyIndex = on_graphics_ ? instance.GetGraphicsQueueFamilyIndex()
+                                         : instance.GetTransferQueueFamilyIndex(),
     };
     auto [pool_result, pool] = device.createCommandPoolUnique(pool_info);
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create copy queue command pool: {}",
@@ -145,8 +148,28 @@ u64 TransferQueue::SubmitCopy(u64 wait_master_tick, vk::Buffer src, vk::Buffer d
     const auto begin_result = cmdbuf.begin(begin_info);
     ASSERT_MSG(begin_result == vk::Result::eSuccess,
                "Failed to begin copy queue command buffer: {}", vk::to_string(begin_result));
+    if (on_graphics_) {
+        // Belt and braces on the graphics route: the master wait is already a
+        // full memory dependency, this mirrors the in-batch fallback's barrier
+        // (buffer_cache.cpp PrepareFaultDownload). Drop it first if the
+        // graphics-ring copy costs more than its measured floor.
+        const vk::BufferMemoryBarrier2 pre_barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = src,
+            .offset = 0,
+            .size = vk::WholeSize,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &pre_barrier,
+        });
+    }
     // The master wait below is a full memory dependency for the writer's
-    // batch, so no barrier precedes the copy.
+    // batch, so no barrier precedes the copy on the transfer route.
     cmdbuf.copyBuffer(src, dst, copies);
     const auto end_result = cmdbuf.end();
     ASSERT_MSG(end_result == vk::Result::eSuccess, "Failed to end copy queue command buffer: {}",
@@ -172,7 +195,24 @@ u64 TransferQueue::SubmitCopy(u64 wait_master_tick, vk::Buffer src, vk::Buffer d
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &signal_sema,
     };
-    const auto submit_result = instance.GetTransferQueue().submit(submit_info);
+    // The graphics route is only legal because the caller guarantees
+    // `writer_tick < scheduler.CurrentTick()` (buffer_cache.cpp
+    // PrepareFaultDownload), i.e. the signalling batch is already submitted:
+    // on the in-order graphics ring a wait on a not-yet-submitted tick would
+    // hang the whole ring. Never relax that condition. The queue itself is
+    // externally synchronised and shared with the scheduler's batches (from
+    // both the GPU command thread and the presenter) and with present, so the
+    // submit takes the same static Scheduler::submit_mutex they do. Ordering
+    // is therefore: behind the writer batch and ahead of every batch the GPU
+    // thread records after the fault, but the presenter's next batch can slip
+    // in first if it wins the lock.
+    vk::Result submit_result;
+    if (on_graphics_) {
+        std::scoped_lock lk{Scheduler::submit_mutex};
+        submit_result = instance.GetGraphicsQueue().submit(submit_info);
+    } else {
+        submit_result = instance.GetTransferQueue().submit(submit_info);
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost,
                "Device lost during copy queue submit");
     slot_ticks[slot] = signal_value;

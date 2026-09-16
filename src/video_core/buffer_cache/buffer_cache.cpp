@@ -67,9 +67,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     readback_window_ = std::bit_floor(
         std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
-    if (readback_offload_ && instance.HasTransferQueue()) {
-        copy_queue_ =
-            std::make_unique<Vulkan::TransferQueue>(instance, *scheduler.GetMasterSemaphore());
+    // Latched once: the copy queue's pool family is fixed at construction.
+    const bool copy_gfx = EmulatorSettings.IsReadbackCopyGfxQueue();
+    if (readback_offload_ && (copy_gfx || instance.HasTransferQueue())) {
+        copy_queue_ = std::make_unique<Vulkan::TransferQueue>(
+            instance, *scheduler.GetMasterSemaphore(), copy_gfx);
     }
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
