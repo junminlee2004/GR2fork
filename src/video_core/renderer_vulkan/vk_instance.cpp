@@ -388,8 +388,7 @@ bool Instance::CreateDevice() {
         int best = -1;
         for (std::size_t i = 0; i < family_properties.size(); i++) {
             const auto flags = family_properties[i].queueFlags;
-            if (i == queue_family_index || !(flags & vk::QueueFlagBits::eTransfer) ||
-                (flags & vk::QueueFlagBits::eGraphics)) {
+            if (!(flags & vk::QueueFlagBits::eTransfer) || (flags & vk::QueueFlagBits::eGraphics)) {
                 continue;
             }
             const bool dedicated = !(flags & vk::QueueFlagBits::eCompute);
