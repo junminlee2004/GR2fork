@@ -840,6 +840,7 @@ struct GPUSettings {
     Setting<bool> fsr_enabled{false};
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
+    Setting<bool> userfaultfd{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -1031,9 +1032,9 @@ struct GPUSettings {
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
     desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
     draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release, \
-    image_fast_state, guest_copy_lock_batch
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache
 #define GPU_SETTINGS_JSON_FIELDS_C \
-    spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, pm4_backing_writes
+    cp_write_backing, runtime_info_stamp_gate, pm4_backing_writes, userfaultfd
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1425,6 +1426,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
+    SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

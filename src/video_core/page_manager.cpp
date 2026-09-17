@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/error.h"
 #include "common/range_lock.h"
 #include "common/signal_context.h"
 #include "core/address_space.h"
@@ -20,21 +21,17 @@
 #ifndef _WIN64
 #include <sys/mman.h>
 #include "common/adaptive_mutex.h"
-#ifdef ENABLE_USERFAULTFD
+#else
+#include <windows.h>
+#endif
+
+#ifdef __linux__
 #include <thread>
 #include <fcntl.h>
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
-#include "common/error.h"
-#endif
-#else
-#include <windows.h>
-#include "common/spin_lock.h"
-#endif
-
-#ifdef __linux__
-#include "common/adaptive_mutex.h"
+#include <sys/syscall.h>
 #else
 #include "common/spin_lock.h"
 #endif
@@ -93,140 +90,19 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
-#ifdef ENABLE_USERFAULTFD
-    Impl(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-        uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
-        ASSERT_MSG(uffd != -1, "{}", Common::GetLastErrorMsg());
 
-        // Request uffdio features from kernel.
-        uffdio_api api;
-        api.api = UFFD_API;
-        api.features = UFFD_FEATURE_THREAD_ID;
-        const int ret = ioctl(uffd, UFFDIO_API, &api);
-        ASSERT(ret == 0 && api.api == UFFD_API);
+    Impl() = default;
+    virtual ~Impl() = default;
 
-        // Create uffd handler thread
-        ufd_thread = std::jthread([&](std::stop_token token) { UffdHandler(token); });
-    }
-
-    void OnMap(VAddr address, size_t size) {
-        uffdio_register reg;
-        reg.range.start = address;
-        reg.range.len = size;
-        reg.mode = UFFDIO_REGISTER_MODE_WP;
-        const int ret = ioctl(uffd, UFFDIO_REGISTER, &reg);
-        ASSERT_MSG(ret != -1, "Uffdio register failed");
-    }
-
-    void OnUnmap(VAddr address, size_t size) {
-        uffdio_range range;
-        range.start = address;
-        range.len = size;
-        const int ret = ioctl(uffd, UFFDIO_UNREGISTER, &range);
-        ASSERT_MSG(ret != -1, "Uffdio unregister failed");
-    }
-
-    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
-        bool allow_write = True(perms & Core::MemoryPermission::Write);
-        // This path changes protection without going through AddressSpace, so
-        // it notifies the epoch observer itself.
-        Core::TrackerProtectScope tracker_scope;
-        Core::NotifyProtectObserver(address, size, allow_write);
-        uffdio_writeprotect wp;
-        wp.range.start = address;
-        wp.range.len = size;
-        wp.mode = allow_write ? 0 : UFFDIO_WRITEPROTECT_MODE_WP;
-        const int ret = ioctl(uffd, UFFDIO_WRITEPROTECT, &wp);
-        ASSERT_MSG(ret != -1, "Uffdio writeprotect failed with error: {}",
-                   Common::GetLastErrorMsg());
-    }
-
-    void UffdHandler(std::stop_token token) {
-        while (!token.stop_requested()) {
-            pollfd pollfd;
-            pollfd.fd = uffd;
-            pollfd.events = POLLIN;
-
-            // Block until the descriptor is ready for data reads.
-            const int pollres = poll(&pollfd, 1, -1);
-            switch (pollres) {
-            case -1:
-                perror("Poll userfaultfd");
-                continue;
-                break;
-            case 0:
-                continue;
-            case 1:
-                break;
-            default:
-                UNREACHABLE_MSG("Unexpected number of descriptors {} out of poll", pollres);
-            }
-
-            // We don't want an error condition to have occured.
-            ASSERT_MSG(!(pollfd.revents & POLLERR), "POLLERR on userfaultfd");
-
-            // We waited until there is data to read, we don't care about anything else.
-            if (!(pollfd.revents & POLLIN)) {
-                continue;
-            }
-
-            // Read message from kernel.
-            uffd_msg msg;
-            const int readret = read(uffd, &msg, sizeof(msg));
-            ASSERT_MSG(readret != -1 || errno == EAGAIN, "Unexpected result of uffd read");
-            if (errno == EAGAIN) {
-                continue;
-            }
-            ASSERT_MSG(readret == sizeof(msg), "Unexpected short read, exiting");
-            ASSERT(msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP);
-
-            // Notify rasterizer about the fault.
-            const VAddr addr = msg.arg.pagefault.address;
-            rasterizer->InvalidateMemory(addr, 1);
-        }
-    }
-
-    std::jthread ufd_thread;
-    int uffd;
-#else
-    Impl(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-
-        // Should be called first.
-        constexpr auto priority = std::numeric_limits<u32>::min();
-        Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
-                                                                  priority);
-    }
-
-    void OnMap(VAddr address, size_t size) {
+    virtual void OnMap(VAddr address, size_t size) {
         // No-op
     }
 
-    void OnUnmap(VAddr address, size_t size) {
+    virtual void OnUnmap(VAddr address, size_t size) {
         // No-op
     }
 
-    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
-        RENDERER_TRACE;
-        auto* memory = Core::Memory::Instance();
-        auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
-        Core::TrackerProtectScope tracker_scope;
-        impl.Protect(address, size, perms);
-    }
-
-    static bool GuestFaultSignalHandler(void* context, void* fault_address) {
-        const auto addr = reinterpret_cast<VAddr>(fault_address);
-        if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
-        } else {
-            return rasterizer->ReadMemory(addr, 8);
-        }
-        return false;
-    }
-#endif
+    virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
 
     template <bool track, bool is_read>
     u32 UpdatePageWatchers(VAddr addr, u64 size) {
@@ -495,8 +371,171 @@ struct PageManager::Impl {
     }
 };
 
-PageManager::PageManager(Vulkan::Rasterizer* rasterizer_)
-    : impl{std::make_unique<Impl>(rasterizer_)} {}
+#ifdef __linux__
+struct UffdImpl : public PageManager::Impl {
+private:
+    std::jthread ufd_thread;
+    int uffd;
+
+public:
+    UffdImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
+        rasterizer = rasterizer_;
+        uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        if (uffd == -1) {
+            LOG_ERROR(Common_Memory,
+                      "userfaultfd syscall failed: {}, falling back to signal implementation",
+                      Common::GetLastErrorMsg());
+            throw std::runtime_error("userfaultfd");
+        }
+
+        // Request uffdio features from kernel.
+        uffdio_api api;
+        api.api = UFFD_API;
+        api.features = UFFD_FEATURE_THREAD_ID;
+        const int ret = ioctl(uffd, UFFDIO_API, &api);
+        if (ret != 0) {
+            LOG_ERROR(Common_Memory,
+                      "uffdio_api call failed: {}, falling back to signal implementation",
+                      Common::GetLastErrorMsg());
+            throw std::runtime_error("uffdio_api");
+        }
+
+        // Create uffd handler thread
+        ufd_thread = std::jthread([&](std::stop_token token) { UffdHandler(token); });
+    }
+
+    ~UffdImpl() = default;
+
+    void OnMap(VAddr address, size_t size) override {
+        uffdio_register reg;
+        reg.range.start = address;
+        reg.range.len = size;
+        reg.mode = UFFDIO_REGISTER_MODE_WP;
+        const int ret = ioctl(uffd, UFFDIO_REGISTER, &reg);
+        ASSERT_MSG(ret != -1, "Uffdio register failed");
+    }
+
+    void OnUnmap(VAddr address, size_t size) override {
+        uffdio_range range;
+        range.start = address;
+        range.len = size;
+        const int ret = ioctl(uffd, UFFDIO_UNREGISTER, &range);
+        ASSERT_MSG(ret != -1, "Uffdio unregister failed");
+    }
+
+    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        bool allow_write = True(perms & Core::MemoryPermission::Write);
+        // This path changes protection without going through AddressSpace, so
+        // it notifies the epoch observer itself.
+        Core::TrackerProtectScope tracker_scope;
+        Core::NotifyProtectObserver(address, size, allow_write);
+        uffdio_writeprotect wp;
+        wp.range.start = address;
+        wp.range.len = size;
+        wp.mode = allow_write ? 0 : UFFDIO_WRITEPROTECT_MODE_WP;
+        const int ret = ioctl(uffd, UFFDIO_WRITEPROTECT, &wp);
+        ASSERT_MSG(ret != -1, "Uffdio writeprotect failed with error: {}",
+                   Common::GetLastErrorMsg());
+    }
+
+    void UffdHandler(std::stop_token token) {
+        while (!token.stop_requested()) {
+            pollfd pollfd;
+            pollfd.fd = uffd;
+            pollfd.events = POLLIN;
+
+            // Block until the descriptor is ready for data reads.
+            const int pollres = poll(&pollfd, 1, -1);
+            switch (pollres) {
+            case -1:
+                perror("Poll userfaultfd");
+                continue;
+                break;
+            case 0:
+                continue;
+            case 1:
+                break;
+            default:
+                UNREACHABLE_MSG("Unexpected number of descriptors {} out of poll", pollres);
+            }
+
+            // We don't want an error condition to have occured.
+            ASSERT_MSG(!(pollfd.revents & POLLERR), "POLLERR on userfaultfd");
+
+            // We waited until there is data to read, we don't care about anything else.
+            if (!(pollfd.revents & POLLIN)) {
+                continue;
+            }
+
+            // Read message from kernel.
+            uffd_msg msg;
+            const int readret = read(uffd, &msg, sizeof(msg));
+            ASSERT_MSG(readret != -1 || errno == EAGAIN, "Unexpected result of uffd read");
+            if (errno == EAGAIN) {
+                continue;
+            }
+            ASSERT_MSG(readret == sizeof(msg), "Unexpected short read, exiting");
+            ASSERT(msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP);
+
+            // Notify rasterizer about the fault.
+            const VAddr addr = msg.arg.pagefault.address;
+            rasterizer->InvalidateMemory(addr, 1);
+        }
+    }
+};
+#endif // __linux__
+
+struct SignalImpl : public PageManager::Impl {
+    SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
+        rasterizer = rasterizer_;
+
+        // Should be called first.
+        constexpr auto priority = std::numeric_limits<u32>::min();
+        Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
+                                                                  priority);
+    }
+
+    void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        RENDERER_TRACE;
+        auto* memory = Core::Memory::Instance();
+        auto& impl = memory->GetAddressSpace();
+        ASSERT_MSG(perms != Core::MemoryPermission::Write,
+                   "Attempted to protect region as write-only which is not a valid permission");
+        Core::TrackerProtectScope tracker_scope;
+        impl.Protect(address, size, perms);
+    }
+
+    static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        const auto addr = reinterpret_cast<VAddr>(fault_address);
+        if (Common::IsWriteError(context)) {
+            return rasterizer->InvalidateMemory(addr, 8);
+        } else {
+            return rasterizer->ReadMemory(addr, 8);
+        }
+        return false;
+    }
+};
+
+PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
+#ifdef __linux__
+    if (EmulatorSettings.IsUserfaultfdTracking()) {
+        // Write-protect faults only: the readback path needs the read faults the
+        // signal implementation delivers, so this fork keeps signals.
+        LOG_WARNING(Config, "userfaultfd tracking is not used: readbacks need read faults");
+    }
+    if (false) {
+        try {
+            impl = std::make_unique<UffdImpl>(rasterizer_);
+            LOG_INFO(Config, "Memory tracking method: userfaultfd");
+            return;
+        } catch (const std::runtime_error& e) {
+            // if uffd is unsupported, falls back to SignalImpl
+        }
+    }
+    LOG_INFO(Config, "Memory tracking method: signals");
+#endif
+    impl = std::make_unique<SignalImpl>(rasterizer_);
+}
 
 PageManager::~PageManager() = default;
 
