@@ -40,9 +40,8 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 
-// Dwords of the flat user-data window the gather-input memo records per stage. Programs with a
-// wider window never arm the memo (they are counted as GIMEMO big=), which caps the probe's cost
-// at one cache line pair until the logged dw= says what the real windows are.
+// Dwords of the flat user-data window the gather-input memo records per stage. A program whose
+// window is wider never arms the memo and is counted as GIMEMO big=.
 constexpr u32 kGatherMemoDw = 64;
 
 struct Program {
@@ -70,60 +69,39 @@ struct Program {
     tsl::robin_map<u64, size_t> perm_index_by_sig{};
 
     // ComputeSpecProxyFp -> perm_idx cache for draws where only resource addresses changed.
-    // base_address is masked and not a fingerprint input; the key only over-discriminates
-    // (GR2: 93.1% reclaim, 0 collisions over 12.2M samples). HS/DS excluded (their spec folds
-    // guest tess constants). Stores perm_idx and reads the module fresh on every hit, so the
-    // ReplaceShader in-place module swap needs no invalidation here.
+    // base_address is masked out of the fingerprint, so the key only over-discriminates. HS/DS are
+    // excluded (their spec folds guest tess constants). Stores perm_idx and reads the module fresh
+    // on every hit, so ReplaceShader's in-place module swap needs no invalidation here.
     struct SpecFpCacheEntry {
         u64 fp{};
         u32 perm_idx{};
-        bool valid{false};
     };
-    // Direct-mapped, indexed by spec_fp & (size-1). Measured reclaim knee on GR2: 64 slots ->
-    // 71%, 1024 -> 91.6%, 4096 -> 97.2% (residual ~2.8% is the cold tail, not conflicts); a
-    // smaller table only collides fingerprints without shrinking the touched-line working set
-    // (16 B/entry). Heap-backed and allocated on first probe so the disabled path keeps the
-    // current Program footprint.
-    // One-entry MRU in front of the fingerprint table: consecutive draws
-    // overwhelmingly repeat the fingerprint, and a hit here touches no extra
-    // cache line. Same validity contract as the table (fp match + index
-    // bound; modules are append-only, ReplaceShader swaps in place).
-    u64 mru_fp{};
-    u32 mru_perm_idx{};
-    // The MRU permutation's module, valid while mru_pipe_gen matches the
-    // lookup's pipe_gen (ReplaceShader swaps modules in place and bumps it).
-    vk::ShaderModule mru_module{};
-    u64 mru_pipe_gen{};
-    // Second entry under the canonical key: two specializations alternating
-    // draw by draw both stay line-hot instead of probing the fingerprint table.
-    u64 mru2_fp{};
-    u32 mru2_perm_idx{};
-    vk::ShaderModule mru2_module{};
-    u64 mru2_pipe_gen{};
+    // One-entry MRU (plus a second in mru2) in front of the fingerprint table. The carried
+    // module is valid only while pipe_gen matches the lookup's pipe_gen (ReplaceShader swaps
+    // modules in place and bumps it); perm_idx is re-checked against modules.size() at use.
+    struct MruEntry {
+        u64 fp{};
+        u32 perm_idx{};
+        vk::ShaderModule module{};
+        u64 pipe_gen{};
+    };
+    MruEntry mru{};
+    MruEntry mru2{};
     void DemoteMru() {
-        mru2_fp = mru_fp;
-        mru2_perm_idx = mru_perm_idx;
-        mru2_module = mru_module;
-        mru2_pipe_gen = mru_pipe_gen;
+        mru2 = mru;
     }
     void SwapMru() {
-        std::swap(mru_fp, mru2_fp);
-        std::swap(mru_perm_idx, mru2_perm_idx);
-        std::swap(mru_module, mru2_module);
-        std::swap(mru_pipe_gen, mru2_pipe_gen);
+        std::swap(mru, mru2);
     }
-    // Bit i set = modules[i].spec.fetch_shader_data is engaged. Read by
-    // FetchShaderRef::operator bool so the per-stage probe stops striding into
-    // the 1520-byte Module array for one engaged byte. ASSIGNED, never OR-ed:
-    // InsertPermut's resize default-constructs gap Modules with disengaged
-    // fetch data, and a twice-written slot must not keep a stale set bit.
+    // Bit i set = modules[i].spec.fetch_shader_data is engaged. ASSIGNED, never OR-ed:
+    // InsertPermut's resize leaves gap Modules disengaged and a rewritten slot must not keep a
+    // stale bit.
     u64 fetch_mask{};
+    // Direct-mapped, indexed by spec_fp & (kSpecFpCacheSize - 1), 16 B/entry. Heap-backed and
+    // allocated on first probe so the disabled path keeps the current Program footprint.
     static constexpr size_t kSpecFpCacheSize = 4096;
     std::unique_ptr<std::array<SpecFpCacheEntry, kSpecFpCacheSize>> spec_fp_lru{};
-    // Associative front over the fingerprint table: a program that cycles
-    // through more specializations per frame than the MRU pair holds keeps
-    // them here with the module carried, so a hit touches neither the 64 KB
-    // table nor the 1520-byte-strided Module. fp 0 marks an empty entry; the
+    // Associative front over the fingerprint table, modules carried. fp 0 marks an empty entry;
     // modules are valid while pipe_gen matches the lookup's, as for mru_module.
     static constexpr u32 kSpecFpFront = 16;
     struct alignas(64) SpecFpFront {
@@ -150,15 +128,9 @@ struct Program {
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
-        // Only keep the first index for a given sig; multiple permutation indices may map to
-        // the same specialization (safe to reuse the same module). sig == 0 means the
-        // signature was never computed (spec_fp_cache off), so the map stays empty.
         const u64 sig = spec.sig;
         modules.emplace_back(module, std::move(spec));
-        SetFetchBit(modules.size() - 1);
-        if (sig != 0) {
-            perm_index_by_sig.try_emplace(sig, modules.size() - 1);
-        }
+        NotePermut(modules.size() - 1, sig);
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
@@ -166,17 +138,20 @@ struct Program {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         const u64 sig = spec.sig;
         modules[perm_idx] = {module, std::move(spec)};
-        SetFetchBit(perm_idx);
-        if (sig != 0) {
-            perm_index_by_sig.try_emplace(sig, perm_idx);
-        }
+        NotePermut(perm_idx, sig);
     }
 
-    void SetFetchBit(size_t perm_idx) {
+    // Only the first index for a given sig is kept: several indices may map to one specialization,
+    // so reusing its module is safe. sig == 0 means the signature was never computed
+    // (spec_fp_cache off).
+    void NotePermut(size_t perm_idx, u64 sig) {
         if (perm_idx < 64) {
             const u64 bit = u64{1} << perm_idx;
             fetch_mask = modules[perm_idx].spec.fetch_shader_data.has_value() ? fetch_mask | bit
                                                                               : fetch_mask & ~bit;
+        }
+        if (sig != 0) {
+            perm_index_by_sig.try_emplace(sig, perm_idx);
         }
     }
 };
@@ -192,8 +167,7 @@ struct FetchShaderRef {
     }
 
     explicit operator bool() const {
-        // The mask read replaces a 1520-byte-strided probe into the Module
-        // array; indices past the mask width fall back to the direct check.
+        // Indices past the mask width fall back to the direct check.
         return program != nullptr &&
                (perm_idx < 64 ? ((program->fetch_mask >> perm_idx) & 1) != 0 : Get().has_value());
     }
@@ -220,11 +194,6 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
-    /// The key refreshed by the latest GetGraphicsPipeline call.
-    const GraphicsPipelineKey& CurrentGraphicsKey() const noexcept {
-        return graphics_key;
-    }
-
     const ComputePipeline* GetComputePipeline();
 
     /// Resolves the stage's program and publishes its info and module into
@@ -246,34 +215,28 @@ public:
         return profile;
     }
 
-    /// Per-window telemetry for the stamp-keyed key reuse; silent when it is off.
-    void DumpKeyReuseStats();
-    /// Per-window telemetry for the program identity memo; silent while nothing ran.
-    void DumpProgramIdentityStats();
     /// Runs before every inline pipeline compile; the rasterizer drops its
     /// guest-copy hold there so a compile never holds the memory map open.
     void SetPreCompileHook(void (*hook)(void*), void* user) {
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
     }
-    /// Per-window telemetry for the static color write mask: pipeline counts and skipped emits.
+
+    /// Per-300-frame telemetry drains, called once per window from the rasterizer.
+    void DumpKeyReuseStats();
+    void DumpProgramIdentityStats();
     void DumpColorMaskStats(u64 emit_skips);
-    /// Per-window telemetry for the runtime-info input memo; silent when it is off.
     void DumpRuntimeInfoMemoStats();
-    /// Shared layout count against the pipeline count; silent when sharing is off.
     void DumpLayoutStats();
     /// Pipelines whose set 0 takes the descriptor heap leg, against the pipeline count.
     void DumpHeapPipelineStats();
-    /// Per-window telemetry for the heap descriptor set ring; silent when recycling is off.
     void DumpDescHeapStats();
-    /// Per-window telemetry for the canonical specialization key; silent when it is off.
     void DumpSpecFpStats();
-    /// Per-window telemetry for the descriptors' in-place read verdicts.
     void DumpSharpReadStats();
 
 private:
     bool RefreshGraphicsKey();
-    bool RefreshGraphicsStages();
+    bool RefreshGraphicsStages(bool track_hash_diff);
     bool ReuseGraphicsKey(u64 pipe_gen);
     bool RefreshComputeKey();
 
@@ -326,9 +289,8 @@ private:
     // built at. While it repeats, every register-derived field of that key
     // still holds and only the stage resolve reruns (ReuseGraphicsKey).
     u64 last_key_stamp{};
-    bool key_is_last{};     // graphics_key is byte-equal to last_graphics_key
-    u64 stage_hash_diff{};  // OR of (old ^ new) over every stage hash an armed resolve rewrites
-    bool hash_diff_armed{}; // set by the stamp-keyed reuse around its stage resolve
+    bool key_is_last{};    // graphics_key is byte-equal to last_graphics_key
+    u64 stage_hash_diff{}; // OR of (old ^ new) over every stage hash an armed resolve rewrites
     bool key_reuse_hash_diff{};
     u64 key_reuse_diff_decisions{};
     u64 nonfull_mask_pipelines{};
@@ -393,6 +355,8 @@ private:
     SHAD_NO_INLINE u32 SnapshotRuntimeInputs(Shader::HwStage stage, u32* __restrict out,
                                              const u32* __restrict cmp, u64* diff) const;
     bool MemoRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage, RuntimeInfoStamp& slot);
+    SHAD_NO_INLINE void ValidateRuntimeInfoMemo(Shader::HwStage stage, Shader::SwStage l_stage,
+                                                RuntimeInputMemo& e, RuntimeInfoStamp& slot);
     // Per logical stage: the last resolved program. Programs are added to
     // program_cache and never removed or re-seated (unique_ptr values survive
     // rehash), so a remembered (hash, Program*) pair is exactly what
@@ -423,8 +387,7 @@ private:
     SHAD_NO_INLINE u64 ResolvePermutationSlow(Shader::HwStage stage, Shader::SwStage l_stage,
                                               const Shader::ShaderParams& params,
                                               Shader::Backend::Bindings& binding, u32 out_slot,
-                                              Program* program, u64 spec_fp, bool spec_fp_eligible,
-                                              size_t key_len);
+                                              Program* program, u64 spec_fp, size_t key_len);
     bool shader_params_memo{};
     // Direct-mapped table behind stage_identity, indexed by the code address:
     // a program a stage returns to resolves from it, validated by the search's
@@ -489,7 +452,7 @@ private:
     bool spec_fp_front{};
     bool spec_key_align{};
     bool slot_prefetch{};
-    bool spec_key_fused{};
+    bool spec_key_fused{}; // set only under spec_fp_canonical == 2
     bool gather_input_memo{};
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
@@ -524,6 +487,7 @@ private:
     void NoteSharpVerdicts(const Shader::Info& info);
     void ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
                          const Shader::RuntimeInfo& runtime_info, Shader::Backend::Bindings start);
+    SHAD_NO_INLINE void NoteFusedDiff(const u8* before, const u8* after, size_t key_len, u64 diff);
     // Cached value of the spec_fp_cache setting, read once at construction (before WarmUp so
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
