@@ -437,8 +437,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
             const void* const dump_src = cblock.constants_heap.data() + dump_const->Offset();
-            if (!rasterizer || !rasterizer->TryCpWriteBacking(dump_const->Address<VAddr>(),
-                                                              dump_src, dump_const->Size())) {
+            if (!rasterizer ||
+                !rasterizer->TryCpWriteBacking(std::bit_cast<VAddr>(dump_const->Address<void*>()),
+                                               dump_src, dump_const->Size())) {
                 memcpy(dump_const->Address<void*>(), dump_src, dump_const->Size());
             }
             break;
@@ -1588,8 +1589,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                if (rasterizer && rasterizer->TryCpWriteBacking(write_data->Address<VAddr>(),
-                                                                write_data->data, data_size)) {
+                if (rasterizer && rasterizer->TryCpWriteBacking(
+                                      std::bit_cast<VAddr>(write_data->Address<void*>()),
+                                      write_data->data, data_size)) {
                     // Stored through the backing alias (cp_write_backing).
                 } else if (rasterizer) {
                     rasterizer->WriteGuestMemory(std::bit_cast<VAddr>(write_data->Address<void*>()),
