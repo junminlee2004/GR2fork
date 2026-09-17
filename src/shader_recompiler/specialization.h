@@ -93,8 +93,7 @@ struct StageSpecialization {
     boost::container::small_vector<FMaskSpecialization, 8> fmasks;
     boost::container::small_vector<SamplerSpecialization, 16> samplers;
     Backend::Bindings start{};
-    // 128-bit signature pair over the fields operator== consults; sig-equality with a sig2
-    // confirm replaces deep permutation compares on the resolve path. Computed only while the
+    // 128-bit signature pair over the fields operator== consults. Computed only while the
     // spec_fp_cache setting is on: sig == 0 doubles as the "never computed" sentinel, and such
     // specs never enter Program::perm_index_by_sig.
     u64 sig{};
@@ -221,9 +220,8 @@ struct StageSpecialization {
     }
 
     // Fills sig/sig2 from every field operator== consults (plus the program identity), so two
-    // specs with equal signatures are interchangeable up to a ~2^-128 collision. Called
-    // explicitly by the pipeline cache when the spec_fp_cache setting is on; never from
-    // construction, so the disabled path pays nothing.
+    // specs with equal signatures are interchangeable up to a ~2^-128 collision. Called explicitly
+    // by the pipeline cache while the spec_fp_cache setting is on.
     void ComputeSig() noexcept {
         u64 h1 = 1469598103934665603ULL;
         u64 h2 = 0x84222325cbf29ce4ULL;
@@ -232,28 +230,21 @@ struct StageSpecialization {
             h1 *= 1099511628211ULL;
             h2 ^= v + 0x9e3779b97f4a7c15ULL + (h2 << 6) + (h2 >> 2);
         };
-        auto mix_pod_bulk = [&](const void* p, size_t n) noexcept {
-            if (n == 0) {
-                return;
-            }
-            step(XXH3_64bits(p, n));
-        };
-        auto mix_pod_vec_fast = [&](const auto& vec) noexcept {
+        auto mix_pod_vec = [&](const auto& vec) noexcept {
             using T = typename std::decay_t<decltype(vec)>::value_type;
             static_assert(std::is_trivially_copyable_v<T>);
             step(static_cast<u64>(vec.size()));
             if (!vec.empty()) {
-                mix_pod_bulk(vec.data(), vec.size() * sizeof(T));
+                step(XXH3_64bits(vec.data(), vec.size() * sizeof(T)));
             }
         };
         step(static_cast<u64>(info ? info->pgm_hash : 0));
         step(static_cast<u64>(info ? static_cast<u32>(info->hw_stage) : 0));
         step(static_cast<u64>(info ? static_cast<u32>(info->sw_stage) : 0));
-        mix_pod_bulk(&runtime_info, sizeof(runtime_info));
-        mix_pod_bulk(&start, sizeof(start));
-        // The donor mirrors bitset into two u64 words at bind time; deriving them here hashes
-        // identical content while keeping the bitset the single source of truth (deserialized
-        // specs restore only the bitset).
+        step(XXH3_64bits(&runtime_info, sizeof(runtime_info)));
+        step(XXH3_64bits(&start, sizeof(start)));
+        // bitset is the single source of truth (Deserialize restores only it), so the two words
+        // are derived here rather than stored.
         static_assert(MaxStageResources == 128);
         step(((bitset << 64) >> 64).to_ullong());
         step((bitset >> 64).to_ullong());
@@ -277,11 +268,11 @@ struct StageSpecialization {
                 step(static_cast<u64>(a.data_format) | (static_cast<u64>(a.num_format) << 8));
             }
         }
-        mix_pod_vec_fast(vs_attribs);
-        mix_pod_vec_fast(buffers);
-        mix_pod_vec_fast(images);
-        mix_pod_vec_fast(fmasks);
-        mix_pod_vec_fast(samplers);
+        mix_pod_vec(vs_attribs);
+        mix_pod_vec(buffers);
+        mix_pod_vec(images);
+        mix_pod_vec(fmasks);
+        mix_pod_vec(samplers);
         sig = h1;
         sig2 = h2;
     }
