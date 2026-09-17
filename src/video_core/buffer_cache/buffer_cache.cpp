@@ -650,9 +650,10 @@ void EmitUnownedPieces(VAddr start, VAddr end, std::span<const std::pair<VAddr, 
 // never grows beyond the union of the islands.
 class PendingUnmark {
 public:
-    /// defer is only legal when the caller drains before it returns.
-    explicit PendingUnmark(MemoryTracker& tracker_, bool defer_ = false)
-        : tracker{tracker_}, defer{defer_} {}
+    /// defer is only legal when the caller drains before it returns. carry is
+    /// only legal on the GPU command thread (protect_carry_merge lock order).
+    explicit PendingUnmark(MemoryTracker& tracker_, bool defer_ = false, bool carry_ = false)
+        : tracker{tracker_}, defer{defer_}, carry{carry_} {}
 
     void Add(VAddr addr, u64 size) {
         const bool adjacent = end != start && addr >= end &&
@@ -667,6 +668,11 @@ public:
 
     void Flush() {
         if (end != start) {
+            // The span is one contiguous run; when it crosses a region boundary
+            // the two halves are released with one call instead of two. The
+            // scope covers nothing but the region walk, so no tracker or memory
+            // manager lock is ever requested with a page-manager lock held.
+            const VideoCore::ProtectCarryScope scope{tracker.GetPageManager(), carry};
             if (defer) {
                 tracker.UnmarkRegionAsGpuModifiedDeferred(start, end - start);
             } else {
@@ -680,6 +686,7 @@ public:
 private:
     MemoryTracker& tracker;
     bool defer = false;
+    bool carry = false;
     VAddr start = 0;
     VAddr end = 0;
 };
@@ -1184,7 +1191,8 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     // the CPU mark: dropping a write watcher on a page whose release is still
     // pending would ask for a write-only mapping, and the mark's own guard
     // would otherwise have to flush the whole region from this thread.
-    DrainPendingReadReleases();
+    // GPU command thread (SendCommand<true>), so the release loop may carry.
+    DrainPendingReadReleases(true);
     // Same write-only-protection hazard as the empty path in Prepare: the mark
     // is only legal once the faulted range's GPU bits are clear. When a veto
     // kept them set, the caller's retry loop resolves the fault instead.
@@ -1205,7 +1213,9 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
 bool BufferCache::FinishIslands(std::span<const vk::BufferCopy> copies,
                                 const MemoryTracker::GpuSeqSnapshots& snapshots, VAddr buffer_base,
                                 const u8* download, bool copied) {
-    PendingUnmark pending{*memory_tracker, defer_read_release_};
+    // Carry: every caller runs on the GPU command thread, the only thread on
+    // which a protect carry is legal.
+    PendingUnmark pending{*memory_tracker, defer_read_release_, true};
     bool vetoed_any = false;
     for (const auto& copy : copies) {
         const VAddr copy_device_addr = buffer_base + copy.srcOffset;
@@ -1269,7 +1279,8 @@ void BufferCache::DrainPendingFinish() {
             offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    DrainPendingReadReleases();
+    // GPU command thread only (every drain site), so the release loop may carry.
+    DrainPendingReadReleases(true);
     finsplit_rest_islands_ += islands;
     finsplit_rest_ns_ += Common::FencedRDTSC() - t0;
     // Pages a damping waiter may still be blocked on were cleared above.

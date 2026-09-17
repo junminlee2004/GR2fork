@@ -108,7 +108,11 @@ public:
     /// Arms every read watcher a written bind left pending. GPU command thread.
     void DrainPendingReadArms(VideoCore::ReadArmSite site) {
         if (deferred_read_arm_) {
-            buffer_cache.DrainPendingReadArms(site);
+            // Every drain site but Submit is reached from the command processor.
+            // The submit hook also fires from Scheduler::Flush, which a guest
+            // thread can reach through Rasterizer::ReadMemory when the download
+            // is not offloaded, so that one never carries.
+            buffer_cache.DrainPendingReadArms(site, site != VideoCore::ReadArmSite::Submit);
         }
     }
     static void PreSubmitThunk(void* self) {
@@ -383,6 +387,8 @@ private:
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
     bool deferred_read_arm_{};
+    // Gates the PCARRY telemetry line only; the behaviour is latched in PageManager.
+    bool protect_carry_merge_{};
     bool deferred_read_release_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.

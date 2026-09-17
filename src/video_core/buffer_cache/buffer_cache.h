@@ -632,25 +632,25 @@ public:
         return out;
     }
     /// Arms every read watcher left pending since the last drain.
-    void DrainPendingReadArms(ReadArmSite site) {
+    void DrainPendingReadArms(ReadArmSite site, bool carry) {
         // finish_release_faulted_first: the islands FinishFaultDownload parked
         // when it released the faulting thread are settled here. Every caller
         // of this function is the GPU command thread, which owns that state.
         if (!pending_finish_.empty()) {
             DrainPendingFinish();
         }
-        const auto d = memory_tracker->ArmPendingReadWatchers();
+        const auto d = memory_tracker->ArmPendingReadWatchers(carry);
         ++rarm_drains_[static_cast<size_t>(site)];
         rarm_regions_ += d.regions;
         rarm_pages_ += d.pages;
         rarm_calls_ += d.calls;
     }
     /// Releases every read watcher a finished download left pending.
-    void DrainPendingReadReleases() {
+    void DrainPendingReadReleases(bool carry) {
         if (!memory_tracker->HasPendingReadReleases()) {
             return;
         }
-        const auto d = memory_tracker->ReleasePendingReadWatchers();
+        const auto d = memory_tracker->ReleasePendingReadWatchers(carry);
         ++rrel_drains_;
         rrel_regions_ += d.regions;
         rrel_pages_ += d.pages;
@@ -703,7 +703,8 @@ public:
         // That unmark defers its own release under deferred_read_release, and a
         // release left pending here would protect memory the guest has already
         // given back. Settle every pending region while the range is mapped.
-        DrainPendingReadReleases();
+        // This is the guest unmap thread, so no protect carry.
+        DrainPendingReadReleases(false);
     }
     struct ReadArmStats {
         std::array<u64, static_cast<size_t>(ReadArmSite::Count)> drains;

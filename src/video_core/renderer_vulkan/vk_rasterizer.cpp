@@ -125,6 +125,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
+    protect_carry_merge_ = EmulatorSettings.IsProtectCarryMerge();
     deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
     deferred_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     if (deferred_read_arm_) {
@@ -1533,6 +1534,16 @@ void Rasterizer::OnSubmit() {
                          "regions={} drained={} per300f",
                          rr.census_batches, rr.census_calls, rr.census_runs, rr.census_pages,
                          rr.drains, rr.regions, rr.calls);
+            }
+            if (protect_carry_merge_) {
+                // merged = cross-region pairs collapsed into one mprotect;
+                // flushed = carries no run absorbed, so the real syscall count
+                // of the read paths is RARM/RREL calls + flushed.
+                if (const auto pc = page_manager.DrainProtectCarryStats(); pc.scopes != 0) {
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] PCARRY scopes={} merged={} flushed={} per300f", pc.scopes,
+                             pc.merged, pc.flushed);
+                }
             }
             if (const auto tf = buffer_cache.DrainTrackerFastStats();
                 tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {

@@ -33,6 +33,12 @@ public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
+    /// For GPU-command-thread callers that open a protect-carry scope around a
+    /// loop of their own; see PageManager::BeginProtectCarry.
+    [[nodiscard]] const PageManager& GetPageManager() const noexcept {
+        return *tracker;
+    }
+
     /// Latched once before any region exists; new regions inherit it.
     void SetDeferReadArm(bool value) {
         defer_read_arm_ = value;
@@ -64,11 +70,20 @@ public:
     /// Releases the read watchers every unmark since the last drain left
     /// pending, coalescing a download's islands into one masked update per
     /// region. GPU command thread only, same constraint as the arm drain.
-    ReadReleaseDrain ReleasePendingReadWatchers() {
+    /// carry: the caller certifies it is the GPU command thread (see
+    /// PageManager::BeginProtectCarry); every other caller must pass false.
+    ReadReleaseDrain ReleasePendingReadWatchers(bool carry) {
         ReadReleaseDrain out{};
         if (upload_walk_depth_ != 0) {
             return out;
         }
+        // Ascending regions, so a run that ends on a region boundary can be
+        // carried into the next call and issued as one protection change.
+        if (pending_read_releases_.size() > 1) {
+            std::ranges::sort(pending_read_releases_, {},
+                              [](const RegionManager* m) { return m->GetCpuAddr(); });
+        }
+        const ProtectCarryScope scope{*tracker, carry};
         for (RegionManager* manager : pending_read_releases_) {
             std::scoped_lock lk{manager->lock};
             out.calls += manager->ReleaseReadWatchers(out.pages);
@@ -104,11 +119,20 @@ public:
     /// Arms the read watchers every mark since the last drain left pending.
     /// GPU command thread only. A walk that holds region locks across its
     /// upload defers the drain to the next site rather than deadlocking.
-    ReadArmDrain ArmPendingReadWatchers() {
+    /// carry: the caller certifies it is the GPU command thread (see
+    /// PageManager::BeginProtectCarry); every other caller must pass false.
+    ReadArmDrain ArmPendingReadWatchers(bool carry) {
         ReadArmDrain out{};
         if (upload_walk_depth_ != 0) {
             return out;
         }
+        // Ascending regions, so a run that ends on a region boundary can be
+        // carried into the next call and issued as one protection change.
+        if (pending_read_arms_.size() > 1) {
+            std::ranges::sort(pending_read_arms_, {},
+                              [](const RegionManager* m) { return m->GetCpuAddr(); });
+        }
+        const ProtectCarryScope scope{*tracker, carry};
         for (RegionManager* manager : pending_read_arms_) {
             std::scoped_lock lk{manager->lock};
             out.calls += manager->ArmReadWatchers(out.pages);

@@ -497,6 +497,9 @@ struct GPUSettings {
     // rounded value (otherwise the interval always fires first).
     // 0 = off.
     Setting<u32> ring_drain_flush_draws{0};
+    // Merge the adjacent per-region read-watcher mprotect calls issued inside one
+    // GpuComm drain/release loop into a single cross-region call.
+    Setting<bool> protect_carry_merge{false};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -867,6 +870,7 @@ struct GPUSettings {
                                        &GPUSettings::tracker_lock_spin_rounds),
             make_override<GPUSettings>("ring_drain_flush_draws",
                                        &GPUSettings::ring_drain_flush_draws),
+            make_override<GPUSettings>("protect_carry_merge", &GPUSettings::protect_carry_merge),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -997,13 +1001,13 @@ struct GPUSettings {
     readback_offload, readback_copy_gfx_queue, gather_input_memo, stream_buffer_size_mb, \
     readback_batching_enabled, readback_offload, readback_copy_gfx_queue, \
     tracker_lock_spin_rounds, stream_buffer_size_mb, readback_batching_enabled, \
-    readback_offload, readback_copy_gfx_queue, ring_drain_flush_draws, \
-    stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
-    vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
-    rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache, pending_pop_throttle, \
-    fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
-    runtime_info_stamp_gate
+    readback_offload, readback_copy_gfx_queue, ring_drain_flush_draws, copy_gpu_buffers, \
+    readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, \
+    readback_copy_gfx_queue, protect_carry_merge, stream_buffer_prefer_host, \
+    direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, \
+    full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, \
+    rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode
 #define GPU_SETTINGS_JSON_FIELDS_B \
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
     bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, \
@@ -1020,11 +1024,14 @@ struct GPUSettings {
     rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, br_mem_fast_state, desc_heap_recycle, \
     push_desc_full_limit, readback_writeback_share, readback_writeback_helper, \
     finish_release_faulted_first, occlude_all, stream_copy_upload_drain, \
-    flush_draw_interval, pipeline_key_stamp_reuse, shader_params_memo
+    flush_draw_interval, pipeline_key_stamp_reuse, shader_params_memo, pending_pop_throttle, \
+    fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
+    runtime_info_stamp_gate
 #define GPU_SETTINGS_JSON_FIELDS_C \
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
     desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
-    draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release
+    draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release, \
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1314,6 +1321,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
+    SETTING_FORWARD_BOOL(m_gpu, ProtectCarryMerge, protect_carry_merge)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)

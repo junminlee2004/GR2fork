@@ -44,6 +44,29 @@ public:
     template <bool track, bool is_read = false>
     u32 UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
+    /// Opens a protect-carry scope on the calling thread (protect_carry_merge).
+    /// Inside one, a per-region watcher update whose last run ends exactly at
+    /// the region boundary keeps its region lock and defers its mprotect, so
+    /// the next region's leading run can be issued as one cross-region call.
+    /// ONLY legal on the GPU command thread, and only around loops that call
+    /// nothing but UpdatePageWatchersForRegion: see the lock-order note at the
+    /// carry site in page_manager.cpp. Callers certify that with an explicit
+    /// flag, and the named sites are Rasterizer::DrainPendingReadArms for every
+    /// ReadArmSite but Submit, plus BufferCache::FinishFaultDownload's
+    /// PendingUnmark and DrainPendingReadReleases; everything else, the
+    /// guest-thread DropPendingReadArms unmap route included, passes false.
+    /// BeginProtectCarry asserts that only one thread ever opens a scope.
+    /// Always paired through ProtectCarryScope.
+    void BeginProtectCarry() const;
+    void EndProtectCarry() const;
+
+    struct ProtectCarryStats {
+        u64 scopes;
+        u64 merged;
+        u64 flushed;
+    };
+    ProtectCarryStats DrainProtectCarryStats() const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);
@@ -57,6 +80,30 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+};
+
+/// RAII protect-carry scope. Never open one with two bare calls: the carry
+/// holds a page-manager lock, so any path that skipped the close would hang
+/// the next guest fault in that region.
+class ProtectCarryScope {
+public:
+    explicit ProtectCarryScope(const PageManager& pm_, bool enable_ = true)
+        : pm{pm_}, enable{enable_} {
+        if (enable) {
+            pm.BeginProtectCarry();
+        }
+    }
+    ~ProtectCarryScope() {
+        if (enable) {
+            pm.EndProtectCarry();
+        }
+    }
+    ProtectCarryScope(const ProtectCarryScope&) = delete;
+    ProtectCarryScope& operator=(const ProtectCarryScope&) = delete;
+
+private:
+    const PageManager& pm;
+    bool enable;
 };
 
 } // namespace VideoCore
