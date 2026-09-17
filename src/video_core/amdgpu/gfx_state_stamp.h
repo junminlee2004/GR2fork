@@ -19,17 +19,14 @@ namespace AmdGpu {
 // them. Any future cache reading an excluded word must extend coverage in the
 // same change.
 //
-// Dormant (active == false) the funnel degrades to a plain memcpy - zero
-// compares, zero bumps - so a disabled framework costs nothing here.
-//
-// Three lanes: value moves on any covered change; dyn_value moves only when a
-// changed block touches a word of dyn_mask, the read set of the dynamic-state
-// updaters in vk_rasterizer.cpp; rt_value moves only for a word of rt_mask,
-// the read set of the render-target memo and the render-scope cache. Every
-// bump site feeds all lanes; config register writes and the draw-packet
-// words carry no mask and move only the value lane. A mask is only as
-// complete as its read set: a consumer that starts reading a new register
-// extends its block table in liverpool.cpp.
+// Three lanes, all fed at every bump site: value moves on any covered change;
+// dyn_value only when a changed block touches a word of dyn_mask, the read set
+// of the dynamic-state updaters in vk_rasterizer.cpp; rt_value only for a word
+// of rt_mask, the read set of the render-target memo and the render-scope
+// cache. Writes below dyn_mask_base and the draw-packet words carry no mask
+// and move only the value lane. A mask is only as complete as its read set: a
+// consumer that starts reading a new register extends its block table in
+// liverpool.cpp.
 struct GfxStateStamp {
     u64 value{1};
     u64 dyn_value{1};
@@ -126,7 +123,8 @@ struct GfxStateStamp {
                     std::memcpy(d + i, c + i, 8);
                 }
             }
-            for (; i < bytes; i += 4) {
+            // bytes is a multiple of 4, so at most one 4-byte tail remains.
+            if (i < bytes) {
                 u32 a, b;
                 std::memcpy(&a, d + i, 4);
                 std::memcpy(&b, c + i, 4);
