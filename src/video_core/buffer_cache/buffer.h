@@ -139,10 +139,7 @@ public:
         return buffer.bda_addr;
     }
 
-    // The access bits that only read. Everything else (ShaderWrite,
-    // TransferWrite, MemoryWrite and the write-bearing initial state) is a
-    // write for the purposes of the merge below, so the enumeration is
-    // positive and a new bit is a write until it is listed here.
+    // Positive list: an access bit not listed here counts as a write.
     static constexpr vk::AccessFlags2 kReadOnlyAccess =
         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eIndirectCommandRead |
@@ -153,11 +150,10 @@ public:
         return !!mask && !(mask & ~kReadOnlyAccess);
     }
 
-    // The read accesses whose cache invalidation a barrier with `mask` as its
-    // destination already performed on RADV: a shader read flushes the vector
-    // and scalar caches and so covers a later vertex or index fetch too; a
-    // vertex or index fetch flushes only the vector cache and covers only its
-    // own kind. Indirect and transfer reads are never covered.
+    // Reads whose cache invalidation a barrier with `mask` as its destination
+    // already performed on RADV: a shader read flushes the vector and scalar
+    // caches and so covers a later vertex or index fetch; a fetch flushes only
+    // the vector cache and covers only fetches. Indirect/transfer never.
     static constexpr vk::AccessFlags2 kShaderReads = vk::AccessFlagBits2::eShaderRead |
                                                      vk::AccessFlagBits2::eUniformRead |
                                                      vk::AccessFlagBits2::eMemoryRead;
@@ -179,21 +175,18 @@ public:
         }
 
         // buffer_barrier_read_merge: Vulkan defines no read-after-read hazard,
-        // so a read-only -> read-only transition needs no barrier at all. The
-        // readers are accumulated instead, which makes the next write
-        // transition source the union of every reader since the last write --
-        // a superset of what the single tracked reader gives today.
-        // Only a reader whose caches the last barrier already invalidated merges
-        // (CoveredReads): a new read type outside that set still gets its own
-        // barrier.
-        if (barrier_read_merge && IsReadOnlyAccess(access_mask) &&
-            IsReadOnlyAccess(dst_acess_mask) && !(dst_acess_mask & ~CoveredReads(access_mask))) {
-            access_mask |= dst_acess_mask;
-            stage |= dst_stage;
-            barrier_rr_merged.fetch_add(1, std::memory_order_relaxed);
-            return {};
-        }
+        // so readers are accumulated instead of barriered and the next write
+        // transition sources their union -- a superset of the single tracked
+        // reader. Only a reader the last barrier already invalidated
+        // (CoveredReads) merges; a new read type outside that set gets its own.
         if (barrier_read_merge) {
+            if (IsReadOnlyAccess(access_mask) && IsReadOnlyAccess(dst_acess_mask) &&
+                !(dst_acess_mask & ~CoveredReads(access_mask))) {
+                access_mask |= dst_acess_mask;
+                stage |= dst_stage;
+                barrier_rr_merged.fetch_add(1, std::memory_order_relaxed);
+                return {};
+            }
             barrier_emitted.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -231,11 +224,8 @@ public:
     // the last readback copy that read it, which deletion waits out.
     u64 gpu_write_tick = 0;
     u64 copy_queue_read_tick = 0;
-    // readback_offload: the buffer cache's garbage collector period of the
-    // last fault download of this buffer, 0 for never. Its later GPU writes
-    // are what a guest read will wait for, but only while the reads keep
-    // coming: a buffer read back once at a load should not have every write
-    // run it takes for the rest of the session submitted early.
+    // readback_offload: gc period of the last fault download, 0 = never; only
+    // writes within kProneWindow gc periods of it submit early.
     u64 readback_prone_tick = 0;
     std::span<u8> mapped_data;
     const Vulkan::Instance* instance;
@@ -249,9 +239,8 @@ public:
     // stages that have read since the last write transition. Same 8 bytes.
     vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eAllCommands};
     // buffer_barrier_read_merge: latched once by the BufferCache constructor,
-    // before any command recording. The counters it gates are process-global
-    // (texture_cache's RefreshImage GetBarrier site was not traced to a single
-    // thread), so they are relaxed atomics; off, none of them is touched.
+    // before any command recording. The counters it gates are written from
+    // more than one thread, hence relaxed atomics; off, none is touched.
     static inline bool barrier_read_merge{false};
     static inline std::atomic<u64> barrier_rr_merged{};
     static inline std::atomic<u64> barrier_emitted{};
@@ -278,6 +267,37 @@ public:
 // of the object as entries are added.
 static_assert(offsetof(Buffer, sync_noop) > offsetof(Buffer, stage));
 
+// Guest lines are cold (written on other cores, read once here) and prefetch
+// never faults, so protected or unmapped pages in sparse ranges are safe;
+// issuing it before the ring bookkeeping and address resolution is deliberate,
+// to overlap the latency.
+inline void PrefetchGuestSource(VAddr device_addr, u64 size) {
+    constexpr u64 prefetch_bytes = 1024;
+    for (u64 i = 0; i < std::min<u64>(size, prefetch_bytes); i += 64) {
+        __builtin_prefetch(reinterpret_cast<const void*>(device_addr + i), 0, 3);
+    }
+}
+
+// Queues each backing span on the lane, falling back to an inline copy from the
+// first span the ring refuses; dst advances span by span.
+SHAD_FORCE_INLINE void PushBackingSpans(StreamCopyLane& lane,
+                                        const Core::MemoryManager::BackingSpan* spans,
+                                        u32 num_spans, u8* dst, bool hardened) {
+    bool queued = true;
+    for (u32 i = 0; i < num_spans; ++i) {
+        if (queued) {
+            queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
+        }
+        if (!queued) {
+            std::memcpy(dst, spans[i].ptr, spans[i].size);
+        }
+        dst += spans[i].size;
+    }
+    if (hardened) {
+        Core::MemoryManager::EndBackingPush();
+    }
+}
+
 class StreamBuffer : public Buffer {
 public:
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -286,9 +306,8 @@ public:
     /// Reserves a region of memory from the stream buffer.
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 
-    /// Ring statistics: wraps and nanoseconds spent blocked waiting for the GPU
-    /// to drain the previous lap, plus bytes handed out. Reported per window by
-    /// the skip cache framework; zero cost when it is inactive.
+    /// Ring statistics reported per window by the skip cache framework;
+    /// blocked_ns is time spent waiting for the GPU to drain the previous lap.
     struct RingStats {
         u64 wraps{};
         u64 blocked_ns{};
@@ -302,10 +321,8 @@ public:
         return ring_stats_;
     }
 
-    /// Ensures that reserved bytes of memory are available to the GPU. The
-    /// header fast path collapses a coherent same-tick commit into the last
-    /// watch without the call or the flush branch - identical to the slow
-    /// path's own first branch.
+    /// Ensures reserved bytes are available to the GPU. The inline arm is
+    /// CommitSlow's own same-tick collapse, kept inline for the per-bind path.
     void Commit() {
         if (is_coherent && current_watch_cursor != 0) {
             auto& last = current_watches[current_watch_cursor - 1];
@@ -322,13 +339,12 @@ public:
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
-        // Deferred drain lane: large-enough guest-addressed sources are copied
-        // by worker threads reading the physical backing view (never
-        // protected, so a worker cannot fault). Host-pointer sources are
-        // stack- or heap-locals whose lifetime ends with the caller and must
-        // stay inline. The 64-byte alignment keeps a job's write-combining
-        // lines private to one core; padding costs are absorbed by the ring.
-        if (auto& lane = StreamCopyLane::Instance(); lane.Enabled() && size >= 192) {
+        // Deferred drain lane: large guest-addressed sources are copied by
+        // workers reading the never-protected physical backing view, so a
+        // worker cannot fault; host-pointer sources die with the caller and
+        // must stay inline. 64-byte alignment keeps a job's lines to one core.
+        if (auto& lane = StreamCopyLane::Instance();
+            lane.Enabled() && size >= StreamCopyLane::kMinLaneBytes) {
             auto* memory = Core::Memory::Instance();
             if (memory->IsValidMapping(src_vaddr)) {
                 Core::MemoryManager::BackingSpan spans[2];
@@ -337,35 +353,14 @@ public:
                     memory->ResolveBackingSpans(src_vaddr, size, spans, 2, hardened);
                 if (num_spans != 0) {
                     const auto [data, offset] = Map(size, alignment < 64 ? 64 : alignment);
-                    u8* dst = data;
-                    bool queued = true;
-                    for (u32 i = 0; i < num_spans; ++i) {
-                        if (queued) {
-                            queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
-                        }
-                        if (!queued) {
-                            std::memcpy(dst, spans[i].ptr, spans[i].size);
-                        }
-                        dst += spans[i].size;
-                    }
-                    if (hardened) {
-                        Core::MemoryManager::EndBackingPush();
-                    }
+                    PushBackingSpans(lane, spans, num_spans, data, hardened);
                     Commit();
                     return offset;
                 }
                 lane.NoteInlineUnresolved();
             }
         }
-        // Guest sources are written by game threads on other cores and read
-        // exactly once here, so their lines are cold. Requesting them before
-        // the ring bookkeeping and address resolution overlaps the memory
-        // latency with that work. Prefetch never faults, so protected or
-        // unmapped pages in sparse ranges are safe to request.
-        constexpr size_t prefetch_bytes = 1024;
-        for (size_t i = 0; i < std::min<size_t>(size, prefetch_bytes); i += 64) {
-            __builtin_prefetch(reinterpret_cast<const void*>(src_vaddr + i), 0, 3);
-        }
+        PrefetchGuestSource(src_vaddr, size);
         const auto [data, offset] = Map(size, alignment);
         auto* memory = Core::Memory::Instance();
         if (memory->IsValidMapping(src_vaddr)) {
@@ -390,7 +385,7 @@ private:
     /// and arms the watch drain for the previous lap.
     SHAD_NO_INLINE void MapWrap();
 
-    /// Waits pending watches until requested upper bound.
+    /// Waits pending watches until requested upper bound; invalidation_mark must be engaged.
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
 
 private:

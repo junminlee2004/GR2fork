@@ -4,35 +4,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include "common/arch.h"
-#if defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(ARCH_X86_64)
-#include <emmintrin.h>
-#endif
 #if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
 #include <cpuid.h>
 #define SHAD_COPY_LANE_MWAITX 1
 #endif
+#include "common/cpu_pause.h"
 #include "common/thread.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
 
 namespace VideoCore {
 
 namespace {
-
-// The spin hint each target actually has, in the ladder common/spin_lock.cpp
-// already ships. The lane spins on three paths and MWAITX covers none of them
-// off x86.
-void CpuPause() {
-#if defined(ARCH_X86_64)
-    _mm_pause();
-#elif defined(ARCH_ARM64) && defined(_MSC_VER)
-    __yield();
-#elif defined(ARCH_ARM64)
-    asm("yield");
-#endif
-}
 
 bool CpuHasMwaitx() {
 #ifdef SHAD_COPY_LANE_MWAITX
@@ -56,7 +38,7 @@ void MonitorWait(const void* line, u32 ticks) {
 #else
     (void)line;
     (void)ticks;
-    CpuPause();
+    Common::CpuPause();
 #endif
 }
 
@@ -71,8 +53,6 @@ void StreamCopyLane::Init(u32 num_workers, bool hardened, u32 idle_ticks) {
     if (num_workers == 0 || !threads_.empty()) {
         return;
     }
-    // Public entry point: clamp here rather than trust the caller, because the
-    // rank indexes a fixed-size cell array.
     num_workers = std::min<u32>(num_workers, kMaxWorkers);
     hardened_ = hardened;
     idle_ticks_ = CpuHasMwaitx() ? idle_ticks : 0;
@@ -103,9 +83,8 @@ void StreamCopyLane::Shutdown() {
     }
     threads_.clear();
     slots_.reset();
-    // The cells, published_ and dequeue_pos_ are cumulative for the object's
-    // life and must be reset together or not at all: zeroing only the cells
-    // would leave the next DrainProducer waiting on a carried-over target.
+    // Cumulative for the object's life: reset together or not at all, or the
+    // next DrainProducer waits on a carried-over target.
 }
 
 bool StreamCopyLane::Push(const u8* src, u8* dst, u32 size) {
@@ -168,16 +147,6 @@ bool StreamCopyLane::ClaimAndCopy() {
     return true;
 }
 
-bool StreamCopyLane::TryDrainShared() {
-    if (!ClaimAndCopy()) {
-        return false;
-    }
-    // Unconditional, in both lane modes: guest fault threads reach the drains
-    // through Buffer::Copy -> Map -> MapWrap, so this is not the worker path.
-    cells_[kHelperCell].done.fetch_add(1, std::memory_order_release);
-    return true;
-}
-
 u64 StreamCopyLane::Completed() const {
     u64 total = 0;
     for (const Cell& cell : cells_) {
@@ -224,7 +193,7 @@ void StreamCopyLane::WorkerLoop(u32 rank) {
                 continue;
             }
             for (int i = 0; i < 64; ++i) {
-                CpuPause();
+                Common::CpuPause();
             }
             continue;
         }
@@ -253,24 +222,25 @@ void StreamCopyLane::DrainProducer() {
         return;
     }
     u64 done = Completed();
-    if (done >= target) {
-        completed_seen_.store(done, std::memory_order_relaxed);
-        return;
-    }
-    ++barriers_;
-    const auto t0 = std::chrono::steady_clock::now();
-    while (done < target) {
-        // Help instead of stalling: the producer drains jobs itself, so a
-        // descheduled worker can never wedge a submit.
-        if (!TryDrainShared()) {
-            CpuPause();
-        }
-        done = Completed();
+    if (done < target) {
+        ++barriers_;
+        const auto t0 = std::chrono::steady_clock::now();
+        do {
+            // Help instead of stalling: the producer drains jobs itself, so a
+            // descheduled worker can never wedge a submit. A non-worker drain
+            // always owns the helper cell.
+            if (ClaimAndCopy()) {
+                cells_[kHelperCell].done.fetch_add(1, std::memory_order_release);
+            } else {
+                Common::CpuPause();
+            }
+            done = Completed();
+        } while (done < target);
+        barrier_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
     }
     completed_seen_.store(done, std::memory_order_relaxed);
-    barrier_wait_ns_ +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
-            .count();
 }
 
 void StreamCopyLane::DrainRemote() {
@@ -278,14 +248,13 @@ void StreamCopyLane::DrainRemote() {
         return;
     }
     const u64 target = published_.load(std::memory_order_acquire);
-    // Same hint as the producer drain: a guest unmap almost always finds the
-    // lane idle, and spinning on the sum would read five worker lines a lap.
+    // Same hint as the producer drain: a guest unmap almost always finds the lane idle.
     if (completed_seen_.load(std::memory_order_relaxed) >= target) {
         return;
     }
     u64 done = Completed();
     while (done < target) {
-        CpuPause();
+        Common::CpuPause();
         done = Completed();
     }
     completed_seen_.store(done, std::memory_order_relaxed);

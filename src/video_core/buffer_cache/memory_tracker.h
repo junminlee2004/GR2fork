@@ -7,14 +7,13 @@
 #include <atomic>
 #include <bit>
 #include <deque>
-#include <utility>
-
 #include <mutex>
 #include <type_traits>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/debug.h"
+#include "common/scope_exit.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -73,24 +72,8 @@ public:
     /// carry: the caller certifies it is the GPU command thread (see
     /// PageManager::BeginProtectCarry); every other caller must pass false.
     ReadReleaseDrain ReleasePendingReadWatchers(bool carry) {
-        ReadReleaseDrain out{};
-        if (upload_walk_depth_ != 0) {
-            return out;
-        }
-        // Ascending regions, so a run that ends on a region boundary can be
-        // carried into the next call and issued as one protection change.
-        if (pending_read_releases_.size() > 1) {
-            std::ranges::sort(pending_read_releases_, {},
-                              [](const RegionManager* m) { return m->GetCpuAddr(); });
-        }
-        const ProtectCarryScope scope{*tracker, carry};
-        for (RegionManager* manager : pending_read_releases_) {
-            std::scoped_lock lk{manager->lock};
-            out.calls += manager->ReleaseReadWatchers(out.pages);
-            ++out.regions;
-        }
-        pending_read_releases_.clear();
-        return out;
+        return DrainPendingWatchers<&RegionManager::ReleaseReadWatchers>(pending_read_releases_,
+                                                                         carry);
     }
 
     struct ReadReleaseCensus {
@@ -110,11 +93,7 @@ public:
         };
     }
 
-    struct ReadArmDrain {
-        u32 regions;
-        u32 pages;
-        u32 calls;
-    };
+    using ReadArmDrain = ReadReleaseDrain;
 
     /// Arms the read watchers every mark since the last drain left pending.
     /// GPU command thread only. A walk that holds region locks across its
@@ -122,30 +101,7 @@ public:
     /// carry: the caller certifies it is the GPU command thread (see
     /// PageManager::BeginProtectCarry); every other caller must pass false.
     ReadArmDrain ArmPendingReadWatchers(bool carry) {
-        ReadArmDrain out{};
-        if (upload_walk_depth_ != 0) {
-            return out;
-        }
-        // Ascending regions, so a run that ends on a region boundary can be
-        // carried into the next call and issued as one protection change.
-        if (pending_read_arms_.size() > 1) {
-            std::ranges::sort(pending_read_arms_, {},
-                              [](const RegionManager* m) { return m->GetCpuAddr(); });
-        }
-        const ProtectCarryScope scope{*tracker, carry};
-        for (RegionManager* manager : pending_read_arms_) {
-            std::scoped_lock lk{manager->lock};
-            out.calls += manager->ArmReadWatchers(out.pages);
-            ++out.regions;
-        }
-        pending_read_arms_.clear();
-        return out;
-    }
-
-    /// Clears the GPU bits of a range that is about to be unmapped, so no
-    /// later drain protects memory the guest has given back.
-    void DropPendingReadArms(VAddr addr, u64 size) {
-        UnmarkRegionAsGpuModified(addr, size);
+        return DrainPendingWatchers<&RegionManager::ArmReadWatchers>(pending_read_arms_, carry);
     }
 
     // Upload-walk peek baseline; GPU-command-thread confined like the walk.
@@ -167,6 +123,33 @@ public:
         return bytes < 2 * TRACKER_BYTES_PER_PAGE ? 0u : std::bit_floor(bytes) >> TRACKER_PAGE_BITS;
     }
 
+    struct FastPathDrain {
+        u64 sum_fast;
+        u64 sum_walk;
+        u64 gpu_fast;
+        u64 gpu_walk;
+        u64 single_null;
+        u64 foreign; // of the two above, the ones the fault path contributed
+        u64 peek_word;
+        u64 peek_split;
+        u64 fused;
+    };
+    FastPathDrain DrainFastPathStats() {
+        const u64 foreign_fast = foreign_stats_.gpu_fast.exchange(0, std::memory_order_relaxed);
+        const u64 foreign_walk = foreign_stats_.gpu_walk.exchange(0, std::memory_order_relaxed);
+        const FastPathDrain out{fast_stats_.sum_fast,
+                                fast_stats_.sum_walk,
+                                fast_stats_.gpu_fast + foreign_fast,
+                                fast_stats_.gpu_walk + foreign_walk,
+                                fast_stats_.single_null,
+                                foreign_fast + foreign_walk,
+                                fast_stats_.peek_word,
+                                fast_stats_.gpu_fast - fast_stats_.peek_word,
+                                fast_stats_.fused};
+        fast_stats_ = {};
+        return out;
+    }
+
     /// Returns true if a region has been modified from the CPU
     bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<true>(
@@ -184,23 +167,17 @@ public:
         RegionManager* region;
         if (TrySingleRegion(query_cpu_addr, query_size, region)) [[likely]] {
             RENDERER_TRACE;
+            const u64 region_offset = query_cpu_addr & TRACKER_HIGHER_PAGE_MASK;
             if constexpr (Foreign) {
                 foreign_stats_.gpu_fast.fetch_add(1, std::memory_order_relaxed);
             } else {
                 ++fast_stats_.gpu_fast;
-                const u64 region_offset = query_cpu_addr & TRACKER_HIGHER_PAGE_MASK;
-                const size_t first = (region_offset / TRACKER_BYTES_PER_PAGE) >> 6;
-                const size_t last = ((region_offset + (query_size ? query_size - 1 : 0)) /
-                                     TRACKER_BYTES_PER_PAGE) >>
-                                    6;
-                fast_stats_.peek_word += first == last;
-                fast_stats_.peek_split += first != last;
+                CountPeekSpan(region_offset, query_size);
             }
             if (region == nullptr) {
                 return false;
             }
-            return region->template PeekRegionModified<Type::GPU>(
-                query_cpu_addr & TRACKER_HIGHER_PAGE_MASK, query_size);
+            return region->template PeekRegionModified<Type::GPU>(region_offset, query_size);
         }
         if constexpr (Foreign) {
             foreign_stats_.gpu_walk.fetch_add(1, std::memory_order_relaxed);
@@ -222,10 +199,7 @@ public:
         ++fast_stats_.gpu_fast;
         ++fast_stats_.fused;
         const u64 region_offset = addr & TRACKER_HIGHER_PAGE_MASK;
-        const size_t first = (region_offset / TRACKER_BYTES_PER_PAGE) >> 6;
-        const size_t last = ((region_offset + (size ? size - 1 : 0)) / TRACKER_BYTES_PER_PAGE) >> 6;
-        fast_stats_.peek_word += first == last;
-        fast_stats_.peek_split += first != last;
+        CountPeekSpan(region_offset, size);
         return region->template PeekRegionModified<Type::GPU>(region_offset, size);
     }
 
@@ -297,43 +271,32 @@ public:
     };
     using GpuSeqSnapshots = boost::container::small_vector<GpuSeqSnapshot, 4>;
 
-    /**
-     * Captures each overlapped region's GPU write sequence. Call on the GPU
-     * command thread at the moment download copies are recorded; pass the
-     * result to GpuWriteSeqMatches when deciding whether the copied data may
-     * be written back.
-     */
+    /// Captures each overlapped region's GPU write sequence. Call on the GPU
+    /// command thread as the download copies are recorded; pass the result to
+    /// GpuWriteSeqMatches.
     void SnapshotGpuWriteSeq(VAddr cpu_addr, u64 size, GpuSeqSnapshots& out) {
         IteratePages<false>(cpu_addr, size, [&out](RegionManager* manager, u64, size_t) {
             out.push_back({manager, manager->gpu_write_seq});
         });
     }
 
-    /**
-     * True when every region overlapping the range still carries the GPU write
-     * sequence captured in the snapshot - that is, no new GPU write to those
-     * regions has been recorded since. A changed sequence means downloaded
-     * bytes for the range may be stale and must not be written back or have
-     * their bits cleared. GPU command thread only, so the comparison cannot
-     * race the writers it guards against.
-     */
+    /// True when no new GPU write reached any overlapped region since the
+    /// snapshot. A mismatch means the downloaded bytes may be stale: do not
+    /// write them back or clear their bits. GPU command thread only, so this
+    /// cannot race the writers it guards.
     bool GpuWriteSeqMatches(VAddr cpu_addr, u64 size, const GpuSeqSnapshots& snap) {
-        bool matches = true;
-        IteratePages<false>(cpu_addr, size, [&](RegionManager* manager, u64, size_t) {
+        return !IteratePages<false>(cpu_addr, size, [&snap](RegionManager* manager, u64, size_t) {
             const auto it = std::ranges::find(snap, manager, &GpuSeqSnapshot::manager);
-            if (it == snap.end() || it->seq != manager->gpu_write_seq) {
-                matches = false;
-            }
+            return it == snap.end() || it->seq != manager->gpu_write_seq;
         });
-        return matches;
     }
 
     /// Advances the word epochs of every existing region overlapping the
     /// range. Missing regions have no consumers and are skipped.
-    void BumpEpochsForRange(VAddr cpu_addr, u64 size, u8 cause) noexcept {
+    void BumpEpochsForRange(VAddr cpu_addr, u64 size) noexcept {
         IteratePages<false>(cpu_addr, size,
-                            [cause](RegionManager* manager, u64 offset, size_t range_size) {
-                                manager->BumpWordEpochs(offset, range_size, cause);
+                            [](RegionManager* manager, u64 offset, size_t range_size) {
+                                manager->BumpWordEpochs(offset, range_size);
                             });
     }
 
@@ -344,19 +307,6 @@ public:
                             [](RegionManager* manager, u64 offset, size_t range_size) {
                                 manager->PoisonEpochWords(offset, range_size);
                             });
-    }
-
-    /// Like IsRegionCpuModified but never creates missing regions; uncovered
-    /// spans report modified, matching a fresh region's all-dirty default.
-    bool PeekRegionCpuModifiedNoCreate(VAddr query_cpu_addr, u64 query_size) noexcept {
-        u64 covered = 0;
-        const bool dirty = IteratePages<false>(
-            query_cpu_addr, query_size,
-            [&covered](RegionManager* manager, u64 offset, size_t size) {
-                covered += size;
-                return manager->template PeekRegionModified<Type::CPU>(offset, size);
-            });
-        return dirty || covered != query_size;
     }
 
     struct EpochSum256 {
@@ -410,10 +360,7 @@ public:
         return Sum256ForRangeResolvedSlow(cpu_addr, size, region);
     }
 
-    /// The general walk of Sum256ForRange. ok is false
-    /// when part of the range has no region, when any covered word is
-    /// poisoned, or when the span exceeds 64 words; callers then fall back to
-    /// their coarse generation key.
+    /// The general walk behind Sum256ForRange.
     SHAD_NO_INLINE EpochSum256 Sum256ForRangeSlow(VAddr cpu_addr, u64 size) noexcept {
         EpochSum256 out{0, true};
         if (size == 0 || size > MAX_EPOCH_SUM_SPAN) {
@@ -442,8 +389,8 @@ public:
         return out;
     }
 
-    /// Twin of Sum256ForRange that also names the region when one covers the
-    /// whole range; the resolved memo probe reads that region directly.
+    /// The general walk behind Sum256ForRangeResolved; names the region only
+    /// when one covers the whole range.
     SHAD_NO_INLINE EpochSum256 Sum256ForRangeResolvedSlow(VAddr cpu_addr, u64 size,
                                                           RegionManager*& region) noexcept {
         EpochSum256 out{0, true};
@@ -479,45 +426,6 @@ public:
         return out;
     }
 
-    struct EpochSums {
-        u64 sum256;
-        u64 sum64;
-        bool poisoned;
-        bool ok;
-    };
-
-    /// Sums the word and subword epochs covering the range. ok is false when
-    /// part of the range has no region yet, since absent epochs prove nothing.
-    EpochSums SumEpochsForRange(VAddr cpu_addr, u64 size) noexcept {
-        EpochSums out{0, 0, false, true};
-        u64 covered = 0;
-        IteratePages<false>(
-            cpu_addr, size,
-            [&out, &covered](RegionManager* manager, u64 offset, size_t range_size) {
-                covered += range_size;
-                const size_t w0 = std::min<u64>(offset >> RegionManager::EPOCH_WORD_BITS,
-                                                RegionManager::NUM_EPOCH_WORDS - 1);
-                const size_t w1 =
-                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_WORD_BITS,
-                                  RegionManager::NUM_EPOCH_WORDS - 1);
-                const u32 poison = manager->poison_words.load(std::memory_order_acquire);
-                for (size_t w = w0; w <= w1; ++w) {
-                    out.sum256 += manager->word_epochs[w].load(std::memory_order_acquire);
-                    out.poisoned |= (poison >> w) & 1u;
-                }
-                const size_t s0 = std::min<u64>(offset >> RegionManager::EPOCH_SUB_BITS,
-                                                RegionManager::NUM_EPOCH_SUBS - 1);
-                const size_t s1 =
-                    std::min<u64>((offset + range_size - 1) >> RegionManager::EPOCH_SUB_BITS,
-                                  RegionManager::NUM_EPOCH_SUBS - 1);
-                for (size_t sub = s0; sub <= s1; ++sub) {
-                    out.sum64 += manager->sub_epochs[sub].load(std::memory_order_acquire);
-                }
-            });
-        out.ok = covered == size;
-        return out;
-    }
-
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         IteratePages<false>(
@@ -528,7 +436,7 @@ public:
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (RegionManager::ReadbacksModeCounted(RegionManager::mode_reads_fault_) !=
+                    if (RegionManager::ReadbacksMode(&RegionManager::mode_reads_fault_) !=
                             GpuReadbacksMode::Disabled &&
                         manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
@@ -559,7 +467,7 @@ public:
                 {
                     std::scoped_lock lk{manager->lock};
                     const bool readbacks =
-                        RegionManager::ReadbacksModeCounted(RegionManager::mode_reads_fault_) !=
+                        RegionManager::ReadbacksMode(&RegionManager::mode_reads_fault_) !=
                         GpuReadbacksMode::Disabled;
                     if (!readbacks ||
                         !manager->template IsRegionModified<Type::GPU>(offset, size)) {
@@ -593,19 +501,14 @@ public:
         // A written bind holds region locks across its upload, which can flush
         // the scheduler; a drain from that flush would take a lock this thread
         // already holds, so it is left to the next drain site.
-        struct WalkDepth {
-            u32* depth;
-            explicit WalkDepth(u32* d) : depth{d} {
-                if (depth) {
-                    ++*depth;
-                }
+        if (is_written) {
+            ++upload_walk_depth_;
+        }
+        SCOPE_EXIT {
+            if (is_written) {
+                --upload_walk_depth_;
             }
-            ~WalkDepth() {
-                if (depth) {
-                    --*depth;
-                }
-            }
-        } walk_depth{is_written ? &upload_walk_depth_ : nullptr};
+        };
         // Nearly every bind is a few hundred bytes and lands inside a single
         // 4MB region. Resolving the manager once up front runs both passes on
         // it directly, without the second memo probe and the per-region
@@ -709,14 +612,11 @@ public:
             u64 walked_regions = 0;
             while (remaining_size > 0) {
                 if (!is_written && page_offset == 0) {
-                    // Register-only scan over the whole regions ahead: the
-                    // general body below costs ~44 instructions with ten
-                    // stack accesses per region, and ~93% of a read-only
-                    // multi-region walk's regions are clean middle regions.
-                    // Trip count and cursor stay in locals and fold into the
-                    // walk state once, so the loop carries nothing through
-                    // memory. A null slot or a dirty region hands the walk
-                    // back to the general body at that region.
+                    // Register-only scan over the whole clean regions ahead: it
+                    // skips the clean middle regions that dominate a read-only
+                    // multi-region walk without the general body's per-region
+                    // stack traffic. A null slot or a dirty region hands the
+                    // walk back to the general body at that region.
                     const std::size_t full = remaining_size >> TRACKER_HIGHER_PAGE_BITS;
                     std::size_t clean = 0;
                     while (clean < full) {
@@ -777,11 +677,8 @@ public:
                 if (nothing_to_upload && i < 64 &&
                     manager->template PeekRegionFullySet<Type::GPU>(offset, size)) {
                     skipped |= u64{1} << i;
-                    // The bits stay as they are, but this is still a new GPU
-                    // write to the region: the write sequence must advance or
-                    // a snapshot taken before this bind could not tell that
-                    // its downloaded bytes are now stale. GPU-command-thread
-                    // confined, like the counter.
+                    // New GPU write: advance the sequence (see the single-region
+                    // path above). GPU-command-thread confined, like the counter.
                     ++manager->gpu_write_seq;
                     continue;
                 }
@@ -797,10 +694,9 @@ public:
             return false;
         }
         {
-            // Second pass mirrors the first walk's region sequence exactly; a
-            // region skipped there was never locked here. Regions all exist
-            // by now (pass one created them), so a null slot is skipped the
-            // way the generic no-create walk skipped it.
+            // Pass two mirrors pass one's region sequence exactly: a region
+            // skipped there was never locked, and every region exists because
+            // pass one created it (a top_tier slot is never cleared).
             u32 unlock_index = 0;
             std::size_t remaining_size = query_size;
             std::size_t page_index = first_page;
@@ -814,9 +710,6 @@ public:
                 page_index++;
                 page_offset = 0;
                 remaining_size -= copy_amount;
-                if (manager == nullptr) {
-                    continue;
-                }
                 const u32 i = unlock_index++;
                 if (i < 64 && (skipped & (u64{1} << i)) != 0) {
                     continue; // never locked in the first pass
@@ -845,33 +738,58 @@ public:
     }
 
 private:
+    /// Drains one pending-watcher list under a single protect-carry scope.
+    /// GPU command thread only; a walk holding region locks across its upload
+    /// (upload_walk_depth_ != 0) defers to the next site rather than deadlocking.
+    /// carry: the caller certifies it is the GPU command thread (see
+    /// PageManager::BeginProtectCarry); every other caller passes false.
+    template <u32 (RegionManager::*Watchers)(u32&)>
+    ReadReleaseDrain DrainPendingWatchers(
+        boost::container::small_vector<RegionManager*, 16>& pending, bool carry) {
+        ReadReleaseDrain out{};
+        if (upload_walk_depth_ != 0) {
+            return out;
+        }
+        // Ascending regions, so a run that ends on a region boundary can be
+        // carried into the next call and issued as one protection change.
+        if (pending.size() > 1) {
+            std::ranges::sort(pending, {}, [](const RegionManager* m) { return m->GetCpuAddr(); });
+        }
+        const ProtectCarryScope scope{*tracker, carry};
+        for (RegionManager* manager : pending) {
+            std::scoped_lock lk{manager->lock};
+            out.calls += (manager->*Watchers)(out.pages);
+            ++out.regions;
+        }
+        pending.clear();
+        return out;
+    }
+
+    /// Whether a single-region GPU peek stays inside one bitset word: the
+    /// input that decides whether an inline single-word peek is worth its
+    /// code size on this workload. size != 0 on both probe paths.
+    SHAD_FORCE_INLINE void CountPeekSpan(u64 region_offset, u64 size) noexcept {
+        const size_t first = (region_offset / TRACKER_BYTES_PER_PAGE) >> 6;
+        const size_t last = ((region_offset + size - 1) / TRACKER_BYTES_PER_PAGE) >> 6;
+        fast_stats_.peek_word += first == last;
+    }
+
     /**
      * Resolve a region index to its manager.
      *
-     * top_tier spans the whole 40 bit guest address space at 4MB granularity,
-     * so it is a 2MB pointer array - larger than the L2 of the handheld parts
-     * this matters on. It is also sparse, so consecutive lookups for unrelated
-     * buffers land on unrelated lines and the load stalls; profiling put ~60%
-     * of SynchronizeBuffer on exactly that load. The live region set is tiny by
-     * comparison, so a small direct mapped memo of resolved indices keeps the
-     * working set in L1.
-     *
+     * top_tier spans the 40 bit guest address space at 4MB granularity, so it
+     * is a 2MB sparse pointer array whose scattered load stalls; the live
+     * region set is tiny, so a small direct mapped memo keeps the probe in L1.
      * This is exactly equivalent to indexing top_tier: a slot only ever goes
-     * from null to a manager and is never cleared or reassigned, so a resolved
-     * mapping stays true for the life of the process. Only non-null results are
-     * recorded, since a null means "not created yet" and can still change.
-     *
-     * Thread local because the tracker is also driven from the guest fault
-     * path; a shared table could tear a key against a neighbouring value and
-     * hand back the wrong manager.
+     * from null to a manager, is never cleared or reassigned, and only non-null
+     * results are memoised. Thread local because the tracker is also driven
+     * from the guest fault path, where a shared table could tear a key against
+     * its value and hand back the wrong manager.
      */
     static constexpr std::size_t NUM_LOOKUP_SLOTS = 128; // power of two
-    // Keys are stored biased by one so that a zeroed table reads as empty.
-    // That keeps the memo constant initialized, which lets the thread local
-    // be reached directly instead of through an initialization guard;
-    // constinit turns a regression of that property into a compile error.
-    // A slot carries its key and value together, 16 byte aligned, so a
-    // probe touches exactly one cache line.
+    // Keys biased by one so a zeroed table reads as empty, keeping the memo
+    // constant initialized (constinit enforces it) so no initialization guard
+    // is emitted; a 16 byte slot keeps a probe to one cache line.
     struct alignas(16) LookupSlot {
         std::size_t key;
         RegionManager* val;
@@ -951,16 +869,12 @@ private:
                 std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
             auto* manager{scattered ? LookupRegion(page_index) : top_tier[page_index]};
             scattered = false;
-            if (manager) {
-                if constexpr (BOOL_BREAK) {
-                    if (func(manager, page_offset, copy_amount)) {
-                        return true;
-                    }
-                } else {
-                    func(manager, page_offset, copy_amount);
+            if (manager == nullptr) {
+                if constexpr (create_region_on_fail) {
+                    manager = CreateRegion(page_index);
                 }
-            } else if constexpr (create_region_on_fail) {
-                manager = CreateRegion(page_index);
+            }
+            if (manager) {
                 if constexpr (BOOL_BREAK) {
                     if (func(manager, page_offset, copy_amount)) {
                         return true;
@@ -993,9 +907,7 @@ private:
         new_manager->defer_read_release_ = defer_read_release_;
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
-        // Returned directly: re-probing the lookup memo twenty instructions
-        // after it just missed only re-derives this pointer. The memo entry
-        // for the fresh page fills on the page's next scattered lookup.
+        // The memo entry for this fresh page fills on its next scattered lookup.
         return new_manager;
     }
 
@@ -1014,11 +926,8 @@ private:
         u64 single_null{};
         u64 gpu_fast{};
         u64 gpu_walk{};
-        // Whether a single-region GPU probe covers one bitset word or straddles
-        // two: the input that decides whether an inline single-word peek is
-        // worth its code size on this workload.
+        // Single-word vs straddling single-region GPU probes.
         u64 peek_word{};
-        u64 peek_split{};
         // GPU probes that reused the region the caller had already resolved.
         u64 fused{};
     };
@@ -1032,35 +941,6 @@ private:
     };
     ForeignPathStats foreign_stats_;
 
-public:
-    struct FastPathDrain {
-        u64 sum_fast;
-        u64 sum_walk;
-        u64 gpu_fast;
-        u64 gpu_walk;
-        u64 single_null;
-        u64 foreign; // of the two above, the ones the fault path contributed
-        u64 peek_word;
-        u64 peek_split;
-        u64 fused;
-    };
-    FastPathDrain DrainFastPathStats() {
-        const u64 foreign_fast = foreign_stats_.gpu_fast.exchange(0, std::memory_order_relaxed);
-        const u64 foreign_walk = foreign_stats_.gpu_walk.exchange(0, std::memory_order_relaxed);
-        const FastPathDrain out{fast_stats_.sum_fast,
-                                fast_stats_.sum_walk,
-                                fast_stats_.gpu_fast + foreign_fast,
-                                fast_stats_.gpu_walk + foreign_walk,
-                                fast_stats_.single_null,
-                                foreign_fast + foreign_walk,
-                                fast_stats_.peek_word,
-                                fast_stats_.peek_split,
-                                fast_stats_.fused};
-        fast_stats_ = {};
-        return out;
-    }
-
-private:
     PageManager* tracker;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;

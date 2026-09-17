@@ -158,7 +158,7 @@ using GpuRangeSet = BasicRangeSet<GpuRangeSetAllocator>;
 
 // Sorted, disjoint, non-touching intervals in a vector: the canonical form of
 // the joining interval set above, with its edge semantics (a zero-size add or
-// subtract is a no-op; a zero-size query is contained and never intersects).
+// subtract is a no-op; a zero-size query is contained).
 // GPU command thread only, like the set it stands in for.
 class FlatRangeSet {
 public:
@@ -173,7 +173,8 @@ public:
         u64 subs;
     };
 
-    FlatRangeSet() {
+    /// Called once from the BufferCache constructor when the flat arm is latched on.
+    void Reserve() {
         v_.reserve(4096);
         scratch_.reserve(4096);
         merged_.reserve(4096);
@@ -250,10 +251,6 @@ public:
         v_.erase(first_erase, last);
     }
 
-    void Clear() {
-        v_.clear();
-    }
-
     bool Contains(VAddr base, size_t size) const {
         if (size == 0) {
             return true;
@@ -268,23 +265,6 @@ public:
         return it->hi >= e;
     }
 
-    bool Intersects(VAddr base, size_t size) const {
-        if (size == 0 || v_.empty()) {
-            return false;
-        }
-        const VAddr e = base + size;
-        auto it = std::upper_bound(v_.begin(), v_.end(), base,
-                                   [](VAddr x, const Interval& i) { return x < i.hi; });
-        return it != v_.end() && it->lo < e;
-    }
-
-    template <typename Func>
-    void ForEach(Func&& func) const {
-        for (const Interval& i : v_) {
-            func(i.lo, i.hi);
-        }
-    }
-
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
         if (size == 0 || v_.empty()) {
@@ -296,20 +276,6 @@ public:
                                    [](VAddr x, const Interval& i) { return x < i.hi; });
         for (; it != v_.end() && it->lo < e; ++it) {
             func(std::max<VAddr>(it->lo, s), std::min<VAddr>(it->hi, e));
-        }
-    }
-
-    template <typename Func>
-    void ForEachNotInRange(VAddr base_addr, size_t size, Func&& func) const {
-        const VAddr end_addr = base_addr + size;
-        ForEachInRange(base_addr, size, [&](VAddr range_addr, VAddr range_end) {
-            if (size_t gap_size = range_addr - base_addr; gap_size != 0) {
-                func(base_addr, gap_size);
-            }
-            base_addr = range_end;
-        });
-        if (base_addr != end_addr) {
-            func(base_addr, end_addr - base_addr);
         }
     }
 
@@ -406,26 +372,8 @@ struct GpuModifiedRangeSet {
             tree.Subtract(base, size);
         }
     }
-    void Clear() {
-        if (flat) {
-            vec.Clear();
-        } else {
-            tree.Clear();
-        }
-    }
     bool Contains(VAddr base, size_t size) const {
         return flat ? vec.Contains(base, size) : tree.Contains(base, size);
-    }
-    bool Intersects(VAddr base, size_t size) const {
-        return flat ? vec.Intersects(base, size) : tree.Intersects(base, size);
-    }
-    template <typename Func>
-    void ForEach(Func&& func) const {
-        if (flat) {
-            vec.ForEach(std::forward<Func>(func));
-        } else {
-            tree.ForEach(std::forward<Func>(func));
-        }
     }
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
@@ -433,14 +381,6 @@ struct GpuModifiedRangeSet {
             vec.ForEachInRange(base_addr, size, std::forward<Func>(func));
         } else {
             tree.ForEachInRange(base_addr, size, std::forward<Func>(func));
-        }
-    }
-    template <typename Func>
-    void ForEachNotInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (flat) {
-            vec.ForEachNotInRange(base_addr, size, std::forward<Func>(func));
-        } else {
-            tree.ForEachNotInRange(base_addr, size, std::forward<Func>(func));
         }
     }
     u64 Size() const {

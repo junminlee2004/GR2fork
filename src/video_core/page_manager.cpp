@@ -196,7 +196,7 @@ struct PageManager::Impl {
         ASSERT(base_page % PAGES_PER_LOCK == 0);
         // A carry that does not end where this region begins can never merge
         // with it, and its lock must go before a second one is requested.
-        if (carry_.active && carry_.begin + carry_.bytes != base_addr) {
+        if (carry_.lock.owns_lock() && carry_.begin + carry_.bytes != base_addr) {
             FlushCarry();
         }
         std::unique_lock<LockType> lk(locks[base_page / PAGES_PER_LOCK]);
@@ -210,12 +210,11 @@ struct PageManager::Impl {
                 RENDERER_TRACE;
                 // A carry from the previous region that abuts this run with the
                 // same permissions becomes one call instead of two.
-                if (carry_.active) {
+                if (carry_.lock.owns_lock()) {
                     if (carry_.perms == perms &&
                         carry_.begin + carry_.bytes == (range_begin << PM_PAGE_BITS)) {
                         Protect(carry_.begin, carry_.bytes + range_bytes, perms);
                         carry_merged_.fetch_add(1, std::memory_order_relaxed);
-                        carry_.active = false;
                         carry_.lock.unlock();
                         ++calls;
                         range_bytes = 0;
@@ -269,10 +268,9 @@ struct PageManager::Impl {
 
         // A trailing run that reaches the region boundary may continue into the
         // next region: keep the lock and the run, and let the next call merge.
-        if (carry_depth_ != 0 && !carry_.active && range_bytes > 0 &&
+        if (carry_depth_ != 0 && !carry_.lock.owns_lock() && range_bytes > 0 &&
             (range_begin << PM_PAGE_BITS) + range_bytes == base_addr + TRACKER_HIGHER_PAGE_SIZE) {
-            carry_ =
-                ProtectCarry{range_begin << PM_PAGE_BITS, range_bytes, perms, std::move(lk), true};
+            carry_ = ProtectCarry{range_begin << PM_PAGE_BITS, range_bytes, perms, std::move(lk)};
             return calls;
         }
         // Add pending (un)protect action
@@ -299,33 +297,26 @@ struct PageManager::Impl {
     // LOCK ORDER. A held carry adds one new edge: page-manager lock N is held
     // while the enclosing loop takes the RegionManager lock of the next region.
     // That is acyclic only because (a) every RegionManager protects only its own
-    // region (region_manager.h ArmReadWatchers/ReleaseReadWatchers/UpdateProtection
-    // all pass their own cpu_addr), so an RM_X holder never asks for PM lock
-    // Y != X; (b) the only holder of two RM locks at once is
-    // ForEachUploadRange<is_written=true>, which cannot be concurrent with a
-    // carry because carries are opened only through an explicit GpuComm-only
-    // flag at the named sites -- Rasterizer::DrainPendingReadArms for every
-    // ReadArmSite but Submit (vk_rasterizer.h), and, inside
-    // BufferCache::FinishFaultDownload (GpuComm via SendCommand<true>), its
-    // PendingUnmark and its DrainPendingReadReleases -- while every other
-    // caller, the guest-thread DropPendingReadArms unmap route and the submit
-    // hook included, passes false; that upload walk runs on the same GPU
-    // command thread, and both read drains bail on upload_walk_depth_ != 0;
-    // (c) Common::RangeLockGuard (the multi-PM-lock holder in the contiguous
-    // UpdatePageWatchers) is try-lock with back-off, so it never blocks holding
-    // one of the locks in its range. Opening a scope on any other thread, or
-    // around a loop that calls anything but UpdatePageWatchersForRegion, breaks
-    // (b) and deadlocks; BeginCarry asserts the single carrying thread. A carry is also never
-    // handed from one region walk to a non-adjacent one: it is flushed before a different lock is
-    // taken. Aggregate without default member initializers on purpose: carry_ below is
-    // value-initialized inside this class definition, where they would not be
-    // usable yet.
+    // region (region_manager.h ArmReadWatchers/ReleaseReadWatchers/
+    // ArmWriteWatchers/ReleaseWriteWatchers all pass their own cpu_addr), so an
+    // RM_X holder never asks for PM lock Y != X; (b) the only holder of two RM
+    // locks at once is ForEachUploadRange<is_written=true>, which runs on the
+    // GPU command thread and cannot be concurrent with a carry: carries are
+    // opened only through the explicit GpuComm-only flag at the sites listed at
+    // PageManager::BeginProtectCarry, and both read drains bail on
+    // upload_walk_depth_ != 0; (c) Common::RangeLockGuard (the multi-PM-lock
+    // holder in the contiguous UpdatePageWatchers) is try-lock with back-off, so
+    // it never blocks holding one of the locks in its range. Opening a scope on
+    // any other thread, or around a loop that calls anything but
+    // UpdatePageWatchersForRegion, breaks (b) and deadlocks; BeginCarry asserts
+    // the single carrying thread. Aggregate without default member initializers
+    // on purpose: carry_ below is value-initialized inside this class
+    // definition, where they would not be usable yet.
     struct ProtectCarry {
         VAddr begin;
         u64 bytes;
         Core::MemoryPermission perms;
         std::unique_lock<LockType> lock;
-        bool active;
     };
     const bool carry_enabled_{EmulatorSettings.IsProtectCarryMerge()};
     std::atomic<u64> carry_thread_{0};
@@ -336,12 +327,11 @@ struct PageManager::Impl {
     std::atomic<u64> carry_flushed_{0};
 
     void FlushCarry() {
-        if (!carry_.active) {
+        if (!carry_.lock.owns_lock()) {
             return;
         }
         Protect(carry_.begin, carry_.bytes, carry_.perms);
         carry_flushed_.fetch_add(1, std::memory_order_relaxed);
-        carry_.active = false;
         carry_.lock.unlock();
     }
 
@@ -522,15 +512,6 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
         // Write-protect faults only: the readback path needs the read faults the
         // signal implementation delivers, so this fork keeps signals.
         LOG_WARNING(Config, "userfaultfd tracking is not used: readbacks need read faults");
-    }
-    if (false) {
-        try {
-            impl = std::make_unique<UffdImpl>(rasterizer_);
-            LOG_INFO(Config, "Memory tracking method: userfaultfd");
-            return;
-        } catch (const std::runtime_error& e) {
-            // if uffd is unsupported, falls back to SignalImpl
-        }
     }
     LOG_INFO(Config, "Memory tracking method: signals");
 #endif

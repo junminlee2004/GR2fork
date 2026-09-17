@@ -13,20 +13,16 @@ namespace VideoCore {
 
 // Off-thread drain lane for guest -> stream-ring uploads.
 //
-// The GPU command thread allocates ring offsets in order (Map/Commit stay
-// untouched) and queues {backing src, ring dst, size} jobs; worker threads
-// move the bytes. Sources are read through the physical backing view, which
-// is never mprotected, so a worker can never take a guest fault and never
-// re-enters emulator machinery. Ordering contract: every queued byte is in
-// place before the command buffer that reads it is submitted, enforced by
-// DrainProducer() at SubmitExecution and MapWrap, and by DrainRemote() ahead
-// of guest unmaps (the backing pointers must outlive the job).
+// The GPU command thread allocates ring offsets in order and queues {backing
+// src, ring dst, size} jobs; worker threads move the bytes. Sources are read
+// through the physical backing view, which is never mprotected, so a worker
+// can never take a guest fault and never re-enters emulator machinery.
+// Ordering contract: every queued byte is in place before the command buffer
+// that reads it is submitted, enforced by DrainProducer() at SubmitExecution
+// and MapWrap, and by DrainRemote() ahead of guest unmaps (the backing
+// pointers must outlive the job).
 //
 // Single producer: only the GPU command thread may call Push/DrainProducer.
-// The queue is a bounded MPMC ring with per-slot sequence numbers; a push is
-// a handful of stores on producer-owned lines. Workers spin briefly between
-// bursts and futex-sleep through idle stretches, so the wake syscall never
-// lands on the producer during a frame.
 class StreamCopyLane {
 public:
     static StreamCopyLane& Instance();
@@ -51,6 +47,9 @@ public:
     /// The lane never runs more workers than this; Init clamps to it, so the
     /// per-consumer cells below are a fixed-size array no caller can index past.
     static constexpr u32 kMaxWorkers = 4;
+
+    /// Smallest copy worth handing to a worker; below this the inline copy wins.
+    static constexpr u32 kMinLaneBytes = 192;
 
     /// GPU command thread only. False = ring full; the caller copies inline.
     bool Push(const u8* src, u8* dst, u32 size);
@@ -96,14 +95,13 @@ private:
     /// Claims one job and copies it. The completion is the CALLER's to record:
     /// workers store into their own cell, everyone else bumps the helper cell.
     bool ClaimAndCopy();
-    bool TryDrainShared();
     /// Total copies completed, as a lower bound: every cell is monotone, so a
     /// value read here was true at some point and can only have grown since.
     u64 Completed() const;
 
     // Written only by Init/Shutdown. Every worker loads slots_ on each drain
     // attempt and every Copy loads num_workers_, so a per-frame store to any
-    // of these four would put the poll line back under the producer's writes.
+    // of this group would put the poll line back under the producer's writes.
     alignas(64) std::unique_ptr<Slot[]> slots_;
     std::vector<std::thread> threads_;
     std::atomic<u32> num_workers_{0};
@@ -130,11 +128,10 @@ private:
     // Read by the producer on every Push.
     alignas(64) std::atomic<u32> sleepers_{};
 
-    // One cell per consumer, last in the class so no offset above it moves.
-    // A shared completion counter and a shared wait census cost 557 of the
-    // machine's 906 cross-core transfers with four workers; each consumer now
-    // owns its line and readers sum. 128 bytes, not 64: the adjacent-line
-    // prefetcher pairs cell i's census line with cell i+1's completion line.
+    // One cell per consumer so no completion or census line is shared; readers
+    // sum. Last in the class so no offset above it moves. 128 bytes, not 64:
+    // the adjacent-line prefetcher pairs cell i's census line with cell i+1's
+    // completion line.
     static constexpr u32 kHelperCell = kMaxWorkers;
     static constexpr u32 kCells = kMaxWorkers + 1;
     struct alignas(128) Cell {

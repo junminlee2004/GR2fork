@@ -9,9 +9,8 @@
 #include <span>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
-#include <xxhash.h>
 #include "common/alignment.h"
-#include "common/arch.h"
+#include "common/cpu_pause.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
@@ -27,11 +26,6 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
-#if defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(ARCH_X86_64)
-#include <emmintrin.h>
-#endif
 
 namespace VideoCore {
 
@@ -40,7 +34,6 @@ static_assert(sizeof(vk::Buffer) == sizeof(VkBuffer));
 static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
-static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
 
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -67,6 +60,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // AlignDown masks, so the window has to be a power of two.
     readback_window_ = std::bit_floor(
         std::clamp<u64>(u64{EmulatorSettings.GetReadbackWindowKb()} * 1024, 4_KB, 8_MB));
+    fault_widen_ = std::bit_floor(u64{EmulatorSettings.GetFaultWidenBytes()});
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
     // Latched once: the copy queue's pool family is fixed at construction.
     const bool copy_gfx = EmulatorSettings.IsReadbackCopyGfxQueue();
@@ -76,13 +70,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
-    writeback_gpucomm_idle_ =
-        writeback_share_ && writeback_offload_ && EmulatorSettings.IsReadbackWritebackGpucommIdle();
+    writeback_gpucomm_idle_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackGpucommIdle();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
-    vinput_fetch_key_ = EmulatorSettings.IsVinputFetchKey() && vertex_lazy_desc_;
+    const bool want_fetch_key = EmulatorSettings.IsVinputFetchKey();
+    vinput_fetch_key_ = want_fetch_key && vertex_lazy_desc_;
     index_bind_whole_ = EmulatorSettings.IsIndexBindWhole();
-    if (EmulatorSettings.IsVinputFetchKey() && !vertex_lazy_desc_) {
+    if (want_fetch_key && !vertex_lazy_desc_) {
         LOG_WARNING(Render_Vulkan, "vinput_fetch_key needs vertex_input_lazy_desc; the vertex "
                                    "input memo stays pipeline-keyed");
     }
@@ -90,6 +84,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // Latched single-threaded, before any GPU-thread pool operation.
     GpuRangeSetMutex::lockfree = EmulatorSettings.IsGpuRangeSetLockfree();
     GpuModifiedRangeSet::flat = EmulatorSettings.IsGpuRangeSetFlat();
+    if (GpuModifiedRangeSet::flat) {
+        gpu_modified_ranges.vec.Reserve();
+    }
     if (written_range_mode_ >= 3) {
         pending_batch_.reserve(PendingLaneCapacity);
     }
@@ -102,18 +99,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                           "BDA Page Table Buffer");
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
-    memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
+    const bool defer_read_arm = EmulatorSettings.IsDeferredReadArm();
+    memory_tracker->SetDeferReadArm(defer_read_arm);
     tracker_mode_latch_ = EmulatorSettings.IsTrackerModeLatch();
     memory_tracker->SetModeLatch(tracker_mode_latch_);
     defer_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     memory_tracker->SetDeferReadRelease(defer_read_release_);
-    // finish_release_faulted_first: the offloaded write-back is what puts the
-    // bytes in guest memory before the second hop (so the staging can be
-    // released inline), and deferred_read_arm is what makes the rasterizer's
-    // per-packet drain sites - where the parked islands are settled - exist.
-    finish_split_ = EmulatorSettings.IsFinishReleaseFaultedFirst() && writeback_offload_ &&
-                    EmulatorSettings.IsDeferredReadArm();
-    if (EmulatorSettings.IsFinishReleaseFaultedFirst() && !finish_split_) {
+    // finish_release_faulted_first needs both: offloaded write-back puts the bytes in guest
+    // memory before the second hop, and deferred_read_arm creates the per-packet drain sites.
+    const bool want_finish_split = EmulatorSettings.IsFinishReleaseFaultedFirst();
+    finish_split_ = want_finish_split && writeback_offload_ && defer_read_arm;
+    if (want_finish_split && !finish_split_) {
         LOG_WARNING(Render_Vulkan, "finish_release_faulted_first needs "
                                    "readback_writeback_offload and deferred_read_arm; the "
                                    "fault download settles every island before releasing");
@@ -163,7 +159,7 @@ void BufferCache::MirrorProtectThunk(void* user, VAddr addr, u64 size, bool writ
         return;
     }
     auto* cache = static_cast<BufferCache*>(user);
-    cache->memory_tracker->BumpEpochsForRange(addr, size, tracker_origin ? 0 : 1);
+    cache->memory_tracker->BumpEpochsForRange(addr, size);
     if (!tracker_origin) {
         // Guest protection grants can hide later guest writes from every
         // watcher, so the covered words are conservatively poisoned.
@@ -173,7 +169,7 @@ void BufferCache::MirrorProtectThunk(void* user, VAddr addr, u64 size, bool writ
 
 void BufferCache::MirrorBackingThunk(void* user, VAddr addr, u64 size) {
     auto* cache = static_cast<BufferCache*>(user);
-    cache->memory_tracker->BumpEpochsForRange(addr, size, 2);
+    cache->memory_tracker->BumpEpochsForRange(addr, size);
 }
 
 void BufferCache::EmitTrackerTelemetry() {
@@ -216,7 +212,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     }
     // Rounded down to a power of two once; the flush callback keeps the
     // original range so readbacks never widen.
-    static const u64 widen = std::bit_floor(u64{EmulatorSettings.GetFaultWidenBytes()});
+    const u64 widen = fault_widen_;
     if (widen >= TRACKER_BYTES_PER_PAGE) {
         const VAddr wide_addr = device_addr & ~(widen - 1);
         const u64 wide_size = ((device_addr + size + widen - 1) & ~(widen - 1)) - wide_addr;
@@ -229,17 +225,33 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 
+std::pair<VAddr, VAddr> BufferCache::ComputeReadbackWindow(const Buffer& buffer, VAddr device_addr,
+                                                           u64 size) const {
+    // GPU-modified ranges come as many small scattered islands, so the download
+    // is widened to a window around the request
+    const u64 WindowSize = readback_window_;
+    const VAddr buf_start = buffer.CpuAddr();
+    const VAddr buf_end = buf_start + buffer.SizeBytes();
+    VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
+    VAddr window_end =
+        std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
+    if (EmulatorSettings.IsReadbackBatchingEnabled()) {
+        // Every readback costs a full GPU drain, so the drain - not the copy -
+        // is what to economise on: service the whole buffer at once and later
+        // faults in it find their data already downloaded. Only GPU-modified
+        // sub-ranges are copied either way, so the number of bytes moved is
+        // unchanged.
+        window_start = buf_start;
+        window_end = buf_end;
+    }
+    return {window_start, window_end};
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    // Offloaded form: the faulting thread is blocked until its data arrives no
-    // matter what, so it - not the GPU command thread - should absorb the
-    // semaphore wait. The GPU command thread only records the download and
-    // flushes (PrepareFaultDownload), then writes the bytes back once the
-    // faulting thread has waited out the fence (FinishFaultDownload); between
-    // the two hops it is free to keep translating draws. Measured before this
-    // change, that wait held the GPU command thread for a third of its wall
-    // clock. When this function is reached from the GPU command thread itself
-    // (its own guest-memory read faulting), SendCommand runs the hops inline
-    // and the wait lands where it always did - never worse than the sync form.
+    // Offloaded form: the faulting thread absorbs the fence wait, the GPU command
+    // thread only records and flushes (PrepareFaultDownload) then writes back
+    // (FinishFaultDownload). Reached on the GPU command thread, SendCommand runs
+    // both hops inline, so the wait lands where the sync form put it.
     if (readback_offload_) {
         for (int attempt = 0; attempt < 2; ++attempt) {
             FaultDownloadJob job;
@@ -249,112 +261,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             liverpool->SendCommand<true>(
                 [&] { PrepareFaultDownload(job, device_addr, size, is_write); });
             if (!job.has_download) {
-                // Nothing pending for this window usually means the fault is
-                // resolved, but it also happens when another thread's download
-                // owns the ranges and has not written back yet. Waiting here
-                // instead of returning keeps that thread from re-faulting in a
-                // tight loop and hammering the GPU command thread with empty
-                // download requests while the first one is in flight.
-                damp_entries_.fetch_add(1, std::memory_order_relaxed);
-                u64 spin = 0;
-                // Foreign: this damping loop runs on whichever thread faulted,
-                // which is usually a guest thread but can be GpuComm itself.
-                if (!job.joins.empty() && !liverpool->OnGpuThread()) {
-                    // readback_writeback_share: the joined owners' islands are
-                    // what keeps this range marked, so wait on their fence
-                    // once and copy a share of their islands instead of
-                    // sleeping. The budget is the same 400 x 50 us envelope,
-                    // charged from the clock; spin >= 400 means it ran out.
-                    constexpr u64 kDampBudgetNs = 400 * 50'000;
-                    const auto t_start = std::chrono::steady_clock::now();
-                    const auto elapsed_ns = [&] {
-                        return static_cast<u64>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - t_start)
-                                .count());
-                    };
-                    bool fence_seen = false;
-                    while (spin < 400 &&
-                           memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
-                        bool helped = false;
-                        for (const auto& s : job.joins) {
-                            if (s->ready.load(std::memory_order_acquire)) {
-                                helped |= HelpWriteBack(*s);
-                            }
-                        }
-                        if (helped) {
-                            continue;
-                        }
-                        if (!fence_seen) {
-                            const u64 el = elapsed_ns();
-                            if (el >= kDampBudgetNs) {
-                                spin = 400;
-                                break;
-                            }
-                            scheduler.GetMasterSemaphore()->WaitFor(job.join_tick,
-                                                                    kDampBudgetNs - el);
-                            if (job.join_copy_queue_tick != 0) {
-                                // The owners' copies retire on the second queue.
-                                const u64 el_copy = elapsed_ns();
-                                if (el_copy < kDampBudgetNs) {
-                                    copy_queue_->WaitFor(job.join_copy_queue_tick,
-                                                         kDampBudgetNs - el_copy);
-                                }
-                            }
-                            // A timeout means the budget is gone as well.
-                            fence_seen = true;
-                            spin = std::min<u64>(400, elapsed_ns() / 50'000);
-                            share_fencewaits_.fetch_add(1, std::memory_order_relaxed);
-                            continue;
-                        }
-                        if (wait_notify_) {
-                            const u64 g = writeback_gen_.load(std::memory_order_acquire);
-                            if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
-                                break;
-                            }
-                            const u64 el2 = elapsed_ns();
-                            if (el2 >= kDampBudgetNs) {
-                                spin = 400;
-                                break;
-                            }
-                            WaitWriteBack(g, (kDampBudgetNs - el2) / 1000);
-                        } else {
-                            std::this_thread::sleep_for(std::chrono::microseconds(50));
-                        }
-                        ++spin;
-                    }
-                } else if (wait_notify_) {
-                    // Same 20 ms envelope as the poll loop below, charged from
-                    // the clock rather than counted in sleeps: the waiter wakes
-                    // when the owning write-back clears its pages.
-                    constexpr u64 kPollBudgetNs = 400 * 50'000;
-                    const auto t_poll = std::chrono::steady_clock::now();
-                    while (true) {
-                        const u64 g = writeback_gen_.load(std::memory_order_acquire);
-                        if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
-                            break;
-                        }
-                        const u64 el =
-                            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                 std::chrono::steady_clock::now() - t_poll)
-                                                 .count());
-                        if (el >= kPollBudgetNs) {
-                            spin = 400;
-                            break;
-                        }
-                        WaitWriteBack(g, (kPollBudgetNs - el) / 1000);
-                        ++spin;
-                    }
-                    spin = std::min<u64>(spin, 400);
-                } else {
-                    for (;
-                         spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size);
-                         ++spin) {
-                        std::this_thread::sleep_for(std::chrono::microseconds(50));
-                    }
-                }
-                damp_iters_.fetch_add(spin, std::memory_order_relaxed);
-                damp_stuck_.fetch_add(spin >= 400, std::memory_order_relaxed);
+                DampAfterEmptyDownload(job, device_addr, size);
                 return;
             }
             if (job.share) {
@@ -372,9 +279,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 s.total = static_cast<u32>(s.pieces.size());
                 if (writeback_helper_ && !liverpool->OnGpuThread()) {
                     // readback_writeback_helper: the priority thread waits the
-                    // same fence and takes islands until the cursor runs out;
-                    // a late arrival costs only the help. The share is
-                    // captured, never the job, which the bounded path moves.
+                    // same fence and takes islands until the cursor runs out. The
+                    // share is captured, never the job, which the bounded path moves.
                     auto share = job.share;
                     scheduler.DeferPriorityOperationAt(job.wait_tick,
                                                        [this, share] { HelpAsPriority(*share); });
@@ -387,12 +293,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             } else {
                 scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
             }
-            offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+            const u64 dt = Common::FencedRDTSC() - t0;
+            offload_wait_ns_.fetch_add(dt, std::memory_order_relaxed);
             if (job.on_copy_queue) {
-                q2_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
+                q2_wait_ns_.fetch_add(dt, std::memory_order_relaxed);
             }
             if (writeback_offload_) {
-                WriteBackFaultDownload(job, liverpool->OnGpuThread() ? 2 : 0);
+                WriteBackFaultDownload(job);
             }
             liverpool->SendCommand<true>(
                 [&] { FinishFaultDownload(job, device_addr, size, is_write); });
@@ -418,28 +325,106 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             DrainPendingFinish();
         }
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-        // GPU-modified ranges come as many small scattered islands, so the download
-        // is widened to a window around the request
-        const u64 WindowSize = readback_window_;
-        const VAddr buf_start = buffer.CpuAddr();
-        const VAddr buf_end = buf_start + buffer.SizeBytes();
-        VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
-        VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
-        if (EmulatorSettings.IsReadbackBatchingEnabled()) {
-            // Every readback costs a full GPU drain, so the drain - not the
-            // copy - is what to economise on: service the whole buffer at once
-            // and later faults in it find their data already downloaded. Only
-            // GPU-modified sub-ranges are copied either way, so the number of
-            // bytes moved is unchanged.
-            window_start = buf_start;
-            window_end = buf_end;
-        }
+        const auto [window_start, window_end] = ComputeReadbackWindow(buffer, device_addr, size);
         DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     });
+}
+
+void BufferCache::DampAfterEmptyDownload(FaultDownloadJob& job, VAddr device_addr, u64 size) {
+    // An empty window can mean another thread's download owns the
+    // ranges, so waiting instead of returning stops a re-fault loop
+    // into the GPU command thread.
+    damp_entries_.fetch_add(1, std::memory_order_relaxed);
+    u64 spin = 0;
+    constexpr u64 kDampBudgetNs = 400 * 50'000;
+    const auto elapsed_ns = [](std::chrono::steady_clock::time_point t) {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - t)
+                                    .count());
+    };
+    // Foreign: this damping loop runs on whichever thread faulted,
+    // which is usually a guest thread but can be GpuComm itself.
+    if (!job.joins.empty() && !liverpool->OnGpuThread()) {
+        // readback_writeback_share: the owners' islands keep this
+        // range marked, so wait the owners' fence once and copy their
+        // islands. Same 400 x 50 us budget, charged from the clock;
+        // spin >= 400 means it ran out.
+        const auto t_start = std::chrono::steady_clock::now();
+        bool fence_seen = false;
+        while (spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
+            bool helped = false;
+            for (const auto& s : job.joins) {
+                if (s->ready.load(std::memory_order_acquire)) {
+                    helped |= HelpWriteBack(*s);
+                }
+            }
+            if (helped) {
+                continue;
+            }
+            if (!fence_seen) {
+                const u64 el = elapsed_ns(t_start);
+                if (el >= kDampBudgetNs) {
+                    spin = 400;
+                    break;
+                }
+                scheduler.GetMasterSemaphore()->WaitFor(job.join_tick, kDampBudgetNs - el);
+                if (job.join_copy_queue_tick != 0) {
+                    // The owners' copies retire on the second queue.
+                    const u64 el_copy = elapsed_ns(t_start);
+                    if (el_copy < kDampBudgetNs) {
+                        copy_queue_->WaitFor(job.join_copy_queue_tick, kDampBudgetNs - el_copy);
+                    }
+                }
+                // A timeout means the budget is gone as well.
+                fence_seen = true;
+                spin = std::min<u64>(400, elapsed_ns(t_start) / 50'000);
+                share_fencewaits_.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (wait_notify_) {
+                const u64 g = writeback_gen_.load(std::memory_order_acquire);
+                if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
+                    break;
+                }
+                const u64 el2 = elapsed_ns(t_start);
+                if (el2 >= kDampBudgetNs) {
+                    spin = 400;
+                    break;
+                }
+                WaitWriteBack(g, (kDampBudgetNs - el2) / 1000);
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            ++spin;
+        }
+    } else if (wait_notify_) {
+        // Same 20 ms envelope as the poll loop below, charged from the
+        // clock: the waiter wakes when the owning write-back clears its pages.
+        const auto t_poll = std::chrono::steady_clock::now();
+        while (true) {
+            const u64 g = writeback_gen_.load(std::memory_order_acquire);
+            if (!memory_tracker->IsRegionGpuModified<true>(device_addr, size)) {
+                break;
+            }
+            const u64 el = elapsed_ns(t_poll);
+            if (el >= kDampBudgetNs) {
+                spin = 400;
+                break;
+            }
+            WaitWriteBack(g, (kDampBudgetNs - el) / 1000);
+            ++spin;
+        }
+        spin = std::min<u64>(spin, 400);
+    } else {
+        for (; spin < 400 && memory_tracker->IsRegionGpuModified<true>(device_addr, size); ++spin) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+    damp_iters_.fetch_add(spin, std::memory_order_relaxed);
+    damp_stuck_.fetch_add(spin >= 400, std::memory_order_relaxed);
 }
 
 namespace {
@@ -536,7 +521,8 @@ void BufferCache::CollectOwnedIslands(VAddr start, VAddr end, OwnedIslands& out)
     std::ranges::sort(out, {}, &std::pair<VAddr, u32>::first);
 }
 
-void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
+void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job) {
+    const bool on_gpu = liverpool->OnGpuThread();
     job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
     auto* memory = Core::Memory::Instance();
     const u8* download = job.staging->mapped_data.data();
@@ -552,7 +538,7 @@ void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
         // every claimed one, so the bytes are all in place when it returns.
         auto& s = *job.share;
         s.ready.store(true, std::memory_order_release);
-        if (writeback_gpucomm_idle_ && !liverpool->OnGpuThread() && !liverpool->HasPendingWork()) {
+        if (writeback_gpucomm_idle_ && !on_gpu && !liverpool->HasPendingWork()) {
             // readback_writeback_gpucomm_idle: the GPU command thread sleeps
             // through this write-back waiting for the Finish; hand it the same
             // cursor the priority thread takes from. Posted only while it has
@@ -589,12 +575,12 @@ void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
     }
     job.copy_ns = Common::FencedRDTSC() - t0;
     hold.reset();
-    job.copier = copier;
+    job.copier = on_gpu ? 2 : 0;
     job.copied = true;
 }
 
-bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes, bool (*bail)(void*),
-                                void* bail_user, u64 max_bytes, u32* max_island) {
+bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes, bool bail_on_pending,
+                                bool* bailed, u64 max_bytes, u32* max_island) {
     auto* memory = Core::Memory::Instance();
     // The hold comes before the first claim, so no claimed island waits on
     // the map while the owner waits on it.
@@ -608,22 +594,32 @@ bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes, bool (*bai
     }
     u64 n = 0;
     u64 bytes = 0;
+    u32 mx = 0;
     do {
         const auto& p = s.pieces[idx];
         memory->TryWriteBacking(std::bit_cast<u8*>(p.dst), s.download + p.src_off, p.size);
         s.done.fetch_add(1, std::memory_order_release);
         ++n;
         bytes += p.size;
-        if (max_island != nullptr && p.size > *max_island) {
-            *max_island = p.size;
+        if (p.size > mx) {
+            mx = p.size;
         }
         // Checked between claims only: a claimed island is always finished, so
         // the owner's tail wait never blocks on a bailed-out copier.
-        if ((max_bytes != 0 && bytes >= max_bytes) || (bail != nullptr && bail(bail_user))) {
+        if (max_bytes != 0 && bytes >= max_bytes) {
+            break;
+        }
+        if (bail_on_pending && liverpool->HasPendingWork()) {
+            if (bailed != nullptr) {
+                *bailed = true;
+            }
             break;
         }
         idx = s.next.fetch_add(1, std::memory_order_acq_rel);
     } while (idx < s.total);
+    if (max_island != nullptr && mx > *max_island) {
+        *max_island = mx;
+    }
     share_helped_.fetch_add(n, std::memory_order_relaxed);
     share_helped_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     if (copied_bytes != nullptr) {
@@ -631,25 +627,6 @@ bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes, bool (*bai
     }
     return true;
 }
-
-namespace {
-// One spin-wait step: a pause on x86, a yield on ARM, nothing elsewhere.
-inline void SpinRelax() {
-#if defined(ARCH_X86_64)
-    _mm_pause();
-#elif defined(ARCH_ARM64) && defined(_MSC_VER)
-    __yield();
-#elif defined(ARCH_ARM64)
-    asm("yield");
-#endif
-}
-// Bail state for the GPU command thread's idle help: the parser it must return
-// to, and whether it was the one that stopped the copy.
-struct GpuIdleBailCtx {
-    AmdGpu::Liverpool* liverpool;
-    bool fired;
-};
-} // namespace
 
 void BufferCache::HelpAsPriority(WriteBackShare& s) {
     if (s.copy_queue_tick != 0) {
@@ -662,7 +639,7 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
         // short pause-spin on ready, then late (the owner copies everything).
         constexpr u32 kReadySpins = 2048;
         for (u32 i = 0; i < kReadySpins && !s.ready.load(std::memory_order_acquire); ++i) {
-            SpinRelax();
+            Common::CpuPause();
         }
         if (!s.ready.load(std::memory_order_acquire)) {
             prio_late_.fetch_add(1, std::memory_order_relaxed);
@@ -678,15 +655,9 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
     }
 }
 
-bool BufferCache::GpuIdleBail(void* user) {
-    auto& ctx = *static_cast<GpuIdleBailCtx*>(user);
-    ctx.fired = ctx.fired || ctx.liverpool->HasPendingWork();
-    return ctx.fired;
-}
-
 void BufferCache::HelpAsGpuIdle(WriteBackShare& s) {
     // Only guard on the first claim: HelpWriteBack takes island #1 ahead of the
-    // loop the bail predicate sits in.
+    // loop the bail test sits in.
     if (liverpool->HasPendingWork()) {
         wbidle_skipped_.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -694,17 +665,17 @@ void BufferCache::HelpAsGpuIdle(WriteBackShare& s) {
     // A single island is a contiguous GPU-dirty run with no size cap of its
     // own, so the yield latency is bounded in bytes too.
     constexpr u64 IdleHelpBytes = 256_KB;
-    GpuIdleBailCtx ctx{liverpool, false};
+    bool fired = false;
     u64 bytes = 0;
     u32 max_island = 0;
-    if (!HelpWriteBack(s, &bytes, &GpuIdleBail, &ctx, IdleHelpBytes, &max_island)) {
+    if (!HelpWriteBack(s, &bytes, true, &fired, IdleHelpBytes, &max_island)) {
         // The owner emptied the cursor before the command was drained.
         wbidle_late_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     wbidle_ran_.fetch_add(1, std::memory_order_relaxed);
     wbidle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    if (ctx.fired || bytes >= IdleHelpBytes) {
+    if (fired || bytes >= IdleHelpBytes) {
         wbidle_bailed_.fetch_add(1, std::memory_order_relaxed);
     }
     for (u32 prev = wbidle_max_island_.load(std::memory_order_relaxed); prev < max_island;) {
@@ -714,48 +685,24 @@ void BufferCache::HelpAsGpuIdle(WriteBackShare& s) {
     }
 }
 
-void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
-                                       bool is_write) {
-    // finish_release_faulted_first: a parked rest still holds tracker bits and
-    // an in-flight registry entry for its islands. Settle it before this
-    // command reads either, so every fault command sees today's state.
-    if (!pending_finish_.empty()) {
-        DrainPendingFinish();
-    }
-    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
-    buffer.readback_prone_tick = gc_tick;
-    // Window widening mirrors the synchronous form above.
-    const u64 WindowSize = readback_window_;
-    const VAddr buf_start = buffer.CpuAddr();
-    const VAddr buf_end = buf_start + buffer.SizeBytes();
-    VAddr window_start = std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
-    VAddr window_end =
-        std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
-    if (EmulatorSettings.IsReadbackBatchingEnabled()) {
-        window_start = buf_start;
-        window_end = buf_end;
-    }
-
-    // Copy collection mirrors DownloadBufferMemory, except destinations index
-    // the job's dedicated staging from zero. The shared download ring cannot be
-    // used here: its reclamation tracks GPU ticks only, and the bytes must
-    // survive on the host until the faulting thread has consumed them.
+template <typename Copies>
+u64 BufferCache::CollectDownloadCopies(Buffer& buffer, VAddr start, u64 size, Copies& copies,
+                                       OwnedIslands& owned) {
     u64 total_size_bytes = 0;
-    FoldPendingRanges(window_start, window_end - window_start);
+    FoldPendingRanges(start, size);
     // An island another readback still owns keeps its range-set entry and its
     // GPU bits: the owner's second hop settles it.
-    OwnedIslands owned;
     if (writeback_offload_) {
-        CollectOwnedIslands(window_start, window_end, owned);
-        wboff_excluded_ += owned.size();
+        CollectOwnedIslands(start, start + size, owned);
+        wboff_.excluded += owned.size();
     }
     memory_tracker->ForEachDownloadRange<false>(
-        window_start, window_end - window_start, [&](u64 device_addr_out, u64 range_size) {
+        start, size, [&](u64 device_addr_out, u64 range_size) {
             const VAddr buffer_addr = buffer.CpuAddr();
-            const auto add_download = [&](VAddr start, VAddr end) {
-                const u64 new_offset = start - buffer_addr;
-                const u64 new_size = end - start;
-                job.copies.push_back(vk::BufferCopy{
+            const auto add_download = [&](VAddr piece_start, VAddr piece_end) {
+                const u64 new_offset = piece_start - buffer_addr;
+                const u64 new_size = piece_end - piece_start;
+                copies.push_back(vk::BufferCopy{
                     .srcOffset = new_offset,
                     .dstOffset = total_size_bytes,
                     .size = new_size,
@@ -774,16 +721,39 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
             // on; the pieces are collected and subtracted after it returns.
             boost::container::small_vector<std::pair<VAddr, VAddr>, 32> pieces;
             gpu_modified_ranges.ForEachInRange(
-                device_addr_out, range_size, [&](VAddr start, VAddr end) {
-                    EmitUnownedPieces(start, end, owned, [&](VAddr piece_start, VAddr piece_end) {
-                        add_download(piece_start, piece_end);
-                        pieces.emplace_back(piece_start, piece_end);
-                    });
+                device_addr_out, range_size, [&](VAddr range_start, VAddr range_end) {
+                    EmitUnownedPieces(range_start, range_end, owned,
+                                      [&](VAddr piece_start, VAddr piece_end) {
+                                          add_download(piece_start, piece_end);
+                                          pieces.emplace_back(piece_start, piece_end);
+                                      });
                 });
             for (const auto& [piece_start, piece_end] : pieces) {
                 SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
             }
         });
+    return total_size_bytes;
+}
+
+void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
+                                       bool is_write) {
+    // finish_release_faulted_first: a parked rest still holds tracker bits and
+    // an in-flight registry entry for its islands. Settle it before this
+    // command reads either, so every fault command sees today's state.
+    if (!pending_finish_.empty()) {
+        DrainPendingFinish();
+    }
+    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    buffer.readback_prone_tick = gc_tick;
+    const auto [window_start, window_end] = ComputeReadbackWindow(buffer, device_addr, size);
+
+    // Destinations index the job's dedicated staging from zero. The shared
+    // download ring cannot be used here: its reclamation tracks GPU ticks only,
+    // and the bytes must survive on the host until the faulting thread has
+    // consumed them.
+    OwnedIslands owned;
+    const u64 total_size_bytes =
+        CollectDownloadCopies(buffer, window_start, window_end - window_start, job.copies, owned);
     if (total_size_bytes == 0) {
         join_empty_.fetch_add(1, std::memory_order_relaxed);
         if (writeback_share_) {
@@ -819,8 +789,6 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     job.staging = AcquireFaultStaging(total_size_bytes);
     memory_tracker->SnapshotGpuWriteSeq(window_start, window_end - window_start, job.snapshots);
     job.buffer_base = buffer.CpuAddr();
-    job.window_start = window_start;
-    job.window_size = window_end - window_start;
 
     // readback_offload: with the writer already submitted, the copy waits
     // for its master tick on the second queue instead of riding in the open
@@ -898,7 +866,6 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     if (!pending_finish_.empty()) {
         DrainPendingFinish();
     }
-    auto* memory = Core::Memory::Instance();
     const u8* download = job.staging->mapped_data.data();
     if (!writeback_offload_) {
         job.staging->InvalidateForRead(0, VK_WHOLE_SIZE);
@@ -909,26 +876,9 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     std::optional<Core::MemoryManager::GuestCopyScope> hold;
     if (writeback_hold_ && !writeback_offload_) {
         hold.emplace(memory);
-        ++writeback_loops_;
+        ++writeback_.loops;
     }
 
-    // Every copy gets its own verdict. This runs on the GPU command thread, so
-    // between the sequence test and the bit clear nothing can interleave; and
-    // because the sequence advances on every recorded GPU write - including
-    // rebinds of already-dirty regions - a matching sequence proves any other
-    // download of the same range holds byte-identical data, making write-back
-    // order among matching jobs irrelevant. Without the offload a mismatched
-    // copy is written back by nobody: its bytes may predate the newer write.
-    // With it every island's bytes are already in guest memory; a vetoed
-    // island keeps its GPU bits, so under Precise readbacks its pages stay
-    // unreadable and the next fault downloads it again.
-    //
-    // The pending span is flushed before any tracker read that could see its
-    // pages: the veto branch below, and the CPU mark at the end (marking with
-    // GPU bits still set would ask for a write-only page, which Protect()
-    // rejects).
-    // Deferred: DrainPendingReadReleases below settles them before returning.
-    //
     // finish_release_faulted_first: the faulting thread is blocked on the
     // pages of its own range only, so those islands are settled here and the
     // rest is parked for the GPU command thread's next drain site. The split
@@ -944,14 +894,11 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
             return Common::AlignDown(lo, TRACKER_BYTES_PER_PAGE) < fault_hi &&
                    Common::AlignUp(lo + copy.size, TRACKER_BYTES_PER_PAGE) > fault_lo;
         };
-        // job.copies was appended in strictly ascending, disjoint address order
-        // (ForEachDownloadRange walks ascending, ForEachInRange and
-        // EmitUnownedPieces emit ascending within each range), and the faulted
-        // span is contiguous, so the intersecting islands form exactly one
-        // contiguous run. Rotating that run to the front is O(n) with no
-        // temporary buffer, and leaves both halves in ascending order - which
-        // PendingUnmark's adjacent-island merge relies on to keep the release
-        // count down (a partitioning split would scramble the rest).
+        // job.copies was appended in strictly ascending, disjoint order by the
+        // ForEachDownloadRange walk and the faulted span is contiguous, so the
+        // intersecting islands are exactly one contiguous run; rotating it to
+        // the front leaves both halves ascending, which PendingUnmark's
+        // adjacent-island merge needs to keep the release count down.
         const auto run_begin = std::find_if(job.copies.begin(), job.copies.end(), intersects);
         const auto run_end = std::find_if_not(run_begin, job.copies.end(), intersects);
         DEBUG_ASSERT(std::find_if(run_end, job.copies.end(), intersects) == job.copies.end());
@@ -959,17 +906,17 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         inline_count = static_cast<size_t>(run_end - run_begin);
     }
     const bool park = inline_count != job.copies.size();
-    const u64 t_inline = Common::FencedRDTSC();
+    const u64 t_inline = park ? Common::FencedRDTSC() : 0;
     bool vetoed_any =
         FinishIslands(std::span<const vk::BufferCopy>(job.copies.data(), inline_count),
                       job.snapshots, job.buffer_base, download, job.copied);
     hold.reset();
     if (writeback_offload_) {
-        ++writeback_loops_;
-        writeback_islands_ += job.written_islands;
-        writeback_bytes_ += job.written_bytes;
-        wboff_copy_ns_ += job.copy_ns;
-        ++(job.copier == 0 ? wboff_guest_ : job.copier == 1 ? wboff_prio_ : wboff_gpucomm_);
+        ++writeback_.loops;
+        writeback_.islands += job.written_islands;
+        writeback_.bytes += job.written_bytes;
+        wboff_.copy_ns += job.copy_ns;
+        ++(job.copier == 0 ? wboff_.guest : wboff_.gpucomm);
     }
     if (park) {
         // The verdict for the whole job is not in yet, so the caller's exit
@@ -979,10 +926,7 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         // neither owned nor in the range set.
         job.fully_cleared = false;
         PendingFinish entry;
-        // The whole vector moves (one pointer steal for a heap-sized window);
-        // copying the tail out would memcpy several hundred islands here, on
-        // the GPU command thread, for every split job. job.copies is dead from
-        // this point on - the job's last reader was the inline settle above.
+        // job.copies has no reader after the inline settle, so the whole vector moves.
         entry.first = inline_count;
         entry.copies = std::move(job.copies);
         entry.snapshots = std::move(job.snapshots);
@@ -995,9 +939,9 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         // The entry drain above means at most one job is ever parked, so no
         // burst of fault commands can hand a later guest handshake a backlog.
         ASSERT(pending_finish_.size() == 1);
-        ++finsplit_jobs_;
-        finsplit_inline_islands_ += inline_count;
-        finsplit_vetoes_ += vetoed_any ? 1 : 0;
+        ++finsplit_.jobs;
+        finsplit_.inline_islands += inline_count;
+        finsplit_.vetoes += vetoed_any ? 1 : 0;
     } else {
         job.fully_cleared = !vetoed_any;
         if (vetoed_any) {
@@ -1029,7 +973,7 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         // Everything above is what the faulting guest thread waits for, so the
         // measurement ends here and not at the park: inline_us and rest_us are
         // then the two halves of today's single hop.
-        finsplit_inline_ns_ += Common::FencedRDTSC() - t_inline;
+        finsplit_.inline_ns += Common::FencedRDTSC() - t_inline;
     }
 }
 
@@ -1039,6 +983,15 @@ bool BufferCache::FinishIslands(std::span<const vk::BufferCopy> copies,
     // Carry: every caller runs on the GPU command thread, the only thread on
     // which a protect carry is legal.
     PendingUnmark pending{*memory_tracker, defer_read_release_, true};
+    // Every copy gets its own verdict, on the GPU command thread, so nothing
+    // interleaves between the sequence test and the bit clear. The sequence
+    // advances on every recorded GPU write - rebinds of already-dirty regions
+    // included - so a matching sequence proves any other download of the range
+    // holds byte-identical data and write-back order among matching jobs is
+    // irrelevant. Without the offload a mismatched copy is written back by
+    // nobody and its bytes may predate the newer write; with it the bytes are
+    // already in guest memory and a vetoed island keeps its GPU bits, so under
+    // Precise readbacks its pages stay unreadable until the next fault.
     bool vetoed_any = false;
     for (const auto& copy : copies) {
         const VAddr copy_device_addr = buffer_base + copy.srcOffset;
@@ -1046,8 +999,8 @@ bool BufferCache::FinishIslands(std::span<const vk::BufferCopy> copies,
             if (writeback_offload_) {
                 ASSERT(copied);
             } else {
-                ++writeback_islands_;
-                writeback_bytes_ += copy.size;
+                ++writeback_.islands;
+                writeback_.bytes += copy.size;
                 memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
                                         download + copy.dstOffset, copy.size);
             }
@@ -1055,6 +1008,7 @@ bool BufferCache::FinishIslands(std::span<const vk::BufferCopy> copies,
             continue;
         }
         vetoed_any = true;
+        // The pending span is flushed before any tracker read that could see its pages.
         pending.Flush();
         // The newer write's own bind restored the range set for its span; put
         // back only what is still marked and uncovered, so the tracker bits
@@ -1104,8 +1058,8 @@ void BufferCache::DrainPendingFinish() {
     }
     // GPU command thread only (every drain site), so the release loop may carry.
     DrainPendingReadReleases(true);
-    finsplit_rest_islands_ += islands;
-    finsplit_rest_ns_ += Common::FencedRDTSC() - t0;
+    finsplit_.rest_islands += islands;
+    finsplit_.rest_ns += Common::FencedRDTSC() - t0;
     // Pages a damping waiter may still be blocked on were cleared above.
     NotifyWriteBack();
 }
@@ -1148,50 +1102,8 @@ template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
     buffer.readback_prone_tick = gc_tick;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
-    u64 total_size_bytes = 0;
-    FoldPendingRanges(device_addr, size);
-    // Islands an offloaded readback still owns stay with their owner's second
-    // hop; the unmark below then covers only the islands downloaded here.
     OwnedIslands owned;
-    if (writeback_offload_) {
-        CollectOwnedIslands(device_addr, device_addr + size, owned);
-        wboff_excluded_ += owned.size();
-    }
-    memory_tracker->ForEachDownloadRange<false>(
-        device_addr, size, [&](u64 device_addr_out, u64 range_size) {
-            const VAddr buffer_addr = buffer.CpuAddr();
-            const auto add_download = [&](VAddr start, VAddr end) {
-                const u64 new_offset = start - buffer_addr;
-                const u64 new_size = end - start;
-                copies.push_back(vk::BufferCopy{
-                    .srcOffset = new_offset,
-                    .dstOffset = total_size_bytes,
-                    .size = new_size,
-                });
-                // Align up to avoid cache conflicts
-                constexpr u64 align = 64ULL;
-                constexpr u64 mask = ~(align - 1ULL);
-                total_size_bytes += (new_size + align - 1) & mask;
-            };
-            if (owned.empty()) {
-                gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
-                SubtractGpuModifiedRange(device_addr_out, range_size);
-                return;
-            }
-            // A subtract from inside the walk erases the node the walk stands
-            // on; the pieces are collected and subtracted after it returns.
-            boost::container::small_vector<std::pair<VAddr, VAddr>, 32> pieces;
-            gpu_modified_ranges.ForEachInRange(
-                device_addr_out, range_size, [&](VAddr start, VAddr end) {
-                    EmitUnownedPieces(start, end, owned, [&](VAddr piece_start, VAddr piece_end) {
-                        add_download(piece_start, piece_end);
-                        pieces.emplace_back(piece_start, piece_end);
-                    });
-                });
-            for (const auto& [piece_start, piece_end] : pieces) {
-                SubtractGpuModifiedRange(piece_start, piece_end - piece_start);
-            }
-        });
+    const u64 total_size_bytes = CollectDownloadCopies(buffer, device_addr, size, copies, owned);
     if (total_size_bytes == 0) {
         return;
     }
@@ -1224,13 +1136,13 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         std::optional<Core::MemoryManager::GuestCopyScope> hold;
         if (writeback_hold_) {
             hold.emplace(memory);
-            ++writeback_loops_;
+            ++writeback_.loops;
         }
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
-            ++writeback_islands_;
-            writeback_bytes_ += copy.size;
+            ++writeback_.islands;
+            writeback_.bytes += copy.size;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
         }
@@ -1260,9 +1172,10 @@ void BufferCache::BindVertexBuffers(
     const Vulkan::GraphicsPipeline& pipeline,
     boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers) {
     static_assert(MaxVertexBindings >= Vulkan::MaxVertexBufferCount);
-    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
+    // An outer hold already owns the lock; this is the scope's own owner test,
+    // made before the scope instead of inside it.
+    if (batch_copy_lock_ && !Core::MemoryManager::tls_in_guest_copy_scope) {
         copy_scope.emplace(memory);
     }
     const auto& regs = liverpool->regs;
@@ -1272,9 +1185,8 @@ void BufferCache::BindVertexBuffers(
     Vulkan::VertexInputs<AmdGpu::Buffer> guest_buffers;
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     const bool memo_active = skipcache.Active();
-    // Lazy: the signatures come from the V# words and the Vulkan descriptions
-    // are built only for a setVertexInputEXT emit. Decided per call, since the
-    // framework mode changes at runtime.
+    // Lazy: the Vulkan descriptions are built only for a setVertexInputEXT emit; decided per
+    // call because the framework mode moves at runtime.
     const bool lazy = vertex_lazy_desc_ && memo_active;
     if (!lazy) {
         pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
@@ -1292,26 +1204,20 @@ void BufferCache::BindVertexBuffers(
         }
     };
 
-    // The resolved inputs go into a flat record compared element-wise with
-    // the previous call's: the layout words key the vertex input state, base
-    // and size add the guest V# contents. Content-keyed, so the user_data
-    // churn that defeats raw-register memos does not apply. location, binding,
-    // inputRate, offset and the divisor class are all read out of the
-    // pipeline's own fetch shader, so the pipeline pointer and the two step
-    // rates key them; only stride and format vary under a fixed pipeline.
-    // Both legs record one entry per fetch shader attribute, in attribute
-    // order; an unbound attribute reads back as the span {~0, 0}. Bits 48-63
-    // of the lazy word carry the attribute's semantic and step-rate operand:
-    // with them the record alone determines the vertex input description.
+    // One entry per fetch-shader attribute, in attribute order; an unbound attribute reads back
+    // as the span {~0, 0}, and bits 48-63 of the lazy word carry the semantic and step-rate
+    // operand, so the record alone determines the vertex input description.
+    // location, binding, inputRate, offset and the divisor class come out of the pipeline's own
+    // fetch shader, so the pipeline pointer and the two step rates key them; only stride and
+    // format vary under a fixed pipeline.
     u32 count = 0;
     bool layout_same = memo_active;
     bool bind_same = memo_active;
     VAddr span_lo = ~VAddr{0};
     VAddr span_hi = 0;
-    // True while every bound span touches the running union, which is the
-    // merge's own disjointness test: the bound spans then merge into the one
-    // range [span_lo, span_hi). A union that only closes through a later
-    // bridging span reads false and takes the general merge.
+    // True while every bound span touches the running union - the merge's own disjointness test;
+    // the bound spans then merge into [span_lo, span_hi). A union that only closes through a
+    // later bridging span reads false and takes the general merge.
     bool chain_ok = true;
     const auto fold = [&](VAddr base, u32 size, u64 layout) {
         VertexBindEntry& e = vertex_bind_entries_[count++];
@@ -1319,18 +1225,17 @@ void BufferCache::BindVertexBuffers(
         bind_same = bind_same & ((e.base == base) & (e.size == size));
         e = VertexBindEntry{base, layout, size};
         const bool bound = base != 0 && size > 0;
-        const VAddr lo = bound ? base : ~VAddr{0};
-        const VAddr hi = bound ? base + size : VAddr{0};
         if (bound) {
-            if (span_hi > span_lo && (hi < span_lo || span_hi < lo)) {
+            const VAddr hi = base + size;
+            if (span_hi > span_lo && (hi < span_lo || span_hi < base)) {
                 chain_ok = false;
             }
-            span_lo = std::min<VAddr>(span_lo, lo);
+            span_lo = std::min<VAddr>(span_lo, base);
             span_hi = std::max<VAddr>(span_hi, hi);
         }
     };
     if (lazy) {
-        ++vinput_calls_;
+        ++vinput_.calls;
         if (const auto& fetch = pipeline.GetFetchShader(); fetch && !fetch->attributes.empty()) {
             ASSERT_MSG(fetch->attributes.size() <= Vulkan::MaxVertexBufferCount,
                        "fetch shader binds {} attributes", fetch->attributes.size());
@@ -1363,12 +1268,11 @@ void BufferCache::BindVertexBuffers(
     vertex_bind_step0_ = regs.vgt_instance_step_rate_0;
     vertex_bind_step1_ = regs.vgt_instance_step_rate_1;
     if (memo_active) {
-        vinput_layout_ += layout_same;
-        vinput_bind_ += bind_same;
+        vinput_.layout += layout_same;
+        vinput_.bind += bind_same;
         const u64 tick = scheduler.CurrentTick();
-        // The memo keys on the bound span's word-epoch sum under the mirror
-        // mode, so faults outside the span no longer invalidate it; the
-        // certificate is the same one the sync memo relies on.
+        // Under the mirror mode the key is the bound span's word-epoch sum, so faults outside
+        // the span no longer invalidate it.
         u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
         bool mem_key_ok = true;
         if (mirror_mode_) {
@@ -1382,13 +1286,11 @@ void BufferCache::BindVertexBuffers(
         }
         if (mem_key_ok && vertex_bind_valid_ && bind_same && tick == vertex_bind_tick_ &&
             mem_key == vertex_bind_mem_key_) {
-            // Identical resolved layout and buffer contents descriptors on the
-            // same command buffer with no intervening CPU write. GPU writes do
-            // not move the key, so a skip additionally requires that no bound
-            // range is GPU modified (else the re-bind's barrier is required).
-            // The generation only moves on new GPU-dirty coverage, so an
-            // unchanged value reproves the recorded clean answer without the
-            // region walk.
+            // Same resolved layout and contents on this command buffer with no intervening CPU
+            // write. GPU writes do not move the key, so a skip additionally needs no bound range
+            // GPU modified (else the re-bind's barrier is required); the generation only moves on
+            // new GPU-dirty coverage, so an unchanged value reproves the recorded clean answer
+            // without the walk.
             if (vertex_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
                 return;
             }
@@ -1416,10 +1318,10 @@ void BufferCache::BindVertexBuffers(
         // blit helper) replaces the dynamic state; the foreign gen certifies
         // none intervened. Read with the fetch key only, which widens the memo.
         const u64 vi_gen = fetch_keyed ? skipcache.ForeignPipelineGen(0) : vertex_input_gen_;
-        if (!memo_active || !vertex_input_valid_ || !layout_same ||
-            vertex_input_tick_ != input_tick || vertex_input_gen_ != vi_gen) {
+        if (!vertex_input_valid_ || !layout_same || vertex_input_tick_ != input_tick ||
+            vertex_input_gen_ != vi_gen) {
             if (lazy) {
-                ++vinput_built_;
+                ++vinput_.built;
                 pipeline.GetVertexInputs(
                     attributes, bindings, divisors,
                     std::span<const AmdGpu::Buffer>{guest_buffers.data(), guest_buffers.size()},
@@ -1431,7 +1333,7 @@ void BufferCache::BindVertexBuffers(
             vertex_input_gen_ = vi_gen;
             vertex_input_valid_ = memo_active;
         } else {
-            vinput_fetchskip_ += !pipe_same;
+            vinput_.fetchskip += !pipe_same;
         }
     }
 
@@ -1439,7 +1341,7 @@ void BufferCache::BindVertexBuffers(
         // If there are no bindings, there is nothing further to do.
         return;
     }
-    vinput_binds_ += vertex_lazy_desc_;
+    vinput_.binds += vertex_lazy_desc_;
 
     const auto span_of = [&](size_t i) {
         const VertexBindEntry& e = vertex_bind_entries_[i];
@@ -1460,7 +1362,7 @@ void BufferCache::BindVertexBuffers(
         // The bound spans merge into one range by construction: one clamp,
         // one modified check, one buffer, and every offset off the unclamped
         // base, exactly what the general merge produces for one range.
-        bool span_proven_clean = memo_active && vertex_bind_valid_;
+        bool span_proven_clean = vertex_bind_valid_;
         const u64 size = memory->ClampRangeSize(span_lo, span_hi - span_lo);
         const bool gpu_modified = IsRegionGpuModified(span_lo, size);
         if (size != span_hi - span_lo || gpu_modified) {
@@ -1474,8 +1376,8 @@ void BufferCache::BindVertexBuffers(
                 barriers.emplace_back(*barrier);
             }
         }
-        // One clean unclamped walk proves the whole memo span at the current
-        // generation; the loop above reads guest memory only inside it.
+        // One clean unclamped walk proves the whole memo span at the current generation; nothing
+        // above it reads guest memory outside the walked range.
         if (span_proven_clean) {
             vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
         }
@@ -1494,7 +1396,7 @@ void BufferCache::BindVertexBuffers(
                 host_strides[i] = guest_buffers[i].GetStride();
             }
         }
-        ++vinput_chain_;
+        ++vinput_.chain;
     } else {
         // Coalesce the bound spans into disjoint ranges. Every entry the span
         // touches collapses into it, which is the whole merge. The array's
@@ -1529,7 +1431,7 @@ void BufferCache::BindVertexBuffers(
         }
 
         // Map buffers for merged ranges
-        bool span_proven_clean = memo_active && vertex_bind_valid_ && num_ranges == 1;
+        bool span_proven_clean = vertex_bind_valid_ && num_ranges == 1;
         for (size_t r = 0; r < num_ranges; ++r) {
             BufferRange& range = ranges[r];
             const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
@@ -1551,11 +1453,9 @@ void BufferCache::BindVertexBuffers(
                 }
             }
         }
-        // A single merged range spans the whole memo span, so one clean
-        // unclamped walk proves it at the current generation. The seed relies
-        // on the loop reading guest memory only inside the walked range: a
-        // read outside it could fault into a veto re-Add that bumps the
-        // generation mid-loop.
+        // A single merged range spans the whole memo span, so one clean unclamped walk proves it.
+        // The seed relies on the loop reading guest memory only inside the walked range: a read
+        // outside could fault into a veto re-Add that bumps the generation mid-loop.
         if (span_proven_clean) {
             vertex_bind_clean_gpu_gen_ = gpu_dirty_generation_;
         }
@@ -1597,9 +1497,10 @@ void BufferCache::BindVertexBuffers(
 u32 BufferCache::BindIndexBuffer(
     u32 index_offset, boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers,
     bool allow_whole) {
-    const bool batch_copy_lock = batch_copy_lock_;
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
-    if (batch_copy_lock) {
+    // An outer hold already owns the lock; this is the scope's own owner test,
+    // made before the scope instead of inside it.
+    if (batch_copy_lock_ && !Core::MemoryManager::tls_in_guest_copy_scope) {
         copy_scope.emplace(memory);
     }
     const auto& regs = liverpool->regs;
@@ -1613,15 +1514,15 @@ u32 BufferCache::BindIndexBuffer(
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    // Resolved lazily: the memo check, the acquire and the barrier decision
-    // all ask the same question about the same range, and a memo hit whose
-    // range is proven clean at the current GPU-dirty generation needs no walk.
-    std::optional<bool> index_gpu_modified{};
+    // Resolved lazily: the memo check, the acquire and the barrier decision all ask the same
+    // question about the same range.
+    bool index_gpu_modified = false;
     // Named by this call's resolving walk when one region covers the range;
     // the final probe below reuses it instead of resolving again.
     RegionManager* region = nullptr;
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
-    if (skipcache.Active()) {
+    const bool memo_active = skipcache.Active();
+    if (memo_active) {
         const u64 tick = scheduler.CurrentTick();
         u64 mem_key = skipcache.Gens().mem_gen.load(std::memory_order_acquire);
         bool mem_key_ok = true;
@@ -1631,25 +1532,21 @@ u32 BufferCache::BindIndexBuffer(
                              index_bind_type_ == static_cast<u32>(index_type) &&
                              index_bind_tick_ == tick;
         bool certified = false;
-        if (resolved) {
-            // The tag compare comes first; the certificate then comes from the
-            // memo's own region when the recording walk named one.
-            if (tag_hit && index_bind_region_ != nullptr) {
-                u64 sum = 0;
-                certified = index_bind_region_->EpochSumResolved(
-                                index_address & TRACKER_HIGHER_PAGE_MASK, index_buffer_size, sum) &&
-                            sum == index_bind_mem_key_;
-                index_bind_fast_ += certified;
-            }
-            if (!certified) {
+        // The certificate comes from the region the recording walk named, so no re-walk.
+        if (resolved && tag_hit && index_bind_region_ != nullptr) {
+            u64 sum = 0;
+            certified = index_bind_region_->EpochSumResolved(
+                            index_address & TRACKER_HIGHER_PAGE_MASK, index_buffer_size, sum) &&
+                        sum == index_bind_mem_key_;
+            index_bind_fast_ += certified;
+        }
+        if (!certified) {
+            if (resolved) {
                 const auto sum = memory_tracker->Sum256ForRangeResolved(index_address,
                                                                         index_buffer_size, region);
                 mem_key = sum.sum;
                 mem_key_ok = sum.ok;
-                certified = tag_hit && mem_key_ok && index_bind_mem_key_ == mem_key;
-            }
-        } else {
-            if (mirror_mode_) {
+            } else if (mirror_mode_) {
                 const auto sum = memory_tracker->Sum256ForRange(index_address, index_buffer_size);
                 mem_key = sum.sum;
                 mem_key_ok = sum.ok;
@@ -1661,18 +1558,18 @@ u32 BufferCache::BindIndexBuffer(
         // exact-bind arm and clears the record.
         certified &= allow_whole || index_whole_first_ == 0;
         if (certified) {
-            // Same resolved index range already bound on this command buffer
-            // with no intervening CPU write; an unchanged GPU-dirty generation
-            // reproves the recorded clean answer without the region walk.
+            // Same resolved range already bound on this command buffer with no intervening CPU
+            // write; an unchanged GPU-dirty generation reproves the recorded clean answer
+            // without the walk.
             if (index_bind_clean_gpu_gen_ == gpu_dirty_generation_) {
                 return index_whole_first_;
             }
             ++index_genwalk_;
-            index_gpu_modified = IsRegionGpuModified(index_address, index_buffer_size);
-            if (!*index_gpu_modified) {
+            if (!IsRegionGpuModified(index_address, index_buffer_size)) {
                 index_bind_clean_gpu_gen_ = gpu_dirty_generation_;
                 return index_whole_first_;
             }
+            index_gpu_modified = true;
         }
         index_bind_addr_ = index_address;
         index_bind_size_ = index_buffer_size;
@@ -1686,36 +1583,33 @@ u32 BufferCache::BindIndexBuffer(
     } else {
         index_bind_valid_ = false;
     }
-    // has_value distinguishes an unresolved answer from a resolved false.
-    if (!index_gpu_modified.has_value()) {
+    if (!index_gpu_modified) {
         index_gpu_modified =
             region != nullptr
                 ? memory_tracker->IsRegionGpuModifiedIn(region, index_address, index_buffer_size)
                 : IsRegionGpuModified(index_address, index_buffer_size);
-        if (index_bind_valid_ && !*index_gpu_modified) {
+        if (index_bind_valid_ && !index_gpu_modified) {
             // The walked range is exactly the stamped memo range, so a fresh
             // clean answer seeds the walk skip for the next hit.
             index_bind_clean_gpu_gen_ = gpu_dirty_generation_;
         }
     }
     const auto [vk_buffer, offset] =
-        ObtainBuffer(index_address, index_buffer_size, false, false, {}, *index_gpu_modified);
-    if (*index_gpu_modified) {
+        ObtainBuffer(index_address, index_buffer_size, false, false, {}, index_gpu_modified);
+    if (index_gpu_modified) {
         if (auto barrier = vk_buffer->GetBarrier(vk::AccessFlagBits2::eIndexRead,
                                                  vk::PipelineStageFlagBits2::eIndexInput)) {
             barriers.emplace_back(*barrier);
         }
     }
     const auto cmdbuf = scheduler.CommandBuffer();
-    // index_bind_whole: one bind per (handle, type, tick) at offset 0 with the
-    // draw addressed through firstIndex. A misaligned offset or a caller whose
-    // firstIndex lives in indirect args takes the exact bind and clears the
-    // record; no foreign index bind exists on this command buffer, so the
-    // key carries no foreign generation.
+    // index_bind_whole: one bind per (handle, type, tick) at offset 0 with the draw addressed
+    // through firstIndex; a misaligned offset, or a caller whose firstIndex lives in indirect
+    // args, takes the exact bind and clears the record.
     const bool whole =
-        index_bind_whole_ && allow_whole && skipcache.Active() && (offset & (index_size - 1)) == 0;
+        index_bind_whole_ && allow_whole && memo_active && (offset & (index_size - 1)) == 0;
     if (!whole) {
-        idxwhole_veto_ += index_bind_whole_;
+        idxwhole_.veto += index_bind_whole_;
         index_whole_handle_ = VK_NULL_HANDLE;
         index_whole_first_ = 0;
         cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
@@ -1725,13 +1619,13 @@ u32 BufferCache::BindIndexBuffer(
     const u64 whole_tick = scheduler.CurrentTick();
     if (handle != index_whole_handle_ || index_whole_type_ != static_cast<u32>(index_type) ||
         index_whole_tick_ != whole_tick) {
-        ++idxwhole_binds_;
+        ++idxwhole_.binds;
         index_whole_handle_ = handle;
         index_whole_type_ = static_cast<u32>(index_type);
         index_whole_tick_ = whole_tick;
         cmdbuf.bindIndexBuffer(vk_buffer->Handle(), 0, index_type);
     } else {
-        ++idxwhole_skips_;
+        ++idxwhole_.skips;
     }
     index_whole_first_ = offset >> (is_index16 ? 1u : 2u);
     return index_whole_first_;
@@ -1862,6 +1756,33 @@ static size_t RangeMemoIndex(VAddr addr, u32 size, size_t sets) noexcept {
     return key & (sets - 1);
 }
 
+namespace {
+struct StreamCopyCacheEntry {
+    VAddr addr; // 0 = invalid
+    u64 tick;
+    // Host-memory generation, or the range's word-epoch sum under the mirror
+    // mode: range-local keying survives the constant generation churn of
+    // unrelated faults.
+    u64 mem_key;
+    u64 gpu_gen;
+    // The region a certifying walk found covering the range, or null; regions
+    // are pooled for the process's life and the cache outlives no BufferCache
+    // in practice.
+    RegionManager* region;
+    u32 offset;
+    u32 size;
+};
+
+struct StreamCopyCache {
+    // Small enough to stay resident in L1: it is probed on every call with a
+    // hashed index, so a larger table turns each probe into a cache miss.
+    static constexpr size_t kSets = 64;
+    static constexpr size_t kWays = 2;
+    std::array<std::array<StreamCopyCacheEntry, kWays>, kSets> sets{};
+    std::array<u8, kSets> lru{};
+};
+} // namespace
+
 // Every shrinking access to gpu_modified_ranges goes through here: the
 // covered-range memo certifies containment only while this counter holds.
 // Callers fold the pending lanes over the window before the enumeration that
@@ -1960,45 +1881,16 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                                                   std::optional<bool> gpu_modified) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE) {
-        // Small read-only uploads dominate this function: the same (addr, size)
-        // binds repeat across draws within one command buffer, so a repeat bind
-        // can reuse the offset the previous copy landed at.
-        //
-        // The submission tick is load bearing, not merely a freshness hint. An
-        // unchanged memory generation does NOT prove the guest left the source
-        // alone: under precise readbacks a read fault can drop a page's
-        // protection without setting its CPU dirty bit, after which guest
-        // writes land unobserved. Keying on the tick keeps a reused offset
-        // confined to a single command buffer, which is what actually bounds
-        // the exposure. Widening that window corrupts vertex data.
-        //
-        // The table is deliberately small enough to stay resident in L1: it is
-        // probed on every call with a hashed index, so a large table turns each
-        // probe into a cache miss and evicts hot data for a lookup that rarely
-        // hits.
+        // The same (addr, size) binds repeat across draws within one command
+        // buffer, so a repeat bind can reuse the offset the previous copy
+        // landed at. The submission tick is load bearing: an unchanged memory
+        // generation does NOT prove the guest left the source alone, because
+        // under precise readbacks a read fault can drop a page's protection
+        // without setting its CPU dirty bit, after which guest writes land
+        // unobserved. Keying on the tick confines a reused offset to one
+        // command buffer; widening that window corrupts vertex data.
         auto& skipcache = VideoCore::Skipcache::Framework::Instance();
         if (skipcache.Active()) {
-            struct StreamCopyCacheEntry {
-                VAddr addr; // 0 = invalid
-                u64 tick;
-                // Host-memory generation, or the range's word-epoch sum under
-                // the mirror mode: range-local keying survives the constant
-                // generation churn of unrelated faults.
-                u64 mem_key;
-                u64 gpu_gen;
-                // The region a certifying walk found covering the range, or
-                // null; regions are pooled for the process's life and the
-                // cache outlives no BufferCache in practice.
-                RegionManager* region;
-                u32 offset;
-                u32 size;
-            };
-            constexpr size_t kSets = 64;
-            constexpr size_t kWays = 2;
-            struct StreamCopyCache {
-                std::array<std::array<StreamCopyCacheEntry, kWays>, kSets> sets{};
-                std::array<u8, kSets> lru{};
-            };
             // Heap-backed: only the pointer lives in TLS (a large in-TLS array
             // blows the guest pthread TLS budget at create time). Probes run on the
             // GPU command thread only; the plain stream_copy_* counters share that contract.
@@ -2007,13 +1899,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
                 storage = std::make_unique<StreamCopyCache>();
             }
             auto& cache = *storage;
-            const size_t set_idx = RangeMemoIndex(device_addr, size, kSets);
+            const size_t set_idx = RangeMemoIndex(device_addr, size, StreamCopyCache::kSets);
             auto& set = cache.sets[set_idx];
             const u64 tick = scheduler.CurrentTick();
-            // Read where it is consumed. Under the resolved epoch the key is
-            // the walk's own sum, computed per compare below and assigned on
-            // the miss arm before the populate, so the generation load here
-            // was a per-bind acquire whose value never reached a compare.
             u64 mem_key = 0;
             bool mem_key_ok = true;
             RegionManager* region = nullptr;
@@ -2030,8 +1918,6 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
             StreamCopyCacheEntry* hit = nullptr;
             bool fast = false;
             if (resolved) {
-                // The tag compare comes first; the certificate then comes from
-                // the entry's own region when the recording walk named one.
                 for (auto& e : set) {
                     if (e.addr != device_addr || e.size != size || e.tick != tick) {
                         continue;
@@ -2135,12 +2021,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBufferSlot(VAddr device_addr, u32 siz
             gc_tick - buffer.readback_prone_tick <= kProneWindow) {
             prone_write_pending_ = true;
         }
-        // Bump the GPU-clean epoch only on new coverage; steady-state
-        // re-writes of the same ranges skip both the bump and the no-op
-        // interval merge. A page of the range that was GPU-clean until this
-        // mark has had nothing covering it since its last unmark, so the set
-        // cannot contain the range. The probe stays after the walk: the
-        // upload's guest read can fault into a download that subtracts.
+        // A page that was GPU-clean until this mark has had nothing covering
+        // it since its last unmark, so the set cannot contain the range. The
+        // probe stays after the walk: the upload's guest read can fault into a
+        // download that subtracts.
         ++written_binds_;
         if (written_range_mode_ != 0 && fresh && size != 0) {
             ++written_fresh_;
@@ -2411,31 +2295,15 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
     }
 }
 
-// Guest upload sources are written by game threads on other cores and read
-// exactly once by the staging copy, so their lines are cold. Requesting the
-// head of an island early overlaps the DRAM latency with the tracker walk,
-// staging map, and barrier setup. Prefetch never faults, so watched or
-// unmapped pages in sparse ranges are safe to request.
-static void PrefetchGuestSource(VAddr device_addr, u64 size) {
-    constexpr u64 prefetch_bytes = 1024;
-    for (u64 i = 0; i < std::min<u64>(size, prefetch_bytes); i += 64) {
-        __builtin_prefetch(reinterpret_cast<const void*>(device_addr + i), 0, 3);
-    }
-}
-
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer, bool* new_gpu_pages) {
     if (new_gpu_pages) {
         *new_gpu_pages = false;
     }
-    bool fresh_pages = false;
-    // Read-only binds dominate and almost never have anything to upload, but
-    // proving it walks every page of the range under the tracker lock. While
-    // the host-memory generation is unchanged the guest bytes still equal the
-    // device-buffer bytes for a range that had nothing to upload, so eliding
-    // the walk and upload is byte-identical. A query contained in a recorded
-    // clean range hits, since a clean range has no dirty subrange. Written
-    // binds are excluded: their walk also marks the range GPU modified.
+    // While the host-memory generation is unchanged, a range that uploaded nothing
+    // still equals the device buffer, so a query contained in a recorded clean range
+    // may skip the walk: a clean range has no dirty subrange. Written binds are
+    // excluded because their walk also marks the range GPU modified.
     auto& skipcache = VideoCore::Skipcache::Framework::Instance();
     const bool texel_read = is_texel_buffer && !is_written;
     const bool memo_eligible =
@@ -2448,7 +2316,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     // sum instead of the global generation, so unrelated faults elsewhere no
     // longer invalidate it. The sum is validated over the recorded range, not
     // the queried subrange, since the stored sum covers exactly that span.
-    const bool epoch_keyed = memo_eligible && mirror_mode_;
+    const bool epoch_keyed = mirror_mode_;
     const u64 memo_gen =
         memo_eligible ? skipcache.Gens().mem_gen.load(std::memory_order_acquire) : 0;
     if (memo_eligible) {
@@ -2459,7 +2327,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
                 continue;
             }
             bool hit = false;
-            if (epoch_keyed && noop.size <= MemoryTracker::MAX_EPOCH_SUM_SPAN) {
+            const bool entry_gen_kind =
+                !epoch_keyed || noop.size > MemoryTracker::MAX_EPOCH_SUM_SPAN;
+            if (!entry_gen_kind) {
                 const auto sum = memory_tracker->Sum256ForRange(noop.addr, noop.size);
                 hit = sum.ok && noop.mem_key == sum.sum;
             } else {
@@ -2482,7 +2352,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();
     vk::Buffer src_buffer = VK_NULL_HANDLE;
-    fresh_pages = memory_tracker->ForEachUploadRange(
+    const bool fresh_pages = memory_tracker->ForEachUploadRange(
         device_addr, size, is_written,
         [&](u64 device_addr_out, u64 range_size) {
             PrefetchGuestSource(device_addr_out, range_size);
@@ -2618,36 +2488,24 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
     // inline copy under their lock discipline.
     auto& lane = VideoCore::StreamCopyLane::Instance();
     const bool drain = upload_drain_ && !is_written && lane.Enabled();
+    const VAddr buffer_start = buffer.CpuAddr();
     for (size_t i = 0; i < copies.size(); ++i) {
         auto& copy = copies[i];
         // Requesting the next island's source overlaps its misses with this
         // island's copy. Walk-time prefetches of early islands may already
         // be evicted on large multi-island syncs, so this repeat is kept.
         if (i + 1 < copies.size()) {
-            PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
+            PrefetchGuestSource(buffer_start + copies[i + 1].dstOffset, copies[i + 1].size);
         }
         u8* const src_pointer = staging + copy.srcOffset;
-        const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
-        if (drain && copy.size >= 192) {
+        const VAddr device_addr = buffer_start + copy.dstOffset;
+        if (drain && copy.size >= StreamCopyLane::kMinLaneBytes) {
             Core::MemoryManager::BackingSpan spans[2];
             const bool hardened = lane.Hardened();
             const u32 num_spans =
                 memory->ResolveBackingSpans(device_addr, copy.size, spans, 2, hardened);
             if (num_spans != 0) {
-                u8* dst = src_pointer;
-                bool queued = true;
-                for (u32 k = 0; k < num_spans; ++k) {
-                    if (queued) {
-                        queued = lane.Push(spans[k].ptr, dst, static_cast<u32>(spans[k].size));
-                    }
-                    if (!queued) {
-                        std::memcpy(dst, spans[k].ptr, spans[k].size);
-                    }
-                    dst += spans[k].size;
-                }
-                if (hardened) {
-                    Core::MemoryManager::EndBackingPush();
-                }
+                PushBackingSpans(lane, spans, num_spans, src_pointer, hardened);
                 copy.srcOffset += offset;
                 continue;
             }
@@ -2668,13 +2526,14 @@ vk::Buffer BufferCache::UploadCopiesFallback(Buffer& buffer, std::span<const vk:
                                  vk::BufferUsageFlagBits::eTransferSrc, total_size_bytes);
     const vk::Buffer src_buffer = temp_buffer->Handle();
     u8* const staging = temp_buffer->mapped_data.data();
+    const VAddr buffer_start = buffer.CpuAddr();
     for (size_t i = 0; i < copies.size(); ++i) {
         const auto& copy = copies[i];
         if (i + 1 < copies.size()) {
-            PrefetchGuestSource(buffer.CpuAddr() + copies[i + 1].dstOffset, copies[i + 1].size);
+            PrefetchGuestSource(buffer_start + copies[i + 1].dstOffset, copies[i + 1].size);
         }
         u8* const src_pointer = staging + copy.srcOffset;
-        const VAddr device_addr = buffer.CpuAddr() + copy.dstOffset;
+        const VAddr device_addr = buffer_start + copy.dstOffset;
         memory->CopySparseMemory(device_addr, src_pointer, copy.size);
     }
     scheduler.DeferOperation([buffer = std::move(temp_buffer)]() mutable { buffer.reset(); });

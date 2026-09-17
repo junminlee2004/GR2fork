@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -127,8 +128,7 @@ public:
         u64 vetoes;
         u64 fallbacks;
         u64 wait_ns;
-        // Fault windows that found nothing to download. Counted whatever the
-        // settings say, so an owner-join design can be sized before it exists.
+        // Fault windows that found nothing to download (counted regardless of settings).
         u64 empty;
         // readback_offload: copies taken by the second queue, the fallbacks
         // by reason, and the faulting threads' wait on that queue.
@@ -178,24 +178,24 @@ public:
 
     /// Snapshot and reset the stream copy cache counters (for periodic logs).
     StreamCopyStats DrainStreamCopyStats() {
-        const StreamCopyStats stats{stream_copy_hits_, stream_copy_probes_, stream_copy_fast_,
-                                    index_bind_fast_,  stream_genwalk_,     vertex_genwalk_,
-                                    index_genwalk_};
-        stream_copy_hits_ = stream_copy_probes_ = stream_copy_fast_ = index_bind_fast_ = 0;
-        stream_genwalk_ = vertex_genwalk_ = index_genwalk_ = 0;
-        return stats;
+        return {std::exchange(stream_copy_hits_, 0), std::exchange(stream_copy_probes_, 0),
+                std::exchange(stream_copy_fast_, 0), std::exchange(index_bind_fast_, 0),
+                std::exchange(stream_genwalk_, 0),   std::exchange(vertex_genwalk_, 0),
+                std::exchange(index_genwalk_, 0)};
     }
 
-    // Telemetry for the DMA-draw full-overlap sync (the round-5 rank-2
-    // instrumentation): how many range syncs run, how many buffers each walk
-    // touches, and how many bytes each pass asks SynchronizeBuffer to cover.
-    // Sizes the bound before any narrowing is designed.
+    // DMA-draw full-overlap sync: range syncs run, buffers walked, bytes covered.
     struct DmaSyncStats {
         u64 calls;
         u64 buffers;
         u64 bytes;
         u64 max_bytes;
     };
+    DmaSyncStats DrainDmaSyncStats() {
+        return {std::exchange(dmasync_calls_, 0), std::exchange(dmasync_buffers_, 0),
+                std::exchange(dmasync_bytes_, 0), std::exchange(dmasync_max_bytes_, 0)};
+    }
+
     // Byte split of the staging upload path by bind writability: the
     // read-only share is what the upload drain setting can move to the lane.
     struct UploadCopyStats {
@@ -204,36 +204,21 @@ public:
         u64 w_calls;
         u64 w_bytes;
     };
-    MemoryTracker::FastPathDrain DrainTrackerFastStats() {
-        return memory_tracker->DrainFastPathStats();
+    UploadCopyStats DrainUploadCopyStats() {
+        return {std::exchange(upload_ro_calls_, 0), std::exchange(upload_ro_bytes_, 0),
+                std::exchange(upload_w_calls_, 0), std::exchange(upload_w_bytes_, 0)};
     }
+
     struct TexelNoopStats {
         u64 hits;
         u64 probes;
     };
     TexelNoopStats DrainTexelNoopStats() {
-        const TexelNoopStats out{texel_noop_hits_, texel_noop_probes_};
-        texel_noop_hits_ = texel_noop_probes_ = 0;
-        return out;
-    }
-    UploadCopyStats DrainUploadCopyStats() {
-        const UploadCopyStats stats{upload_ro_calls_, upload_ro_bytes_, upload_w_calls_,
-                                    upload_w_bytes_};
-        upload_ro_calls_ = 0;
-        upload_ro_bytes_ = 0;
-        upload_w_calls_ = 0;
-        upload_w_bytes_ = 0;
-        return stats;
+        return {std::exchange(texel_noop_hits_, 0), std::exchange(texel_noop_probes_, 0)};
     }
 
-    DmaSyncStats DrainDmaSyncStats() {
-        const DmaSyncStats stats{dmasync_calls_, dmasync_buffers_, dmasync_bytes_,
-                                 dmasync_max_bytes_};
-        dmasync_calls_ = 0;
-        dmasync_buffers_ = 0;
-        dmasync_bytes_ = 0;
-        dmasync_max_bytes_ = 0;
-        return stats;
+    MemoryTracker::FastPathDrain DrainTrackerFastStats() {
+        return memory_tracker->DrainFastPathStats();
     }
 
     /// Binds host vertex buffers for the current draw.
@@ -255,14 +240,10 @@ public:
 
     /// Obtains a buffer for the specified region.
     ///
-    /// `gpu_modified` lets a caller that already knows whether the range is GPU
-    /// modified hand that answer in rather than have it recomputed. Resolving it
-    /// is a chain of dependent loads - a 2 MiB pointer table, then the region
-    /// object, then its bitmap - which the out-of-order engine cannot overlap
-    /// and the prefetcher cannot predict, so paying for it twice on the same
-    /// range is worth avoiding. Only valid for read-only queries: a written bind
-    /// marks the range GPU modified as a side effect, so a value sampled
-    /// beforehand would be stale by the time it is used.
+    /// `gpu_modified` hands in an answer the caller already resolved, so the
+    /// dependent-load chain (page table -> region -> bitmap) is not walked
+    /// twice. Read-only queries only: a written bind marks the range GPU
+    /// modified as a side effect, so a value sampled beforehand is stale.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
                                                        BufferId buffer_id = {},
@@ -352,9 +333,7 @@ private:
         std::unique_ptr<Buffer> staging; // pool buffer holding the copied data
         boost::container::small_vector<vk::BufferCopy, 4> copies;
         MemoryTracker::GpuSeqSnapshots snapshots;
-        VAddr buffer_base = 0;  // guest base of the source buffer at record time
-        VAddr window_start = 0; // range whose tracker bits the writeback clears
-        u64 window_size = 0;
+        VAddr buffer_base = 0; // guest base of the source buffer at record time
         u64 wait_tick = 0;
         // readback_offload: the copy retires on the second queue's own
         // timeline at this tick; wait_tick then names the writer's batch.
@@ -364,7 +343,9 @@ private:
         u64 written_islands = 0; // filled by the offloaded write-back
         u64 written_bytes = 0;
         u64 copy_ns = 0;
-        u8 copier = 0; // 0 guest thread, 1 priority thread, 2 GPU command thread
+        // 0 guest thread, 2 GPU command thread; 1 (priority thread) is never
+        // assigned - the priority helper is counted by prio_helped_/prio_bytes_.
+        u8 copier = 0;
         bool copied = false;
         bool has_download = false;
         bool fully_cleared = false; // FinishFaultDownload verdict
@@ -376,6 +357,11 @@ private:
         u64 join_copy_queue_tick = 0; // newest copy-queue tick among them
     };
 
+    /// The [start, end) of the buffer to read back for a fault on
+    /// [device_addr, device_addr + size), widened and clamped to the buffer.
+    std::pair<VAddr, VAddr> ComputeReadbackWindow(const Buffer& buffer, VAddr device_addr,
+                                                  u64 size) const;
+
     /// Records download copies for an offloaded fault readback and flushes the
     /// submission. GPU command thread only (reached via SendCommand).
     void PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size, bool is_write);
@@ -385,17 +371,24 @@ private:
     void FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size, bool is_write);
 
     /// Copies every downloaded island into guest memory through the backing
-    /// view. Any thread; the caller has waited out job.wait_tick.
-    void WriteBackFaultDownload(FaultDownloadJob& job, u8 copier);
+    /// view. Any thread; the caller has waited out job.wait_tick. Records the
+    /// copying thread in job.copier: 0 guest, 2 GPU command thread.
+    void WriteBackFaultDownload(FaultDownloadJob& job);
+
+    /// readback_offload: nothing to download for this window - waits out the owners'
+    /// write-back by helping, waiting a notify or sleeping, so the faulting thread does
+    /// not re-fault into the GPU command thread. Runs on whichever thread faulted.
+    void DampAfterEmptyDownload(FaultDownloadJob& job, VAddr device_addr, u64 size);
 
     /// Copies islands of another job's share until its cursor is exhausted;
     /// false when none was left. Any thread, once the share is ready. The
-    /// bytes it copied are added to copied_bytes when one is given. A bail
-    /// predicate, when given, is polled before every claim past the first, and
-    /// a non-zero max_bytes stops claiming once that many bytes were copied;
-    /// either way a claimed island is always finished.
+    /// bytes it copied are added to copied_bytes when one is given. With
+    /// bail_on_pending, liverpool->HasPendingWork() is polled before every claim
+    /// past the first and sets *bailed when it stops the copy; a non-zero
+    /// max_bytes stops claiming once that many bytes were copied. Either way a
+    /// claimed island is always finished.
     bool HelpWriteBack(WriteBackShare& share, u64* copied_bytes = nullptr,
-                       bool (*bail)(void*) = nullptr, void* bail_user = nullptr, u64 max_bytes = 0,
+                       bool bail_on_pending = false, bool* bailed = nullptr, u64 max_bytes = 0,
                        u32* max_island = nullptr);
 
     /// Priority-ops thread, after the share's fence: copies islands until the
@@ -418,18 +411,24 @@ private:
     /// Same, from a thread that may not be the GPU command thread: hops over
     /// when it is not, so the parked state stays GPU-command-thread confined.
     void DrainPendingFinishSynced();
+
     /// GPU command thread, drained while it has nothing else to do: copies
     /// islands of a share up to a byte cap, yielding at the first island
     /// boundary after a submit or command arrives.
     void HelpAsGpuIdle(WriteBackShare& share);
 
-    /// HelpWriteBack bail for HelpAsGpuIdle; the argument is its bail context.
-    static bool GpuIdleBail(void* user);
-
     using OwnedIslands = boost::container::small_vector<std::pair<VAddr, u32>, 16>;
     /// Islands of in-flight readbacks that overlap [start, end), sorted by
     /// address. GPU command thread only.
     void CollectOwnedIslands(VAddr start, VAddr end, OwnedIslands& out) const;
+
+    /// Records the download copies for the GPU-modified islands of
+    /// [start, start + size), folds the pending ranges, subtracts what it took
+    /// and reports the in-flight islands it left to their owners in 'owned'.
+    /// Copy destinations are packed from zero. Returns the staging bytes.
+    template <typename Copies>
+    u64 CollectDownloadCopies(Buffer& buffer, VAddr start, u64 size, Copies& copies,
+                              OwnedIslands& owned);
 
     /// Takes a staging buffer of at least the given size from the fault pool.
     /// GPU command thread only.
@@ -457,8 +456,6 @@ private:
     vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies, bool is_written,
                             size_t total_size_bytes);
 
-    /// Records the barriers and copy commands for a completed upload batch.
-    /// Out of line so the no-upload walk in SynchronizeBuffer stays compact.
     /// The slot path of ObtainBuffer: taken when the range cannot be served
     /// from the stream ring. Outlined so the ring path, which is most binds,
     /// does not carry its code through the instruction fetcher.
@@ -466,6 +463,8 @@ private:
                                                             bool is_written, bool is_texel_buffer,
                                                             BufferId buffer_id);
 
+    /// Records the barriers and copy commands for a completed upload batch.
+    /// Out of line so the no-upload walk in SynchronizeBuffer stays compact.
     SHAD_NO_INLINE void EmitBufferUpload(Buffer& buffer, vk::Buffer src_buffer,
                                          std::span<const vk::BufferCopy> copies);
 
@@ -491,16 +490,12 @@ private:
     FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
 
-    // Vertex/index bind memos (adaptive skip caches, inline form). Validity
-    // requires same submission tick (stream ring offsets are only stable
-    // within one command buffer) and an unchanged memory key: the host-memory
-    // generation, or the bound range's word-epoch sum under the mirror mode. The clean-gen fields
-    // record the gpu_dirty_generation_ at which the memoized range was last proven not GPU
-    // modified; zero means unproven.
-    // The record of the last call's resolved inputs, compared element-wise
-    // by the next call: the layout words alone key the vertex input state,
-    // base and size add the guest V# contents. All five fields are written
-    // together on every call.
+    // Vertex/index bind memos (adaptive skip caches, inline form). A memo is valid only on the
+    // same submission tick (stream ring offsets are stable only within one command buffer) with
+    // an unchanged memory key: mem_gen, or the bound range's word-epoch sum under mirror mode.
+    // The clean-gen fields hold the gpu_dirty_generation_ at which the range was last proven not
+    // GPU modified; zero means unproven. In VertexBindEntry the layout words key the vertex
+    // input state; base and size add the guest V# contents.
     static constexpr u32 MaxVertexBindings = 32;
     struct VertexBindEntry {
         VAddr base;
@@ -527,8 +522,8 @@ private:
     RegionManager* index_bind_region_{}; // certifies the mem key without the walk
     u64 index_bind_clean_gpu_gen_{};
     bool index_bind_valid_{};
-    // index_bind_whole: the host buffer bound whole (offset 0) on this tick and
-    // the firstIndex the last bind answered; an exact bind clears the handle.
+    // Last whole index bind (offset 0) on this tick and the firstIndex it answered; an exact
+    // bind clears the handle.
     VkBuffer index_whole_handle_{};
     u64 index_whole_tick_{};
     u32 index_whole_type_{};
@@ -605,11 +600,7 @@ public:
         u64 fetchskip;
     };
     VertexInputStats DrainVertexInputStats() {
-        const VertexInputStats out{vinput_calls_,  vinput_built_, vinput_binds_,    vinput_chain_,
-                                   vinput_layout_, vinput_bind_,  vinput_fetchskip_};
-        vinput_calls_ = vinput_built_ = vinput_binds_ = vinput_chain_ = vinput_layout_ =
-            vinput_bind_ = vinput_fetchskip_ = 0;
-        return out;
+        return std::exchange(vinput_, {});
     }
     struct IndexWholeStats {
         u64 binds;
@@ -617,9 +608,7 @@ public:
         u64 veto;
     };
     IndexWholeStats DrainIndexWholeStats() {
-        const IndexWholeStats out{idxwhole_binds_, idxwhole_skips_, idxwhole_veto_};
-        idxwhole_binds_ = idxwhole_skips_ = idxwhole_veto_ = 0;
-        return out;
+        return std::exchange(idxwhole_, {});
     }
     struct WritebackStats {
         u64 loops;
@@ -627,16 +616,12 @@ public:
         u64 bytes;
     };
     WritebackStats DrainWritebackStats() {
-        const WritebackStats out{writeback_loops_, writeback_islands_, writeback_bytes_};
-        writeback_loops_ = writeback_islands_ = writeback_bytes_ = 0;
-        return out;
+        return std::exchange(writeback_, {});
     }
     /// Marks a CP write CPU-dirty without releasing its write watcher; the
-    /// caller writes the bytes through the backing alias afterwards. Refuses
-    /// (false) exactly where the ordinary fault path would do more than mark:
-    /// an unregistered range - InvalidateMemory returns early on those, so the
-    /// tracker must not gain state here either - or a GPU-modified page, which
-    /// owes a readback.
+    /// caller then writes the bytes through the backing alias. Refuses an
+    /// unregistered range (InvalidateMemory returns early on those, so the
+    /// tracker must not gain state here either) or a GPU-modified page.
     [[nodiscard]] bool MarkCpuWriteKeepArmed(VAddr addr, u64 size) {
         if (!IsRegionRegistered(addr, size)) {
             return false;
@@ -653,10 +638,10 @@ public:
             DrainPendingFinish();
         }
         const auto d = memory_tracker->ArmPendingReadWatchers(carry);
-        ++rarm_drains_[static_cast<size_t>(site)];
-        rarm_regions_ += d.regions;
-        rarm_pages_ += d.pages;
-        rarm_calls_ += d.calls;
+        ++rarm_.drains[static_cast<size_t>(site)];
+        rarm_.regions += d.regions;
+        rarm_.pages += d.pages;
+        rarm_.calls += d.calls;
     }
     /// Releases every read watcher a finished download left pending.
     void DrainPendingReadReleases(bool carry) {
@@ -695,28 +680,21 @@ public:
         u64 vetoes;
     };
     FinishSplitStats DrainFinishSplitStats() {
-        const FinishSplitStats out{finsplit_jobs_,         finsplit_inline_islands_,
-                                   finsplit_rest_islands_, finsplit_inline_ns_,
-                                   finsplit_rest_ns_,      finsplit_vetoes_};
-        finsplit_jobs_ = finsplit_inline_islands_ = finsplit_rest_islands_ = 0;
-        finsplit_inline_ns_ = finsplit_rest_ns_ = finsplit_vetoes_ = 0;
-        return out;
+        return std::exchange(finsplit_, {});
     }
     /// Clears the GPU bits of a range the guest is unmapping.
     void DropPendingReadArms(VAddr addr, u64 size) {
         // finish_release_faulted_first: unlike every other drain site this one
         // is reached from guest threads (MemoryManager::UnmapMemory ->
-        // Rasterizer::UnmapMemory), so the parked islands are settled through
-        // the GPU command thread; leaving a release pending on memory the
-        // guest is giving back is what the unmark below has to avoid.
+        // Rasterizer::UnmapMemory), so the parked islands are settled through the
+        // GPU command thread.
         if (pending_finish_any_.load(std::memory_order_acquire)) {
             DrainPendingFinishSynced();
         }
-        memory_tracker->DropPendingReadArms(addr, size);
-        // That unmark defers its own release under deferred_read_release, and a
-        // release left pending here would protect memory the guest has already
-        // given back. Settle every pending region while the range is mapped.
-        // This is the guest unmap thread, so no protect carry.
+        memory_tracker->UnmarkRegionAsGpuModified(addr, size);
+        // The unmark defers its own release under deferred_read_release, and a
+        // release left pending would protect memory the guest has already given
+        // back, so settle while the range is still mapped; guest thread, no carry.
         DrainPendingReadReleases(false);
     }
     struct ReadArmStats {
@@ -726,10 +704,7 @@ public:
         u64 calls;
     };
     ReadArmStats DrainReadArmStats() {
-        const ReadArmStats out{rarm_drains_, rarm_regions_, rarm_pages_, rarm_calls_};
-        rarm_drains_ = {};
-        rarm_regions_ = rarm_pages_ = rarm_calls_ = 0;
-        return out;
+        return std::exchange(rarm_, {});
     }
     struct WriteBackOffloadStats {
         u64 guest;
@@ -738,6 +713,9 @@ public:
         u64 excluded;
         u64 copy_ns;
     };
+    WriteBackOffloadStats DrainWriteBackOffloadStats() {
+        return std::exchange(wboff_, {});
+    }
     struct WbIdleStats {
         u64 posted;
         u64 ran;
@@ -748,19 +726,10 @@ public:
         u32 max_island;
     };
     WbIdleStats DrainWbIdleStats() {
-        return WbIdleStats{wbidle_posted_.exchange(0, std::memory_order_relaxed),
-                           wbidle_ran_.exchange(0, std::memory_order_relaxed),
-                           wbidle_skipped_.exchange(0, std::memory_order_relaxed),
-                           wbidle_bailed_.exchange(0, std::memory_order_relaxed),
-                           wbidle_late_.exchange(0, std::memory_order_relaxed),
-                           wbidle_bytes_.exchange(0, std::memory_order_relaxed),
-                           wbidle_max_island_.exchange(0, std::memory_order_relaxed)};
-    }
-    WriteBackOffloadStats DrainWriteBackOffloadStats() {
-        const WriteBackOffloadStats out{wboff_guest_, wboff_prio_, wboff_gpucomm_, wboff_excluded_,
-                                        wboff_copy_ns_};
-        wboff_guest_ = wboff_prio_ = wboff_gpucomm_ = wboff_excluded_ = wboff_copy_ns_ = 0;
-        return out;
+        const auto take = [](auto& c) { return c.exchange(0, std::memory_order_relaxed); };
+        return WbIdleStats{take(wbidle_posted_),    take(wbidle_ran_),  take(wbidle_skipped_),
+                           take(wbidle_bailed_),    take(wbidle_late_), take(wbidle_bytes_),
+                           take(wbidle_max_island_)};
     }
     struct WriteBackShareStats {
         u64 shares;
@@ -827,6 +796,9 @@ public:
                              fs.subs};
     }
 
+    /// Emits and resets the tracker telemetry lines of this window.
+    void EmitTrackerTelemetry();
+
 private:
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
@@ -872,12 +844,7 @@ private:
     };
     boost::container::small_vector<PendingFinish, 2> pending_finish_;
     std::atomic<bool> pending_finish_any_{};
-    u64 finsplit_jobs_{};
-    u64 finsplit_inline_islands_{};
-    u64 finsplit_rest_islands_{};
-    u64 finsplit_inline_ns_{};
-    u64 finsplit_rest_ns_{};
-    u64 finsplit_vetoes_{};
+    FinishSplitStats finsplit_{};
     // Offload counters; wait_ns is written by faulting guest threads.
     std::atomic<u64> offload_jobs_{};
     std::atomic<u64> offload_vetoes_{};
@@ -899,12 +866,6 @@ private:
     u64 stream_genwalk_{};
     u64 vertex_genwalk_{};
     u64 index_genwalk_{};
-
-public:
-    /// Emits and resets the tracker telemetry lines of this window.
-    void EmitTrackerTelemetry();
-
-private:
     static void MirrorProtectThunk(void* user, VAddr addr, u64 size, bool write_granted,
                                    bool tracker_origin);
     static void MirrorBackingThunk(void* user, VAddr addr, u64 size);
@@ -921,24 +882,10 @@ private:
     bool vertex_lazy_desc_{};
     bool vinput_fetch_key_{};
     bool index_bind_whole_{};
-    u64 vinput_calls_{};
-    u64 vinput_built_{};
-    u64 vinput_binds_{};
-    u64 vinput_chain_{};
-    u64 vinput_layout_{};
-    u64 vinput_bind_{};
-    u64 vinput_fetchskip_{};
-    u64 idxwhole_binds_{};
-    u64 idxwhole_skips_{};
-    u64 idxwhole_veto_{};
-    u64 writeback_loops_{};
-    u64 writeback_islands_{};
-    u64 writeback_bytes_{};
-    u64 wboff_guest_{};
-    u64 wboff_prio_{};
-    u64 wboff_gpucomm_{};
-    u64 wboff_excluded_{};
-    u64 wboff_copy_ns_{};
+    VertexInputStats vinput_{};
+    IndexWholeStats idxwhole_{};
+    WritebackStats writeback_{};
+    WriteBackOffloadStats wboff_{};
     std::atomic<u64> wbidle_posted_{};
     std::atomic<u64> wbidle_ran_{};
     std::atomic<u64> wbidle_skipped_{};
@@ -946,10 +893,7 @@ private:
     std::atomic<u64> wbidle_late_{};
     std::atomic<u64> wbidle_bytes_{};
     std::atomic<u32> wbidle_max_island_{};
-    std::array<u64, static_cast<size_t>(ReadArmSite::Count)> rarm_drains_{};
-    u64 rarm_regions_{};
-    u64 rarm_pages_{};
-    u64 rarm_calls_{};
+    ReadArmStats rarm_{};
     bool batch_copy_lock_{};
     bool upload_drain_{};
     u64 upload_ro_calls_{};
@@ -962,21 +906,18 @@ private:
     u64 dmasync_buffers_{};
     u64 dmasync_bytes_{};
     u64 dmasync_max_bytes_{};
-    // Refault damping census, written by guest threads on the fault path.
-    // readback_wait_notify: a waiter blocks until a write-back clears the
-    // pages it faulted on. Polling cost the damping loop far more than the
-    // 50 us it asked for, because a sleep that short is not honoured on a
-    // loaded core; the generation plus condition variable wakes it exactly
-    // when the owner finishes.
+    // readback_wait_notify: the fault waiter blocks on the write-back generation
+    // instead of polling (a 50 us sleep is not honoured on a loaded core).
     bool wait_notify_{};
     bool defer_read_release_{};
     u64 rrel_drains_{};
     u64 rrel_regions_{};
     u64 rrel_pages_{};
     u64 rrel_calls_{};
-    // Fault window, and the cap on the faulting thread's fence wait. Both are
-    // latched once: a fault reads them on the guest thread's critical path.
+    // Fault window, and the widened invalidate span. Both are latched once:
+    // a fault reads them on the guest thread's critical path.
     u64 readback_window_{};
+    u64 fault_widen_{};
     std::mutex writeback_cv_m_;
     std::condition_variable writeback_cv_;
     std::atomic<u64> writeback_gen_{};
@@ -999,6 +940,7 @@ private:
             return writeback_gen_.load(std::memory_order_acquire) != gen_snapshot;
         });
     }
+    // Refault damping census, written by guest threads on the fault path.
     alignas(64) std::atomic<u64> damp_entries_{};
     std::atomic<u64> damp_iters_{};
     std::atomic<u64> damp_stuck_{};

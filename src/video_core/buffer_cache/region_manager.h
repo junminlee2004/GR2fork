@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <optional>
 #include <utility>
 
 #include "common/div_ceil.h"
@@ -18,13 +17,8 @@
 #else
 #include "common/spin_lock.h"
 #endif
-#include "common/arch.h"
-#if defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(ARCH_X86_64)
-#include <emmintrin.h>
-#endif
 #include "common/assert.h"
+#include "common/cpu_pause.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -39,10 +33,8 @@ using LockType = Common::SpinLock;
 #endif
 
 /**
- * The region lock, with a bounded spin in front of the blocking acquire. A
- * guest write fault holds this lock across its mprotect, far longer than the
- * adaptive mutex spins, so a contended acquire falls to a futex sleep and pays
- * a wake round trip on top of the remaining hold.
+ * The region lock: a bounded spin (tracker_lock_spin_rounds, see that setting for why) in
+ * front of the blocking acquire.
  *
  * Counter invariant: every increment sits inside the `rounds != 0` gate and
  * must never be hoisted out of it; gpu_spin_rounds is non-zero on the
@@ -52,15 +44,8 @@ using LockType = Common::SpinLock;
  */
 class RegionLock {
 public:
-    RegionLock() = default;
-    RegionLock(const RegionLock&) = delete;
-    RegionLock& operator=(const RegionLock&) = delete;
-    RegionLock(RegionLock&&) = delete;
-    RegionLock& operator=(RegionLock&&) = delete;
-
     void lock() noexcept {
-        // The budget is read first: with the setting at 0 this is the plain
-        // blocking acquire, not one extra trylock per region per bind.
+        // Budget first: at 0 this stays the plain blocking acquire, no extra trylock.
         const u32 rounds = gpu_spin_rounds;
         if (rounds == 0) {
             inner_.lock();
@@ -72,7 +57,7 @@ public:
         ++contended_;
         for (u32 r = 0; r < rounds; ++r) {
             for (int p = 0; p < SPINS_PER_ROUND; ++p) {
-                Pause();
+                Common::CpuPause();
             }
             if (inner_.try_lock()) {
                 rounds_used_ += r + 1;
@@ -87,10 +72,6 @@ public:
 
     void unlock() {
         inner_.unlock();
-    }
-
-    [[nodiscard]] bool try_lock() {
-        return inner_.try_lock();
     }
 
     struct Stats {
@@ -109,16 +90,6 @@ public:
 
 private:
     static constexpr int SPINS_PER_ROUND = 16;
-
-    static void Pause() {
-#if defined(ARCH_X86_64)
-        _mm_pause();
-#elif defined(ARCH_ARM64) && defined(_MSC_VER)
-        __yield();
-#elif defined(ARCH_ARM64)
-        asm("yield");
-#endif
-    }
 
     static inline u64 contended_{};
     static inline u64 spun_{};
@@ -178,15 +149,12 @@ public:
      * @param dirty_addr    Base address to mark or unmark as modified
      * @param size          Size in bytes to mark or unmark as modified
      */
-    /// DeferRelease is opt-in per CALL SITE, never a global mode: only an
-    /// unmark whose caller drains afterwards may leave a release pending. A
-    /// pending release keeps the page unreadable, so an undrained one refaults
-    /// the guest forever.
-    /// KeepArmed marks CPU-dirty without touching protection: the caller has
-    /// already written the bytes through the backing alias, so the page keeps
-    /// its write watcher and the guest still faults on it.
-    template <Type type, bool enable, bool DeferRelease = false, bool KeepArmed = false>
+    /// DeferRelease is opt-in per CALL SITE, never a global mode: a pending release keeps the
+    /// page unreadable, so an undrained one refaults the guest forever. KeepArmed marks
+    /// CPU-dirty without touching protection: the caller already wrote the bytes through the
+    /// backing alias, so the page keeps its write watcher and the guest still faults on it.
     /// Returns whether any bit changed.
+    template <Type type, bool enable, bool DeferRelease = false, bool KeepArmed = false>
     bool ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
         RENDERER_TRACE;
         const size_t offset = dirty_addr - cpu_addr;
@@ -198,25 +166,19 @@ public:
         }
 
         if constexpr (type == Type::GPU && enable) {
-            // GPU bits are only ever mutated on the GPU command thread, so this
-            // is a plain counter. It advances on marks alone: an unchanged
-            // value between two points on that thread proves no new GPU write
-            // was recorded for this region in between, which is the guard the
-            // offloaded readback path uses before clearing bits it earlier
-            // snapshotted.
+            // Marks only, and GPU bits are mutated on the GPU command thread alone, so a plain
+            // counter suffices: an unchanged value between two points on that thread proves no
+            // new GPU write was recorded for this region, which is the guard the offloaded
+            // readback path checks before clearing bits it snapshotted earlier.
             ++gpu_write_seq;
         }
         RegionBits& bits = GetRegionBits<type>();
-        // A range already in the target state makes the write below an
-        // identity: the bits cannot change, so the protection masks derived
-        // from them cannot change either. Skipping it also leaves the sequence
-        // count stable for concurrent lock-free readers.
+        // A range already in the target state makes the write below an identity - the bits cannot
+        // change, so neither can the protection masks derived from them - and skipping it also
+        // leaves the sequence count stable for concurrent lock-free readers. The exception is a
+        // KeepArmed mark that left a CPU-dirty page still armed: a guest write fault on it must
+        // fall through and release it, or the guest refaults on the same page without end.
         if constexpr (enable) {
-            // Every set page is armed or already listed for the next drain, so
-            // a range that is entirely set needs no arm of its own - unless a
-            // KeepArmed mark left a CPU-dirty page still armed, in which case a
-            // guest write fault on it must fall through and release it, or the
-            // guest refaults on the same page without end.
             if (bits.AllInRange(start_page, end_page) &&
                 (type != Type::CPU || KeepArmed || writeable.AllInRange(start_page, end_page))) {
                 return false;
@@ -233,24 +195,28 @@ public:
             bits.UnsetRange(start_page, end_page);
         }
         if constexpr (type == Type::CPU) {
-            if constexpr (enable) {
-                // A page whose release is still pending is unreadable; dropping
-                // its write watcher below would ask for a write-only mapping,
-                // which Protect rejects. Settle the whole region's pending
-                // mask first - it is bounded by one region and the drain has
-                // usually cleared it already.
-                if constexpr (!KeepArmed) {
-                    if (read_release_pending_) {
-                        u32 pages = 0;
-                        ReleaseReadWatchers(pages);
-                    }
+            // A page whose release is still pending is unreadable, and dropping
+            // its write watcher below would ask for a write-only mapping, which
+            // Protect rejects: settle the region pending mask first.
+            if constexpr (enable && !KeepArmed) {
+                if (read_release_pending_) {
+                    u32 pages = 0;
+                    ReleaseReadWatchers(pages);
                 }
             }
-            RefreshCpuSummary(start_page, end_page);
-            if constexpr (!KeepArmed) {
-                UpdateProtection<!enable>(start_page, end_page);
+            if constexpr (enable) {
+                MarkCpuSummary(start_page, end_page);
+            } else {
+                RefreshCpuSummary(start_page, end_page);
             }
-        } else if (ReadbacksModeCounted(enable ? mode_reads_mark_ : mode_reads_unmark_) ==
+            if constexpr (!KeepArmed) {
+                if constexpr (enable) {
+                    ReleaseWriteWatchers(start_page, end_page);
+                } else {
+                    ArmWriteWatchers();
+                }
+            }
+        } else if (ReadbacksMode(enable ? &mode_reads_mark_ : &mode_reads_unmark_) ==
                    GpuReadbacksMode::Precise) {
             if constexpr (enable) {
                 if (defer_read_arm_) {
@@ -288,24 +254,18 @@ public:
             return;
         }
 
-        // Only the clearing form mutates the bits; entering the scope
-        // conditionally keeps pure iteration off the writers' path.
-        std::optional<WriteScope> write_scope;
-        if constexpr (clear) {
-            write_scope.emplace(*this);
-        }
         RegionBits& bits = GetRegionBits<type>();
         RegionBits mask(bits, start_page, end_page);
 
         if constexpr (clear) {
+            WriteScope write_scope{*this};
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 RefreshCpuSummary(start_page, end_page);
-                UpdateProtection<true>();
+                ArmWriteWatchers();
             } else if (ReadbacksMode() != GpuReadbacksMode::Disabled) {
-                // The bind path, deliberately never deferred: it is gated on
-                // any readbacks mode, not Precise alone, and its caller is not
-                // the download completion the drain hangs off.
+                // Never deferred: gated on any readbacks mode, and its caller
+                // is not the download completion the drain hangs off.
                 u32 pages = 0;
                 ReleaseReadWatchers(pages);
             }
@@ -354,26 +314,12 @@ public:
                 return false;
             }
         }
-        // Ask the range directly: materialising a masked copy of the whole
-        // region's bits to answer a yes/no question was the single largest
-        // cost on the bind path.
         return GetRegionBits<type>().AnyInRange(start_page, end_page);
     }
 
-    /**
-     * Read whether a range is modified without taking the lock.
-     *
-     * The dirty bits are read optimistically between two reads of a sequence
-     * counter that writers make odd while mutating. An unchanged even counter
-     * proves no writer ran during the read, so the answer is exactly what the
-     * locked query would have returned. Contended acquisitions of this lock
-     * between the GPU thread and the guest fault handler are otherwise the
-     * dominant cost of every buffer bind.
-     */
     /// Whole-region CPU-clean test with no range math: the seqlock read of the
-    /// summary word alone. Only the multi-region upload walk uses it, on
-    /// regions it covers completely; a false answer merely hands the region
-    /// to the full check.
+    /// summary word alone. Valid only on a region the query covers completely;
+    /// a false answer merely hands the region to the full check.
     [[nodiscard]] bool PeekFullRegionClean() const noexcept {
         return (state.load(std::memory_order_acquire) & CLEAN_MASK) == 0;
     }
@@ -381,12 +327,9 @@ public:
     template <Type type>
     [[nodiscard]] bool PeekRegionModified(u64 offset, u64 size) noexcept {
         if constexpr (type == Type::CPU) {
-            // Clean-case fast path: half the function's measured cost was
-            // call glue executed before the summary test. The degenerate
-            // range guards must run before SummaryMask (out-of-range pages
-            // are shift-count UB), and the seq/fence ordering here is
-            // exactly the outlined protocol's - a stale summary read is
-            // caught by the seq re-check and falls through.
+            // The range guards must precede SummaryMask (out-of-range pages
+            // are shift-count UB); an even sequence with a zero summary mask
+            // in the SAME load proves the range clean, else fall through.
             const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
             const size_t end_page =
                 Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
@@ -403,19 +346,7 @@ public:
 
     template <Type type>
     [[nodiscard]] SHAD_NO_INLINE bool PeekRegionModifiedSlow(u64 offset, u64 size) noexcept {
-        for (u32 attempt = 0; attempt < 4; ++attempt) {
-            const u64 before = state.load(std::memory_order_acquire);
-            if (before & SEQ_ONE) {
-                continue; // writer in flight
-            }
-            const bool result = IsRegionModified<type>(offset, size);
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if (state.load(std::memory_order_relaxed) == before) {
-                return result;
-            }
-        }
-        std::scoped_lock lk{lock};
-        return IsRegionModified<type>(offset, size);
+        return SeqPeek([&] { return IsRegionModified<type>(offset, size); });
     }
 
     /// Lock-free counterpart of PeekRegionModified for full coverage.
@@ -427,28 +358,14 @@ public:
         if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
             return false;
         }
-        for (u32 attempt = 0; attempt < 4; ++attempt) {
-            const u64 before = state.load(std::memory_order_acquire);
-            if (before & SEQ_ONE) {
-                continue;
-            }
-            const bool result = GetRegionBits<type>().AllInRange(start_page, end_page);
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if (state.load(std::memory_order_relaxed) == before) {
-                return result;
-            }
-        }
-        std::scoped_lock lk{lock};
-        return GetRegionBits<type>().AllInRange(start_page, end_page);
+        return SeqPeek([&] { return GetRegionBits<type>().AllInRange(start_page, end_page); });
     }
 
     /// Arms the read watcher of every GPU-dirty page that still lacks one and
-    /// returns the protection calls issued. A page with gpu and readable both
-    /// set awaits its arm; the arm and release masks are disjoint, so a
-    /// release never touches a pending page and the arm of a page unmarked
-    /// before its drain is simply never issued. readable is cleared under this
-    /// lock before the watcher update, because the read watcher count is one
-    /// bit and arming an armed page would wrap it.
+    /// returns the protection calls issued. The arm and release masks are
+    /// disjoint, so a release never touches a pending page. readable is cleared
+    /// under this lock before the watcher update: the read watcher count is one
+    /// bit, and arming an armed page would wrap it.
     u32 ArmReadWatchers(u32& pages) {
         read_arm_pending_ = false;
         RegionBits mask = gpu & readable;
@@ -464,13 +381,11 @@ public:
 
     /// Releases the read watcher of every page that is no longer GPU dirty and
     /// returns the protection calls issued. The mask is consumed by the
-    /// readable update, so one call per island sees one island: that is one
-    /// mprotect each, and every mprotect broadcasts a TLB shootdown to each
-    /// core running a thread of this process. Batching the releases lets the
-    /// gap-merge in UpdatePageWatchersForRegion fuse them into few calls.
+    /// readable update; batching the releases lets the gap-merge in
+    /// UpdatePageWatchersForRegion fuse their mprotects into few calls.
     u32 ReleaseReadWatchers(u32& pages) {
         read_release_pending_ = false;
-        RegionBits mask = ~gpu & ~readable;
+        RegionBits mask = ~(gpu | readable);
         if (mask.None()) {
             return 0;
         }
@@ -484,39 +399,32 @@ public:
         release_calls_.fetch_add(calls, std::memory_order_relaxed);
         release_pages_.fetch_add(pages, std::memory_order_relaxed);
         release_runs_.fetch_add(runs, std::memory_order_relaxed);
-        ++release_batches_;
+        release_batches_.fetch_add(1, std::memory_order_relaxed);
         return calls;
     }
 
     /// Readbacks mode latched once before any region exists (see
-    /// MemoryTracker::SetModeLatch). A live EmulatorSettings read is a global
-    /// mutex pair plus a shared_ptr refcount round trip, and it sits on every
-    /// GPU mark/unmark and every fault invalidate; latched, it is one load.
-    /// Written on the ctor thread before the reader threads exist and constant
-    /// afterwards; atomic+relaxed only to keep that publication race-free.
+    /// MemoryTracker::SetModeLatch), so mark/unmark and fault paths read a word
+    /// instead of EmulatorSettings. Written on the ctor thread before readers
+    /// exist and constant afterwards; relaxed atomics only to publish it safely.
     static inline std::atomic<bool> mode_latched_{false};
     static inline std::atomic<u32> readbacks_mode_{GpuReadbacksMode::Disabled};
 
-    static u32 ReadbacksMode() noexcept {
-        return mode_latched_.load(std::memory_order_relaxed)
-                   ? readbacks_mode_.load(std::memory_order_relaxed)
-                   : EmulatorSettings.GetReadbacksMode();
-    }
-
-    /// Census of the reads the latch removes, counted at the read site: a call
-    /// that early-returns never reaches the read and takes no mutex today.
-    /// Only counted while latched, so the off arm keeps the live read alone.
-    static inline std::atomic<u64> mode_reads_mark_{};
-    static inline std::atomic<u64> mode_reads_unmark_{};
-    static inline std::atomic<u64> mode_reads_fault_{};
-
-    static u32 ReadbacksModeCounted(std::atomic<u64>& counter) noexcept {
+    static u32 ReadbacksMode(std::atomic<u64>* counter = nullptr) noexcept {
         if (!mode_latched_.load(std::memory_order_relaxed)) {
             return EmulatorSettings.GetReadbacksMode();
         }
-        counter.fetch_add(1, std::memory_order_relaxed);
+        if (counter != nullptr) {
+            counter->fetch_add(1, std::memory_order_relaxed);
+        }
         return readbacks_mode_.load(std::memory_order_relaxed);
     }
+
+    /// Census of the reads the latch removes, counted at the read site and
+    /// only while latched, so the unlatched arm keeps the live read alone.
+    static inline std::atomic<u64> mode_reads_mark_{};
+    static inline std::atomic<u64> mode_reads_unmark_{};
+    static inline std::atomic<u64> mode_reads_fault_{};
 
     /// Read-watcher release census. Static because a release happens from any
     /// region; drained once per telemetry window through the tracker.
@@ -567,35 +475,28 @@ public:
     // with a content record gets a cheap it-cannot-have-changed certificate.
     static constexpr u64 EPOCH_WORD_BITS = 18; // 256KB per word
     static constexpr size_t NUM_EPOCH_WORDS = TRACKER_HIGHER_PAGE_SIZE >> EPOCH_WORD_BITS;
-    static constexpr u64 EPOCH_SUB_BITS = 16; // 64KB per subword
-    static constexpr size_t NUM_EPOCH_SUBS = TRACKER_HIGHER_PAGE_SIZE >> EPOCH_SUB_BITS;
 
-    void BumpWordEpochs(u64 offset, u64 size, u8 cause) noexcept {
+    /// Clamped epoch-word range covering [offset, offset + size) of this region.
+    static constexpr std::pair<size_t, size_t> EpochWordRange(u64 offset, u64 size) noexcept {
+        return {std::min<u64>(offset >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1),
+                std::min<u64>((offset + size - 1) >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1)};
+    }
+
+    void BumpWordEpochs(u64 offset, u64 size) noexcept {
         if (size == 0) {
             return;
         }
-        const size_t w0 = std::min<u64>(offset >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
-        const size_t w1 =
-            std::min<u64>((offset + size - 1) >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
+        const auto [w0, w1] = EpochWordRange(offset, size);
         for (size_t w = w0; w <= w1; ++w) {
             word_epochs[w].fetch_add(1, std::memory_order_release);
-            last_bump_cause[w].store(cause, std::memory_order_relaxed);
-        }
-        const size_t s0 = std::min<u64>(offset >> EPOCH_SUB_BITS, NUM_EPOCH_SUBS - 1);
-        const size_t s1 = std::min<u64>((offset + size - 1) >> EPOCH_SUB_BITS, NUM_EPOCH_SUBS - 1);
-        for (size_t sub = s0; sub <= s1; ++sub) {
-            sub_epochs[sub].fetch_add(1, std::memory_order_release);
         }
     }
 
-    /// Single-region form of the tracker's word-epoch sum for a range this
-    /// manager fully covers: same loads, same sum, same poison rule. The
-    /// caller proves size != 0 and coverage by recording the region only from
-    /// a walk that certified the range. A range inside one epoch word, which
-    /// is nearly every call, is answered here; the straddling walk is outlined
-    /// so its unrolled loop does not sit in every caller. The poison word is
-    /// read before the epoch word on both arms, so a concurrent poison-and-bump
-    /// pair is seen from the same side either way.
+    /// Single-region form of the tracker's word-epoch sum: same loads, same
+    /// sum, same poison rule. The caller certifies size != 0 and full coverage
+    /// by this region, which is what lets the shifts below skip the
+    /// NUM_EPOCH_WORDS clamp Bump/Poison apply. Poison is read before the epoch
+    /// words on both arms, so a poison-and-bump pair is seen from one side.
     [[nodiscard]] bool EpochSumResolved(u64 offset, u64 size, u64& sum) const noexcept {
         const size_t w0 = offset >> EPOCH_WORD_BITS;
         const size_t w1 = (offset + size - 1) >> EPOCH_WORD_BITS;
@@ -622,23 +523,14 @@ public:
         if (size == 0) {
             return;
         }
-        const size_t w0 = std::min<u64>(offset >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
-        const size_t w1 =
-            std::min<u64>((offset + size - 1) >> EPOCH_WORD_BITS, NUM_EPOCH_WORDS - 1);
-        u32 mask = 0;
-        for (size_t w = w0; w <= w1; ++w) {
-            mask |= 1u << w;
-        }
-        poison_words.fetch_or(mask, std::memory_order_release);
+        const auto [w0, w1] = EpochWordRange(offset, size);
+        poison_words.fetch_or((2u << w1) - (1u << w0), std::memory_order_release);
     }
 
-    // 16-bit summary over the CPU dirty bits: bit k covers pages
-    // [k*64, k*64+64) - exactly one storage word of the bitset. Maintained
-    // under the same write scope as the bits, so the lock-free peek's seqlock
-    // protocol covers it too; the region starts fully dirty, so the summary
-    // starts fully set. Readers treat it as a prefilter only: clean is
-    // authoritative (a clear bit proves its word is zero), dirty falls
-    // through to the exact scan.
+    // 16-bit summary over the CPU dirty bits: bit k covers exactly one storage
+    // word of the bitset. Maintained under the same write scope as the bits, so
+    // the lock-free peek's seqlock covers it too; a prefilter only - clean is
+    // authoritative (a clear bit proves its word is zero), dirty rescans exactly.
     static constexpr size_t PAGES_PER_SUMMARY_BIT = 64;
     static_assert(NUM_PAGES_PER_REGION / PAGES_PER_SUMMARY_BIT <= 16);
 
@@ -646,6 +538,16 @@ public:
         const size_t w0 = start_page / PAGES_PER_SUMMARY_BIT;
         const size_t w1 = (end_page - 1) / PAGES_PER_SUMMARY_BIT;
         return static_cast<u16>(((2u << w1) - (1u << w0)) & 0xFFFFu);
+    }
+
+    // Set form for a range whose pages were just set: every summary word the
+    // range touches is now non-empty, so the refresh loop can only OR these
+    // bits in. Runs inside a WriteScope, on the low 16 bits only.
+    void MarkCpuSummary(size_t start_page, size_t end_page) noexcept {
+        if (const u16 add = static_cast<u16>(SummaryMask(start_page, end_page) & ~Summary());
+            add != 0) {
+            state.fetch_or(add, std::memory_order_relaxed);
+        }
     }
 
     // Runs inside a WriteScope; the xor keeps the update atomic against the
@@ -669,48 +571,56 @@ public:
     }
 
     std::array<std::atomic<u64>, NUM_EPOCH_WORDS> word_epochs{};
-    std::array<std::atomic<u64>, NUM_EPOCH_SUBS> sub_epochs{};
-    std::array<std::atomic<u8>, NUM_EPOCH_WORDS> last_bump_cause{};
     std::atomic<u32> poison_words{0};
 
 private:
-    /**
-     * Notify tracker about changes in the CPU tracking state of a word in the buffer
-     *
-     * @param word_index   Index to the word to notify to the tracker
-     * @param current_bits Current state of the word
-     * @param new_bits     New state of the word
-     *
-     * @tparam track True when the tracker should start tracking the new pages
-     */
-    template <bool track>
-    void UpdateProtection([[maybe_unused]] size_t lo = 0,
-                          [[maybe_unused]] size_t hi = NUM_PAGES_PER_REGION) {
-        RENDERER_TRACE;
-        // Directional, not symmetric: the arming pass takes only pages that
-        // lost their CPU bit and are still writable, the releasing pass only
-        // pages that gained it and are still armed. While writeable == cpu
-        // both equal today's cpu ^ writeable; they differ on a page a CPU mark
-        // deliberately left armed (cpu 1, writeable 0), which the arming pass
-        // must skip or it adds a second watcher no release ever returns. The
-        // release form is range-limited so a fault elsewhere in the region
-        // does not un-arm those pages either.
-        RegionBits mask;
-        if constexpr (track) {
-            mask = writeable & ~cpu;
-        } else {
-            mask = RegionBits(cpu & ~writeable, lo, hi);
+    // Seqlock read: the bits are read between two reads of a sequence counter
+    // writers make odd, so an unchanged even counter proves no writer ran and
+    // the answer equals the locked query's. This lock is contended between the
+    // GPU thread and the guest fault handler on every bind.
+    template <typename F>
+    [[nodiscard]] SHAD_FORCE_INLINE bool SeqPeek(F&& read) noexcept {
+        for (u32 attempt = 0; attempt < 4; ++attempt) {
+            const u64 before = state.load(std::memory_order_acquire);
+            if (before & SEQ_ONE) {
+                continue; // writer in flight
+            }
+            const bool result = read();
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (state.load(std::memory_order_relaxed) == before) {
+                return result;
+            }
         }
+        std::scoped_lock lk{lock};
+        return read();
+    }
+
+    // Takes only pages that lost their CPU bit and are still writable.
+    // Directional, not symmetric: a page a CPU mark deliberately left armed
+    // (cpu 1, writeable 0) must be skipped here or it gains a second watcher
+    // no release ever returns.
+    void ArmWriteWatchers() {
+        RENDERER_TRACE;
+        RegionBits mask = writeable & ~cpu;
         if (mask.None()) {
             return;
         }
-        if constexpr (track) {
-            // == writeable & ~mask, without materialising a second bitset.
-            writeable &= cpu;
-        } else {
-            writeable |= mask;
+        // == writeable & ~mask, without materialising a second bitset.
+        writeable &= cpu;
+        tracker->UpdatePageWatchersForRegion<true, false>(cpu_addr, mask);
+    }
+
+    // Takes only pages that gained the CPU bit and are still armed, limited to
+    // [lo, hi) so a fault elsewhere in the region does not un-arm the pages a
+    // KeepArmed mark left armed.
+    void ReleaseWriteWatchers(size_t lo, size_t hi) {
+        RENDERER_TRACE;
+        RegionBits mask(cpu & ~writeable, lo, hi);
+        if (mask.None()) {
+            return;
         }
-        tracker->UpdatePageWatchersForRegion<track, false>(cpu_addr, mask);
+        writeable |= mask;
+        tracker->UpdatePageWatchersForRegion<false, false>(cpu_addr, mask);
     }
 
     PageManager* tracker;
@@ -723,9 +633,9 @@ private:
 
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 // The per-uaddr futex parse that proves or disproves tracker_lock_spin_rounds
-// identifies these locks by the 0x4E8 = 1256 byte stride between them. Keep the
+// identifies these locks by the 0x2D8 = 728 byte stride between them. Keep the
 // size pinned so the next trace still resolves.
-static_assert(sizeof(RegionManager) == 1256);
+static_assert(sizeof(RegionManager) == 728);
 #endif
 
 } // namespace VideoCore

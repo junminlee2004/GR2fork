@@ -435,30 +435,26 @@ struct GPUSettings {
     Setting<u32> adaptive_skipcaches_mode{AdaptiveSkipCachesMode::SkipCachesDisabled};
     // Size of the uniform stream ring in MiB. The ring blocks the GPU command
     // thread whenever it wraps, until the GPU drains the previous lap, so a
-    // larger ring trades host memory for fewer stalls. 0 keeps the default.
+    // larger ring trades host memory for fewer stalls. Values below 16 are
+    // raised to 16 MiB.
     Setting<u32> stream_buffer_size_mb{64};
     // Widen each guest readback to cover every GPU-modified range in the
     // affected buffer instead of a fixed window. The same bytes are copied,
     // but the whole buffer is serviced by one GPU drain rather than one per
-    // window, which is where the cost of readbacks actually is.
+    // window.
     Setting<bool> readback_batching_enabled{false};
     // Service guest read faults off the GPU command thread: it only records
     // the download and, later, clears the tracker; the faulting thread waits
     // the fence and writes the bytes back itself, under the writeback
-    // sub-settings below. The download copy runs on a second queue that
-    // waits only for the batch that last wrote the buffer, so the guest read
-    // waits for its writer rather than for everything the GPU thread has run
-    // ahead and recorded since. The copy falls back to the
+    // sub-settings below. The download copy runs on a second queue that waits
+    // only for the batch that last wrote the buffer. The copy falls back to the
     // open command buffer when the writer is still unsubmitted, when a
     // device-address shader could have written it, or when the device has no
     // transfer-capable family beside graphics.
     Setting<bool> readback_offload{false};
-    // readback_offload: submit the second-queue readback copy on the graphics
-    // queue instead of the compute family. The copy is then recorded in order,
-    // right behind the writer batch and ahead of every batch the GPU thread
-    // records after the fault (and ahead of the presenter next batch unless the
-    // presenter wins the submit lock first), rather than crawling beside them
-    // starved on the compute ring.
+    // Submits the second-queue readback copy on the graphics queue instead of
+    // the compute family, so it is recorded in order right behind the writer
+    // batch. Needs readback_offload.
     Setting<bool> readback_copy_gfx_queue{false};
     // Latches readbacks_mode into the memory tracker at construction. The live read is a global
     // mutex plus a shared_ptr copy per call and sits on every GPU mark/unmark and every fault
@@ -469,29 +465,24 @@ struct GPUSettings {
     // collector walk meets an entry touched since its list tick, so a hot image is relinked once
     // per ticks_to_destroy instead of once per tick. List mode only (ignored with texture_lru_log).
     Setting<bool> texture_lru_lazy_touch{false};
-    // readback_writeback_gpucomm_idle: while an offloaded readback is written back
-    // and the GPU command thread has no submit or command queued, it copies islands
-    // of the share like the priority thread does, stopping at the first island after
-    // a submit or command arrives or once its byte cap is reached. Needs
-    // readback_offload + readback_writeback_share.
+    // While an offloaded readback is written back and the GPU command thread has
+    // no submit or command queued, it copies islands of the share like the
+    // priority thread does, stopping at the first island after a submit or
+    // command arrives or once its byte cap is reached. Needs readback_offload +
+    // readback_writeback_share.
     Setting<bool> readback_writeback_gpucomm_idle{false};
     // GetProgram keeps the spec-key gather inputs (flat user data, pgm_base, RI hash, start
     // bindings) in the per-stage slot; a byte-identical repeat for the same program is a slot
     // hit without the gather. Needs spec_key_fused; off while spec_fp_validate is on.
     Setting<bool> gather_input_memo{false};
     // On the GPU command thread a contended tracker region lock is spun on (a
-    // try_lock every 16 PAUSE) for up to this many rounds before blocking. The
-    // adaptive mutex only spins a few microseconds, while a guest write fault
-    // holds the region lock across its 64KB mprotect, so every contended
-    // acquisition pays a futex sleep plus wake round trip today. 0 keeps the
-    // plain blocking lock on every thread.
+    // try_lock every 16 PAUSE) for up to this many rounds before blocking.
+    // 0 keeps the plain blocking lock on every thread.
     Setting<u32> tracker_lock_spin_rounds{0};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
-    // Polled every 32 draws past the count; clamped to >= 32 and rounded up to a multiple of 32
-    // (the poll granularity), and ignored unless flush_draw_interval is set larger than the
-    // rounded value (otherwise the interval always fires first).
-    // 0 = off.
+    // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
+    // the rounded value. 0 = off.
     Setting<u32> ring_drain_flush_draws{0};
     // Merge the adjacent per-region read-watcher mprotect calls issued inside one
     // GpuComm drain/release loop into a single cross-region call.
@@ -516,7 +507,8 @@ struct GPUSettings {
     // command thread). 1 runs the unsafe fast path: no foreign-producer
     // refusal and no unmap push windows - only for titles that never unmap
     // mid-play. 2 runs the hardened path, safe everywhere. Both modes drain
-    // through two worker threads, fenced before every submit.
+    // through worker threads, two unless stream_copy_lane_threads says
+    // otherwise, fenced before every submit.
     Setting<u32> stream_copy_workers{0};
     // Skip the eager FindBuffer in binding pass 1 for read-only descriptors
     // small enough for the stream path, which never dereferences the id.
@@ -724,8 +716,9 @@ struct GPUSettings {
     // Widens a buffer upload to the dirty pages around it, so one protection
     // call re-arms a chunk of this many bytes instead of one per bind. The
     // widening stays inside the bound buffer and stops at the first page that
-    // is clean or holds pending GPU writes. Rounded down to a power of two,
-    // capped at 65536; 0 disables it.
+    // is clean or holds pending GPU writes. Capped at 65536 and rounded down to
+    // a power of two; anything below 8 KiB (two tracker pages), 0 included,
+    // disables it.
     Setting<u32> upload_arm_chunk_bytes{0};
     // Answers a guest write fault against a lock-free coverage bitmap of the
     // registered images before taking the texture cache mutex, so a fault in
@@ -751,8 +744,7 @@ struct GPUSettings {
     // Pools are never reset in this mode.
     Setting<bool> desc_heap_recycle{false};
     // Lets a pipeline whose set-0 descriptor total equals maxPushDescriptors use push
-    // descriptors; the limit is inclusive, the older test kept such pipelines on the
-    // descriptor heap.
+    // descriptors; the limit is inclusive.
     Setting<bool> push_desc_full_limit{false};
     // Guest threads parked behind another thread's in-flight readback wait on its fence
     // and copy its downloaded islands through a shared cursor instead of sleeping.
@@ -796,8 +788,7 @@ struct GPUSettings {
     // adaptive_skipcaches_mode 2; the boot latch turns it off otherwise.
     Setting<u32> draw_glue_memo{0};
     // A guest thread waiting on another thread's fault download blocks on the
-    // write-back that clears its pages instead of polling every 50 us. The poll
-    // overshoots several times over under load, which is what the stall cost.
+    // write-back that clears its pages instead of polling every 50 us.
     Setting<bool> readback_wait_notify{false};
     // Size of the guest-memory window a read fault downloads, in KiB, rounded
     // down to a power of two and clamped to 4..8192. Smaller means each fault
@@ -832,6 +823,7 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     // TODO add overrides
+#define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
             make_override<GPUSettings>("null_gpu", &GPUSettings::null_gpu),
@@ -850,139 +842,105 @@ struct GPUSettings {
             make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
             make_override<GPUSettings>("readback_linear_images_enabled",
                                        &GPUSettings::readback_linear_images_enabled),
-            make_override<GPUSettings>("adaptive_skipcaches_mode",
-                                       &GPUSettings::adaptive_skipcaches_mode),
-            make_override<GPUSettings>("stream_buffer_size_mb",
-                                       &GPUSettings::stream_buffer_size_mb),
-            make_override<GPUSettings>("readback_batching_enabled",
-                                       &GPUSettings::readback_batching_enabled),
-            make_override<GPUSettings>("readback_offload", &GPUSettings::readback_offload),
-            make_override<GPUSettings>("readback_copy_gfx_queue",
-                                       &GPUSettings::readback_copy_gfx_queue),
-            make_override<GPUSettings>("tracker_mode_latch", &GPUSettings::tracker_mode_latch),
-            make_override<GPUSettings>("texture_lru_lazy_touch",
-                                       &GPUSettings::texture_lru_lazy_touch),
-            make_override<GPUSettings>("readback_writeback_gpucomm_idle",
-                                       &GPUSettings::readback_writeback_gpucomm_idle),
-            make_override<GPUSettings>("gather_input_memo", &GPUSettings::gather_input_memo),
-            make_override<GPUSettings>("tracker_lock_spin_rounds",
-                                       &GPUSettings::tracker_lock_spin_rounds),
-            make_override<GPUSettings>("ring_drain_flush_draws",
-                                       &GPUSettings::ring_drain_flush_draws),
-            make_override<GPUSettings>("protect_carry_merge", &GPUSettings::protect_carry_merge),
-            make_override<GPUSettings>("stream_buffer_prefer_host",
-                                       &GPUSettings::stream_buffer_prefer_host),
-            make_override<GPUSettings>("stream_upload_mirror_mode",
-                                       &GPUSettings::stream_upload_mirror_mode),
-            make_override<GPUSettings>("fault_widen_bytes", &GPUSettings::fault_widen_bytes),
-            make_override<GPUSettings>("pending_pop_throttle", &GPUSettings::pending_pop_throttle),
-            make_override<GPUSettings>("stream_copy_workers", &GPUSettings::stream_copy_workers),
-            make_override<GPUSettings>("stream_findbuffer_elide",
-                                       &GPUSettings::stream_findbuffer_elide),
-            make_override<GPUSettings>("spec_fp_cache", &GPUSettings::spec_fp_cache),
-            make_override<GPUSettings>("dyn_state_memo", &GPUSettings::dyn_state_memo),
-            make_override<GPUSettings>("runtime_info_stamp_gate",
-                                       &GPUSettings::runtime_info_stamp_gate),
-            make_override<GPUSettings>("occlude_all", &GPUSettings::occlude_all),
-            make_override<GPUSettings>("stream_copy_upload_drain",
-                                       &GPUSettings::stream_copy_upload_drain),
-            make_override<GPUSettings>("flush_draw_interval", &GPUSettings::flush_draw_interval),
-            make_override<GPUSettings>("pipeline_key_stamp_reuse",
-                                       &GPUSettings::pipeline_key_stamp_reuse),
-            make_override<GPUSettings>("shader_params_memo", &GPUSettings::shader_params_memo),
-            make_override<GPUSettings>("spec_fp_canonical", &GPUSettings::spec_fp_canonical),
-            make_override<GPUSettings>("texture_view_memo", &GPUSettings::texture_view_memo),
-            make_override<GPUSettings>("sampler_memo_lockfree",
-                                       &GPUSettings::sampler_memo_lockfree),
-            make_override<GPUSettings>("desc_delta_inplace", &GPUSettings::desc_delta_inplace),
-            make_override<GPUSettings>("bind_line_prefetch", &GPUSettings::bind_line_prefetch),
-            make_override<GPUSettings>("guest_copy_hold_segment",
-                                       &GPUSettings::guest_copy_hold_segment),
-            make_override<GPUSettings>("findimg_touch_lockfree",
-                                       &GPUSettings::findimg_touch_lockfree),
-            make_override<GPUSettings>("findimg_touch_batch", &GPUSettings::findimg_touch_batch),
-            make_override<GPUSettings>("findimg_trust_gen", &GPUSettings::findimg_trust_gen),
-            make_override<GPUSettings>("findimg_range_invalidate",
-                                       &GPUSettings::findimg_range_invalidate),
-            make_override<GPUSettings>("buffer_barrier_read_merge",
-                                       &GPUSettings::buffer_barrier_read_merge),
-            make_override<GPUSettings>("cp_write_backing", &GPUSettings::cp_write_backing),
-            make_override<GPUSettings>("stream_copy_resolved_epoch",
-                                       &GPUSettings::stream_copy_resolved_epoch),
-            make_override<GPUSettings>("written_range_fast", &GPUSettings::written_range_fast),
-            make_override<GPUSettings>("spec_fp_slot_inplace", &GPUSettings::spec_fp_slot_inplace),
-            make_override<GPUSettings>("spec_fp_front", &GPUSettings::spec_fp_front),
-            make_override<GPUSettings>("findimg_memo_ways", &GPUSettings::findimg_memo_ways),
-            make_override<GPUSettings>("findimg_memo_entries", &GPUSettings::findimg_memo_entries),
-            make_override<GPUSettings>("bind_noop_memo", &GPUSettings::bind_noop_memo),
-            make_override<GPUSettings>("spec_key_fast", &GPUSettings::spec_key_fast),
-            make_override<GPUSettings>("gpu_range_set_lockfree",
-                                       &GPUSettings::gpu_range_set_lockfree),
-            make_override<GPUSettings>("gpu_range_set_flat", &GPUSettings::gpu_range_set_flat),
-            make_override<GPUSettings>("readback_writeback_hold",
-                                       &GPUSettings::readback_writeback_hold),
-            make_override<GPUSettings>("backing_write_memo", &GPUSettings::backing_write_memo),
-            make_override<GPUSettings>("image_update_direct", &GPUSettings::image_update_direct),
-            make_override<GPUSettings>("desc_layout_share", &GPUSettings::desc_layout_share),
-            make_override<GPUSettings>("vertex_input_lazy_desc",
-                                       &GPUSettings::vertex_input_lazy_desc),
-            make_override<GPUSettings>("runtime_info_input_memo",
-                                       &GPUSettings::runtime_info_input_memo),
-            make_override<GPUSettings>("readback_writeback_offload",
-                                       &GPUSettings::readback_writeback_offload),
-            make_override<GPUSettings>("key_reuse_hash_diff", &GPUSettings::key_reuse_hash_diff),
-            make_override<GPUSettings>("desc_delta_partial", &GPUSettings::desc_delta_partial),
-            make_override<GPUSettings>("shader_params_memo_entries",
-                                       &GPUSettings::shader_params_memo_entries),
-            make_override<GPUSettings>("dyn_state_stamp", &GPUSettings::dyn_state_stamp),
-            make_override<GPUSettings>("texture_lru_log", &GPUSettings::texture_lru_log),
-            make_override<GPUSettings>("texel_sync_noop", &GPUSettings::texel_sync_noop),
-            make_override<GPUSettings>("deferred_read_arm", &GPUSettings::deferred_read_arm),
-            make_override<GPUSettings>("static_color_write_mask",
-                                       &GPUSettings::static_color_write_mask),
-            make_override<GPUSettings>("spec_key_fused", &GPUSettings::spec_key_fused),
-            make_override<GPUSettings>("parser_reg_run", &GPUSettings::parser_reg_run),
-            make_override<GPUSettings>("push_const_dedup", &GPUSettings::push_const_dedup),
-            make_override<GPUSettings>("stream_copy_idle_us", &GPUSettings::stream_copy_idle_us),
-            make_override<GPUSettings>("stream_copy_lane_threads",
-                                       &GPUSettings::stream_copy_lane_threads),
-            make_override<GPUSettings>("upload_arm_chunk_bytes",
-                                       &GPUSettings::upload_arm_chunk_bytes),
-            make_override<GPUSettings>("texture_invalidate_filter",
-                                       &GPUSettings::texture_invalidate_filter),
-            make_override<GPUSettings>("rt_state_stamp", &GPUSettings::rt_state_stamp),
-            make_override<GPUSettings>("push_vp_memo", &GPUSettings::push_vp_memo),
-            make_override<GPUSettings>("ri_memo_fused_cmp", &GPUSettings::ri_memo_fused_cmp),
-            make_override<GPUSettings>("br_mem_fast_state", &GPUSettings::br_mem_fast_state),
-            make_override<GPUSettings>("desc_heap_recycle", &GPUSettings::desc_heap_recycle),
-            make_override<GPUSettings>("push_desc_full_limit", &GPUSettings::push_desc_full_limit),
-            make_override<GPUSettings>("readback_writeback_share",
-                                       &GPUSettings::readback_writeback_share),
-            make_override<GPUSettings>("readback_writeback_helper",
-                                       &GPUSettings::readback_writeback_helper),
-            make_override<GPUSettings>("finish_release_faulted_first",
-                                       &GPUSettings::finish_release_faulted_first),
-            make_override<GPUSettings>("bind_write_plan", &GPUSettings::bind_write_plan),
-            make_override<GPUSettings>("findimg_memo_first", &GPUSettings::findimg_memo_first),
-            make_override<GPUSettings>("vinput_fetch_key", &GPUSettings::vinput_fetch_key),
-            make_override<GPUSettings>("index_bind_whole", &GPUSettings::index_bind_whole),
-            make_override<GPUSettings>("findimg_slot_hint", &GPUSettings::findimg_slot_hint),
-            make_override<GPUSettings>("bind_image_lean", &GPUSettings::bind_image_lean),
-            make_override<GPUSettings>("desc_delta_flat", &GPUSettings::desc_delta_flat),
-            make_override<GPUSettings>("draw_glue_memo", &GPUSettings::draw_glue_memo),
-            make_override<GPUSettings>("readback_wait_notify", &GPUSettings::readback_wait_notify),
-            make_override<GPUSettings>("readback_window_kb", &GPUSettings::readback_window_kb),
-            make_override<GPUSettings>("deferred_read_release",
-                                       &GPUSettings::deferred_read_release),
-            make_override<GPUSettings>("image_fast_state", &GPUSettings::image_fast_state),
-            make_override<GPUSettings>("guest_copy_lock_batch",
-                                       &GPUSettings::guest_copy_lock_batch),
-            make_override<GPUSettings>("spec_mru_perm_probe", &GPUSettings::spec_mru_perm_probe),
+            GPU_OVERRIDE(adaptive_skipcaches_mode),
+            GPU_OVERRIDE(stream_buffer_size_mb),
+            GPU_OVERRIDE(readback_batching_enabled),
+            GPU_OVERRIDE(readback_offload),
+            GPU_OVERRIDE(readback_copy_gfx_queue),
+            GPU_OVERRIDE(tracker_mode_latch),
+            GPU_OVERRIDE(texture_lru_lazy_touch),
+            GPU_OVERRIDE(readback_writeback_gpucomm_idle),
+            GPU_OVERRIDE(gather_input_memo),
+            GPU_OVERRIDE(tracker_lock_spin_rounds),
+            GPU_OVERRIDE(ring_drain_flush_draws),
+            GPU_OVERRIDE(protect_carry_merge),
+            GPU_OVERRIDE(stream_buffer_prefer_host),
+            GPU_OVERRIDE(stream_upload_mirror_mode),
+            GPU_OVERRIDE(fault_widen_bytes),
+            GPU_OVERRIDE(pending_pop_throttle),
+            GPU_OVERRIDE(stream_copy_workers),
+            GPU_OVERRIDE(stream_findbuffer_elide),
+            GPU_OVERRIDE(spec_fp_cache),
+            GPU_OVERRIDE(dyn_state_memo),
+            GPU_OVERRIDE(runtime_info_stamp_gate),
+            GPU_OVERRIDE(occlude_all),
+            GPU_OVERRIDE(stream_copy_upload_drain),
+            GPU_OVERRIDE(flush_draw_interval),
+            GPU_OVERRIDE(pipeline_key_stamp_reuse),
+            GPU_OVERRIDE(shader_params_memo),
+            GPU_OVERRIDE(spec_fp_canonical),
+            GPU_OVERRIDE(texture_view_memo),
+            GPU_OVERRIDE(sampler_memo_lockfree),
+            GPU_OVERRIDE(desc_delta_inplace),
+            GPU_OVERRIDE(bind_line_prefetch),
+            GPU_OVERRIDE(guest_copy_hold_segment),
+            GPU_OVERRIDE(findimg_touch_lockfree),
+            GPU_OVERRIDE(findimg_touch_batch),
+            GPU_OVERRIDE(findimg_trust_gen),
+            GPU_OVERRIDE(findimg_range_invalidate),
+            GPU_OVERRIDE(buffer_barrier_read_merge),
+            GPU_OVERRIDE(cp_write_backing),
+            GPU_OVERRIDE(stream_copy_resolved_epoch),
+            GPU_OVERRIDE(written_range_fast),
+            GPU_OVERRIDE(spec_fp_slot_inplace),
+            GPU_OVERRIDE(spec_fp_front),
+            GPU_OVERRIDE(findimg_memo_ways),
+            GPU_OVERRIDE(findimg_memo_entries),
+            GPU_OVERRIDE(bind_noop_memo),
+            GPU_OVERRIDE(spec_key_fast),
+            GPU_OVERRIDE(gpu_range_set_lockfree),
+            GPU_OVERRIDE(gpu_range_set_flat),
+            GPU_OVERRIDE(readback_writeback_hold),
+            GPU_OVERRIDE(backing_write_memo),
+            GPU_OVERRIDE(image_update_direct),
+            GPU_OVERRIDE(desc_layout_share),
+            GPU_OVERRIDE(vertex_input_lazy_desc),
+            GPU_OVERRIDE(runtime_info_input_memo),
+            GPU_OVERRIDE(readback_writeback_offload),
+            GPU_OVERRIDE(key_reuse_hash_diff),
+            GPU_OVERRIDE(desc_delta_partial),
+            GPU_OVERRIDE(shader_params_memo_entries),
+            GPU_OVERRIDE(dyn_state_stamp),
+            GPU_OVERRIDE(texture_lru_log),
+            GPU_OVERRIDE(texel_sync_noop),
+            GPU_OVERRIDE(deferred_read_arm),
+            GPU_OVERRIDE(static_color_write_mask),
+            GPU_OVERRIDE(spec_key_fused),
+            GPU_OVERRIDE(parser_reg_run),
+            GPU_OVERRIDE(push_const_dedup),
+            GPU_OVERRIDE(stream_copy_idle_us),
+            GPU_OVERRIDE(stream_copy_lane_threads),
+            GPU_OVERRIDE(upload_arm_chunk_bytes),
+            GPU_OVERRIDE(texture_invalidate_filter),
+            GPU_OVERRIDE(rt_state_stamp),
+            GPU_OVERRIDE(push_vp_memo),
+            GPU_OVERRIDE(ri_memo_fused_cmp),
+            GPU_OVERRIDE(br_mem_fast_state),
+            GPU_OVERRIDE(desc_heap_recycle),
+            GPU_OVERRIDE(push_desc_full_limit),
+            GPU_OVERRIDE(readback_writeback_share),
+            GPU_OVERRIDE(readback_writeback_helper),
+            GPU_OVERRIDE(finish_release_faulted_first),
+            GPU_OVERRIDE(bind_write_plan),
+            GPU_OVERRIDE(findimg_memo_first),
+            GPU_OVERRIDE(vinput_fetch_key),
+            GPU_OVERRIDE(index_bind_whole),
+            GPU_OVERRIDE(findimg_slot_hint),
+            GPU_OVERRIDE(bind_image_lean),
+            GPU_OVERRIDE(desc_delta_flat),
+            GPU_OVERRIDE(draw_glue_memo),
+            GPU_OVERRIDE(readback_wait_notify),
+            GPU_OVERRIDE(readback_window_kb),
+            GPU_OVERRIDE(deferred_read_release),
+            GPU_OVERRIDE(image_fast_state),
+            GPU_OVERRIDE(guest_copy_lock_batch),
+            GPU_OVERRIDE(spec_mru_perm_probe),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
         };
     }
+#undef GPU_OVERRIDE
 };
 // nlohmann's field macros take at most 63 names, so the GPU settings are
 // serialized in two groups; new settings go at the end of the second.
@@ -1017,9 +975,8 @@ struct GPUSettings {
     stream_findbuffer_elide, dyn_state_memo, bind_write_plan, findimg_memo_first, \
     vinput_fetch_key, index_bind_whole, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
     draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release, \
-    image_fast_state, guest_copy_lock_batch
-#define GPU_SETTINGS_JSON_FIELDS_C \
-    spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, userfaultfd
+    image_fast_state, guest_copy_lock_batch, spec_fp_cache, cp_write_backing, \
+    runtime_info_stamp_gate, userfaultfd
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1027,7 +984,6 @@ template <
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_A))
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_B))
-    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_C))
 }
 template <
     typename BasicJsonType,
@@ -1035,7 +991,6 @@ template <
 void from_json(const BasicJsonType& nlohmann_json_j, GPUSettings& nlohmann_json_t) {
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_A))
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_B))
-    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_C))
 }
 // -------------------------------
 // Vulkan settings

@@ -52,18 +52,11 @@ std::string_view BufferTypeName(MemoryUsage type) {
 [[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryUsage usage) {
     switch (usage) {
     case MemoryUsage::Stream:
-        // On an APU there is no separate device memory to stage into: the
-        // "device local" host-visible heap is the same DRAM, exposed uncached
-        // and write-combining. Guest data is memcpy'd into this ring thousands
-        // of times per frame, and every copy is followed by a lock-prefixed
-        // instruction that has to drain those write-combining buffers, so
-        // placing the ring in ordinary cached memory can be the cheaper trade
-        // even though the GPU then reads it over the coherent fabric. Off by
-        // default; on discrete parts PREFER_DEVICE remains the right answer.
-        if (EmulatorSettings.IsStreamBufferPreferHost()) {
-            return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-        }
-        return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        // On an APU the host-visible device heap is the same write-combining
+        // DRAM, so a cached ring can be the cheaper trade; off by default,
+        // PREFER_DEVICE stays right for discrete parts.
+        return EmulatorSettings.IsStreamBufferPreferHost() ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST
+                                                           : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     case MemoryUsage::DeviceLocal:
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     case MemoryUsage::Upload:
@@ -293,22 +286,16 @@ void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_
 }
 
 bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_wait) {
-    if (!invalidation_mark) {
-        return true;
-    }
+    DEBUG_ASSERT(invalidation_mark.has_value());
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        // allow_wait is tested first so the free check is only performed when
-        // its answer can change what happens. Reaching it costs a semaphore
-        // query, and when waiting is permitted the result was discarded and
-        // then recomputed by the wait below, which performs the same cached
-        // check and refresh itself. Every stream map ran this, which made it
-        // roughly one ioctl per buffer bind.
+        // allow_wait first: IsFree costs a semaphore query, and when waiting is
+        // permitted WaitTagged performs the same check itself.
         if (!allow_wait && !scheduler->IsFree(watch.tick)) {
             return false;
         }
-        // WaitTagged times only waits whose tick is not already known free, so
-        // blocked_ns counts real stalls and none of the drain walk itself.
+        // WaitTagged only times ticks not already known free, so blocked_ns
+        // counts real stalls, not the drain walk.
         ring_stats_.blocked_ns +=
             scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
         wait_bound = watch.upper_bound;
