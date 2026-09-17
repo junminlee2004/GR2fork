@@ -307,7 +307,13 @@ void PatchMemory(const patchInfo& patch) {
     }
 
     if (patch.patchMask == PatchMask::Mask) {
-        cheatAddress = reinterpret_cast<void*>(PatternScan(patch.offsetStr) + patch.maskOffset);
+        const uintptr_t baseAddress = PatternScan(patch.offsetStr);
+        if (baseAddress == 0) {
+            LOG_ERROR(Loader, "PatternScan failed for patch {} with pattern: {}", patch.modNameStr,
+                      patch.offsetStr);
+            return;
+        }
+        cheatAddress = reinterpret_cast<void*>(baseAddress + patch.maskOffset);
     }
 
     if (patch.patchMask == PatchMask::Mask_Jump32) {
