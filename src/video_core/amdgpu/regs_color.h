@@ -113,14 +113,12 @@ struct ColorBufferMask {
     }
 };
 
-// Swizzle() below runs per color target at draw rate and the compiler leaves it
-// an out-of-line call over two more calls. The table is built at compile time by
-// evaluating the same MRT table and RemapSwizzle, so the mapping stays defined in
-// one place. comp_swap is a 2-bit and format a 5-bit hardware field, so the index
-// is 0..127 by construction. Format codes with no components cannot reach
-// Swizzle() - operator bool() rejects code 0 and no color target carries the
-// others - and skipping them keeps the builder from indexing the MRT table at
-// components - 1 == 0xFFFFFFFF, which the old runtime derivation would have.
+// Draw-rate table built at compile time from the same MRT table and
+// RemapSwizzle, so the mapping stays defined in one place. comp_swap (2 bits)
+// and format (5 bits) make the index 0..127 by construction, so Swizzle() needs
+// no bounds check. Zero-component format codes keep the default entry: skipping
+// them keeps the builder off mrt_swizzles[...][components - 1 == 0xFFFFFFFF],
+// and operator bool() rejects code 0 while no color target carries the others.
 namespace detail {
 consteval std::array<CompMapping, 128> BuildColorSwizzleLut() {
     // clang-format off
