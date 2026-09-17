@@ -128,9 +128,7 @@ TransferQueue::TransferQueue(const Instance& instance_, MasterSemaphore& master_
 
 TransferQueue::~TransferQueue() {
     // Every submit retires before its command buffer and the timeline go.
-    if (current_tick > 1) {
-        Wait(current_tick - 1);
-    }
+    Wait(current_tick - 1);
 }
 
 u64 TransferQueue::SubmitCopy(u64 wait_master_tick, vk::Buffer src, vk::Buffer dst,
@@ -138,9 +136,7 @@ u64 TransferQueue::SubmitCopy(u64 wait_master_tick, vk::Buffer src, vk::Buffer d
     const size_t slot = next_slot;
     next_slot = (next_slot + 1) % NumSlots;
     // A slot is reused only once its previous submit has retired.
-    if (slot_ticks[slot] != 0) {
-        Wait(slot_ticks[slot]);
-    }
+    Wait(slot_ticks[slot]);
     const auto cmdbuf = cmdbufs[slot];
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
@@ -149,10 +145,9 @@ u64 TransferQueue::SubmitCopy(u64 wait_master_tick, vk::Buffer src, vk::Buffer d
     ASSERT_MSG(begin_result == vk::Result::eSuccess,
                "Failed to begin copy queue command buffer: {}", vk::to_string(begin_result));
     if (on_graphics_) {
-        // Belt and braces on the graphics route: the master wait is already a
-        // full memory dependency, this mirrors the in-batch fallback's barrier
-        // (buffer_cache.cpp PrepareFaultDownload). Drop it first if the
-        // graphics-ring copy costs more than its measured floor.
+        // Redundant with the master wait below (already a full memory
+        // dependency); mirrors the in-batch pre_barrier in buffer_cache.cpp
+        // PrepareFaultDownload.
         const vk::BufferMemoryBarrier2 pre_barrier = {
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
@@ -195,17 +190,13 @@ u64 TransferQueue::SubmitCopy(u64 wait_master_tick, vk::Buffer src, vk::Buffer d
         .signalSemaphoreCount = 1,
         .pSignalSemaphores = &signal_sema,
     };
-    // The graphics route is only legal because the caller guarantees
-    // `writer_tick < scheduler.CurrentTick()` (buffer_cache.cpp
-    // PrepareFaultDownload), i.e. the signalling batch is already submitted:
-    // on the in-order graphics ring a wait on a not-yet-submitted tick would
-    // hang the whole ring. Never relax that condition. The queue itself is
-    // externally synchronised and shared with the scheduler's batches (from
-    // both the GPU command thread and the presenter) and with present, so the
-    // submit takes the same static Scheduler::submit_mutex they do. Ordering
-    // is therefore: behind the writer batch and ahead of every batch the GPU
-    // thread records after the fault, but the presenter's next batch can slip
-    // in first if it wins the lock.
+    // Graphics route: legal only because the caller guarantees the signalling
+    // batch is already submitted (writer_tick < scheduler.CurrentTick(), in
+    // buffer_cache.cpp PrepareFaultDownload); on the in-order graphics ring a
+    // wait on a not-yet-submitted tick hangs the ring. Never relax that. The
+    // queue is shared with the scheduler's batches (GPU command thread and
+    // presenter) and with present, so the submit takes the same static
+    // Scheduler::submit_mutex; the presenter's next batch can still win it.
     vk::Result submit_result;
     if (on_graphics_) {
         std::scoped_lock lk{Scheduler::submit_mutex};
@@ -239,18 +230,8 @@ void TransferQueue::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
-    Refresh();
-    if (IsFree(tick)) {
-        return;
+    while (!WaitFor(tick, WAIT_TIMEOUT)) {
     }
-    const vk::SemaphoreWaitInfo wait_info = {
-        .semaphoreCount = 1,
-        .pSemaphores = &semaphore.get(),
-        .pValues = &tick,
-    };
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
-    }
-    Refresh();
 }
 
 bool TransferQueue::WaitFor(u64 tick, u64 timeout_ns) {
