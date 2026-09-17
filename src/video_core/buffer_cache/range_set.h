@@ -265,6 +265,16 @@ public:
         return it->hi >= e;
     }
 
+    bool Intersects(VAddr base, size_t size) const {
+        if (size == 0 || v_.empty()) {
+            return false;
+        }
+        const VAddr e = base + size;
+        auto it = std::upper_bound(v_.begin(), v_.end(), base,
+                                   [](VAddr x, const Interval& i) { return x < i.hi; });
+        return it != v_.end() && it->lo < e;
+    }
+
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
         if (size == 0 || v_.empty()) {
@@ -276,6 +286,13 @@ public:
                                    [](VAddr x, const Interval& i) { return x < i.hi; });
         for (; it != v_.end() && it->lo < e; ++it) {
             func(std::max<VAddr>(it->lo, s), std::min<VAddr>(it->hi, e));
+        }
+    }
+
+    template <typename Func>
+    void ForEach(Func&& func) const {
+        for (const Interval& i : v_) {
+            func(i.lo, i.hi);
         }
     }
 
