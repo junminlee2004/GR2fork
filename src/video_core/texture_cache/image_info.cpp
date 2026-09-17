@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <bit>
+#include <memory>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
@@ -9,12 +12,6 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/tile.h"
-
-#include <array>
-#include <bit>
-#include <memory>
-
-#include <magic_enum/magic_enum.hpp>
 
 namespace VideoCore {
 
@@ -123,13 +120,8 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
 
 namespace {
 
-/**
- * Building an ImageInfo from a T# is a pure function of the descriptor's 32
- * bytes, the depth flag, and Neo mode, but it runs once per texture bind - so
- * the per-mip tiling walk in UpdateSize is re-derived for every draw that
- * rebinds the same texture. Keying on the whole descriptor makes a hit exactly
- * equivalent to constructing, so this is a pure memo rather than a heuristic.
- */
+// Keyed on the full 32-byte T# plus is_depth; Neo mode is fixed for the run, so
+// the ctor is a pure function of the key and a hit is exactly a construct.
 struct ImageInfoMemo {
     static constexpr size_t NumEntries = 256; // direct mapped, power of two
 
