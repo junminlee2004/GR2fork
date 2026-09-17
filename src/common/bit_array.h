@@ -196,6 +196,18 @@ public:
         data.fill(~0ULL);
     }
 
+    inline constexpr bool None() const {
+        u64 result = 0;
+        for (const auto& word : data) {
+            result |= word;
+        }
+        return result == 0;
+    }
+
+    inline constexpr bool Any() const {
+        return !None();
+    }
+
     /// Whether any bit in [start, end) is set, without materialising a masked
     /// copy of the array. Equivalent to BitArray(*this, start, end).Any().
     inline constexpr bool AnyInRange(size_t start, size_t end) const {
@@ -214,21 +226,6 @@ public:
         return AnyInRangeMultiWord(first_word, last_word, start_mask, end_mask);
     }
 
-    /// The straddling case, outlined. Its vector loop makes every caller that
-    /// inlines AnyInRange end in a vzeroupper it never executes, and the
-    /// tracker probes that dominate the callers are single-word.
-    SHAD_NO_INLINE bool AnyInRangeMultiWord(size_t first_word, size_t last_word, u64 start_mask,
-                                            u64 end_mask) const {
-        // Accumulate rather than exit early: without the data-dependent branch
-        // the compiler vectorises the scan, which beats a word-at-a-time loop
-        // on arrays this size even when a hit sits in the first word.
-        u64 result = (data[first_word] & start_mask) | (data[last_word] & end_mask);
-        for (size_t i = first_word + 1; i < last_word; ++i) {
-            result |= data[i];
-        }
-        return result != 0;
-    }
-
     /// Whether every bit in [start, end) is set, without materialising a copy.
     inline constexpr bool AllInRange(size_t start, size_t end) const {
         if (start >= end || end > N) {
@@ -244,25 +241,13 @@ public:
             const u64 mask = start_mask & end_mask;
             return (data[first_word] & mask) == mask;
         }
-        // Mirrors AnyInRange's branchless reduction; bits outside the range are
-        // forced set so one full-word comparison decides the whole span.
+        // Branchless like AnyInRangeMultiWord: bits outside the range are forced
+        // set, so one full-word comparison decides the whole span.
         u64 result = (data[first_word] | ~start_mask) & (data[last_word] | ~end_mask);
         for (size_t i = first_word + 1; i < last_word; ++i) {
             result &= data[i];
         }
         return result == ~0ULL;
-    }
-
-    inline constexpr bool None() const {
-        u64 result = 0;
-        for (const auto& word : data) {
-            result |= word;
-        }
-        return result == 0;
-    }
-
-    inline constexpr bool Any() const {
-        return !None();
     }
 
     Range FirstRangeFrom(size_t start) const {
@@ -458,6 +443,19 @@ public:
     }
 
 private:
+    /// The straddling case, outlined: inlining this vector loop would leave every
+    /// AnyInRange caller with a vzeroupper it never executes, and the tracker
+    /// probes that dominate the callers are single-word.
+    SHAD_NO_INLINE bool AnyInRangeMultiWord(size_t first_word, size_t last_word, u64 start_mask,
+                                            u64 end_mask) const {
+        // Branchless on purpose: with no data-dependent exit the scan vectorises.
+        u64 result = (data[first_word] & start_mask) | (data[last_word] & end_mask);
+        for (size_t i = first_word + 1; i < last_word; ++i) {
+            result |= data[i];
+        }
+        return result != 0;
+    }
+
     std::array<u64, WORD_COUNT> data{};
 };
 
