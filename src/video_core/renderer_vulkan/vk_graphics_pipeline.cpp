@@ -483,11 +483,6 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
 template void GraphicsPipeline::GetVertexInputs(
-    VertexInputs<vk::VertexInputAttributeDescription>& attributes,
-    VertexInputs<vk::VertexInputBindingDescription>& bindings,
-    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    std::span<const AmdGpu::Buffer> sharps, u32 step_rate_0, u32 step_rate_1) const;
-template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes,
     VertexInputs<vk::VertexInputBindingDescription2EXT>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
