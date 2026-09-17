@@ -8,7 +8,6 @@
 #include <bit>
 #include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -420,7 +419,7 @@ struct DynamicState {
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance, bool async_submit = false);
+    explicit Scheduler(const Instance& instance);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -483,28 +482,6 @@ public:
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
-
-    /// Joins the asynchronous submit FIFO: returns once the batch signalling
-    /// `tick` has actually been handed to the queue. No-op without the submit
-    /// thread and for a tick the current (still open) batch will sign.
-    /// A non-zero budget bounds the wait (timed waiters keep their budget).
-    /// NEVER call this while holding Scheduler::submit_mutex: the worker needs
-    /// that lock to drain.
-    void EnsureSubmitted(u64 tick, u64 budget_ns = 0);
-
-    struct SubmitQueueStats {
-        u64 submits;     ///< batches issued by the worker
-        u64 depth_max;   ///< deepest the FIFO ever got
-        u64 lat_tsc;     ///< enqueue -> queue submit, summed (RDTSC ticks)
-        u64 lat_max_tsc; ///< worst single hand-off
-        u64 joins;       ///< EnsureSubmitted calls that had to block
-        u64 join_tsc;    ///< time spent blocked in EnsureSubmitted
-        u64 full;        ///< producer stalls on a full FIFO
-        u64 full_tsc;    ///< time the producer spent stalled
-        u64 waits;       ///< times the worker found the FIFO empty
-    };
-    /// Reads and clears the submit-FIFO counters (telemetry only).
-    SubmitQueueStats DrainSubmitQueueStats();
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -583,25 +560,11 @@ public:
     }
 
     static std::mutex submit_mutex;
-    // Serialises the pre-submit section of SubmitExecution (submit hook,
-    // StreamCopyLane::DrainProducer, Skipcache::InvalidateAll, cmdbuf end)
-    // across schedulers. submit_mutex used to cover it, but with the submit
-    // thread the draw scheduler does not hold submit_mutex there - and it must
-    // not, since the worker holds it across the ioctl. Only taken while some
-    // scheduler submits asynchronously; lock order is presubmit -> submit.
-    static std::mutex presubmit_mutex;
-    static std::atomic<bool> async_submit_active;
 
 private:
     void AllocateWorkerCommandBuffers();
 
     void SubmitExecution(SubmitInfo& info);
-
-    /// Issues one recorded batch to the graphics queue (the part of
-    /// SubmitExecution that the submit thread takes over).
-    void IssueSubmit(vk::CommandBuffer cmdbuf, SubmitInfo& info);
-
-    void SubmitThreadLoop();
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
@@ -630,37 +593,6 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
-    // Asynchronous submit FIFO (submit_thread setting, latched at
-    // construction). The recording thread pushes a closed command buffer here
-    // and the worker issues it in tick order; depth is capped so a stalled
-    // worker back-pressures onto the producer instead of growing the command
-    // pool without limit.
-    struct QueuedSubmit {
-        vk::CommandBuffer cmdbuf;
-        SubmitInfo info;
-        u64 tick;
-        u64 enqueue_tsc;
-    };
-    static constexpr size_t kSubmitQueueCap = 8;
-    std::deque<QueuedSubmit> submit_queue_;
-    std::mutex submit_queue_mutex_;
-    std::condition_variable submit_queue_cv_;
-    std::condition_variable submitted_cv_;
-    std::condition_variable space_cv_;
-    u64 submitted_tick_{};
-    bool async_submit_{};
-    bool submit_stop_{};
-    bool worker_waiting_{};
-    std::jthread submit_thread_;
-    u64 sq_submits_{};
-    u64 sq_depth_max_{};
-    u64 sq_lat_tsc_{};
-    u64 sq_lat_max_tsc_{};
-    u64 sq_joins_{};
-    u64 sq_join_tsc_{};
-    u64 sq_full_{};
-    u64 sq_full_tsc_{};
-    u64 sq_waits_{};
     RenderState render_state;
     bool is_rendering = false;
     // The first direct measurement of the render scope rate: everything the

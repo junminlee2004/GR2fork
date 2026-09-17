@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
-
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/rdtsc.h"
@@ -17,38 +15,19 @@
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
-std::mutex Scheduler::presubmit_mutex;
-std::atomic<bool> Scheduler::async_submit_active{false};
 
-Scheduler::Scheduler(const Instance& instance, bool async_submit)
+Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
     pop_poll_throttle_ = EmulatorSettings.GetPendingPopThrottle();
-    async_submit_ = async_submit;
-    if (async_submit_) {
-        async_submit_active.store(true, std::memory_order_release);
-        submit_thread_ = std::jthread(std::bind_front(&Scheduler::SubmitThreadLoop, this));
-    }
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
 
 Scheduler::~Scheduler() {
-    if (submit_thread_.joinable()) {
-        {
-            std::scoped_lock ql{submit_queue_mutex_};
-            submit_stop_ = true;
-        }
-        submit_queue_cv_.notify_all();
-        submit_thread_.join();
-    }
-    if (async_submit_) {
-        // Keep the static honest: no scheduler is handing submits off anymore.
-        async_submit_active.store(false, std::memory_order_release);
-    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -164,9 +143,6 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
-    // Host waits on a queued tick are spec-legal, but blocking in the driver
-    // for a batch that has not been handed to the queue yet only adds latency.
-    EnsureSubmitted(tick);
     master_semaphore.Wait(tick);
 }
 
@@ -217,18 +193,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
-    // With the submit thread the queue submit itself leaves this thread, so
-    // submit_mutex cannot cover the pre-submit section any more (the worker
-    // holds it across the ioctl). presubmit_mutex keeps that section
-    // serialised against the other schedulers, which still submit inline.
-    std::unique_lock pre{presubmit_mutex, std::defer_lock};
-    if (async_submit_active.load(std::memory_order_acquire)) {
-        pre.lock();
-    }
-    std::unique_lock lk{submit_mutex, std::defer_lock};
-    if (!async_submit_) {
-        lk.lock();
-    }
+    std::scoped_lock lk{submit_mutex};
     // Every submit of this scheduler runs on the GPU command thread, which is
     // where the hook's state lives.
     if (submit_hook_) {
@@ -257,46 +222,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    if (async_submit_) {
-        // Hand the closed batch to the worker and go back to recording. The
-        // FIFO is drained in tick order by a single consumer, so the ring
-        // still receives this scheduler's batches in the order they closed.
-        std::unique_lock ql{submit_queue_mutex_};
-        if (submit_queue_.size() >= kSubmitQueueCap) {
-            // Back-pressure onto the recording thread; otherwise a stalled
-            // worker would grow the command pool instead.
-            const u64 t0 = Common::FencedRDTSC();
-            ++sq_full_;
-            space_cv_.wait(ql, [this] { return submit_queue_.size() < kSubmitQueueCap; });
-            sq_full_tsc_ += Common::FencedRDTSC() - t0;
-        }
-        submit_queue_.push_back({current_cmdbuf, info, signal_value, Common::FencedRDTSC()});
-        sq_depth_max_ = std::max<u64>(sq_depth_max_, submit_queue_.size());
-        const bool wake = worker_waiting_;
-        ql.unlock();
-        if (wake) {
-            submit_queue_cv_.notify_one();
-        }
-    } else {
-        IssueSubmit(current_cmdbuf, info);
-    }
-    if (pre.owns_lock()) {
-        pre.unlock();
-    }
-    AllocateWorkerCommandBuffers();
-
-    // Apply pending operations
-    PopPendingOperations();
-}
-
-void Scheduler::IssueSubmit(vk::CommandBuffer cmdbuf, SubmitInfo& info) {
-    // The worker owns no other lock here; the inline path already holds
-    // submit_mutex for the whole of SubmitExecution.
-    std::unique_lock ml{submit_mutex, std::defer_lock};
-    if (async_submit_) {
-        ml.lock();
-    }
-
     static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -315,7 +240,7 @@ void Scheduler::IssueSubmit(vk::CommandBuffer cmdbuf, SubmitInfo& info) {
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
         .commandBufferCount = 1U,
-        .pCommandBuffers = &cmdbuf,
+        .pCommandBuffers = &current_cmdbuf,
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
@@ -325,71 +250,10 @@ void Scheduler::IssueSubmit(vk::CommandBuffer cmdbuf, SubmitInfo& info) {
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     master_semaphore.Refresh();
-}
+    AllocateWorkerCommandBuffers();
 
-void Scheduler::SubmitThreadLoop() {
-    Common::SetCurrentThreadName("shadPS4:GpuSubmit");
-
-    std::unique_lock lk{submit_queue_mutex_};
-    while (true) {
-        if (submit_queue_.empty()) {
-            if (submit_stop_) {
-                return;
-            }
-            ++sq_waits_;
-            worker_waiting_ = true;
-            submit_queue_cv_.wait(lk, [this] { return !submit_queue_.empty() || submit_stop_; });
-            worker_waiting_ = false;
-            continue;
-        }
-        QueuedSubmit job = std::move(submit_queue_.front());
-        submit_queue_.pop_front();
-        lk.unlock();
-        space_cv_.notify_one();
-        IssueSubmit(job.cmdbuf, job.info);
-        const u64 lat = Common::FencedRDTSC() - job.enqueue_tsc;
-        lk.lock();
-        submitted_tick_ = job.tick;
-        ++sq_submits_;
-        sq_lat_tsc_ += lat;
-        sq_lat_max_tsc_ = std::max(sq_lat_max_tsc_, lat);
-        submitted_cv_.notify_all();
-    }
-}
-
-void Scheduler::EnsureSubmitted(u64 tick, u64 budget_ns) {
-    if (!async_submit_) {
-        return;
-    }
-    // A tick the open batch has not signed yet cannot be in the FIFO; the
-    // caller's own flush path handles that case.
-    if (tick >= master_semaphore.CurrentTick()) {
-        return;
-    }
-    std::unique_lock ql{submit_queue_mutex_};
-    if (submitted_tick_ >= tick) {
-        return;
-    }
-    const u64 t0 = Common::FencedRDTSC();
-    const auto reached = [this, tick] { return submitted_tick_ >= tick; };
-    if (budget_ns != 0) {
-        submitted_cv_.wait_for(ql, std::chrono::nanoseconds(budget_ns), reached);
-    } else {
-        submitted_cv_.wait(ql, reached);
-    }
-    ++sq_joins_;
-    sq_join_tsc_ += Common::FencedRDTSC() - t0;
-}
-
-Scheduler::SubmitQueueStats Scheduler::DrainSubmitQueueStats() {
-    std::scoped_lock ql{submit_queue_mutex_};
-    return SubmitQueueStats{
-        std::exchange(sq_submits_, u64{0}), std::exchange(sq_depth_max_, u64{0}),
-        std::exchange(sq_lat_tsc_, u64{0}), std::exchange(sq_lat_max_tsc_, u64{0}),
-        std::exchange(sq_joins_, u64{0}),   std::exchange(sq_join_tsc_, u64{0}),
-        std::exchange(sq_full_, u64{0}),    std::exchange(sq_full_tsc_, u64{0}),
-        std::exchange(sq_waits_, u64{0}),
-    };
+    // Apply pending operations
+    PopPendingOperations();
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

@@ -1159,14 +1159,6 @@ void Rasterizer::OnSubmit() {
                          off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma, ms(off.q2_wait_ns),
                          std::exchange(writer_flushes_, u64{0}));
             }
-            if (const auto sq = scheduler.DrainSubmitQueueStats(); sq.submits) {
-                const auto us = [hz](u64 tsc) { return hz ? tsc * 1000000 / hz : 0; };
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] SUBMITQ submits={} depth_max={} lat_us={} lat_max_us={} "
-                         "joins={} join_us={} full={} full_us={} waits={} per300f",
-                         sq.submits, sq.depth_max, us(sq.lat_tsc), us(sq.lat_max_tsc), sq.joins,
-                         us(sq.join_tsc), sq.full, us(sq.full_tsc), sq.waits);
-            }
             if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,

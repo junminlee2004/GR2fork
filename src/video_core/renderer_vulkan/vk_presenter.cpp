@@ -472,8 +472,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance, EmulatorSettings.IsSubmitThread()}, present_scheduler{instance},
-      flip_scheduler{instance}, swapchain{instance, window},
+      draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      swapchain{instance, window},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
@@ -1073,13 +1073,6 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
-    // This submit waits on the frame's ready tick, and a queue wait may not
-    // precede its signaller on the in-order ring. ready_tick belongs to
-    // whichever scheduler prepared the frame (flip and present schedulers also
-    // sign it), so join the draw FIFO only for a draw-timeline value.
-    if (frame->ready_semaphore == draw_scheduler.GetMasterSemaphore()->Handle()) {
-        draw_scheduler.EnsureSubmitted(frame->ready_tick);
-    }
     scheduler.Flush(info);
 
     // Present to swapchain.
