@@ -18,6 +18,12 @@ using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 
+// Access bits that make a subresource's current state a write that must be
+// ordered even when layout and access already match.
+constexpr vk::AccessFlags2 kWriteFlags = vk::AccessFlagBits2::eTransferWrite |
+                                         vk::AccessFlagBits2::eShaderWrite |
+                                         vk::AccessFlagBits2::eMemoryWrite;
+
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance* instance,
                                            const ImageInfo& info) {
     vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
@@ -244,16 +250,12 @@ SHAD_NO_INLINE ImageViewId Image::InsertView(const ImageViewInfo& view_info) {
 
 void Image::RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                               vk::PipelineStageFlags2 dst_stage,
-                              std::optional<SubresourceRange> subres_range) {
+                              const std::optional<SubresourceRange>& subres_range) {
     backing->noop_epoch = backing->state_epoch;
     backing->noop_layout = dst_layout;
     backing->noop_access = dst_mask;
     backing->noop_stage = dst_stage;
-    backing->noop_range =
-        subres_range
-            ? (u64{subres_range->base.level} | (u64{subres_range->base.layer} << 16) |
-               (u64{subres_range->extent.levels} << 32) | (u64{subres_range->extent.layers} << 48))
-            : ~u64{0};
+    backing->noop_range = RangeKey(subres_range);
 }
 
 Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
@@ -267,14 +269,10 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     bool partially_transited = !subresource_states.empty();
 
-    constexpr auto uniform_write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                         vk::AccessFlagBits2::eShaderWrite |
-                                         vk::AccessFlagBits2::eMemoryWrite;
     // A vector with zero divergent entries is equivalent to empty: collapse it
-    // instead of scanning every mip x layer on each call. This scan was
-    // measured at a third of the GPU thread on subresource-heavy scenes.
-    // Entries may still differ in pipeline stage; the union keeps the next
-    // full-resource barrier's source stage a superset of every entry's.
+    // instead of scanning every mip x layer on each call. Entries may still
+    // differ in pipeline stage; the union keeps the next full-resource
+    // barrier's source stage a superset of every entry's.
     if (partially_transited && backing->subres_divergent == 0) {
         last_state.pl_stage |= backing->subres_stage_union;
         subresource_states.clear();
@@ -285,23 +283,12 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
     // A partial transition into the state the whole image is already in would
     // materialize the vector only to fill it with identical values.
     if (needs_partial_transition && !partially_transited && last_state.layout == dst_layout &&
-        last_state.access_mask == dst_mask && !(last_state.access_mask & uniform_write_flags)) {
+        last_state.access_mask == dst_mask && !(last_state.access_mask & kWriteFlags)) {
         RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
         return {};
     }
-
-    // Memo probe: an identical query under an unchanged state epoch produced no
-    // barriers, and reproducing that answer costs a full subresource scan.
-    const u64 range_key =
-        subres_range
-            ? (u64{subres_range->base.level} | (u64{subres_range->base.layer} << 16) |
-               (u64{subres_range->extent.levels} << 32) | (u64{subres_range->extent.layers} << 48))
-            : ~u64{0};
-    if (backing->noop_epoch == backing->state_epoch && backing->noop_layout == dst_layout &&
-        backing->noop_access == dst_mask && backing->noop_stage == dst_stage &&
-        backing->noop_range == range_key) {
-        return {};
-    }
+    // Both entries (the inline GetBarriers and TransitSlow's caller Transit) have
+    // already probed BarriersNoop; the collapse above only bumps state_epoch.
     const bool had_subres = !subresource_states.empty();
 
     Barriers barriers;
@@ -313,12 +300,9 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
             backing->subres_stage_union = last_state.pl_stage;
         }
         const State base_state = last_state;
-        constexpr auto divergent_write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                               vk::AccessFlagBits2::eShaderWrite |
-                                               vk::AccessFlagBits2::eMemoryWrite;
         const bool dst_divergent = dst_layout != base_state.layout ||
                                    dst_mask != base_state.access_mask ||
-                                   static_cast<bool>(dst_mask & divergent_write_flags);
+                                   static_cast<bool>(dst_mask & kWriteFlags);
 
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
@@ -342,10 +326,7 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 
-                constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                             vk::AccessFlagBits2::eShaderWrite |
-                                             vk::AccessFlagBits2::eMemoryWrite;
-                const bool is_write = static_cast<bool>(state.access_mask & write_flags);
+                const bool is_write = static_cast<bool>(state.access_mask & kWriteFlags);
                 if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
@@ -365,39 +346,33 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
                             .layerCount = 1,
                         },
                     });
-                    const bool was_divergent =
-                        state.layout != base_state.layout ||
-                        state.access_mask != base_state.access_mask ||
-                        static_cast<bool>(state.access_mask & divergent_write_flags);
+                    const bool was_divergent = state.layout != base_state.layout ||
+                                               state.access_mask != base_state.access_mask ||
+                                               static_cast<bool>(state.access_mask & kWriteFlags);
                     backing->subres_divergent +=
                         static_cast<u32>(dst_divergent) - static_cast<u32>(was_divergent);
-                    backing->subres_stage_union |= dst_stage;
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
-                    BumpStateEpoch();
-                    Skipcache::Framework::Instance().BumpLayoutGen();
                 }
             }
         }
 
+        if (!barriers.empty()) {
+            backing->subres_stage_union |= dst_stage;
+            BumpStateEpoch();
+            Skipcache::Framework::Instance().BumpLayoutGen();
+        }
+
         if (!needs_partial_transition) {
-            // The loop unified every entry to the destination state; reflect
-            // that in last_state so the next full-resource comparison is
-            // against reality (it previously stayed stale after the clear).
-            last_state.layout = dst_layout;
-            last_state.access_mask = dst_mask;
-            last_state.pl_stage = dst_stage;
+            // The loop unified every entry; the tail writes last_state to that state.
             subresource_states.clear();
             backing->subres_divergent = 0;
             backing->subres_stage_union = {};
             BumpStateEpoch();
         }
     } else { // Full resource transition
-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite |
-                                     vk::AccessFlagBits2::eMemoryWrite;
-        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
+        const bool is_write = static_cast<bool>(last_state.access_mask & kWriteFlags);
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
             RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
             return {};
@@ -442,14 +417,8 @@ Image::Barriers Image::GetBarriersSlow(vk::ImageLayout dst_layout, vk::AccessFla
 }
 
 void Image::TransitSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                        std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf /*= {}*/) {
-    // Adjust pipeline stage
-    const vk::PipelineStageFlags2 dst_pl_stage =
-        (dst_mask == vk::AccessFlagBits2::eTransferRead ||
-         dst_mask == vk::AccessFlagBits2::eTransferWrite)
-            ? vk::PipelineStageFlagBits2::eTransfer
-            : vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
-
+                        vk::PipelineStageFlags2 dst_pl_stage, std::optional<SubresourceRange> range,
+                        vk::CommandBuffer cmdbuf /*= {}*/) {
     const auto barriers = GetBarriersSlow(dst_layout, dst_mask, dst_pl_stage, range);
     if (barriers.empty()) {
         return;

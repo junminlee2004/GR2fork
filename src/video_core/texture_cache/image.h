@@ -133,7 +133,7 @@ struct Image {
     /// backing's state epoch changes.
     void RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                            vk::PipelineStageFlags2 dst_stage,
-                           std::optional<SubresourceRange> subres_range);
+                           const std::optional<SubresourceRange>& subres_range);
 
     /// Header fast path for GetBarriers' repeat no-op answer: the memo the
     /// outlined body maintains proves an identical query under an unchanged
@@ -142,17 +142,18 @@ struct Image {
     /// applicable bumps state_epoch, which misses this memo.
     static constexpr vk::PipelineStageFlags2 kShaderReadStages =
         vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+    static constexpr u64 RangeKey(const std::optional<SubresourceRange>& r) {
+        return r ? (u64{r->base.level} | (u64{r->base.layer} << 16) |
+                    (u64{r->extent.levels} << 32) | (u64{r->extent.layers} << 48))
+                 : ~u64{0};
+    }
     void BumpStateEpoch() {
         backing_epoch = ++backing->state_epoch;
     }
     bool BarriersNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                       vk::PipelineStageFlags2 dst_stage,
                       const std::optional<SubresourceRange>& subres_range) const {
-        const u64 range_key =
-            subres_range ? (u64{subres_range->base.level} | (u64{subres_range->base.layer} << 16) |
-                            (u64{subres_range->extent.levels} << 32) |
-                            (u64{subres_range->extent.layers} << 48))
-                         : ~u64{0};
+        const u64 range_key = RangeKey(subres_range);
         return backing->noop_epoch == backing->state_epoch && backing->noop_layout == dst_layout &&
                backing->noop_access == dst_mask && backing->noop_stage == dst_stage &&
                backing->noop_range == range_key;
@@ -179,10 +180,11 @@ struct Image {
         if (BarriersNoop(dst_layout, dst_mask, dst_pl_stage, range)) {
             return;
         }
-        TransitSlow(dst_layout, dst_mask, range, cmdbuf);
+        TransitSlow(dst_layout, dst_mask, dst_pl_stage, range, cmdbuf);
     }
     void TransitSlow(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                     std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
+                     vk::PipelineStageFlags2 dst_pl_stage, std::optional<SubresourceRange> range,
+                     vk::CommandBuffer cmdbuf = {});
     void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset);
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                   u64 offset, u64 download_size);
@@ -209,10 +211,9 @@ public:
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
 
-    // Atomic fast state for the lock-free UpdateImage fast path: most calls
-    // find the image clean, tracked and recently touched, yet pay the shared
-    // lock. {dirty, tracked, last_touch_tick} pack into one u64. Wrapped so
-    // the defaulted Image moves keep working (slot storage moves on growth).
+    // Atomic fast state for the lock-free UpdateImage fast path: {dirty,
+    // tracked, last_touch_tick} in one u64, so the common clean-and-tracked call
+    // skips the shared lock. Wrapped so the defaulted Image moves keep working.
     static constexpr u64 kFastStateDirty = 1ULL << 0;
     static constexpr u64 kFastStateTracked = 1ULL << 1;
     static constexpr u64 kFastStateTouchShift = 2;
@@ -250,10 +251,9 @@ public:
     // read by TouchImageUnlocked from the guest-thread video-out registration too.
     mutable u64 lru_touch_tick{~u64{0}};
     u64 tick_accessed_last{};
-    // The garbage collector period of the last access. ResolveOverlap ages an
-    // image by this, not by the scheduler tick: a tick here is a flush, and at
-    // one flush per few hundred draws NumFramesBeforeRemoval ticks is about a
-    // frame, so a live target aliased by a later pass was being freed.
+    // The garbage collector period of the last access. ResolveOverlap must age
+    // by this, not by the scheduler tick: a tick is a flush, so
+    // NumFramesBeforeRemoval ticks is about a frame and live targets were freed.
     u64 gc_tick_accessed_last{};
     struct {
         u32 is_bound : 1;
@@ -290,21 +290,17 @@ public:
         vk::PipelineStageFlags2 noop_stage{};
         u64 noop_range{};
         std::vector<State> subresource_states;
-        // Number of subresource_states entries whose layout or access differ
-        // from `state`, or that carry write access. While the vector is alive
-        // `state` is frozen, so this is stable; when it is zero every entry
-        // would no-op any matching-state scan and the vector is equivalent to
-        // empty. Stages are deliberately excluded (they do not affect the
-        // scan's skip condition); stage_union tracks them so a collapse can
-        // widen the source stage mask conservatively instead.
+        // Count of subresource_states entries whose layout or access differ from
+        // `state` or that carry write access; `state` is frozen while the vector is
+        // alive, so the count is stable. Zero means the vector is equivalent to
+        // empty. Stages are excluded (they do not affect the scan's skip
+        // condition); subres_stage_union carries them instead.
         u32 subres_divergent{};
         vk::PipelineStageFlags2 subres_stage_union{};
-        // The handle rides beside its key so a view hit ends at this record
-        // instead of chasing the id through the slot vector into the
-        // ImageView object. image_view_ids stays, pushed in lockstep with
-        // view_records: FreeImage's deferred reclaim walks it to erase views,
-        // and an entry present in one vector but not the other leaks the view
-        // for the process lifetime.
+        // The handle rides beside its key so a view hit ends here instead of
+        // chasing the id through the slot vector. image_view_ids stays, pushed in
+        // lockstep with view_records: FreeImage's deferred reclaim walks it, and an
+        // entry in one vector but not the other leaks the view for the process life.
         struct ViewRecord {
             ImageViewInfo info;
             vk::ImageView handle{};
@@ -318,9 +314,8 @@ public:
     // Mirror of backing->state_epoch: every bump and backing switch writes it,
     // so the bind path compares it on this line instead of the backing's.
     u64 backing_epoch{};
-    // Mirror of backing->num_samples: FindView's per-bind sample check read
-    // the LAST field of the 528-byte backing, a line nothing else on the draw
-    // path touches. Updated wherever backing or its sample count changes.
+    // Mirror of backing->num_samples, off the backing's last cache line.
+    // Update wherever backing or its sample count changes.
     u32 backing_num_samples{};
     // Index of this image's live entry in the texture cache's touch log.
     u32 lru_log_pos{std::numeric_limits<u32>::max()};
