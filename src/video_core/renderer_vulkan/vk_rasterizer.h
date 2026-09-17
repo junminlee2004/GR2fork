@@ -23,8 +23,8 @@ class MemoryManager;
 
 namespace Vulkan {
 
-// The image binding list's overflow: the assertion body, outlined.
-SHAD_NO_INLINE void ImageBindingsOverflow();
+// The assert body, outlined for the bind paths.
+SHAD_NO_INLINE void BindAssertFailed();
 
 class GraphicsPipeline;
 
@@ -176,18 +176,17 @@ private:
     /// Builds a pipeline's descriptor write plan from the list this bind just emitted.
     SHAD_NO_INLINE void BuildBindWritePlan(const Pipeline* pipeline);
 
+    /// The once-per-300-frames [SkipCache] telemetry block, out of OnSubmit's lines.
+    void EmitSkipcacheTelemetry(VideoCore::Skipcache::Framework& skipcache);
+
 private:
-    // =========================================================================
-    // BeginRendering skip cache (adaptive framework; see SKIPCACHE_DESIGN.md
-    // and the verify contract in skipcache.h). The snapshot is always a
-    // clear-free state: populate is refused whenever the freshly built state
-    // carries any clear flag, which structurally subsumes both the
-    // consumed-on-read CMASK trap and the level-triggered register-clear trap.
-    // Guards are read-only and run BEFORE the slow path can consume meta.
-    // =========================================================================
+    // BeginRendering skip cache (verify contract in skipcache.h). The snapshot
+    // is always clear-free: populate refuses any state carrying a clear flag,
+    // which subsumes the consumed-on-read CMASK and level-triggered
+    // register-clear traps. Guards are read-only and run BEFORE the slow path
+    // can consume meta.
     struct BrAttachmentGuard {
         VAddr meta_addr{}; // 0 = no metadata
-        u32 slice{};
         VideoCore::ImageId image_id{};
         u64 image_uid{};
         const void* backing{};
@@ -233,10 +232,8 @@ private:
     u32 prone_run_draws_{};
     u64 writer_flushes_{};
     u64 interval_flushes_{};
-    // ring_drain_flush_draws: once the open batch holds this many draws, a
-    // poll every 32nd draw flushes it if every batch submitted so far has
-    // retired. Boot-latched, clamped to >= 32 and rounded up to the multiple
-    // of 32 that actually fires; 0 = off.
+    // ring_drain_flush_draws: boot-latched, clamped to >= 32 and rounded up to
+    // the multiple of 32 that actually fires; 0 = off.
     u32 ring_drain_flush_draws_{};
     u64 drain_flushes_{};
     u32 drain_reach_{};
@@ -249,12 +246,10 @@ private:
     VideoCore::Skipcache::CacheCounters findimg_last_{};
     VideoCore::Skipcache::CacheCounters br_last_{};
     VideoCore::Skipcache::CacheCounters rt_last_{};
-    // How often the register stamp the render target memo keys on moves
-    // between probes: its miss floor, and the sizing input for a wider key.
+    // Moves of the register stamp the render target memo keys on: its miss floor.
     u64 rt_stamp_last_{};
     u64 rt_stamp_moves_{};
-    // The whole-register-file stamp's moves beside the lane the memo keys on;
-    // equal until a narrower lane is selected, then the gap is the lane's win.
+    // The whole-register-file stamp's moves beside the keyed lane; the gap is the lane's win.
     u64 rt_gfx_last_{};
     u64 rt_gfx_moves_{};
     // Last drained framework counters of the descriptor delta cache; the
@@ -263,11 +258,9 @@ private:
     VideoCore::Skipcache::CacheCounters dynstate_last_{};
     u64 dyn_stamp_last_{};
     u64 gfx_stamp_last_{};
-    /// Flushes at the draw interval, or now when forced; true when it did.
-    bool MaybeIntervalFlush(bool force = false);
-    /// readback_offload: whether the run of prone-buffer writes the draw
-    /// just recorded belongs to is due for its flush.
-    bool WriterFlushDue(bool prone_write);
+    /// Flushes at the draw interval, or now when the prone-write run the
+    /// draw just recorded belongs to is due for its flush (readback_offload).
+    void MaybeIntervalFlush(bool prone_write);
     bool elide_findbuffer_{};
     bool bind_prefetch_{};
     // One guest-copy shared hold per packet run (guest_copy_hold_segment).
@@ -311,18 +304,28 @@ private:
     u64 bindplan_mismatch_{};
     bool bind_noop_{};
     bool memo_first_{};
-    // findimg_slot_hint: the bound pipeline's hint cursor for BindTextures,
-    // both null when off. Every binding ordinal consumes one slot, rejected
-    // or not, so the ordinals stay stable from the first bind.
     bool bind_lean_{};
     u64 bindlean_primes_{};
     u64 bindlean_full_{};
+    // findimg_slot_hint: the bound pipeline's hint cursor for BindTextures,
+    // both null when off. Every binding ordinal consumes one slot, rejected
+    // or not, so the ordinals stay stable from the first bind.
     bool findimg_hint_{};
     u16* image_hint_cur_{};
     u16* image_hint_end_{};
     void SkipImageHints(size_t n) {
         image_hint_cur_ +=
             std::min<size_t>(n, static_cast<size_t>(image_hint_end_ - image_hint_cur_));
+    }
+    void RejectImageBindings(u32 num_bindings) {
+        plan_rejected_ = true;
+        SkipImageHints(num_bindings);
+        for (u32 i = 0; i < num_bindings; ++i) {
+            image_bindings.emplace_back();
+        }
+        if (!plan_hit_) {
+            image_descriptor_array_sizes.push_back(num_bindings);
+        }
     }
     u64 bindnoop_hits_{};
     u64 bindnoop_slow_{};
@@ -356,6 +359,7 @@ private:
         const GraphicsPipeline* pipeline{}; // compared, never dereferenced
         u32 cb_count{};
         std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS> cb_id{};
+        // Debug-only audit snapshot (RtMemoProbe's NDEBUG block).
         std::array<u64, AmdGpu::NUM_COLOR_BUFFERS> cb_uid{};
         VideoCore::ImageId db_id{};
         u64 db_uid{};
@@ -382,14 +386,12 @@ private:
         // compares it instead of the pipeline identity.
         std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
     };
-    bool DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 reg_stamp, u64 dyn_gen,
-                      u64 pipe_gen);
+    bool DynMemoProbe(VideoCore::Skipcache::CacheCounters& ctr, const GraphicsPipeline* pipeline,
+                      u32 flags, u64 reg_stamp, u64 dyn_gen, u64 pipe_gen);
     DynStateMemo dyn_memo_{};
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
     bool deferred_read_arm_{};
-    // Gates the PCARRY telemetry line only; the behaviour is latched in PageManager.
-    bool protect_carry_merge_{};
     bool deferred_read_release_{};
     bool cp_write_backing_{};
     // CPWRITE census, GPU command thread only: plain adds, drained per300f.
@@ -433,8 +435,7 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Pipeline::BufferBarriers buffer_barriers;
     // 120 bytes: unaligned it straddles three cache lines, so every draw's
-    // rebuild touches a third line for eight bytes of it. The value-init is a
-    // no-op today and the base case for a prefix-clear memo later.
+    // rebuild touches a third line for eight bytes of it.
     alignas(64) Shader::PushData push_data{};
     // push_vp_memo: the high-water marks of the previous draw's user-data and
     // buffer-offset writes, pinned into push_data's second line so the prefix
@@ -458,7 +459,7 @@ private:
         }
         ImageBindingInfo& PrimeNext() {
             if (n == slots.size()) [[unlikely]] {
-                ImageBindingsOverflow();
+                BindAssertFailed();
             }
             return slots[n++];
         }
@@ -474,9 +475,6 @@ private:
         }
         ImageBindingInfo* end() {
             return slots.data() + n;
-        }
-        size_t size() const noexcept {
-            return n;
         }
     };
     ImageBindingList image_bindings;
@@ -502,10 +500,7 @@ private:
     std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos{};
     u32 buffer_info_n_{};
 
-    // Buffer bind scratch census. Five stores per stage, none per binding:
-    // the per-stage binding count is the multiplier every estimate of this
-    // path's cost rests on and it has never been measured. Declared last so
-    // no hot member's offset moves.
+    // Buffer bind scratch census: five stores per stage, none per binding.
     u64 bindscratch_calls_{};
     u64 bindscratch_binds_{};
     u64 bindscratch_bindmax_{};
@@ -517,8 +512,7 @@ private:
     // counts) instead of the pipeline identity, and compare the depth_control
     // and color_control bits their bodies read against these populate-time
     // snapshots. draw_samples_target_ is the render-scope body's one
-    // non-register input: whether this draw binds a colour target as a
-    // texture. Declared last so no hot member moves.
+    // non-register input: whether this draw binds a colour target as a texture.
     u64 RtLaneStamp() const noexcept;
     bool rt_state_stamp_{};
     u32 rt_memo_mrt_mask_{};

@@ -7,8 +7,6 @@
 
 #include <boost/container/throw_exception.hpp>
 
-#include <xxhash.h>
-
 #include "common/rdtsc.h"
 
 #include "common/debug.h"
@@ -60,13 +58,9 @@ static SHAD_NO_INLINE void WarnMetadataTextureRead() {
 }
 
 // The assertion macro's body; it returns, as the macro does.
-static SHAD_NO_INLINE void BindAssertFailed() {
+SHAD_NO_INLINE void BindAssertFailed() {
     LOG_CRITICAL(Debug, "Assertion Failed!");
     assert_fail_impl();
-}
-
-SHAD_NO_INLINE void ImageBindingsOverflow() {
-    BindAssertFailed();
 }
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -104,7 +98,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     }
     memory->SetRasterizer(this);
     auto& skipcache = Skipcache::Framework::Instance();
-    skipcache.Init(static_cast<Skipcache::Mode>(EmulatorSettings.GetAdaptiveSkipCachesMode()));
+    const u32 sc_mode = EmulatorSettings.GetAdaptiveSkipCachesMode();
+    const bool sc_enabled = sc_mode != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    skipcache.Init(static_cast<Skipcache::Mode>(sc_mode));
     skipcache.RegisterInvalidate(&Rasterizer::BrInvalidateThunk, this);
     br_readback_gate_ = EmulatorSettings.IsReadbackLinearImagesEnabled();
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
@@ -125,7 +121,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         segment_copy_hold_ = true;
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
-    protect_carry_merge_ = EmulatorSettings.IsProtectCarryMerge();
     cp_write_backing_ = EmulatorSettings.IsCpWriteBacking();
     deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
     deferred_read_release_ = EmulatorSettings.IsDeferredReadRelease();
@@ -136,10 +131,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
     if (const u32 drain = EmulatorSettings.GetRingDrainFlushDraws(); drain != 0) {
-        // The draw counter only runs with an interval set, and the interval
-        // fires first unless it is the larger of the two. The poll is every
-        // 32nd draw, so the count is rounded up to the multiple of 32 that
-        // actually fires and the boot line reports that value.
+        // The poll runs every 32nd draw, so the count is rounded up to the
+        // multiple of 32 that actually fires; the boot line reports that value.
         const u32 clamped = (std::max<u32>(drain, 32) + 31u) & ~31u;
         if (flush_draw_interval_ != 0 && clamped < flush_draw_interval_) {
             ring_drain_flush_draws_ = clamped;
@@ -151,12 +144,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     }
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
     tracker_lock_spin_ = EmulatorSettings.GetTrackerLockSpinRounds() != 0;
-    // The register stamp is armed once from the boot value of the skip-cache
-    // mode; enabling the framework later from the settings dialog leaves it
-    // pinned, and a frozen stamp compares every draw register-identical.
-    dyn_memo_enabled_ =
-        EmulatorSettings.IsDynStateMemo() &&
-        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    // Latched from the boot skip-cache mode: a stamp left pinned by a later
+    // enable would compare every draw register-identical.
+    dyn_memo_enabled_ = EmulatorSettings.IsDynStateMemo() && sc_enabled;
     dyn_class_stamp_ = dyn_memo_enabled_ && EmulatorSettings.IsDynStateStamp();
     // A dormant funnel freezes both stamp lanes, so the memo would go permanently stale.
     push_vp_memo_ = EmulatorSettings.IsPushVpMemo() && liverpool->IsGfxStampActive();
@@ -168,8 +158,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (glue_mode_ != 0) {
         using VideoCore::Skipcache::CacheId;
         using VideoCore::Skipcache::State;
-        const bool forced = EmulatorSettings.GetAdaptiveSkipCachesMode() ==
-                            AdaptiveSkipCachesMode::SkipCachesForced;
+        const bool forced = sc_mode == AdaptiveSkipCachesMode::SkipCachesForced;
         const bool caches_on = skipcache.GetState(CacheId::PrepareRt) == State::Enabled &&
                                skipcache.GetState(CacheId::BeginRendering) == State::Enabled &&
                                skipcache.GetState(CacheId::DynState) == State::Enabled;
@@ -184,26 +173,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (EmulatorSettings.IsPushVpMemo() && !push_vp_memo_) {
         LOG_WARNING(Render_Vulkan, "push_vp_memo needs adaptive_skipcaches_mode != 0; it is off");
     }
-    // Same pinning: the rt lane is latched from the boot values.
-    rt_state_stamp_ =
-        EmulatorSettings.IsRtStateStamp() &&
-        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    // Same boot-mode pinning for the rt lane.
+    rt_state_stamp_ = EmulatorSettings.IsRtStateStamp() && sc_enabled;
     // The re-certification reads the image word the no-op tier reads, so it
     // follows image_fast_state.
     br_mem_fast_state_ =
-        EmulatorSettings.IsBrMemFastState() && EmulatorSettings.IsImageFastState() &&
-        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+        EmulatorSettings.IsBrMemFastState() && EmulatorSettings.IsImageFastState() && sc_enabled;
     if (EmulatorSettings.IsBrMemFastState() && !EmulatorSettings.IsImageFastState()) {
         LOG_WARNING(Render_Vulkan, "br_mem_fast_state needs image_fast_state; it is off");
     }
-    // Calibrated once on the boot path: EstimateRDTSCFrequency sleeps ~101ms
-    // to measure, and calling it from the per-300-frame telemetry block put a
-    // deterministic two-frame stall on the GPU command thread every ~17s.
+    // EstimateRDTSCFrequency sleeps ~101ms to measure: boot path only, never
+    // the per-300-frame telemetry block.
     tsc_hz_ = Common::EstimateRDTSCFrequency();
-    // Mode, not a worker count: 0 disables the lane, 1 is the unsafe fast
-    // path (titles that never unmap mid-play), 2 and above the hardened one.
-    // Both modes run two workers, the measured knee, unless the thread
-    // setting says otherwise.
+    // Mode, not a worker count: 0 off, 1 the unsafe fast path (titles that
+    // never unmap mid-play), >=2 hardened; two workers unless
+    // stream_copy_lane_threads says otherwise.
     const u32 lane_mode = EmulatorSettings.GetStreamCopyWorkers();
     if (lane_mode != 0) {
         const u32 lane_threads = EmulatorSettings.GetStreamCopyLaneThreads();
@@ -213,7 +197,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
             workers, lane_mode >= 2,
             static_cast<u32>(std::min<u64>(idle_ticks, std::numeric_limits<u32>::max())));
         Core::MemoryManager::RegisterUnmapDrain(
-            [](void*) { VideoCore::StreamCopyLane::Instance().DrainRemote(); }, nullptr);
+            [] { VideoCore::StreamCopyLane::Instance().DrainRemote(); });
     }
 }
 
@@ -235,12 +219,12 @@ void Rasterizer::CpSync() {
 }
 
 void Rasterizer::BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle) {
-    const u64 tick = scheduler.CurrentTick();
-    const size_t idx = point == vk::PipelineBindPoint::eCompute ? 1 : 0;
     if (!Skipcache::Framework::Instance().Active()) {
         scheduler.CommandBuffer().bindPipeline(point, handle);
         return;
     }
+    const u64 tick = scheduler.CurrentTick();
+    const size_t idx = point == vk::PipelineBindPoint::eCompute ? 1 : 0;
     const u64 fgen = Skipcache::Framework::Instance().ForeignPipelineGen(idx);
     if (tick == last_bound_tick_ && last_bound_pipeline_[idx] == handle &&
         last_bound_pipeline_gen_[idx] == fgen) {
@@ -367,36 +351,27 @@ bool Rasterizer::RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u6
         return false;
     }
 #ifndef NDEBUG
-    // The equal texture generation above is the certificate: image_uid is
-    // written only by the Image constructor, whose registration ends in a
-    // generation bump, and both the unregister and the delete of a slot bump
-    // it too, so an identity change cannot hide behind an equal generation.
-    // The loop was a partial guard, never a proof, and a guest-thread unmap
-    // freeing under the texture mutex bumps the generation before the next
-    // probe as well; the residual window between this compare and the replay
-    // is one the loop never closed either. Debug builds keep it as an audit.
-    for (u32 cb = 0; cb < m.cb_count; ++cb) {
-        if (!m.cb_id[cb]) {
-            continue;
-        }
-        const auto& image = texture_cache.GetImage(m.cb_id[cb]);
-        if (image.image_uid != m.cb_uid[cb] ||
-            False(image.flags & VideoCore::ImageFlagBits::Registered)) {
-            ++ctr.veto[0];
-            DEBUG_ASSERT_MSG(false,
-                             "render target identity changed under an equal texture generation");
-            return false;
+    // The equal texture generation above is the certificate: image_uid is written only by the
+    // Image constructor, and registration, unregister and slot delete all bump the generation, so
+    // an identity change cannot hide behind an equal generation. Debug builds keep the walk as an
+    // audit of that certificate.
+    const auto id_ok = [&](VideoCore::ImageId id, u64 uid) {
+        const auto& image = texture_cache.GetImage(id);
+        return image.image_uid == uid && True(image.flags & VideoCore::ImageFlagBits::Registered);
+    };
+    bool ok = true;
+    for (u32 cb = 0; ok && cb < m.cb_count; ++cb) {
+        if (m.cb_id[cb]) {
+            ok = id_ok(m.cb_id[cb], m.cb_uid[cb]);
         }
     }
-    if (m.db_id) {
-        const auto& image = texture_cache.GetImage(m.db_id);
-        if (image.image_uid != m.db_uid ||
-            False(image.flags & VideoCore::ImageFlagBits::Registered)) {
-            ++ctr.veto[0];
-            DEBUG_ASSERT_MSG(false,
-                             "render target identity changed under an equal texture generation");
-            return false;
-        }
+    if (ok && m.db_id) {
+        ok = id_ok(m.db_id, m.db_uid);
+    }
+    if (!ok) {
+        ++ctr.veto[0];
+        DEBUG_ASSERT_MSG(false, "render target identity changed under an equal texture generation");
+        return false;
     }
 #endif
     return true;
@@ -427,7 +402,10 @@ void Rasterizer::RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pi
     auto& sc = Skipcache::Framework::Instance();
     constexpr auto kCache = CacheId::PrepareRt;
     const u32 cb_count = std::bit_width(pipeline->GetGraphicsKey().mrt_mask);
-    if (would_hit && sc.GetState(kCache) != State::Learning) {
+    if (would_hit) {
+        if (sc.GetState(kCache) == State::Learning) {
+            return; // observe-only
+        }
         const auto& m = rt_memo_;
         bool same = m.cb_count == cb_count && m.db_id == db_desc.first &&
                     (!m.db_id || rt_memo_db_view_ == db_desc.second.view_info);
@@ -437,27 +415,29 @@ void Rasterizer::RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pi
         }
         if (same) {
             sc.RecordVerifyClean(kCache);
-        } else if (sc.Gens().tex_gen.load(std::memory_order_acquire) != tex_gen) {
-            sc.RecordVerifyAborted(kCache);
-            rt_memo_.valid = false;
         } else {
-            sc.RecordDivergence(kCache, "render target resolution mismatch");
+            if (sc.Gens().tex_gen.load(std::memory_order_acquire) != tex_gen) {
+                sc.RecordVerifyAborted(kCache);
+            } else {
+                sc.RecordDivergence(kCache, "render target resolution mismatch");
+            }
             rt_memo_.valid = false;
         }
         return;
-    }
-    if (would_hit) {
-        return; // Learning observe-only
     }
     auto& m = rt_memo_;
     m.valid = false;
     m.cb_count = cb_count;
     for (u32 cb = 0; cb < cb_count; ++cb) {
         m.cb_id[cb] = cb_descs[cb].first;
+#ifndef NDEBUG
         m.cb_uid[cb] = m.cb_id[cb] ? texture_cache.GetImage(m.cb_id[cb]).image_uid : 0;
+#endif
     }
     m.db_id = db_desc.first;
+#ifndef NDEBUG
     m.db_uid = m.db_id ? texture_cache.GetImage(m.db_id).image_uid : 0;
+#endif
     m.pipeline = pipeline;
     m.reg_stamp = reg_stamp;
     m.pipe_gen = pipe_gen;
@@ -667,10 +647,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                              gens.img_dirty_gen == c.token.img_dirty_gen &&
                              gens.meta_gen == c.meta_gen && gens.layout_gen == c.layout_gen &&
                              draw_samples_target_ == c.attachment_feedback_loop;
-        if (!bind_ok) {
-            ++glue_bind_miss_;
-            glue = false;
-        }
+        glue_bind_miss_ += !bind_ok;
+        glue = bind_ok;
     }
     const RenderState* state;
     if (glue && !glue_shadow) {
@@ -693,19 +671,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         const u32 flags = 1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2);
         const bool dyn_ok_term =
             dyn_memo_.flags == flags &&
-            scheduler.GetDynamicState().InvalidateGen() == dyn_memo_.dyn_gen &&
+            scheduler.GetDynamicState().invalidate_gen == dyn_memo_.dyn_gen &&
             gens.pipe_gen.load(std::memory_order_acquire) == dyn_memo_.pipe_gen;
-        if (!dyn_ok_term) {
-            ++glue_dyn_miss_;
-            glue = false;
-        }
+        glue_dyn_miss_ += !dyn_ok_term;
+        glue = dyn_ok_term;
     }
-    bool dyn_ok;
-    if (glue && !glue_shadow) {
-        dyn_ok = true;
-    } else {
-        dyn_ok = UpdateDynamicState(pipeline, is_indexed);
-    }
+    const bool dyn_ok = (glue && !glue_shadow) || UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(*state);
     if (glue_shadow && glue && !(rt_ok && glue_br_ok_ && dyn_ok)) {
         ++glue_div_;
@@ -737,11 +708,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (flush_draw_interval_ != 0 || readback_offload_) {
         // The flush submits; it must not run under the guest-copy shared lock.
         copy_scope.reset();
-        MaybeIntervalFlush(WriterFlushDue(prone_write));
+        MaybeIntervalFlush(prone_write);
     }
 }
 
-bool Rasterizer::WriterFlushDue(bool prone_write) {
+void Rasterizer::MaybeIntervalFlush(bool prone_write) {
     if (prone_write) {
         prone_run_ = true;
         ++prone_run_draws_;
@@ -749,10 +720,7 @@ bool Rasterizer::WriterFlushDue(bool prone_write) {
     // The run is submitted once a draw that does not write a prone buffer
     // ends it, or every 64 draws inside it; a flush the depth-clear guard
     // refuses leaves the run pending for the next draw.
-    return prone_run_ && (!prone_write || prone_run_draws_ >= 64);
-}
-
-bool Rasterizer::MaybeIntervalFlush(bool force) {
+    const bool force = prone_run_ && (!prone_write || prone_run_draws_ >= 64);
     const u64 tick = scheduler.CurrentTick();
     if (tick != flush_tick_) {
         flush_tick_ = tick;
@@ -760,28 +728,25 @@ bool Rasterizer::MaybeIntervalFlush(bool force) {
     }
     bool drain = false;
     if (!force && (flush_draw_interval_ == 0 || ++draws_since_flush_ < flush_draw_interval_)) {
-        // The batch already holds enough draws to be worth submitting: if the
-        // GPU has retired everything submitted so far it is recording into an
-        // idle ring, so hand it this much of the batch now.
+        // If the GPU has retired everything submitted so far it is recording
+        // into an idle ring; hand it this much of the open batch now.
         if (ring_drain_flush_draws_ == 0 || draws_since_flush_ < ring_drain_flush_draws_ ||
             (draws_since_flush_ & 31) != 0) {
-            return false;
+            return;
         }
-        // Counted before the vetoes: reach == 0 in the log means the count is
-        // never reached and the design's draws-per-batch model was wrong,
-        // while reach - polls is what the clear veto costs.
+        // Counted before the vetoes: reach - polls is what the clear veto costs.
         ++drain_reach_;
         // The clear veto below is level-triggered, so a poll inside a clear
         // pass could never flush; do not pay its query. (A firing drain reads
         // the attachment again there; the second read cannot differ.)
         const auto& clear_ds = scheduler.GetRenderState().depth_stencil_attachment;
         if (clear_ds.depth_clear || clear_ds.stencil_clear) {
-            return false;
+            return;
         }
         ++drain_polls_;
         if (!scheduler.IsFree(tick - 1)) {
             ++drain_busy_;
-            return false;
+            return;
         }
         drain = true;
     }
@@ -790,7 +755,7 @@ bool Rasterizer::MaybeIntervalFlush(bool force) {
     // a flush would clear the attachment a second time.
     const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
     if (ds.depth_clear || ds.stencil_clear) {
-        return false;
+        return;
     }
     DropCopyHold(hold_drops_flush_);
     scheduler.Flush();
@@ -807,7 +772,6 @@ bool Rasterizer::MaybeIntervalFlush(bool force) {
     } else if (!drain) {
         ++interval_flushes_;
     }
-    return true;
 }
 
 void Rasterizer::BeginPacketRun() {
@@ -862,10 +826,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    // One shared-lock hold covers every guest copy of the whole draw setup;
-    // the per-function scopes inside become TLS-flag no-ops. Placed after the
-    // filter and pipeline resolution so filtered draws pay nothing and a
-    // pipeline compile never holds the memory map open.
+    // One shared-lock hold for the whole setup; placement rationale: see Draw.
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (segment_copy_hold_ && in_packet_run_) {
         ArmCopyHold();
@@ -959,10 +920,7 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    // One shared-lock hold covers every guest copy of the whole draw setup;
-    // the per-function scopes inside become TLS-flag no-ops. Placed after the
-    // filter and pipeline resolution so filtered draws pay nothing and a
-    // pipeline compile never holds the memory map open.
+    // One shared-lock hold for the whole setup; placement rationale: see Draw.
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (segment_copy_hold_ && in_packet_run_) {
         ArmCopyHold();
@@ -987,7 +945,7 @@ void Rasterizer::DispatchDirect() {
     const bool prone_write = readback_offload_ && buffer_cache.TakeProneWrite();
     if (flush_draw_interval_ != 0 || readback_offload_) {
         copy_scope.reset();
-        MaybeIntervalFlush(WriterFlushDue(prone_write));
+        MaybeIntervalFlush(prone_write);
     }
 }
 
@@ -1042,547 +1000,46 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    {
-        // Guest packet census. Deliberately outside the skipcache gate below:
-        // it describes what the title submits, not how this fork caches, so it
-        // stays available for surveying any game on stock settings. A
-        // non-zero occl or setpred means the title drives the occlusion path,
-        // which shadPS4 currently answers with a fixed "visible" result.
-        static u64 last_packet_frame = 0;
-        const u64 frame = DebugState.GetFrameNum();
-        if (frame - last_packet_frame >= 300) {
-            last_packet_frame = frame;
-            auto& pk = liverpool->packet_stats;
-            auto& rs = liverpool->run_stats;
-            // The six opcodes that most often end a register run: the packets
-            // the run loop cannot absorb, ranked, rather than a residual.
-            std::string brk;
-            for (u32 n = 0; n < 6; ++n) {
-                u32 top = 0;
-                u64 top_count = 0;
-                for (u32 op = 0; op < rs.break_opcode.size(); ++op) {
-                    if (rs.break_opcode[op] > top_count) {
-                        top_count = rs.break_opcode[op];
-                        top = op;
-                    }
+    const u64 frame = DebugState.GetFrameNum();
+    // Guest packet census. Deliberately outside the skipcache gate below: it describes what the
+    // title submits, not how this fork caches. A non-zero occl or setpred means the title drives
+    // the occlusion path, which shadPS4 currently answers with a fixed "visible" result.
+    static u64 last_packet_frame = 0;
+    if (frame - last_packet_frame >= 300) {
+        last_packet_frame = frame;
+        auto& pk = liverpool->packet_stats;
+        auto& rs = liverpool->run_stats;
+        // The six opcodes that most often end a register run, ranked rather than a residual.
+        std::string brk;
+        for (u32 n = 0; n < 6; ++n) {
+            u32 top = 0;
+            u64 top_count = 0;
+            for (u32 op = 0; op < rs.break_opcode.size(); ++op) {
+                if (rs.break_opcode[op] > top_count) {
+                    top_count = rs.break_opcode[op];
+                    top = op;
                 }
-                if (top_count == 0) {
-                    break;
-                }
-                brk += fmt::format("{}0x{:02x}:{}", brk.empty() ? "" : ",", top, top_count);
-                rs.break_opcode[top] = 0;
             }
-            LOG_INFO(Render,
-                     "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} run={} runs={} "
-                     "outer={} brk={} per300f",
-                     pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
-                     pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets, brk);
-            pk = {};
-            rs = {};
+            if (top_count == 0) {
+                break;
+            }
+            brk += fmt::format("{}0x{:02x}:{}", brk.empty() ? "" : ",", top, top_count);
+            rs.break_opcode[top] = 0;
         }
+        LOG_INFO(Render,
+                 "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} run={} runs={} "
+                 "outer={} brk={} per300f",
+                 pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
+                 pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets, brk);
+        pk = {};
+        rs = {};
     }
     auto& skipcache = Skipcache::Framework::Instance();
     if (skipcache.Active()) {
-        // Ring pressure report: wraps are what block this thread, so surface
-        // them next to the cache accounting rather than in a separate channel.
         static u64 last_report_frame = 0;
-        const u64 frame = DebugState.GetFrameNum();
         if (frame - last_report_frame >= 300) {
             last_report_frame = frame;
-            auto& st = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Stats();
-            const u64 hz = tsc_hz_;
-            LOG_INFO(Render_Skipcache,
-                     "[SkipCache] RING maps={} MiB={} wraps={} armed={} blocked_ms={} per300f",
-                     st.maps, st.bytes >> 20, st.wraps, st.armed,
-                     hz ? st.blocked_ns * 1000 / hz : 0);
-            st = VideoCore::StreamBuffer::RingStats{};
-            if (bindscratch_calls_) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] BINDSCRATCH calls={} binds={} bindmax={} infos={} "
-                         "infomax={} per300f",
-                         bindscratch_calls_, bindscratch_binds_, bindscratch_bindmax_,
-                         bindscratch_infos_, bindscratch_infomax_);
-                bindscratch_calls_ = bindscratch_binds_ = bindscratch_bindmax_ = 0;
-                bindscratch_infos_ = bindscratch_infomax_ = 0;
-            }
-            if (const auto rp = scheduler.DrainRenderScopeStats(); rp.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RPASS calls={} restarts={} interrupted={} per300f", rp.calls,
-                         rp.restarts, rp.interrupted);
-            }
-            if (VideoCore::Buffer::barrier_read_merge) {
-                LOG_INFO(
-                    Render_Skipcache,
-                    "[SkipCache] BUFBAR emitted={} merged={} saved={} "
-                    "per300f",
-                    VideoCore::Buffer::barrier_emitted.exchange(0, std::memory_order_relaxed),
-                    VideoCore::Buffer::barrier_rr_merged.exchange(0, std::memory_order_relaxed),
-                    VideoCore::Buffer::barrier_rr_saved.exchange(0, std::memory_order_relaxed));
-                VideoCore::Buffer::barrier_rr_mark.store(0, std::memory_order_relaxed);
-            }
-            auto& ws = scheduler.WaitStats();
-            const auto ms = [hz](u64 ns) { return hz ? ns * 1000 / hz : 0; };
-            LOG_INFO(Render_Skipcache,
-                     "[SkipCache] WAITS finish={}/{}ms ring={}/{}ms fault={}/{}ms "
-                     "dlbuf={}/{}ms dlimg={}/{}ms per300f",
-                     ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
-                     ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
-            ws = {};
-            if (tracker_lock_spin_) {
-                const auto tl = VideoCore::RegionLock::Drain();
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] TRKLOCK contended={} spun={} blocked={} rounds_used={} "
-                         "per300f",
-                         tl.contended, tl.spun, tl.blocked, tl.rounds_used);
-            }
-            const auto off = buffer_cache.DrainOffloadStats();
-            if (off.jobs || off.fallbacks) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} "
-                         "empty={} per300f",
-                         off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
-            }
-            if (EmulatorSettings.IsFinishReleaseFaultedFirst()) {
-                if (const auto fs = buffer_cache.DrainFinishSplitStats(); fs.jobs) {
-                    const auto us = [hz](u64 ns) { return hz ? ns * 1000000 / hz : 0; };
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] FINSPLIT jobs={} inline_islands={} rest_islands={} "
-                             "inline_us={} rest_us={} vetoes={} per300f",
-                             fs.jobs, fs.inline_islands, fs.rest_islands, us(fs.inline_ns),
-                             us(fs.rest_ns), fs.vetoes);
-                }
-            }
-            if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma || writer_flushes_) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} "
-                         "wflush={} per300f",
-                         off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma, ms(off.q2_wait_ns),
-                         std::exchange(writer_flushes_, u64{0}));
-            }
-            if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f", wb.loops,
-                         wb.islands, wb.bytes >> 10);
-            }
-            if (const auto wo = buffer_cache.DrainWriteBackOffloadStats();
-                wo.guest + wo.prio + wo.gpucomm) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WBOFF guest={} prio={} gpucomm={} excluded={} copy_ms={} "
-                         "per300f",
-                         wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
-            }
-            if (EmulatorSettings.IsReadbackWritebackGpucommIdle()) {
-                if (const auto wi = buffer_cache.DrainWbIdleStats(); wi.posted) {
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] WBIDLE posted={} ran={} skipped={} bailed={} late={} "
-                             "KiB={} max_island_KiB={} per300f",
-                             wi.posted, wi.ran, wi.skipped, wi.bailed, wi.late, wi.bytes >> 10,
-                             wi.max_island >> 10);
-                }
-            }
-            if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "
-                         "helped_KiB={} owner_islands={} tail_us={} prio_posted={} "
-                         "prio_helped={} prio_KiB={} prio_late={} per300f",
-                         ws.shares, ws.joins, ws.fencewaits, ws.helped, ws.helped_bytes >> 10,
-                         ws.owner_islands, hz ? ws.tail_ns * 1000000 / hz : 0, ws.prio_posted,
-                         ws.prio_helped, ws.prio_bytes >> 10, ws.prio_late);
-            }
-            const auto sc = buffer_cache.DrainStreamCopyStats();
-            if (sc.probes) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] STREAMCOPY hits={} probes={} fast={} idxfast={} "
-                         "genwalk={}/{}/{} per300f",
-                         sc.hits, sc.probes, sc.fast, sc.idxfast, sc.stream_genwalk,
-                         sc.vertex_genwalk, sc.index_genwalk);
-            }
-            if (const auto vi = buffer_cache.DrainVertexInputStats(); vi.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] VINPUT calls={} built={} binds={} chain={} layout={} bind={} "
-                         "fetchskip={} per300f",
-                         vi.calls, vi.built, vi.binds, vi.chain, vi.layout, vi.bind, vi.fetchskip);
-            }
-            if (const auto iw = buffer_cache.DrainIndexWholeStats();
-                iw.binds + iw.skips + iw.veto) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] IDXWHOLE binds={} skips={} veto={} per300f",
-                         iw.binds, iw.skips, iw.veto);
-            }
-            if (flush_draw_interval_ != 0) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
-                         interval_flushes_);
-                interval_flushes_ = 0;
-            }
-            if (ring_drain_flush_draws_ != 0) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] DRAINFLUSH fired={} reach={} polls={} busy={} drawsum={} "
-                         "drawmax={} per300f",
-                         std::exchange(drain_flushes_, u64{0}), std::exchange(drain_reach_, u32{0}),
-                         std::exchange(drain_polls_, u64{0}), std::exchange(drain_busy_, u64{0}),
-                         std::exchange(drain_draw_sum_, u64{0}),
-                         std::exchange(drain_draw_max_, u32{0}));
-            }
-            if (segment_copy_hold_) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] COPYHOLD arms={} covered={} drops_run={} drops_flush={} "
-                         "drops_wait={} drops_cmd={} compiles={} per300f",
-                         hold_arms_, hold_draws_covered_, hold_drops_run_, hold_drops_flush_,
-                         hold_drops_wait_, hold_drops_cmd_, hold_compiles_);
-                hold_arms_ = hold_draws_covered_ = hold_drops_run_ = hold_drops_flush_ =
-                    hold_drops_wait_ = hold_drops_cmd_ = hold_compiles_ = 0;
-            }
-            if (const auto bw = Core::MemoryManager::DrainBackingWriteStats(); bw.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] BACKWRITE calls={} hits={} hitKiB={} missKiB={} multi={} "
-                         "per300f",
-                         bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
-            }
-            pipeline_cache.DumpColorMaskStats(
-                scheduler.GetDynamicState().DrainColorWriteMaskSkips());
-            pipeline_cache.DumpKeyReuseStats();
-            pipeline_cache.DumpProgramIdentityStats();
-            pipeline_cache.DumpSpecFpStats();
-            pipeline_cache.DumpSharpReadStats();
-            pipeline_cache.DumpRuntimeInfoMemoStats();
-            pipeline_cache.DumpLayoutStats();
-            pipeline_cache.DumpHeapPipelineStats();
-            pipeline_cache.DumpDescHeapStats();
-            const auto vm = texture_cache.DrainViewMemoStats();
-            if (vm.hits || vm.slow) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] VIEWMEMO hits={} slow={} writebacks={} per300f", vm.hits,
-                         vm.slow, vm.writebacks);
-            }
-            if (skipcache.ActiveMode() == Skipcache::Mode::Forced) {
-                const auto& fc = skipcache.Counters(Skipcache::CacheId::FindImage);
-                if (fc.eligible != findimg_last_.eligible) {
-                    const auto d = [&](u64 Skipcache::CacheCounters::* f) {
-                        return fc.*f - findimg_last_.*f;
-                    };
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] FINDIMG probes={} hits={} cold={} key={} gen={} view={} "
-                             "veto={} vfy={}/{}/{} per300f",
-                             d(&Skipcache::CacheCounters::eligible),
-                             d(&Skipcache::CacheCounters::hits),
-                             d(&Skipcache::CacheCounters::miss_cold),
-                             d(&Skipcache::CacheCounters::miss_key),
-                             fc.miss_gen[Skipcache::LaneTex] -
-                                 findimg_last_.miss_gen[Skipcache::LaneTex],
-                             fc.veto[1] - findimg_last_.veto[1], fc.veto[0] - findimg_last_.veto[0],
-                             d(&Skipcache::CacheCounters::verify_clean),
-                             d(&Skipcache::CacheCounters::verify_diverged),
-                             d(&Skipcache::CacheCounters::verify_aborted));
-                    findimg_last_ = fc;
-                }
-                // draw_glue_memo: the glued draws count as probes and hits of
-                // the three caches they stood in for, folded once per window
-                // so probes= stays equal to draws; shadow mode ran the real
-                // probes and folds nothing.
-                if (glue_mode_ != 0) {
-                    if (glue_mode_ != 3) {
-                        for (const auto id :
-                             {Skipcache::CacheId::PrepareRt, Skipcache::CacheId::BeginRendering,
-                              Skipcache::CacheId::DynState}) {
-                            auto& ctr = skipcache.Counters(id);
-                            ctr.eligible += glue_hits_;
-                            ctr.hits += glue_hits_;
-                        }
-                    }
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] GLUE probes={} hits={} entry={} bind={} dyn={} arms={} "
-                             "div={} per300f",
-                             glue_probes_, glue_hits_, glue_entry_miss_, glue_bind_miss_,
-                             glue_dyn_miss_, glue_arms_, glue_div_);
-                    glue_probes_ = glue_hits_ = glue_entry_miss_ = glue_bind_miss_ =
-                        glue_dyn_miss_ = glue_arms_ = glue_div_ = 0;
-                }
-                // The render scope and render target caches have never had a
-                // reported hit rate; both are probed on the same draw entry.
-                // RTMEMO veto= prints 0 by construction in release: the identity
-                // audit behind it is compiled only into debug builds.
-                const auto& bc = skipcache.Counters(Skipcache::CacheId::BeginRendering);
-                const auto& rc = skipcache.Counters(Skipcache::CacheId::PrepareRt);
-                if (bc.eligible != br_last_.eligible) {
-                    const auto lane = [&](Skipcache::MissLane l) {
-                        return bc.miss_gen[l] - br_last_.miss_gen[l];
-                    };
-                    u64 vetoes = 0;
-                    for (size_t i = 0; i < bc.veto.size(); ++i) {
-                        vetoes += bc.veto[i] - br_last_.veto[i];
-                    }
-                    // mem= is the moved-generation probes the attachment words
-                    // could not re-certify (every one of them with
-                    // br_mem_fast_state off); memok= the ones they did.
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] BRRT br={}/{} brpop={}/{} key={} reg={} tick={} mem={} "
-                             "tex={} idg={} veto={} vdepth={} vcolor={} vfbl={} same={} "
-                             "sameopen={} memok={} per300f",
-                             bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
-                             bc.populated - br_last_.populated,
-                             bc.populate_refused - br_last_.populate_refused,
-                             bc.miss_key - br_last_.miss_key, lane(Skipcache::LaneReg),
-                             lane(Skipcache::LaneTick), lane(Skipcache::LaneMem),
-                             lane(Skipcache::LaneTex), lane(Skipcache::LaneImgDirty), vetoes,
-                             br_veto_depth_, br_veto_color_, br_veto_fbl_, br_same_state_,
-                             br_same_open_, br_mem_recert_);
-                    br_last_ = bc;
-                    br_veto_depth_ = br_veto_color_ = br_veto_fbl_ = br_same_state_ =
-                        br_same_open_ = br_mem_recert_ = 0;
-                }
-                if (rc.eligible != rt_last_.eligible) {
-                    const auto d = [&](u64 Skipcache::CacheCounters::* f) {
-                        return rc.*f - rt_last_.*f;
-                    };
-                    LOG_INFO(
-                        Render_Skipcache,
-                        "[SkipCache] RTMEMO probes={} hits={} cold={} key={} reg={} tex={} "
-                        "pipe={} veto={} stampmv={} bits={} gfxmv={} per300f",
-                        d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
-                        d(&Skipcache::CacheCounters::miss_cold),
-                        d(&Skipcache::CacheCounters::miss_key),
-                        rc.miss_gen[Skipcache::LaneReg] - rt_last_.miss_gen[Skipcache::LaneReg],
-                        rc.miss_gen[Skipcache::LaneTex] - rt_last_.miss_gen[Skipcache::LaneTex],
-                        rc.miss_gen[Skipcache::LanePipe] - rt_last_.miss_gen[Skipcache::LanePipe],
-                        rc.veto[0] - rt_last_.veto[0], rt_stamp_moves_,
-                        rc.veto[1] - rt_last_.veto[1], rt_gfx_moves_);
-                    rt_last_ = rc;
-                    rt_stamp_moves_ = 0;
-                    rt_gfx_moves_ = 0;
-                }
-            }
-            if (const auto& dc = skipcache.Counters(Skipcache::CacheId::DynState);
-                dc.eligible != dynstate_last_.eligible) {
-                const auto d = [&](u64 Skipcache::CacheCounters::* f) {
-                    return dc.*f - dynstate_last_.*f;
-                };
-                const u64 gfx_stamp = liverpool->GetGfxStateStamp();
-                const u64 dyn_stamp = liverpool->GetDynStateStamp();
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] DYNSTATE probes={} hits={} reg={} key={} gen={} stamp={} "
-                         "dyn={} per300f",
-                         d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
-                         dc.miss_gen[Skipcache::LaneReg] -
-                             dynstate_last_.miss_gen[Skipcache::LaneReg],
-                         d(&Skipcache::CacheCounters::miss_key),
-                         dc.miss_gen[Skipcache::LaneTick] + dc.miss_gen[Skipcache::LanePipe] -
-                             dynstate_last_.miss_gen[Skipcache::LaneTick] -
-                             dynstate_last_.miss_gen[Skipcache::LanePipe],
-                         gfx_stamp - gfx_stamp_last_, dyn_stamp - dyn_stamp_last_);
-                dynstate_last_ = dc;
-                gfx_stamp_last_ = gfx_stamp;
-                dyn_stamp_last_ = dyn_stamp;
-            }
-            if (const auto rf = liverpool->DrainRegFunnelStats(); rf.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] REGFUNNEL calls={} classified={} rtclass={} per300f",
-                         rf.calls, rf.classified, rf.classified_rt);
-            }
-            if (bindpf_img_) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] BINDPF img={} backing={} per300f",
-                         bindpf_img_, bindpf_backing_);
-                bindpf_img_ = bindpf_backing_ = 0;
-            }
-            if (bind_lean_) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] BINDLEAN primes={} full={} per300f",
-                         bindlean_primes_, bindlean_full_);
-                bindlean_primes_ = bindlean_full_ = 0;
-            }
-            if (bind_write_plan_ != 0) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] BINDPLAN binds={} hits={} builds={} dyn={} defer={} "
-                         "mismatch={} flat={} per300f",
-                         bindplan_binds_, bindplan_hits_, bindplan_builds_, bindplan_dyn_,
-                         bindplan_defer_, bindplan_mismatch_, bindplan_flat_);
-                bindplan_binds_ = bindplan_hits_ = bindplan_builds_ = bindplan_dyn_ =
-                    bindplan_defer_ = bindplan_mismatch_ = bindplan_flat_ = 0;
-            }
-            if (bind_noop_) {
-                const auto bn = texture_cache.DrainBindNoopStats();
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] BINDNOOP hits={} slow={} records={} zero={} per300f",
-                         bindnoop_hits_, bindnoop_slow_, bn.records, bn.zero);
-                bindnoop_hits_ = bindnoop_slow_ = 0;
-            }
-            if (memo_first_) {
-                const auto ts = texture_cache.DrainTsGateStats();
-                LOG_INFO(Render_Skipcache, "[SkipCache] TSGATE calls={} rejects={} per300f",
-                         ts.calls, ts.rejects);
-            }
-            if (const auto af = texture_cache.DrainAddrFilterStats(); af.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] ADDRFILT calls={} cands={} fast={} walk={} per300f", af.calls,
-                         af.cands, af.fast, af.walk);
-            }
-            const auto ft = texture_cache.DrainFindTouchStats();
-            if (ft.consumed) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] FINDTOUCH consumed={} locks={} batched={} flushes={} per300f",
-                         ft.consumed, ft.locks, ft.batched, ft.flushes);
-            }
-            if (const auto iu = texture_cache.DrainImageUpdateStats();
-                iu.fast || iu.relock || iu.full) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] IMGUPD fast={} relock={} full={} per300f",
-                         iu.fast, iu.relock, iu.full);
-            }
-            if (const auto ll = texture_cache.DrainLruLogStats(); ll.pushes || ll.walked) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] LRULOG pushes={} walked={} skipped={} compact={} size={} "
-                         "dead={} per300f",
-                         ll.pushes, ll.walked, ll.skipped, ll.compactions, ll.size, ll.dead);
-            }
-            if (const auto lz = texture_cache.DrainLruLazyStats(); lz.enabled) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] LRULAZY gcruns={} hard={} visits={} maxvisit={} relinks={} "
-                         "frees={} per300f",
-                         lz.gc_runs, lz.hard, lz.visits, lz.maxvisit, lz.relinks, lz.frees);
-            }
-            if (const auto fw = texture_cache.DrainFindImageWayStats(); fw.ways) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] FINDIMGWAYS ways={} entries={} hits={}/{}/{}/{} evict={} "
-                         "per300f",
-                         fw.ways, fw.entries, fw.hits[0], fw.hits[1], fw.hits[2], fw.hits[3],
-                         fw.evictions);
-            }
-            if (const auto fh = texture_cache.DrainFindImageHintStats(); fh.probes) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] FINDIMGHINT probes={} hits={} none={} per300f", fh.probes,
-                         fh.hits, fh.none);
-            }
-            if (const auto rv = texture_cache.DrainMemoRangeStats(); rv.enabled) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] FINDIMGRV walks={} inval={} bumps={} per300f", rv.walks,
-                         rv.inval, rv.bumps);
-            }
-            const auto ss = texture_cache.DrainSamplerStats();
-            if (ss.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] SAMPLER calls={} slow={} touches={} map={} per300f", ss.calls,
-                         ss.slow, ss.touches, ss.map);
-            }
-            const auto dd = skipcache.DrainDescDeltaStats();
-            if (dd.probes || dd.heap) {
-                // key + gen + cold + veto0 + whole == probes - hits - partial, so
-                // whole is defined by that identity rather than counted twice.
-                const auto& dc = skipcache.Counters(Skipcache::CacheId::DescDelta);
-                const u64 key = dc.miss_key - desc_last_.miss_key;
-                const u64 gen =
-                    dc.miss_gen[Skipcache::LaneTick] - desc_last_.miss_gen[Skipcache::LaneTick];
-                const u64 cold = dc.miss_cold - desc_last_.miss_cold;
-                const u64 veto0 = dc.veto[0] - desc_last_.veto[0];
-                const u64 misses = dd.probes - dd.hits - dd.partial;
-                const u64 whole = misses - std::min<u64>(misses, key + gen + cold + veto0);
-                desc_last_ = dc;
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] DESCDELTA probes={} hits={} partial={} descs={} pushed={} "
-                         "split={} runs={} key={} gen={} cold={} whole={} heap={} heapdescs={} "
-                         "heap32={} heap40={} heap48={} heap64={} heapbig={} heapimg={} "
-                         "heapsmp={} flat={} unflat={} extmiss={} per300f",
-                         dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split, dd.runs,
-                         key, gen, cold, whole, dd.heap, dd.heap_descs, dd.heap_hist[0],
-                         dd.heap_hist[1], dd.heap_hist[2], dd.heap_hist[3], dd.heap_hist[4],
-                         dd.heap_images, dd.heap_samplers, dd.flat, dd.unflat, dd.extmiss);
-            }
-            if (const auto inv = texture_cache.DrainInvalidateFilterStats(); inv.probes) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] IMGFAULT probes={} skips={} unsound={} per300f", inv.probes,
-                         inv.skips, inv.unsound);
-            }
-            if (const auto pc = skipcache.DrainPushConstStats(); pc.probes) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] PUSHCONST probes={} hits={} per300f",
-                         pc.probes, pc.hits);
-            }
-            if (pushvp_probes_) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] PUSHVP probes={} hits={} udw={} bow={} per300f",
-                         pushvp_probes_, pushvp_hits_, pushvp_udw_, pushvp_bow_);
-                pushvp_probes_ = pushvp_hits_ = pushvp_udw_ = pushvp_bow_ = 0;
-            }
-            const auto us = buffer_cache.DrainUploadCopyStats();
-            if (us.ro_calls || us.w_calls) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
-                         us.ro_calls, us.ro_bytes >> 20, us.w_calls, us.w_bytes >> 20);
-            }
-            if (cp_write_backing_ && cpwrite_seen_ != 0) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] CPWRITE writes={} armed={} backing={} gpu={} nofit={} "
-                         "nobacking={} per300f",
-                         cpwrite_seen_, cpwrite_armed_, cpwrite_backing_, cpwrite_gpu_,
-                         cpwrite_nofit_, cpwrite_nobacking_);
-                cpwrite_seen_ = cpwrite_armed_ = cpwrite_backing_ = cpwrite_gpu_ = cpwrite_nofit_ =
-                    cpwrite_nobacking_ = 0;
-            }
-            if (const auto ra = buffer_cache.DrainReadArmStats();
-                ra.drains[0] + ra.drains[1] + ra.drains[2] + ra.drains[3] + ra.drains[4] != 0) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RARM run={} submit={} fence={} wait={} idle={} regions={} "
-                         "pages={} calls={} per300f",
-                         ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4],
-                         ra.regions, ra.pages, ra.calls);
-            }
-            if (const auto rr = buffer_cache.DrainReadReleaseStats(); rr.census_batches != 0) {
-                // calls is the mprotect count of the read-watcher release path,
-                // and each one broadcasts a TLB shootdown to every core.
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] RREL batches={} calls={} runs={} pages={} drains={} "
-                         "regions={} drained={} per300f",
-                         rr.census_batches, rr.census_calls, rr.census_runs, rr.census_pages,
-                         rr.drains, rr.regions, rr.calls);
-            }
-            if (protect_carry_merge_) {
-                // merged = cross-region pairs collapsed into one mprotect;
-                // flushed = carries no run absorbed, so the real syscall count
-                // of the read paths is RARM/RREL calls + flushed.
-                if (const auto pc = page_manager.DrainProtectCarryStats(); pc.scopes != 0) {
-                    LOG_INFO(Render_Skipcache,
-                             "[SkipCache] PCARRY scopes={} merged={} flushed={} per300f", pc.scopes,
-                             pc.merged, pc.flushed);
-                }
-            }
-            if (const auto tf = buffer_cache.DrainTrackerFastStats();
-                tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] TRKFAST sum1={} sumwalk={} gpu1={} gpuwalk={} nul={} "
-                         "foreign={} fused={} per300f",
-                         tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null,
-                         tf.foreign, tf.fused);
-                if (tf.peek_word + tf.peek_split != 0) {
-                    LOG_INFO(Render_Skipcache, "[SkipCache] PEEK1W word={} split={} per300f",
-                             tf.peek_word, tf.peek_split);
-                }
-            }
-            if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
-                LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f",
-                         tn.hits, tn.probes);
-            }
-            const auto wr = buffer_cache.DrainWrittenRangeStats();
-            if (wr.binds) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] WRANGE binds={} fresh={} hits={} adds={} shrinks={} folds={} "
-                         "folded={} full={} direct={} lockskips={} per300f",
-                         wr.binds, wr.fresh, wr.hits, wr.adds, wr.shrinks, wr.folds, wr.folded,
-                         wr.full, wr.direct, wr.lockskips);
-                const auto gr = buffer_cache.DrainGpuRangeStats();
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] GPURANGE flat={} live={} batches={} batched={} moved={} "
-                         "subs={} per300f",
-                         gr.flat, gr.live, gr.batches, gr.batched, gr.moved, gr.subs);
-            }
-            const auto ds = buffer_cache.DrainDmaSyncStats();
-            if (ds.calls) {
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] DMASYNC calls={} buffers={} MiB={} maxMiB={} per300f",
-                         ds.calls, ds.buffers, ds.bytes >> 20, ds.max_bytes >> 20);
-            }
-            if (auto& lane = VideoCore::StreamCopyLane::Instance(); lane.Enabled()) {
-                const auto ls = lane.DrainStats();
-                LOG_INFO(Render_Skipcache,
-                         "[SkipCache] LANE jobs={} MiB={} unres={} full={} barriers={} "
-                         "wait_ms={} mwaits={} woke={} wjobs={}/{}/{}/{} help={} per300f",
-                         ls.jobs, ls.bytes >> 20, ls.inline_unresolved, ls.inline_full, ls.barriers,
-                         ls.barrier_wait_ns / 1000000, ls.mwaits, ls.mwait_wakes, ls.worker_jobs[0],
-                         ls.worker_jobs[1], ls.worker_jobs[2], ls.worker_jobs[3], ls.helper_jobs);
-            }
-            buffer_cache.EmitTrackerTelemetry();
+            EmitSkipcacheTelemetry(skipcache);
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());
@@ -1595,12 +1052,467 @@ void Rasterizer::OnSubmit() {
     buffer_cache.RunGarbageCollector();
 }
 
+void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
+    // Ring pressure: wraps are what block this thread.
+    auto& st = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream).Stats();
+    const u64 hz = tsc_hz_;
+    const auto ms = [hz](u64 ns) { return hz ? ns * 1000 / hz : 0; };
+    const auto us = [hz](u64 ns) { return hz ? ns * 1000000 / hz : 0; };
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] RING maps={} MiB={} wraps={} armed={} blocked_ms={} per300f", st.maps,
+             st.bytes >> 20, st.wraps, st.armed, ms(st.blocked_ns));
+    st = VideoCore::StreamBuffer::RingStats{};
+    if (bindscratch_calls_) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] BINDSCRATCH calls={} binds={} bindmax={} infos={} "
+                 "infomax={} per300f",
+                 bindscratch_calls_, bindscratch_binds_, bindscratch_bindmax_, bindscratch_infos_,
+                 bindscratch_infomax_);
+        bindscratch_calls_ = bindscratch_binds_ = bindscratch_bindmax_ = 0;
+        bindscratch_infos_ = bindscratch_infomax_ = 0;
+    }
+    if (const auto rp = scheduler.DrainRenderScopeStats(); rp.calls) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] RPASS calls={} restarts={} interrupted={} per300f",
+                 rp.calls, rp.restarts, rp.interrupted);
+    }
+    if (VideoCore::Buffer::barrier_read_merge) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] BUFBAR emitted={} merged={} saved={} "
+                 "per300f",
+                 VideoCore::Buffer::barrier_emitted.exchange(0, std::memory_order_relaxed),
+                 VideoCore::Buffer::barrier_rr_merged.exchange(0, std::memory_order_relaxed),
+                 VideoCore::Buffer::barrier_rr_saved.exchange(0, std::memory_order_relaxed));
+        VideoCore::Buffer::barrier_rr_mark.store(0, std::memory_order_relaxed);
+    }
+    auto& ws = scheduler.WaitStats();
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] WAITS finish={}/{}ms ring={}/{}ms fault={}/{}ms "
+             "dlbuf={}/{}ms dlimg={}/{}ms per300f",
+             ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count, ms(ws[2].ns),
+             ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
+    ws = {};
+    if (tracker_lock_spin_) {
+        const auto tl = VideoCore::RegionLock::Drain();
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] TRKLOCK contended={} spun={} blocked={} rounds_used={} "
+                 "per300f",
+                 tl.contended, tl.spun, tl.blocked, tl.rounds_used);
+    }
+    const auto off = buffer_cache.DrainOffloadStats();
+    if (off.jobs || off.fallbacks) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] OFFLOAD jobs={} vetoes={} fallbacks={} wait_ms={} "
+                 "empty={} per300f",
+                 off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
+    }
+    if (EmulatorSettings.IsFinishReleaseFaultedFirst()) {
+        if (const auto fs = buffer_cache.DrainFinishSplitStats(); fs.jobs) {
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] FINSPLIT jobs={} inline_islands={} rest_islands={} "
+                     "inline_us={} rest_us={} vetoes={} per300f",
+                     fs.jobs, fs.inline_islands, fs.rest_islands, us(fs.inline_ns), us(fs.rest_ns),
+                     fs.vetoes);
+        }
+    }
+    if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma || writer_flushes_) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} "
+                 "wflush={} per300f",
+                 off.q2_copies, off.q2_open, off.q2_unknown, off.q2_dma, ms(off.q2_wait_ns),
+                 std::exchange(writer_flushes_, u64{0}));
+    }
+    if (const auto wb = buffer_cache.DrainWritebackStats(); wb.islands) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] WRITEBACK loops={} islands={} KiB={} per300f",
+                 wb.loops, wb.islands, wb.bytes >> 10);
+    }
+    if (const auto wo = buffer_cache.DrainWriteBackOffloadStats();
+        wo.guest + wo.prio + wo.gpucomm) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] WBOFF guest={} prio={} gpucomm={} excluded={} copy_ms={} "
+                 "per300f",
+                 wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
+    }
+    if (EmulatorSettings.IsReadbackWritebackGpucommIdle()) {
+        if (const auto wi = buffer_cache.DrainWbIdleStats(); wi.posted) {
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] WBIDLE posted={} ran={} skipped={} bailed={} late={} "
+                     "KiB={} max_island_KiB={} per300f",
+                     wi.posted, wi.ran, wi.skipped, wi.bailed, wi.late, wi.bytes >> 10,
+                     wi.max_island >> 10);
+        }
+    }
+    if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "
+                 "helped_KiB={} owner_islands={} tail_us={} prio_posted={} "
+                 "prio_helped={} prio_KiB={} prio_late={} per300f",
+                 ws.shares, ws.joins, ws.fencewaits, ws.helped, ws.helped_bytes >> 10,
+                 ws.owner_islands, us(ws.tail_ns), ws.prio_posted, ws.prio_helped,
+                 ws.prio_bytes >> 10, ws.prio_late);
+    }
+    if (const auto sc = buffer_cache.DrainStreamCopyStats(); sc.probes) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] STREAMCOPY hits={} probes={} fast={} idxfast={} "
+                 "genwalk={}/{}/{} per300f",
+                 sc.hits, sc.probes, sc.fast, sc.idxfast, sc.stream_genwalk, sc.vertex_genwalk,
+                 sc.index_genwalk);
+    }
+    if (const auto vi = buffer_cache.DrainVertexInputStats(); vi.calls) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] VINPUT calls={} built={} binds={} chain={} layout={} bind={} "
+                 "fetchskip={} per300f",
+                 vi.calls, vi.built, vi.binds, vi.chain, vi.layout, vi.bind, vi.fetchskip);
+    }
+    if (const auto iw = buffer_cache.DrainIndexWholeStats(); iw.binds + iw.skips + iw.veto) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] IDXWHOLE binds={} skips={} veto={} per300f",
+                 iw.binds, iw.skips, iw.veto);
+    }
+    if (flush_draw_interval_ != 0) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f", interval_flushes_);
+        interval_flushes_ = 0;
+    }
+    if (ring_drain_flush_draws_ != 0) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] DRAINFLUSH fired={} reach={} polls={} busy={} drawsum={} "
+                 "drawmax={} per300f",
+                 std::exchange(drain_flushes_, u64{0}), std::exchange(drain_reach_, u32{0}),
+                 std::exchange(drain_polls_, u64{0}), std::exchange(drain_busy_, u64{0}),
+                 std::exchange(drain_draw_sum_, u64{0}), std::exchange(drain_draw_max_, u32{0}));
+    }
+    if (segment_copy_hold_) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] COPYHOLD arms={} covered={} drops_run={} drops_flush={} "
+                 "drops_wait={} drops_cmd={} compiles={} per300f",
+                 hold_arms_, hold_draws_covered_, hold_drops_run_, hold_drops_flush_,
+                 hold_drops_wait_, hold_drops_cmd_, hold_compiles_);
+        hold_arms_ = hold_draws_covered_ = hold_drops_run_ = hold_drops_flush_ = hold_drops_wait_ =
+            hold_drops_cmd_ = hold_compiles_ = 0;
+    }
+    if (const auto bw = Core::MemoryManager::DrainBackingWriteStats(); bw.calls) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] BACKWRITE calls={} hits={} hitKiB={} missKiB={} multi={} "
+                 "per300f",
+                 bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
+    }
+    pipeline_cache.DumpColorMaskStats(scheduler.GetDynamicState().DrainColorWriteMaskSkips());
+    pipeline_cache.DumpKeyReuseStats();
+    pipeline_cache.DumpProgramIdentityStats();
+    pipeline_cache.DumpSpecFpStats();
+    pipeline_cache.DumpSharpReadStats();
+    pipeline_cache.DumpRuntimeInfoMemoStats();
+    pipeline_cache.DumpLayoutStats();
+    pipeline_cache.DumpHeapPipelineStats();
+    pipeline_cache.DumpDescHeapStats();
+    if (const auto vm = texture_cache.DrainViewMemoStats(); vm.hits || vm.slow) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] VIEWMEMO hits={} slow={} writebacks={} per300f",
+                 vm.hits, vm.slow, vm.writebacks);
+    }
+    if (skipcache.ActiveMode() == Skipcache::Mode::Forced) {
+        const auto& fc = skipcache.Counters(Skipcache::CacheId::FindImage);
+        if (fc.eligible != findimg_last_.eligible) {
+            const auto d = [&](u64 Skipcache::CacheCounters::* f) {
+                return fc.*f - findimg_last_.*f;
+            };
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] FINDIMG probes={} hits={} cold={} key={} gen={} view={} "
+                     "veto={} vfy={}/{}/{} per300f",
+                     d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
+                     d(&Skipcache::CacheCounters::miss_cold),
+                     d(&Skipcache::CacheCounters::miss_key),
+                     fc.miss_gen[Skipcache::LaneTex] - findimg_last_.miss_gen[Skipcache::LaneTex],
+                     fc.veto[1] - findimg_last_.veto[1], fc.veto[0] - findimg_last_.veto[0],
+                     d(&Skipcache::CacheCounters::verify_clean),
+                     d(&Skipcache::CacheCounters::verify_diverged),
+                     d(&Skipcache::CacheCounters::verify_aborted));
+            findimg_last_ = fc;
+        }
+        // draw_glue_memo: the glued draws count as probes and hits of the three
+        // caches they stood in for, folded once per window so probes= stays equal
+        // to draws; shadow mode folds nothing.
+        if (glue_mode_ != 0) {
+            if (glue_mode_ != 3) {
+                for (const auto id :
+                     {Skipcache::CacheId::PrepareRt, Skipcache::CacheId::BeginRendering,
+                      Skipcache::CacheId::DynState}) {
+                    auto& ctr = skipcache.Counters(id);
+                    ctr.eligible += glue_hits_;
+                    ctr.hits += glue_hits_;
+                }
+            }
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] GLUE probes={} hits={} entry={} bind={} dyn={} arms={} "
+                     "div={} per300f",
+                     glue_probes_, glue_hits_, glue_entry_miss_, glue_bind_miss_, glue_dyn_miss_,
+                     glue_arms_, glue_div_);
+            glue_probes_ = glue_hits_ = glue_entry_miss_ = glue_bind_miss_ = glue_dyn_miss_ =
+                glue_arms_ = glue_div_ = 0;
+        }
+        // The render scope and render target caches are probed on the same draw entry.
+        // RTMEMO veto= prints 0 in release: the identity audit behind it is debug-only.
+        const auto& bc = skipcache.Counters(Skipcache::CacheId::BeginRendering);
+        const auto& rc = skipcache.Counters(Skipcache::CacheId::PrepareRt);
+        if (bc.eligible != br_last_.eligible) {
+            const auto lane = [&](Skipcache::MissLane l) {
+                return bc.miss_gen[l] - br_last_.miss_gen[l];
+            };
+            u64 vetoes = 0;
+            for (size_t i = 0; i < bc.veto.size(); ++i) {
+                vetoes += bc.veto[i] - br_last_.veto[i];
+            }
+            // mem= is the moved-generation probes the attachment words
+            // could not re-certify (every one of them with
+            // br_mem_fast_state off); memok= the ones they did.
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] BRRT br={}/{} brpop={}/{} key={} reg={} tick={} mem={} "
+                     "tex={} idg={} veto={} vdepth={} vcolor={} vfbl={} same={} "
+                     "sameopen={} memok={} per300f",
+                     bc.eligible - br_last_.eligible, bc.hits - br_last_.hits,
+                     bc.populated - br_last_.populated,
+                     bc.populate_refused - br_last_.populate_refused,
+                     bc.miss_key - br_last_.miss_key, lane(Skipcache::LaneReg),
+                     lane(Skipcache::LaneTick), lane(Skipcache::LaneMem), lane(Skipcache::LaneTex),
+                     lane(Skipcache::LaneImgDirty), vetoes, br_veto_depth_, br_veto_color_,
+                     br_veto_fbl_, br_same_state_, br_same_open_, br_mem_recert_);
+            br_last_ = bc;
+            br_veto_depth_ = br_veto_color_ = br_veto_fbl_ = br_same_state_ = br_same_open_ =
+                br_mem_recert_ = 0;
+        }
+        if (rc.eligible != rt_last_.eligible) {
+            const auto d = [&](u64 Skipcache::CacheCounters::* f) { return rc.*f - rt_last_.*f; };
+            LOG_INFO(Render_Skipcache,
+                     "[SkipCache] RTMEMO probes={} hits={} cold={} key={} reg={} tex={} "
+                     "pipe={} veto={} stampmv={} bits={} gfxmv={} per300f",
+                     d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
+                     d(&Skipcache::CacheCounters::miss_cold),
+                     d(&Skipcache::CacheCounters::miss_key),
+                     rc.miss_gen[Skipcache::LaneReg] - rt_last_.miss_gen[Skipcache::LaneReg],
+                     rc.miss_gen[Skipcache::LaneTex] - rt_last_.miss_gen[Skipcache::LaneTex],
+                     rc.miss_gen[Skipcache::LanePipe] - rt_last_.miss_gen[Skipcache::LanePipe],
+                     rc.veto[0] - rt_last_.veto[0], rt_stamp_moves_, rc.veto[1] - rt_last_.veto[1],
+                     rt_gfx_moves_);
+            rt_last_ = rc;
+            rt_stamp_moves_ = 0;
+            rt_gfx_moves_ = 0;
+        }
+    }
+    if (const auto& dc = skipcache.Counters(Skipcache::CacheId::DynState);
+        dc.eligible != dynstate_last_.eligible) {
+        const auto d = [&](u64 Skipcache::CacheCounters::* f) { return dc.*f - dynstate_last_.*f; };
+        const u64 gfx_stamp = liverpool->GetGfxStateStamp();
+        const u64 dyn_stamp = liverpool->GetDynStateStamp();
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] DYNSTATE probes={} hits={} reg={} key={} gen={} stamp={} "
+                 "dyn={} per300f",
+                 d(&Skipcache::CacheCounters::eligible), d(&Skipcache::CacheCounters::hits),
+                 dc.miss_gen[Skipcache::LaneReg] - dynstate_last_.miss_gen[Skipcache::LaneReg],
+                 d(&Skipcache::CacheCounters::miss_key),
+                 dc.miss_gen[Skipcache::LaneTick] + dc.miss_gen[Skipcache::LanePipe] -
+                     dynstate_last_.miss_gen[Skipcache::LaneTick] -
+                     dynstate_last_.miss_gen[Skipcache::LanePipe],
+                 gfx_stamp - gfx_stamp_last_, dyn_stamp - dyn_stamp_last_);
+        dynstate_last_ = dc;
+        gfx_stamp_last_ = gfx_stamp;
+        dyn_stamp_last_ = dyn_stamp;
+    }
+    if (const auto rf = liverpool->DrainRegFunnelStats(); rf.calls) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] REGFUNNEL calls={} classified={} rtclass={} per300f", rf.calls,
+                 rf.classified, rf.classified_rt);
+    }
+    if (bindpf_img_) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] BINDPF img={} backing={} per300f", bindpf_img_,
+                 bindpf_backing_);
+        bindpf_img_ = bindpf_backing_ = 0;
+    }
+    if (bind_lean_) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] BINDLEAN primes={} full={} per300f",
+                 bindlean_primes_, bindlean_full_);
+        bindlean_primes_ = bindlean_full_ = 0;
+    }
+    if (bind_write_plan_ != 0) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] BINDPLAN binds={} hits={} builds={} dyn={} defer={} "
+                 "mismatch={} flat={} per300f",
+                 bindplan_binds_, bindplan_hits_, bindplan_builds_, bindplan_dyn_, bindplan_defer_,
+                 bindplan_mismatch_, bindplan_flat_);
+        bindplan_binds_ = bindplan_hits_ = bindplan_builds_ = bindplan_dyn_ = bindplan_defer_ =
+            bindplan_mismatch_ = bindplan_flat_ = 0;
+    }
+    if (bind_noop_) {
+        const auto bn = texture_cache.DrainBindNoopStats();
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] BINDNOOP hits={} slow={} records={} zero={} per300f", bindnoop_hits_,
+                 bindnoop_slow_, bn.records, bn.zero);
+        bindnoop_hits_ = bindnoop_slow_ = 0;
+    }
+    if (memo_first_) {
+        const auto ts = texture_cache.DrainTsGateStats();
+        LOG_INFO(Render_Skipcache, "[SkipCache] TSGATE calls={} rejects={} per300f", ts.calls,
+                 ts.rejects);
+    }
+    if (const auto af = texture_cache.DrainAddrFilterStats(); af.calls) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] ADDRFILT calls={} cands={} fast={} walk={} per300f",
+                 af.calls, af.cands, af.fast, af.walk);
+    }
+    if (const auto ft = texture_cache.DrainFindTouchStats(); ft.consumed) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] FINDTOUCH consumed={} locks={} batched={} flushes={} per300f",
+                 ft.consumed, ft.locks, ft.batched, ft.flushes);
+    }
+    if (const auto iu = texture_cache.DrainImageUpdateStats(); iu.fast || iu.relock || iu.full) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] IMGUPD fast={} relock={} full={} per300f", iu.fast,
+                 iu.relock, iu.full);
+    }
+    if (const auto ll = texture_cache.DrainLruLogStats(); ll.pushes || ll.walked) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] LRULOG pushes={} walked={} skipped={} compact={} size={} "
+                 "dead={} per300f",
+                 ll.pushes, ll.walked, ll.skipped, ll.compactions, ll.size, ll.dead);
+    }
+    if (const auto lz = texture_cache.DrainLruLazyStats(); lz.enabled) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] LRULAZY gcruns={} hard={} visits={} maxvisit={} relinks={} "
+                 "frees={} per300f",
+                 lz.gc_runs, lz.hard, lz.visits, lz.maxvisit, lz.relinks, lz.frees);
+    }
+    if (const auto fw = texture_cache.DrainFindImageWayStats(); fw.ways) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] FINDIMGWAYS ways={} entries={} hits={}/{}/{}/{} evict={} "
+                 "per300f",
+                 fw.ways, fw.entries, fw.hits[0], fw.hits[1], fw.hits[2], fw.hits[3], fw.evictions);
+    }
+    if (const auto fh = texture_cache.DrainFindImageHintStats(); fh.probes) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] FINDIMGHINT probes={} hits={} none={} per300f",
+                 fh.probes, fh.hits, fh.none);
+    }
+    if (const auto rv = texture_cache.DrainMemoRangeStats(); rv.enabled) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] FINDIMGRV walks={} inval={} bumps={} per300f",
+                 rv.walks, rv.inval, rv.bumps);
+    }
+    if (const auto ss = texture_cache.DrainSamplerStats(); ss.calls) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] SAMPLER calls={} slow={} touches={} map={} per300f",
+                 ss.calls, ss.slow, ss.touches, ss.map);
+    }
+    if (const auto dd = skipcache.DrainDescDeltaStats(); dd.probes || dd.heap) {
+        // key + gen + cold + veto0 + whole == probes - hits - partial, so
+        // whole is defined by that identity rather than counted twice.
+        const auto& dc = skipcache.Counters(Skipcache::CacheId::DescDelta);
+        const u64 key = dc.miss_key - desc_last_.miss_key;
+        const u64 gen = dc.miss_gen[Skipcache::LaneTick] - desc_last_.miss_gen[Skipcache::LaneTick];
+        const u64 cold = dc.miss_cold - desc_last_.miss_cold;
+        const u64 veto0 = dc.veto[0] - desc_last_.veto[0];
+        const u64 misses = dd.probes - dd.hits - dd.partial;
+        const u64 whole = misses - std::min<u64>(misses, key + gen + cold + veto0);
+        desc_last_ = dc;
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] DESCDELTA probes={} hits={} partial={} descs={} pushed={} "
+                 "split={} runs={} key={} gen={} cold={} whole={} heap={} heapdescs={} "
+                 "heap32={} heap40={} heap48={} heap64={} heapbig={} heapimg={} "
+                 "heapsmp={} flat={} unflat={} extmiss={} per300f",
+                 dd.probes, dd.hits, dd.partial, dd.descs, dd.pushed, dd.split, dd.runs, key, gen,
+                 cold, whole, dd.heap, dd.heap_descs, dd.heap_hist[0], dd.heap_hist[1],
+                 dd.heap_hist[2], dd.heap_hist[3], dd.heap_hist[4], dd.heap_images,
+                 dd.heap_samplers, dd.flat, dd.unflat, dd.extmiss);
+    }
+    if (const auto inv = texture_cache.DrainInvalidateFilterStats(); inv.probes) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] IMGFAULT probes={} skips={} unsound={} per300f",
+                 inv.probes, inv.skips, inv.unsound);
+    }
+    if (const auto pc = skipcache.DrainPushConstStats(); pc.probes) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] PUSHCONST probes={} hits={} per300f", pc.probes,
+                 pc.hits);
+    }
+    if (pushvp_probes_) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] PUSHVP probes={} hits={} udw={} bow={} per300f",
+                 pushvp_probes_, pushvp_hits_, pushvp_udw_, pushvp_bow_);
+        pushvp_probes_ = pushvp_hits_ = pushvp_udw_ = pushvp_bow_ = 0;
+    }
+    if (const auto us = buffer_cache.DrainUploadCopyStats(); us.ro_calls || us.w_calls) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
+                 us.ro_calls, us.ro_bytes >> 20, us.w_calls, us.w_bytes >> 20);
+    }
+    if (cp_write_backing_ && cpwrite_seen_ != 0) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] CPWRITE writes={} armed={} backing={} gpu={} nofit={} "
+                 "nobacking={} per300f",
+                 cpwrite_seen_, cpwrite_armed_, cpwrite_backing_, cpwrite_gpu_, cpwrite_nofit_,
+                 cpwrite_nobacking_);
+        cpwrite_seen_ = cpwrite_armed_ = cpwrite_backing_ = cpwrite_gpu_ = cpwrite_nofit_ =
+            cpwrite_nobacking_ = 0;
+    }
+    if (const auto ra = buffer_cache.DrainReadArmStats();
+        ra.drains[0] + ra.drains[1] + ra.drains[2] + ra.drains[3] + ra.drains[4] != 0) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] RARM run={} submit={} fence={} wait={} idle={} regions={} "
+                 "pages={} calls={} per300f",
+                 ra.drains[0], ra.drains[1], ra.drains[2], ra.drains[3], ra.drains[4], ra.regions,
+                 ra.pages, ra.calls);
+    }
+    if (const auto rr = buffer_cache.DrainReadReleaseStats(); rr.census_batches != 0) {
+        // calls is the mprotect count of the read-watcher release path,
+        // and each one broadcasts a TLB shootdown to every core.
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] RREL batches={} calls={} runs={} pages={} drains={} "
+                 "regions={} drained={} per300f",
+                 rr.census_batches, rr.census_calls, rr.census_runs, rr.census_pages, rr.drains,
+                 rr.regions, rr.calls);
+    }
+    // merged = cross-region pairs collapsed into one mprotect;
+    // flushed = carries no run absorbed, so the real syscall count
+    // of the read paths is RARM/RREL calls + flushed.
+    if (const auto pc = page_manager.DrainProtectCarryStats(); pc.scopes != 0) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] PCARRY scopes={} merged={} flushed={} per300f",
+                 pc.scopes, pc.merged, pc.flushed);
+    }
+    if (const auto tf = buffer_cache.DrainTrackerFastStats();
+        tf.sum_fast + tf.sum_walk + tf.gpu_fast + tf.gpu_walk != 0) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] TRKFAST sum1={} sumwalk={} gpu1={} gpuwalk={} nul={} "
+                 "foreign={} fused={} per300f",
+                 tf.sum_fast, tf.sum_walk, tf.gpu_fast, tf.gpu_walk, tf.single_null, tf.foreign,
+                 tf.fused);
+        if (tf.peek_word + tf.peek_split != 0) {
+            LOG_INFO(Render_Skipcache, "[SkipCache] PEEK1W word={} split={} per300f", tf.peek_word,
+                     tf.peek_split);
+        }
+    }
+    if (const auto tn = buffer_cache.DrainTexelNoopStats(); tn.probes) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] TEXELNOOP hits={} probes={} per300f", tn.hits,
+                 tn.probes);
+    }
+    if (const auto wr = buffer_cache.DrainWrittenRangeStats(); wr.binds) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] WRANGE binds={} fresh={} hits={} adds={} shrinks={} folds={} "
+                 "folded={} full={} direct={} lockskips={} per300f",
+                 wr.binds, wr.fresh, wr.hits, wr.adds, wr.shrinks, wr.folds, wr.folded, wr.full,
+                 wr.direct, wr.lockskips);
+        const auto gr = buffer_cache.DrainGpuRangeStats();
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] GPURANGE flat={} live={} batches={} batched={} moved={} "
+                 "subs={} per300f",
+                 gr.flat, gr.live, gr.batches, gr.batched, gr.moved, gr.subs);
+    }
+    if (const auto ds = buffer_cache.DrainDmaSyncStats(); ds.calls) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] DMASYNC calls={} buffers={} MiB={} maxMiB={} per300f", ds.calls,
+                 ds.buffers, ds.bytes >> 20, ds.max_bytes >> 20);
+    }
+    if (auto& lane = VideoCore::StreamCopyLane::Instance(); lane.Enabled()) {
+        const auto ls = lane.DrainStats();
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] LANE jobs={} MiB={} unres={} full={} barriers={} "
+                 "wait_ms={} mwaits={} woke={} wjobs={}/{}/{}/{} help={} per300f",
+                 ls.jobs, ls.bytes >> 20, ls.inline_unresolved, ls.inline_full, ls.barriers,
+                 ls.barrier_wait_ns / 1000000, ls.mwaits, ls.mwait_wakes, ls.worker_jobs[0],
+                 ls.worker_jobs[1], ls.worker_jobs[2], ls.worker_jobs[3], ls.helper_jobs);
+    }
+    buffer_cache.EmitTrackerTelemetry();
+}
+
 // ---- BindingSkip LEARNING probe (observe-only) ---------------------------
-// Measures whether a per-stage binding replay cache would pay: would-hit =
-// same pipeline, same cmdbuf tick, every stage's pgm_hash and user_data words
-// bit-identical (memcmp, never hash). Data-gates the wave-2 replay build; by
-// the instrument-contamination rule this probe writes nothing and returns
-// nothing.
+// Observe-only: it writes nothing and returns nothing. Would-hit = same
+// pipeline, same cmdbuf tick, every stage's pgm_hash and user_data words
+// bit-identical (memcmp, never hash).
 enum BsVeto : u8 {
     BsVetoPipeline = 0,
     BsVetoTick = 1,
@@ -1609,8 +1521,7 @@ enum BsVeto : u8 {
     BsVetoUserData = 4,
 };
 
-// Entered only through the gate at the bind site, which is the probe's own
-// former first statement.
+// Entered only through the gate at the bind site.
 void Rasterizer::BindingSkipProbeBody(const Pipeline* pipeline) {
     using namespace VideoCore::Skipcache;
     auto& sc = Skipcache::Framework::Instance();
@@ -1690,19 +1601,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
-    {
-        auto& sc = Skipcache::Framework::Instance();
-        if (sc.Active() && sc.ShouldProbe(Skipcache::CacheId::BindingSkipProbe)) [[unlikely]] {
-            BindingSkipProbeBody(pipeline);
-        }
+    if (auto& sc = Skipcache::Framework::Instance();
+        sc.Active() && sc.ShouldProbe(Skipcache::CacheId::BindingSkipProbe)) [[unlikely]] {
+        BindingSkipProbeBody(pipeline);
     }
 
     set_writes.clear();
     buffer_barriers.clear();
-    // buffer_barrier_read_merge telemetry: the earliest point of a draw, so a
-    // later merge count above this mark means this draw merged at least one
-    // read-after-read transition. Pipeline::BindResources turns that into a
-    // saved render-pass restart only when the list it is handed is empty.
+    // barrier_rr_mark, taken at the draw's earliest point: a later merged count above it means
+    // this draw merged a read-after-read transition, which Pipeline::BindResources turns into a
+    // saved render-pass restart only when the barrier list it is handed is empty.
     if (VideoCore::Buffer::barrier_read_merge) {
         VideoCore::Buffer::barrier_rr_mark.store(
             VideoCore::Buffer::barrier_rr_merged.load(std::memory_order_relaxed),
@@ -1729,12 +1637,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     if (push_vp_memo_) {
-        // The four floats depend only on viewport_control and viewports[0],
-        // both in the dyn block table, so an unmoved stamp lane proves them
-        // unchanged and they stay in place. The async-compute queue never
-        // flushes the stamp, so a dispatch running under a pending viewport
-        // write pushes floats that only a position-writing stage reads, which
-        // compute never is; the next graphics draw flushes and rebuilds.
+        // The four floats depend only on viewport_control and viewports[0], both in the dyn
+        // block, so an unmoved stamp lane proves them unchanged. The async-compute queue never
+        // flushes the stamp, so a dispatch under a pending viewport write pushes floats only a
+        // position-writing stage reads, which compute never is; the next graphics draw rebuilds.
         const u64 stamp =
             dyn_class_stamp_ ? liverpool->GetDynStateStamp() : liverpool->GetGfxStateStamp();
         ++pushvp_probes_;
@@ -1764,8 +1670,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             continue;
         }
         // A stage's buffers and its samplers each collapse into one write; the
-        // image loop still emits one per descriptor array. The list hands out
-        // its own slots now, so no per-stage growth step is needed.
+        // image loop still emits one per descriptor array.
         stage->PushUd(binding, push_data);
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
@@ -1816,12 +1721,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     return true;
 }
 
-// The shortcuts keep their own compute guards: the gate at the bind site
-// makes them redundant today, and they protect any future direct caller.
 void Rasterizer::BuildBindWritePlan(const Pipeline* pipeline) {
-    // An image array whose count follows the T# gives every bind its own
-    // shape, and a bind that rejected a T# emitted a default type for it:
-    // neither list is the pipeline's.
+    // A bind that rejected a T# emitted a default type for it, so its list is
+    // not the pipeline's.
     auto& plan = pipeline->bind_plan;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
@@ -1888,6 +1790,8 @@ void Rasterizer::BuildBindWritePlan(const Pipeline* pipeline) {
     ++bindplan_builds_;
 }
 
+// The shortcuts keep their own compute guards: the gate at the bind site
+// makes them redundant today, and they protect any future direct caller.
 bool Rasterizer::TakeComputeShortcut(const Pipeline* pipeline) {
     return IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
            IsComputeImageClear(pipeline);
@@ -2058,11 +1962,9 @@ static_assert(Shader::NUM_IMAGES + Shader::NUM_BUFFERS / 2 + 2 * Shader::MaxStag
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
-    // One shared-lock hold covers every guest copy this stage stages
-    // (flatbuf, clip planes, stream uploads); see GuestCopyScope. A hold armed
-    // by the draw or the packet run already owns the lock, in which case this
-    // scope would construct only to find itself a non-owner; the flag test is
-    // that same check, made before the scope instead of inside it.
+    // One shared-lock hold covers this stage's guest copies; see GuestCopyScope.
+    // A hold already armed by the draw or the packet run makes this scope a
+    // non-owner, so the flag is tested before constructing it.
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (batch_copy_lock_ && !Core::MemoryManager::tls_in_guest_copy_scope) {
         copy_scope.emplace(memory);
@@ -2076,14 +1978,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            // Stream-eligible read-only bindings never dereference the id:
-            // ObtainBuffer's stream path returns before touching it and
-            // re-resolves on its own when it falls through to the slot path.
-            // FindBuffer here is three dependent cache-missing loads. DMA
-            // stages keep the eager call so registration still feeds the BDA
-            // page table. The predicate is a hint: a mismatch with
-            // ObtainBuffer's guard costs one late FindBuffer, never
-            // correctness.
+            // Stream-eligible read-only bindings never dereference the id, and the
+            // eager FindBuffer is three dependent cache-missing loads. The predicate
+            // is a hint: a mismatch with ObtainBuffer's guard costs one late
+            // FindBuffer, never correctness. DMA stages keep the eager call so
+            // registration still feeds the BDA page table.
             const bool defer = elide_findbuffer && !desc.is_written &&
                                size <= VideoCore::BufferCache::CACHING_PAGESIZE && !stage.uses_dma;
             const auto buffer_id =
@@ -2193,17 +2092,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         ++binding.buffer;
     }
 
-    // Every pass-2 arm appends exactly one buffer_info, so the stage's infos
-    // are contiguous and in binding order, and each spanned binding is a
-    // descriptorCount-1 eStorageBuffer carrying this stage's flags - the
-    // identity a consecutive-binding update requires. descriptorCount 0 is
-    // illegal, hence the guard.
     buffer_info_n_ = info_n;
     const u64 stage_infos = info_n - first_info;
     bindscratch_infos_ += stage_infos;
     bindscratch_infomax_ = std::max<u64>(bindscratch_infomax_, stage_infos);
 
     binding.unified += static_cast<u32>(stage.buffers.size());
+    // One info per binding, so the stage's infos are contiguous and in binding order;
+    // each spanned binding is a descriptorCount-1 eStorageBuffer with this stage's flags.
+    // descriptorCount 0 is illegal, hence the !empty() guard.
     if (!plan_hit_ && !stage.buffers.empty()) {
         auto& set_write = set_writes.Next();
         set_write.dstSet = VK_NULL_HANDLE;
@@ -2215,10 +2112,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
-// Every image info reaches the descriptor delta walk as 24 deterministic
-// bytes: the four tail padding bytes are zeroed after construction, since a
-// copy from a temporary may carry garbage into them. A writer that bypasses
-// this fails toward a spurious miss, a push of correct bytes, never a wrong skip.
+// Every image info reaches the descriptor delta walk as 24 deterministic bytes: the four
+// tail bytes are zeroed because a copy from a temporary may carry garbage into them. A
+// writer that bypasses this fails toward a spurious miss, never a wrong skip.
 template <typename Infos>
 static void AppendImageInfo(Infos& infos, vk::Sampler sampler, vk::ImageView view,
                             vk::ImageLayout layout) {
@@ -2248,21 +2144,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         // A null or format-less T# is rejected in every mode: the memo cannot
         // hold one, and a scene of unbound slots must not depress its hit ratio.
         if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
-            plan_rejected_ = true;
-            SkipImageHints(num_bindings);
-            for (u32 i = 0; i < num_bindings; ++i) {
-                image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            }
-            if (!plan_hit_) {
-                image_descriptor_array_sizes.push_back(num_bindings);
-            }
+            RejectImageBindings(num_bindings);
             continue;
         }
 
-        // The rest of the validation is dead on a consumed memo hit (no valid
-        // entry holds a failing T#), so with findimg_memo_first the memo probes
-        // first and the gate runs on the routes that reach FindImage. Bindings
-        // with an eager view (mip fallback) are gated here, before the view.
+        // The rest of the validation is dead on a consumed memo hit (no valid entry holds a
+        // failing T#); an eager-view (mip fallback) binding is gated here, before the view.
         if (!memo_first_ || mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
             if (texture_cache.IsMeta(tsharp.Address())) [[unlikely]] {
                 WarnMetadataTextureRead();
@@ -2272,20 +2159,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
                 !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
                 WarnInvalidTsharp(tsharp, data_fmt, num_fmt);
-                plan_rejected_ = true;
-                SkipImageHints(num_bindings);
-                for (u32 i = 0; i < num_bindings; ++i) {
-                    image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
-                                                std::tuple{});
-                }
-                if (!plan_hit_) {
-                    image_descriptor_array_sizes.push_back(num_bindings);
-                }
+                RejectImageBindings(num_bindings);
                 continue;
             }
         }
 
-        for (auto i = 0; i < num_bindings; i++) {
+        for (u32 i = 0; i < num_bindings; i++) {
             // Mip fallback rewrites the view range before the memo probe, so
             // only fallback-free bindings defer the view build to a memo miss.
             // With bind_image_lean those prime the probe's inputs in place.
@@ -2329,10 +2208,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 // The gate rejected the T#: this binding stays null and the
                 // rest of the array is filled the way the rejection arm does.
                 plan_rejected_ = true;
-                SkipImageHints(num_bindings - static_cast<u32>(i) - 1);
-                for (u32 j = static_cast<u32>(i) + 1; j < num_bindings; ++j) {
-                    image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
-                                                std::tuple{});
+                SkipImageHints(num_bindings - i - 1);
+                for (u32 j = i + 1; j < num_bindings; ++j) {
+                    image_bindings.emplace_back();
                 }
                 break;
             }
@@ -2350,12 +2228,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
             image->binding.is_bound = 1u;
             if (bind_prefetch_) {
-                // Pass two reads these lines first: props for a texture
-                // binding's layout choice, the backing pointer for the view
-                // memo compare, and the backing's state line for the barrier
-                // probe. A storage binding never reads props there. After a
-                // stencil redirect the memo backing belongs to the pre-redirect
-                // image; its line is warmed for nothing.
+                // Warms what pass two reads first. A storage binding never reads
+                // props there, and after a stencil redirect the memo backing belongs
+                // to the pre-redirect image, so its line is warmed for nothing.
                 if (!image_desc.is_written) {
                     __builtin_prefetch(&image->info.props, 0, 3);
                 }
@@ -2422,10 +2297,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 const auto new_layout = image.info.props.is_depth
                                             ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                             : vk::ImageLayout::eShaderReadOnlyOptimal;
-                // A no-op recorded under the backing's current epoch repeats,
-                // and the layout recorded with it is the one the backing still
-                // holds. The compare is against the live image: a rebind
-                // re-resolve leaves the memo backing on another image.
+                // A no-op under the backing's current epoch repeats with the layout it
+                // recorded; the compare uses the live image, as a rebind re-resolve
+                // moves memo_backing.
                 if (bind_noop_ && desc.memo_bind_epoch != 0 &&
                     desc.memo_bind_epoch == image.backing_epoch &&
                     desc.memo_backing == image.backing) {
@@ -2481,9 +2355,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         AppendImageInfo(image_infos, vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
     }
 
-    // Each spanned binding is a descriptorCount-1 eSampler with this stage's
-    // flags and no immutable sampler, which is what a consecutive-binding
-    // update requires. descriptorCount 0 is illegal, hence the guard.
+    // Each spanned binding is a descriptorCount-1 eSampler with this stage's flags.
+    // descriptorCount 0 is illegal, hence the !empty() guard.
     binding.unified += static_cast<u32>(stage.samplers.size());
     if (!plan_hit_ && !stage.samplers.empty()) {
         auto& set_write = set_writes.Next();
@@ -2514,7 +2387,7 @@ bool Rasterizer::BrGuardAttachment(const BrAttachmentGuard& g,
                                    VideoCore::Skipcache::CacheCounters& ctr) {
     // 1. Armed meta clear: compute clear shaders and FillBuffer arm CMASK/HTILE
     //    without any register write; the stamp cannot see them (read-only).
-    if (g.meta_addr && texture_cache.IsMetaCleared(g.meta_addr, g.slice)) {
+    if (g.meta_addr && texture_cache.IsMetaCleared(g.meta_addr, g.base_layer)) {
         ++ctr.veto[BrVetoMetaClear];
         return false;
     }
@@ -2760,6 +2633,20 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     // Capture per-attachment guards from post-Transit live state.
     br_cache_.cb_count = fresh.num_color_attachments;
     const auto& regs = liverpool->regs;
+    const auto fill = [this](BrAttachmentGuard& g, VideoCore::ImageId image_id,
+                             const VideoCore::TextureCache::ImageDesc& desc, VAddr meta_addr) {
+        auto& image = texture_cache.GetImage(image_id);
+        g.meta_addr = meta_addr;
+        g.image_id = image_id;
+        g.image_uid = image.image_uid;
+        g.backing = image.backing;
+        g.expected_layout = image.backing->state.layout;
+        g.expected_access = image.backing->state.access_mask;
+        g.base_level = desc.view_info.range.base.level;
+        g.base_layer = desc.view_info.range.base.layer;
+        g.num_levels = desc.view_info.range.extent.levels;
+        g.num_layers = desc.view_info.range.extent.layers;
+    };
     for (u32 cb = 0; cb < fresh.num_color_attachments; ++cb) {
         auto& g = br_cache_.cb_guard[cb];
         g = {};
@@ -2767,46 +2654,20 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
         if (!image_id) {
             continue;
         }
-        auto& image = texture_cache.GetImage(image_id);
-        const auto& col_buf = regs.color_buffers[cb];
-        g.meta_addr = col_buf.CmaskAddress();
-        g.image_id = image_id;
-        g.image_uid = image.image_uid;
-        g.backing = image.backing;
-        g.expected_layout = image.backing->state.layout;
-        g.expected_access = image.backing->state.access_mask;
-        g.base_level = desc.view_info.range.base.level;
-        g.base_layer = desc.view_info.range.base.layer;
-        g.num_levels = desc.view_info.range.extent.levels;
-        g.num_layers = desc.view_info.range.extent.layers;
-        g.slice = g.base_layer;
+        fill(g, image_id, desc, regs.color_buffers[cb].CmaskAddress());
     }
-    br_cache_.has_db = db_desc.first.operator bool();
+    br_cache_.has_db = bool(db_desc.first);
     if (br_cache_.has_db) {
         auto& g = br_cache_.db_guard;
-        g = {};
         const auto& [image_id, desc] = db_desc;
-        auto& image = texture_cache.GetImage(image_id);
-        g.meta_addr = regs.depth_htile_data_base.GetAddress();
-        g.image_id = image_id;
-        g.image_uid = image.image_uid;
-        g.backing = image.backing;
-        g.expected_layout = image.backing->state.layout;
-        g.expected_access = image.backing->state.access_mask;
-        g.base_level = desc.view_info.range.base.level;
-        g.base_layer = desc.view_info.range.base.layer;
-        g.num_levels = desc.view_info.range.extent.levels;
-        g.num_layers = desc.view_info.range.extent.layers;
-        g.slice = g.base_layer;
+        fill(g, image_id, desc, regs.depth_htile_data_base.GetAddress());
     }
     br_cache_.pipeline = pipeline;
-    {
-        const auto& key = pipeline->GetGraphicsKey();
-        br_mrt_mask_ = key.mrt_mask;
-        br_color_samples_ = key.color_samples;
-        br_depth_bits_ = std::bit_cast<u32>(regs.depth_control) & kRtDepthControlBits;
-        br_color_bits_ = std::bit_cast<u32>(regs.color_control) & kRtColorControlBits;
-    }
+    const auto& key = pipeline->GetGraphicsKey();
+    br_mrt_mask_ = key.mrt_mask;
+    br_color_samples_ = key.color_samples;
+    br_depth_bits_ = std::bit_cast<u32>(regs.depth_control) & kRtDepthControlBits;
+    br_color_bits_ = std::bit_cast<u32>(regs.color_control) & kRtColorControlBits;
     // The refused or invalid snapshot is still in place: a byte-equal rebuild
     // is a miss whose cause the body could not see. Consumed by the BRRT line;
     // is_rendering is read after the body's Transits.
@@ -2815,11 +2676,9 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     br_same_open_ += same && scheduler.IsRendering();
     br_cache_.state = fresh;
     br_cache_.attachment_feedback_loop = attachment_feedback_loop;
-    {
-        const auto& gens = sc.Gens();
-        br_cache_.meta_gen = gens.meta_gen;
-        br_cache_.layout_gen = gens.layout_gen;
-    }
+    const auto& gens = sc.Gens();
+    br_cache_.meta_gen = gens.meta_gen;
+    br_cache_.layout_gen = gens.layout_gen;
     // Commit re-check: a cross-thread invalidation landing mid-build forces
     // the next probe to miss (seqlock consumer side).
     const DrawToken t2 = sc.Capture(RtLaneStamp(), scheduler.CurrentTick());
@@ -2867,8 +2726,10 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
-    // The zero-init is load-bearing: RenderState::operator== compares the
-    // colour tail byte-wise, so the member is reset, not reused.
+    // fresh_state_ is reused, so the reset is load-bearing: it zeroes the colour slots at and past
+    // num_color_attachments (the producer invariant in vk_scheduler.h) and the depth attachment's
+    // has_depth/depth_clear/has_stencil/stencil_clear, which are written only under
+    // DepthValid()/StencilValid().
     RenderState& state = fresh_state_;
     state = {};
     state.width = instance.GetMaxFramebufferWidth();
@@ -2878,7 +2739,6 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
-            state.color_attachments[cb] = {};
             continue;
         }
         auto* image = &texture_cache.GetImage(image_id);
@@ -2926,9 +2786,6 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
         attachment.is_clear = is_clear;
 
         image->usage.render_target = 1u;
-    }
-    for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
-        state.color_attachments[cb] = {};
     }
 
     if (auto image_id = db_desc.first; image_id) {
@@ -2983,8 +2840,6 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
         }
 
         image.usage.depth_target = true;
-    } else {
-        state.depth_stencil_attachment = {};
     }
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
@@ -2997,13 +2852,11 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
             ctr.miss_ns += skipcache.CorrectSample(skipcache.Now() - br_miss_t0);
             ++ctr.miss_samples;
         }
-        if (br_would_hit) {
-            if (skipcache.GetState(CacheId::BeginRendering) !=
-                VideoCore::Skipcache::State::Learning) {
-                BrVerify(state, br_token);
-            }
-        } else {
+        if (!br_would_hit) {
             BrPopulate(state, br_token, pipeline);
+        } else if (skipcache.GetState(CacheId::BeginRendering) !=
+                   VideoCore::Skipcache::State::Learning) {
+            BrVerify(state, br_token);
         }
     }
     glue_br_ok_ = glue_mode_ != 0 && br_probing && br_cache_.valid &&
@@ -3118,10 +2971,9 @@ bool Rasterizer::TryCpWriteBacking(VAddr addr, const void* data, u64 size) {
         return false;
     }
     ++cpwrite_seen_;
-    // One page only. TryWriteBacking reports success after copying just the
-    // backed prefix of a range that runs into an unbacked VMA; a write inside
-    // a single page cannot do that, since VMAs and their physical areas are
-    // page granular, so there its `true` really means every byte moved.
+    // One page only: TryWriteBacking reports success after copying just the backed
+    // prefix of a range running into an unbacked VMA. VMAs and their physical areas
+    // are page granular, so within a single page its `true` means every byte moved.
     if (VideoCore::PageManager::GetPageAddr(addr) !=
         VideoCore::PageManager::GetPageAddr(addr + size - 1)) {
         ++cpwrite_nofit_;
@@ -3137,20 +2989,14 @@ bool Rasterizer::TryCpWriteBacking(VAddr addr, const void* data, u64 size) {
         return false;
     }
     ++cpwrite_armed_;
-    // The three locks below are taken and released in sequence, never nested:
-    // the region lock inside the tracker walk, then the texture cache mutex,
-    // then the memory manager's shared lock. A guest unmap takes them in the
-    // opposite order, so hoisting the backing write under the region lock
-    // would deadlock against it. Keep them sequential.
+    // The three locks below are sequential, never nested; a guest unmap takes them in
+    // the opposite order, so hoisting the backing write under the region lock would
+    // deadlock against it.
     if (!buffer_cache.MarkCpuWriteKeepArmed(addr, size)) {
         ++cpwrite_gpu_;
         return false;
     }
     texture_cache.InvalidateMemory(addr, size);
-    // Today one fault per armed page pays this global bump; keeping the page armed
-    // makes EVERY armed CP write pay it (plus the texture invalidate walk). The arm
-    // is only worth it while cpwrite_armed_ stays near the RW->R pairs it removes -
-    // see the CPWRITE fail condition in the notes.
     Skipcache::Framework::Instance().BumpMemGen();
     if (!memory->TryWriteBacking(reinterpret_cast<void*>(addr), data, size)) {
         ++cpwrite_nobacking_;
@@ -3177,10 +3023,8 @@ void Rasterizer::ProcessDownloadImages() {
     texture_cache.ProcessDownloadImages();
 }
 
-// Async-signal-safe per-thread cache of recent positive IsMapped intervals:
-// the fault handler and per-binding validation both hammer this at high rate,
-// and the shared lock costs far more than the lookup. Map/Unmap bump the
-// generation (release); an acquire load drops stale hits.
+// Async-signal-safe per-thread cache of positive IsMapped intervals; no lock on the
+// fast path. Map/Unmap bump the generation (release), an acquire load drops stale hits.
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     if (size == 0) {
         // There is no memory, so not mapped.
@@ -3201,8 +3045,8 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         return false;
     }
     const bool cache_active = Skipcache::Framework::Instance().Active();
-    const u64 cur_gen = mapped_ranges_gen_.load(std::memory_order_acquire);
     if (cache_active) {
+        const u64 cur_gen = mapped_ranges_gen_.load(std::memory_order_acquire);
         if (cur_gen == tls_gen) [[likely]] {
             for (const auto& e : tls_cache) {
                 if (addr >= e.base && query_end <= e.limit) {
@@ -3215,9 +3059,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
         }
     }
 
-    // Miss: find(addr) instead of contains(range) - the iterator returns the
-    // containing interval bounds for free, which seed future hits in the same
-    // neighborhood.
+    // find(addr), not contains(range): the iterator hands back the containing bounds.
     Common::RecursiveSharedLock lock{mapped_ranges_mutex};
     const auto it = mapped_ranges.find(addr);
     if (it == mapped_ranges.end()) {
@@ -3226,8 +3068,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     const VAddr lo = it->lower();
     const VAddr hi = it->upper();
     if (query_end > hi) {
-        // In a tracked interval but straddling its upper bound; entries cache
-        // only fully contained ranges.
+        // Inside a tracked interval but past its upper bound: not fully contained.
         return false;
     }
     if (cache_active) {
@@ -3268,10 +3109,10 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     Skipcache::Framework::Instance().BumpMemGen();
 }
 
-bool Rasterizer::DynMemoProbe(const GraphicsPipeline* pipeline, u32 flags, u64 reg_stamp,
+bool Rasterizer::DynMemoProbe(VideoCore::Skipcache::CacheCounters& ctr,
+                              const GraphicsPipeline* pipeline, u32 flags, u64 reg_stamp,
                               u64 dyn_gen, u64 pipe_gen) {
     using namespace VideoCore::Skipcache;
-    auto& ctr = Skipcache::Framework::Instance().Counters(CacheId::DynState);
     const auto& m = dyn_memo_;
     if (m.flags == 0) {
         ++ctr.miss_cold;
@@ -3320,9 +3161,9 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
             dyn_class_stamp_ ? liverpool->GetDynStateStamp() : liverpool->GetGfxStateStamp();
         // Read live, never from a draw-entry token: the binds that run before
         // this can flush the command buffer and re-arm every dirty bit.
-        dyn_gen = dynamic_state.InvalidateGen();
+        dyn_gen = dynamic_state.invalidate_gen;
         dyn_pipe_gen = skipcache->Gens().pipe_gen.load(std::memory_order_acquire);
-        dyn_would_hit = DynMemoProbe(pipeline, flags, dyn_stamp, dyn_gen, dyn_pipe_gen);
+        dyn_would_hit = DynMemoProbe(ctr, pipeline, flags, dyn_stamp, dyn_gen, dyn_pipe_gen);
         if (timed) {
             ctr.guard_ns += skipcache->CorrectSample(skipcache->Now() - t0);
             ++ctr.guard_samples;

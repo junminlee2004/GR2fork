@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <thread>
-#include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -146,9 +145,8 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
-    // The batch scope already holds the shared lock for this thread; taking
-    // it again is legal (recursive-shared) but pays the contended
-    // reader-count RMW this scope exists to elide.
+    // A GuestCopyScope on this thread already holds the shared lock for the batch; re-taking it is
+    // legal (recursive-shared) but pays the contended reader-count RMW the scope exists to elide.
     std::shared_lock lk{mutex, std::defer_lock};
     if (!tls_in_guest_copy_scope) {
         lk.lock();
@@ -156,17 +154,10 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
-    // Resolving the area costs a red-black tree descent, and the GPU command
-    // thread copies guest memory thousands of times per frame - enough that the
-    // pointer chasing outweighs both the lock and the copy itself. Remembering
-    // recently resolved areas turns that descent into a couple of compares.
-    //
-    // Caching is safe here precisely because this runs under the shared lock:
-    // the map can only change under the exclusive lock, which cannot be held
-    // while any reader is, so a generation captured inside this scope cannot go
-    // stale before the scope ends. Entries are thread local, so concurrent
-    // readers never share one. Only fully-mapped areas are recorded, since a
-    // sparse hole still needs the zero-filling walk below.
+    // Memoised FindVMA. Safe under the shared lock: the map only mutates under the
+    // exclusive lock, so a generation read here cannot go stale before the scope ends.
+    // Entries are thread local. Only fully-mapped areas are recorded - a sparse hole
+    // still needs the zero-filling walk below.
     struct MappedAreaMemo {
         u64 generation;
         VAddr base;
@@ -233,27 +224,26 @@ void SetBackingWriteObserver(BackingWriteObserver observer, void* user) {
     g_backing_observer.store(observer, std::memory_order_release);
 }
 
-static std::atomic<void (*)(void*)> g_unmap_drain{nullptr};
-static std::atomic<void*> g_unmap_drain_user{nullptr};
+static std::atomic<void (*)()> g_unmap_drain{nullptr};
 // Open push windows: incremented by ResolveBackingSpans while it still holds
 // the shared lock, closed by EndBackingPush after the jobs are queued. The
 // holder never blocks between the two (queueing is lock-free), so the unmap
-// side's bounded wait cannot deadlock.
+// side's bounded wait cannot deadlock. The lane's unsafe mode passes
+// open_push_window=false and accepts the unmap race.
 static std::atomic<u32> g_backing_push_windows{0};
 
 void MemoryManager::EndBackingPush() {
     g_backing_push_windows.fetch_sub(1, std::memory_order_release);
 }
 
-void MemoryManager::RegisterUnmapDrain(void (*drain)(void*), void* user) {
-    g_unmap_drain_user.store(user, std::memory_order_release);
+void MemoryManager::RegisterUnmapDrain(void (*drain)()) {
     g_unmap_drain.store(drain, std::memory_order_release);
 }
 
 u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out,
                                        u32 max_spans, bool open_push_window) {
-    // The batch scope already holds the shared lock for this thread (see
-    // CopySparseMemory); the vma map and phys_areas are stable underneath it.
+    // Shared lock unless a GuestCopyScope already holds it (see CopySparseMemory); the vma map
+    // and phys_areas are stable under either hold.
     std::shared_lock lk{mutex, std::defer_lock};
     if (!tls_in_guest_copy_scope) {
         lk.lock();
@@ -261,14 +251,8 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
     // Chunk memo, generation-keyed like CopySparseMemory's area memo: the
     // stream lane resolves thousands of small ranges per frame and nearly all
     // of them land in the same few backing chunks.
-    struct ChunkMemo {
-        u64 generation;
-        VAddr base;
-        VAddr end;
-        const u8* backing;
-    };
     static constexpr size_t NumMemoEntries = 4;
-    static thread_local std::array<ChunkMemo, NumMemoEntries> memo{};
+    static thread_local std::array<BackingChunkMemo, NumMemoEntries> memo{};
     static thread_local size_t memo_next = 0;
     for (const auto& entry : memo) {
         if (entry.generation == vma_generation && virtual_addr >= entry.base &&
@@ -300,14 +284,14 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
             if (start_in_dma >= phys->second.size) {
                 continue;
             }
-            const u8* backing = impl.BackingBase() + phys->second.base + start_in_dma;
+            u8* backing = impl.BackingBase() + phys->second.base + start_in_dma;
             const u64 chunk = std::min<u64>(remaining, phys->second.size - start_in_dma);
             if (num_spans == max_spans) {
                 return 0;
             }
             out[num_spans++] = BackingSpan{backing, chunk};
             if (num_spans == 1 && chunk == size) {
-                memo[memo_next] = ChunkMemo{
+                memo[memo_next] = BackingChunkMemo{
                     .generation = vma_generation,
                     .base = addr - start_in_dma,
                     .end = addr - start_in_dma + phys->second.size,
@@ -326,10 +310,7 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
             }
         }
     }
-    // A successful resolve opens the push window before the shared lock
-    // drops; the caller closes it with EndBackingPush once its jobs are
-    // queued, and the unmap drain waits the window out first. The lane's
-    // unsafe mode runs without windows and accepts the unmap race.
+    // Opened while the shared lock is still held; see g_backing_push_windows.
     if (open_push_window) {
         g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
     }
@@ -338,7 +319,7 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
-    // Inside a guest-copy scope the outer hold keeps the map stable.
+    // Shared lock unless a GuestCopyScope already holds it (see CopySparseMemory).
     std::shared_lock lk{mutex, std::defer_lock};
     if (!tls_in_guest_copy_scope) {
         lk.lock();
@@ -349,10 +330,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
         observer(g_backing_observer_user.load(std::memory_order_acquire), virtual_addr, size);
     }
     if (backing_write_memo_) {
-        // Backing writes land in the same few chunks - fence labels repeat and
-        // readback islands ascend through one buffer - so the resolved chunk is
-        // remembered per thread and revalidated by the map generation under
-        // the shared lock, as CopySparseMemory's area memo is.
+        // Per-thread chunk memo, revalidated by the map generation under the shared lock (see
+        // CopySparseMemory).
         auto& memo = tls_backing_write_memo;
         ++memo.calls;
         for (const auto& e : memo.entries) {
@@ -369,27 +348,16 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
-    // Pointers, not copies: a VirtualMemoryArea drags a std::map of physical
-    // areas and a std::string along, and this runs per guest-visible GPU
-    // write. The shared lock held for the whole function, or the outer
-    // scope's, keeps the map (and therefore these pointers) stable.
-    boost::container::small_vector<const VirtualMemoryArea*, 4> vmas_to_write;
-    auto current_vma = FindVMA(virtual_addr);
-    while (current_vma->second.Overlaps(virtual_addr, size)) {
-        if (!HasPhysicalBacking(current_vma->second)) {
-            break;
-        }
-        vmas_to_write.emplace_back(&current_vma->second);
-        current_vma++;
-    }
-
-    if (vmas_to_write.empty()) {
+    // The shared lock held for this function, or the outer scope's, keeps the map and therefore
+    // this iterator stable.
+    const u64 total = size;
+    auto vma_it = FindVMA(virtual_addr);
+    if (!vma_it->second.Overlaps(virtual_addr, total) || !HasPhysicalBacking(vma_it->second)) {
         return false;
     }
 
-    const u64 total = size;
-    for (const VirtualMemoryArea* vma_ptr : vmas_to_write) {
-        const VirtualMemoryArea& vma = *vma_ptr;
+    do {
+        const VirtualMemoryArea& vma = vma_it->second;
         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
         auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
         for (; phys_handle != vma.phys_areas.end(); phys_handle++) {
@@ -418,7 +386,9 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
             memcpy(backing, data, copy_size);
             size -= copy_size;
         }
-    }
+        ++vma_it;
+    } while (size != 0 && vma_it->second.Overlaps(virtual_addr, total) &&
+             HasPhysicalBacking(vma_it->second));
 
     return true;
 }
@@ -1220,17 +1190,15 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 }
 
 s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
-    // Backing pointers held by queued stream-lane jobs must not outlive the
-    // mapping they resolve into. Wait out open push windows first: a span
-    // resolved before this unmap took the lock may not have reached the
-    // queue yet, and a drain snapshot taken now would miss it. The window
-    // holder never takes this mutex between resolve and queue, so the wait
-    // is bounded by a lock-free push (worst case one ring-wrap drain).
+    // Queued stream-lane jobs hold backing pointers into this mapping. Wait out open push
+    // windows first - a drain snapshot taken now would miss a span already resolved but not
+    // yet queued - then drain. Bounded: the holder never takes this mutex between resolve and
+    // queue.
     while (g_backing_push_windows.load(std::memory_order_acquire) != 0) {
         std::this_thread::yield();
     }
     if (const auto drain = g_unmap_drain.load(std::memory_order_acquire)) {
-        drain(g_unmap_drain_user.load(std::memory_order_acquire));
+        drain();
     }
     u64 unmapped_bytes = 0;
     do {
@@ -1791,10 +1759,8 @@ MemoryManager::PhysHandle MemoryManager::MergeAdjacent(PhysMap& handle_map, Phys
 }
 
 MemoryManager::VMAHandle MemoryManager::CarveVMA(VAddr virtual_addr, u64 size) {
-    // Every caller carves in order to change an area's type or protection, and
-    // the whole-area case below returns without splitting, so bumping here
-    // rather than only in Split/MergeAdjacent is what makes "the generation
-    // moved" mean "no area's extent or mapped state survived unchanged".
+    // Bump here too: the whole-area case below returns without splitting, so
+    // Split/MergeAdjacent alone would miss a type or protection change.
     ++vma_generation;
     auto vma_handle = FindVMA(virtual_addr);
 

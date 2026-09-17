@@ -198,11 +198,8 @@ public:
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
-        // Bounds come from cached scalars rather than from the map itself. The
-        // boundary test runs on every guest memory copy, and reaching it through
-        // the map costs two out of line red-black tree steps per call for a span
-        // that only changes when the map is mutated - which carving and merging
-        // never do, and which is refreshed anyway whenever the map changes.
+        // vma_span_{begin,end} mirror vma_map's extent; RefreshVmaBounds updates them at every
+        // site that changes the map, so this per-copy boundary test needs no tree walk.
         if (virtual_addr < vma_span_begin || virtual_addr >= vma_span_end) {
             return false;
         }
@@ -247,13 +244,10 @@ public:
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
-    /// Holds the memory map's shared lock open for a batch of guest copies.
-    /// CopySparseMemory calls made by the owning thread inside the scope skip
-    /// their own acquisition, so a bind pass staging dozens of guest ranges
-    /// pays one pair of reader-count atomics instead of one per copy - the
-    /// contended RMW on that counter is the dominant cost of the copies
-    /// themselves. The lock is recursive-shared, so nesting stays safe, and
-    /// only the outermost scope takes ownership.
+    /// Holds the memory map's shared lock open for a batch of guest copies: while
+    /// tls_in_guest_copy_scope is set, CopySparseMemory, ResolveBackingSpans and TryWriteBacking
+    /// skip their own acquisition. The mutex is recursive-shared, so nesting is safe and only the
+    /// outermost scope takes ownership.
     class GuestCopyScope {
     public:
         explicit GuestCopyScope(MemoryManager* mm) : mm_{mm}, owner_{!tls_in_guest_copy_scope} {
@@ -293,7 +287,7 @@ public:
 
     /// Called (if registered) before an unmap edits the address space, so the
     /// stream copy lane can drain jobs whose backing pointers would dangle.
-    static void RegisterUnmapDrain(void (*drain)(void*), void* user);
+    static void RegisterUnmapDrain(void (*drain)());
 
     /// Ends the push window ResolveBackingSpans opened: spans resolved under
     /// the shared lock stay unmap-safe until the caller queued its jobs, and

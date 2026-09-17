@@ -51,24 +51,18 @@ struct RenderState {
     u16 num_layers;
     u16 num_color_attachments;
 
-    // One attachment as four explicit word compares. The OR-of-XORs form is
-    // what keeps this out of the library: an early-exit chain of equalities
-    // over adjacent memory is folded back into a bcmp call, and a constant
-    // 96- or 128-byte memcmp exceeds the inline budget the same way.
+    // Four explicit word compares: the OR-of-XORs form keeps the compare
+    // inline, where an equality chain or a memcmp folds back into a bcmp call.
     static bool AttachmentEqual(const RenderAttachment& a, const RenderAttachment& b) noexcept {
         const auto wa = std::bit_cast<std::array<u64, 4>>(a);
         const auto wb = std::bit_cast<std::array<u64, 4>>(b);
         return ((wa[0] ^ wb[0]) | (wa[1] ^ wb[1]) | (wa[2] ^ wb[2]) | (wa[3] ^ wb[3])) == 0;
     }
 
-    // Only the live extent can differ: every producer leaves the colour slots
-    // at and past num_color_attachments zeroed and no consumer reads them, so
-    // comparing the whole 296 bytes was comparing a constant tail. The shape
-    // words go first, then the depth attachment, which is what actually
-    // changes when a render target moves. Memory safety rests on
-    // num_color_attachments <= 8, which holds because it is std::bit_width of
-    // the pipeline key's u32 mrt_mask, itself bounded by the fragment shader's
-    // NUM_COLOR_BUFFERS exports; a widening of that bound would revisit this.
+    // Invariants: every producer zeroes the colour slots at and past
+    // num_color_attachments and no consumer reads them, so the tail needs no
+    // compare; num_color_attachments <= 8 because it is std::bit_width of the
+    // pipeline key's u32 mrt_mask, which is what bounds the loop safely.
     bool operator==(const RenderState& other) const noexcept {
         if (width != other.width || height != other.height || num_layers != other.num_layers ||
             num_color_attachments != other.num_color_attachments) {
@@ -128,7 +122,7 @@ struct StencilOps {
 
 // Games can leave float dynamic-state registers non-finite; NaN != NaN makes a
 // value compare re-arm the dirty bit and re-emit the command on every draw.
-// The bit_cast only compiles for a padding-free T, so every byte compared is a
+// Every T compared here is float-only and padding-free, so every byte is a
 // value byte.
 template <typename T>
 bool SameFloatBits(const T& a, const T& b) {
@@ -213,6 +207,9 @@ struct DynamicState {
     // dirty_state.
     u64 invalidate_gen{1};
 
+    /// Counts mask changes no pipeline declares dynamic; drained per 300 frames.
+    u64 color_write_mask_skips_{};
+
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
 
@@ -220,10 +217,6 @@ struct DynamicState {
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
         ++invalidate_gen;
-    }
-
-    u64 InvalidateGen() const {
-        return invalidate_gen;
     }
 
     // Raw view of the dirty bitfield for skip-cache verification. Unused bits
@@ -234,6 +227,10 @@ struct DynamicState {
         static_assert(sizeof(dirty_state) <= sizeof(bits));
         std::memcpy(&bits, &dirty_state, sizeof(dirty_state));
         return bits;
+    }
+
+    u64 DrainColorWriteMaskSkips() {
+        return std::exchange(color_write_mask_skips_, u64{0});
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -389,12 +386,6 @@ struct DynamicState {
         }
     }
 
-    /// Mask changes that no pipeline declares dynamic; a compliance count.
-    u64 DrainColorWriteMaskSkips() {
-        return std::exchange(color_write_mask_skips_, u64{0});
-    }
-    u64 color_write_mask_skips_{};
-
     void SetColorWriteMasks(const ColorWriteMasks& color_write_masks_) {
         if (!std::ranges::equal(color_write_masks, color_write_masks_)) {
             color_write_masks = color_write_masks_;
@@ -433,17 +424,14 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
-    /// Where a blocking wait came from, so the cost can be attributed. Kept
-    /// tiny: one counter pair per site, summed on the waiting thread.
+    /// Where a blocking wait came from, so the cost can be attributed; one
+    /// counter pair per site, summed on the waiting thread.
     enum class WaitSite : u8 {
         Finish,
         StreamRing,
         FaultBuffer,
         DownloadBuffer,
         DownloadImage,
-        ResourcePool,
-        DeferredOp,
-        Other,
         Count,
     };
     struct WaitStat {
@@ -572,7 +560,6 @@ private:
     SubmitHook submit_hook_{};
     void* submit_hook_user_{};
     const Instance& instance;
-    std::array<WaitStat, static_cast<size_t>(WaitSite::Count)> wait_stats_{};
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
@@ -595,8 +582,7 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
-    // The first direct measurement of the render scope rate: everything the
-    // campaign has quoted for it so far came from branch-edge inference.
+    std::array<WaitStat, static_cast<size_t>(WaitSite::Count)> wait_stats_{};
     u64 rs_calls_{};
     u64 rs_restarts_{};
     u64 rs_interrupted_{};
