@@ -373,31 +373,21 @@ constexpr NumberConversion MapNumberConversionCases(const NumberFormat num_fmt,
 // The two mappings above run per color target and per sharp at draw rate, and
 // the compiler lowers the nested switches to mispredicting jump tables. The
 // lookup tables are built at compile time by evaluating the case bodies, so
-// the mapping stays defined in one place. Number formats come from 4-bit and
-// data formats from 6-bit hardware fields, which the masks make explicit.
+// the mapping stays defined in one place.
 namespace detail {
-consteval std::array<std::array<u8, 64>, 16> BuildRemapNumberFormatLut() {
+template <auto MapFn>
+consteval std::array<std::array<u8, 64>, 16> BuildFormatLut() {
     std::array<std::array<u8, 64>, 16> lut{};
     for (u32 nf = 0; nf < lut.size(); ++nf) {
         for (u32 df = 0; df < lut[nf].size(); ++df) {
-            lut[nf][df] = static_cast<u8>(
-                RemapNumberFormatCases(static_cast<NumberFormat>(nf), static_cast<DataFormat>(df)));
+            lut[nf][df] =
+                static_cast<u8>(MapFn(static_cast<NumberFormat>(nf), static_cast<DataFormat>(df)));
         }
     }
     return lut;
 }
-consteval std::array<std::array<u8, 64>, 16> BuildMapNumberConversionLut() {
-    std::array<std::array<u8, 64>, 16> lut{};
-    for (u32 nf = 0; nf < lut.size(); ++nf) {
-        for (u32 df = 0; df < lut[nf].size(); ++df) {
-            lut[nf][df] = static_cast<u8>(MapNumberConversionCases(static_cast<NumberFormat>(nf),
-                                                                   static_cast<DataFormat>(df)));
-        }
-    }
-    return lut;
-}
-inline constexpr auto kRemapNumberFormatLut = BuildRemapNumberFormatLut();
-inline constexpr auto kMapNumberConversionLut = BuildMapNumberConversionLut();
+inline constexpr auto kRemapNumberFormatLut = BuildFormatLut<RemapNumberFormatCases>();
+inline constexpr auto kMapNumberConversionLut = BuildFormatLut<MapNumberConversionCases>();
 } // namespace detail
 
 constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
