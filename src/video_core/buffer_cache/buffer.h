@@ -153,6 +153,24 @@ public:
         return !!mask && !(mask & ~kReadOnlyAccess);
     }
 
+    // The read accesses whose cache invalidation a barrier with `mask` as its
+    // destination already performed on RADV: a shader read flushes the vector
+    // and scalar caches and so covers a later vertex or index fetch too; a
+    // vertex or index fetch flushes only the vector cache and covers only its
+    // own kind. Indirect and transfer reads are never covered.
+    static constexpr vk::AccessFlags2 kShaderReads = vk::AccessFlagBits2::eShaderRead |
+                                                     vk::AccessFlagBits2::eUniformRead |
+                                                     vk::AccessFlagBits2::eMemoryRead;
+    static constexpr vk::AccessFlags2 kFetchReads =
+        vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eIndexRead;
+    static constexpr vk::AccessFlags2 CoveredReads(vk::AccessFlags2 mask) noexcept {
+        if (mask & kShaderReads) {
+            return vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eUniformRead |
+                   kFetchReads;
+        }
+        return mask & kFetchReads;
+    }
+
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u32 offset = 0) {
@@ -165,11 +183,11 @@ public:
         // readers are accumulated instead, which makes the next write
         // transition source the union of every reader since the last write --
         // a superset of what the single tracked reader gives today.
-        // Only a reader whose access bits the last barrier already made visible
-        // merges: the driver invalidates different caches per access type, so
-        // a new read type still gets its own barrier.
+        // Only a reader whose caches the last barrier already invalidated merges
+        // (CoveredReads): a new read type outside that set still gets its own
+        // barrier.
         if (barrier_read_merge && IsReadOnlyAccess(access_mask) &&
-            IsReadOnlyAccess(dst_acess_mask) && !(dst_acess_mask & ~access_mask)) {
+            IsReadOnlyAccess(dst_acess_mask) && !(dst_acess_mask & ~CoveredReads(access_mask))) {
             access_mask |= dst_acess_mask;
             stage |= dst_stage;
             barrier_rr_merged.fetch_add(1, std::memory_order_relaxed);
