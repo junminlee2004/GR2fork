@@ -228,6 +228,17 @@ private:
     u32 prone_run_draws_{};
     u64 writer_flushes_{};
     u64 interval_flushes_{};
+    // ring_drain_flush_draws: once the open batch holds this many draws, a
+    // poll every 32nd draw flushes it if every batch submitted so far has
+    // retired. Boot-latched, clamped to >= 32 and rounded up to the multiple
+    // of 32 that actually fires; 0 = off.
+    u32 ring_drain_flush_draws_{};
+    u64 drain_flushes_{};
+    u32 drain_reach_{};
+    u64 drain_polls_{};
+    u64 drain_busy_{};
+    u64 drain_draw_sum_{};
+    u32 drain_draw_max_{};
     // Snapshot of the framework's FindImage counters at the last report; the
     // per-window line prints the deltas (Forced mode never resets them).
     VideoCore::Skipcache::CacheCounters findimg_last_{};

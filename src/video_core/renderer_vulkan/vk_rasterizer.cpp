@@ -133,6 +133,20 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (const u32 interval = EmulatorSettings.GetFlushDrawInterval(); interval != 0) {
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
+    if (const u32 drain = EmulatorSettings.GetRingDrainFlushDraws(); drain != 0) {
+        // The draw counter only runs with an interval set, and the interval
+        // fires first unless it is the larger of the two. The poll is every
+        // 32nd draw, so the count is rounded up to the multiple of 32 that
+        // actually fires and the boot line reports that value.
+        const u32 clamped = (std::max<u32>(drain, 32) + 31u) & ~31u;
+        if (flush_draw_interval_ != 0 && clamped < flush_draw_interval_) {
+            ring_drain_flush_draws_ = clamped;
+        } else {
+            LOG_WARNING(Render_Vulkan,
+                        "ring_drain_flush_draws {} needs 0 < it < flush_draw_interval {}: disabled",
+                        clamped, flush_draw_interval_);
+        }
+    }
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
     tracker_lock_spin_ = EmulatorSettings.GetTrackerLockSpinRounds() != 0;
     // The register stamp is armed once from the boot value of the skip-cache
@@ -742,8 +756,32 @@ bool Rasterizer::MaybeIntervalFlush(bool force) {
         flush_tick_ = tick;
         draws_since_flush_ = 0;
     }
+    bool drain = false;
     if (!force && (flush_draw_interval_ == 0 || ++draws_since_flush_ < flush_draw_interval_)) {
-        return false;
+        // The batch already holds enough draws to be worth submitting: if the
+        // GPU has retired everything submitted so far it is recording into an
+        // idle ring, so hand it this much of the batch now.
+        if (ring_drain_flush_draws_ == 0 || draws_since_flush_ < ring_drain_flush_draws_ ||
+            (draws_since_flush_ & 31) != 0) {
+            return false;
+        }
+        // Counted before the vetoes: reach == 0 in the log means the count is
+        // never reached and the design's draws-per-batch model was wrong,
+        // while reach - polls is what the clear veto costs.
+        ++drain_reach_;
+        // The clear veto below is level-triggered, so a poll inside a clear
+        // pass could never flush; do not pay its query. (A firing drain reads
+        // the attachment again there; the second read cannot differ.)
+        const auto& clear_ds = scheduler.GetRenderState().depth_stencil_attachment;
+        if (clear_ds.depth_clear || clear_ds.stencil_clear) {
+            return false;
+        }
+        ++drain_polls_;
+        if (!scheduler.IsFree(tick - 1)) {
+            ++drain_busy_;
+            return false;
+        }
+        drain = true;
     }
     // A pending depth or stencil clear belongs to the open render scope:
     // BeginRendering re-derives the clear load op, so a scope re-begun after
@@ -754,12 +792,17 @@ bool Rasterizer::MaybeIntervalFlush(bool force) {
     }
     DropCopyHold(hold_drops_flush_);
     scheduler.Flush();
+    if (drain) {
+        ++drain_flushes_;
+        drain_draw_sum_ += draws_since_flush_;
+        drain_draw_max_ = std::max(drain_draw_max_, draws_since_flush_);
+    }
     draws_since_flush_ = 0;
     if (force) {
         prone_run_ = false;
         prone_run_draws_ = 0;
         ++writer_flushes_;
-    } else {
+    } else if (!drain) {
         ++interval_flushes_;
     }
     return true;
@@ -1175,6 +1218,15 @@ void Rasterizer::OnSubmit() {
                 LOG_INFO(Render_Skipcache, "[SkipCache] IFLUSH count={} per300f",
                          interval_flushes_);
                 interval_flushes_ = 0;
+            }
+            if (ring_drain_flush_draws_ != 0) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] DRAINFLUSH fired={} reach={} polls={} busy={} drawsum={} "
+                         "drawmax={} per300f",
+                         std::exchange(drain_flushes_, u64{0}), std::exchange(drain_reach_, u32{0}),
+                         std::exchange(drain_polls_, u64{0}), std::exchange(drain_busy_, u64{0}),
+                         std::exchange(drain_draw_sum_, u64{0}),
+                         std::exchange(drain_draw_max_, u32{0}));
             }
             if (segment_copy_hold_) {
                 LOG_INFO(Render_Skipcache,
