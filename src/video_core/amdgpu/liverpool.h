@@ -65,30 +65,6 @@ struct Liverpool {
     // One bit per context and uconfig register word the dynamic-state
     // updaters read; the stamp's dyn lane classifies writes against it.
     std::array<u64, (Regs::NumRegs - Regs::ContextRegWordOffset) / 64> dyn_reg_mask_{};
-
-    u64 GetGfxStateStamp() const noexcept {
-        return gfx_stamp.value;
-    }
-    u64 GetDynStateStamp() const noexcept {
-        return gfx_stamp.dyn_value;
-    }
-    u64 GetRtStateStamp() const noexcept {
-        return gfx_stamp.rt_value;
-    }
-    struct RegFunnelStats {
-        u64 calls;
-        u64 classified;
-        u64 classified_rt;
-    };
-    RegFunnelStats DrainRegFunnelStats() noexcept {
-        const RegFunnelStats out{gfx_stamp.funnel_calls, gfx_stamp.funnel_classified,
-                                 gfx_stamp.funnel_classified_rt};
-        gfx_stamp.funnel_calls = gfx_stamp.funnel_classified = gfx_stamp.funnel_classified_rt = 0;
-        return out;
-    }
-    bool IsGfxStampActive() const noexcept {
-        return gfx_stamp.active;
-    }
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 
@@ -133,6 +109,30 @@ public:
 
     bool OnGpuThread() const noexcept {
         return std::this_thread::get_id() == gpu_id;
+    }
+
+    u64 GetGfxStateStamp() const noexcept {
+        return gfx_stamp.value;
+    }
+    u64 GetDynStateStamp() const noexcept {
+        return gfx_stamp.dyn_value;
+    }
+    u64 GetRtStateStamp() const noexcept {
+        return gfx_stamp.rt_value;
+    }
+    struct RegFunnelStats {
+        u64 calls;
+        u64 classified;
+        u64 classified_rt;
+    };
+    RegFunnelStats DrainRegFunnelStats() noexcept {
+        const RegFunnelStats out{gfx_stamp.funnel_calls, gfx_stamp.funnel_classified,
+                                 gfx_stamp.funnel_classified_rt};
+        gfx_stamp.funnel_calls = gfx_stamp.funnel_classified = gfx_stamp.funnel_classified_rt = 0;
+        return out;
+    }
+    bool IsGfxStampActive() const noexcept {
+        return gfx_stamp.active;
     }
 
     template <bool wait_done = false>
@@ -183,15 +183,9 @@ public:
     };
     Common::SlotVector<AscQueueInfo> asc_queues{};
 
-    /**
-     * Purely diagnostic census of the packets the guest submits, reported
-     * periodically and then reset. Answers whether this title drives the
-     * occlusion path at all - shadPS4 answers every occlusion query with a
-     * large "visible" count and ignores SET_PREDICATION, so a title that
-     * culls from query results would be submitting draws it means to skip.
-     * GPU-parser-thread confined, like the counters above. The register run
-     * census lives in RunStats and describes this fork's parser, not the title.
-     */
+    // Purely diagnostic census of the packets the guest submits, drained and
+    // reset by the 300-frame PACKETS line in Rasterizer::OnSubmit.
+    // GPU-parser-thread confined, like the counters above.
     struct PacketStats {
         u64 draws;            // graphics draws submitted by the guest
         u64 predicated_draws; // ... of which carry the predicate header bit
@@ -244,9 +238,8 @@ private:
     SHAD_NO_INLINE std::span<const u32> RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
                                                            uintptr_t base_addr);
     // The two hottest packet arms, shared by the pre-dispatch fast path and
-    // their switch cases so the routes cannot drift. The hot bodies inline
-    // into the caller (the call frame their assert machinery forced was
-    // 33-51% of the outlined symbols); the assert-carrying tails stay cold.
+    // their switch cases so the routes cannot drift. The hot bodies inline into
+    // the caller; the assert-carrying tails stay cold and out of line.
     SHAD_FORCE_INLINE void SetContextRegHot(const union PM4Header* header, u32 count);
     SHAD_NO_INLINE void SetContextRegExtentTail(u32 reg_addr, const union PM4Header* header,
                                                 const u32* payload);
