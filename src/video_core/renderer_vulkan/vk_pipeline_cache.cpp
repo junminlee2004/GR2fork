@@ -916,14 +916,6 @@ bool PipelineCache::MemoRuntimeInfo(HwStage stage, SwStage l_stage, RuntimeInfoS
         return true;
     }
     BuildRuntimeInfo(stage, l_stage);
-    // Census: a rebuilt struct equal to a resident one is a miss a memo keyed
-    // on the derived words would have hit. Read by the RIMEMO line.
-    for (const auto& r : entries) {
-        if (r.used && std::memcmp(&r.ri, &runtime_infos[l], sizeof(Shader::RuntimeInfo)) == 0) {
-            ++rimemo_dup;
-            break;
-        }
-    }
     RuntimeInputMemo& e = &entries[0] == last ? entries[1] : entries[0];
     e.n_words = static_cast<u8>(n);
     std::memcpy(e.words.data(), words.data(), n * sizeof(u32));
@@ -1275,12 +1267,9 @@ void PipelineCache::DumpRuntimeInfoMemoStats() {
         return;
     }
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} fused={} scan={} dup={} "
-             "per300f",
-             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss, rimemo_fused, rimemo_scan,
-             rimemo_dup);
+             "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} fused={} scan={} per300f",
+             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss, rimemo_fused, rimemo_scan);
     rimemo_hits = rimemo_misses = rimemo_restores = rimemo_vmiss = rimemo_fused = rimemo_scan = 0;
-    rimemo_dup = 0;
 }
 
 void PipelineCache::DumpLayoutStats() {

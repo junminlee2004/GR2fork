@@ -387,7 +387,6 @@ private:
     u64 rimemo_vmiss{};
     u64 rimemo_fused{};
     u64 rimemo_scan{};
-    u64 rimemo_dup{}; // misses whose rebuilt struct equalled a resident entry
     // Fuse: cmp names the candidate's words and *diff receives the OR of every
     // differing word; without it the body is the plain snapshot.
     template <bool Fuse>

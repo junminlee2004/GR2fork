@@ -784,10 +784,6 @@ struct GPUSettings {
     // Binds each host index buffer once per command buffer and addresses the draw
     // through firstIndex; the exact sub-range bind per draw is the off path.
     Setting<bool> index_bind_whole{false};
-    // Walks every descriptor-heap bind through a shadow delta slot and reports what a
-    // push of its first maxPushDescriptors descriptors would have hit; the bind itself is
-    // unchanged. Costs 0.4-1.5% of the GPU thread while on: a measuring leg, off for kits.
-    Setting<bool> desc_heap_shadow_census{false};
     // Per pipeline, the image memo slot each image binding last matched; the probe
     // compares that entry before the hashed way scan. Never a certificate: the
     // entry must pass the full key compare and the generation checks as before.
@@ -978,8 +974,6 @@ struct GPUSettings {
             make_override<GPUSettings>("findimg_memo_first", &GPUSettings::findimg_memo_first),
             make_override<GPUSettings>("vinput_fetch_key", &GPUSettings::vinput_fetch_key),
             make_override<GPUSettings>("index_bind_whole", &GPUSettings::index_bind_whole),
-            make_override<GPUSettings>("desc_heap_shadow_census",
-                                       &GPUSettings::desc_heap_shadow_census),
             make_override<GPUSettings>("findimg_slot_hint", &GPUSettings::findimg_slot_hint),
             make_override<GPUSettings>("bind_image_lean", &GPUSettings::bind_image_lean),
             make_override<GPUSettings>("desc_delta_flat", &GPUSettings::desc_delta_flat),
@@ -1030,9 +1024,9 @@ struct GPUSettings {
     flush_draw_interval, pipeline_key_stamp_reuse, shader_params_memo, pending_pop_throttle, \
     fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
-    desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
-    draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release, \
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache
+    findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, \
+    readback_wait_notify, readback_window_kb, deferred_read_release, image_fast_state, \
+    guest_copy_lock_batch, spec_fp_cache
 #define GPU_SETTINGS_JSON_FIELDS_C \
     cp_write_backing, runtime_info_stamp_gate, pm4_backing_writes, userfaultfd
 // clang-format on
@@ -1397,7 +1391,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FindimgMemoFirst, findimg_memo_first)
     SETTING_FORWARD_BOOL(m_gpu, VinputFetchKey, vinput_fetch_key)
     SETTING_FORWARD_BOOL(m_gpu, IndexBindWhole, index_bind_whole)
-    SETTING_FORWARD_BOOL(m_gpu, DescHeapShadowCensus, desc_heap_shadow_census)
     SETTING_FORWARD_BOOL(m_gpu, FindimgSlotHint, findimg_slot_hint)
     SETTING_FORWARD_BOOL(m_gpu, BindImageLean, bind_image_lean)
     SETTING_FORWARD_BOOL(m_gpu, DescDeltaFlat, desc_delta_flat)

@@ -568,7 +568,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU findimgMemoFirst: {}", EmulatorSettings.IsFindimgMemoFirst());
     LOG_INFO(Config, "GPU vinputFetchKey: {}", EmulatorSettings.IsVinputFetchKey());
     LOG_INFO(Config, "GPU indexBindWhole: {}", EmulatorSettings.IsIndexBindWhole());
-    LOG_INFO(Config, "GPU descHeapShadowCensus: {}", EmulatorSettings.IsDescHeapShadowCensus());
     LOG_INFO(Config, "GPU findimgSlotHint: {}", EmulatorSettings.IsFindimgSlotHint());
     LOG_INFO(Config, "GPU bindImageLean: {}", EmulatorSettings.IsBindImageLean());
     LOG_INFO(Config, "GPU descDeltaFlat: {}", EmulatorSettings.IsDescDeltaFlat());
