@@ -114,8 +114,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
-    // A push outside the delta-cached path rewrites this bind point's set 0
-    // behind the cache; the bump makes its next probe miss.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(0);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
@@ -127,8 +125,6 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         it = --color_to_ms_depth_pl.end();
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
-    // A pipeline bound outside the dedup path; the bump makes the dedup
-    // treat its last bound handle as unknown.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(0);
 
     const vk::Viewport viewport = {
@@ -221,8 +217,6 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
-    // A push outside the delta-cached path rewrites this bind point's set 0
-    // behind the cache; the bump makes its next probe miss.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(0);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
@@ -234,8 +228,6 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         it = --ms_image_copy_pl.end();
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
-    // A pipeline bound outside the dedup path; the bump makes the dedup
-    // treat its last bound handle as unknown.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(0);
 
     const vk::Viewport viewport = {
