@@ -44,11 +44,8 @@ class TextureCache {
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
-    // Page-table bucket entry. The guest range is copied in at registration
-    // (it is immutable while registered), so overlap filtering reads the
-    // bucket's contiguous memory instead of chasing each candidate's cold
-    // 768-byte Image struct - the dominant cost of FindImage was that
-    // dependent load missing cache once per candidate.
+    // Page-table bucket entry: the guest range is copied in at registration and is immutable while
+    // registered, so overlap filtering reads the bucket instead of the cold Image.
     struct PageImageRef {
         ImageId id;
         u32 size; // RegisterImage asserts guest_size fits
@@ -75,22 +72,17 @@ public:
     };
 
     struct ImageDesc {
-        // Lazy for shader-resource bindings: a FINDIMG memo hit reads only
-        // type and view_info afterwards, so the 376-byte build (NSDMI
-        // prologue, TLS memo probe, copy-out) is deferred until a route that
-        // actually reaches FindImage materializes it via Info(). Target
-        // ctors (CB/DB/VideoOut) stay eager: FindRenderTarget and
-        // FindDepthTarget read the engaged value through the const accessor.
+        // Lazy for shader-resource bindings, materialized by Info() only on routes that reach
+        // FindImage. Target ctors (CB/DB/VideoOut) stay eager: FindRenderTarget and FindDepthTarget
+        // read the engaged value through the const accessor.
         std::optional<ImageInfo> info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
         AmdGpu::Image deferred_tsharp{};
         bool deferred_is_depth{};
 
-        // Deferred view: a FINDIMG memo hit copies the post-rebase view info
-        // out of the entry, so the 56-byte build (SurfaceFormat, swizzle, view
-        // type) runs only on the routes that reach FindImage. Bindings that
-        // mutate the view before the probe (mip fallback) build it eagerly.
+        // Deferred view: built only on routes that reach FindImage. Bindings that mutate the view
+        // before the probe (mip fallback) build it eagerly.
         bool view_ready{true};
         bool deferred_is_array{};
 
@@ -248,14 +240,10 @@ public:
         return image;
     }
 
-    // Twin of UpdateImageFast: UpdateImage would take its no-op tier for this
-    // image right now (clean, tracked, touched within the interval). Reads the
+    // UpdateImage would take its no-op tier for this image right now. Reads the
     // slot directly so the LRU is not touched.
     [[nodiscard]] bool IsImageUpdateNoop(ImageId id, u64 now_tick) const noexcept {
-        const u64 fast = slot_images[id].ReadFastState();
-        return (fast & (Image::kFastStateDirty | Image::kFastStateTracked)) ==
-                   Image::kFastStateTracked &&
-               now_tick - (fast >> Image::kFastStateTouchShift) <= kTouchIntervalTicks;
+        return FastStateNoop(slot_images[id].ReadFastState(), now_tick);
     }
 
     /// Retrieves the image view with the specified id.
@@ -379,15 +367,10 @@ public:
                 continue;
             }
             const size_t size_before = lru_log_.size();
-            if constexpr (std::is_same_v<std::invoke_result_t<Func, ImageId>, bool>) {
-                const bool stop = func(e.id);
-                DEBUG_ASSERT(lru_log_.size() == size_before);
-                if (stop) {
-                    return;
-                }
-            } else {
-                func(e.id);
-                DEBUG_ASSERT(lru_log_.size() == size_before);
+            const bool stop = func(e.id);
+            DEBUG_ASSERT(lru_log_.size() == size_before);
+            if (stop) {
+                return;
             }
         }
     }
@@ -410,21 +393,14 @@ public:
                 }
             }
             for (const PageImageRef& ref : *it) {
-                // Mirrors Image::Overlaps exactly, from the bucket copy; the
-                // Image itself is only touched for genuine overlaps, so the
-                // Picked dedup semantics (including across nested walks) are
-                // unchanged.
+                // Mirrors Image::Overlaps exactly, from the bucket copy.
                 if (ref.addr >= cpu_addr + size || cpu_addr >= ref.addr + ref.size) {
                     continue;
                 }
                 const ImageId image_id = ref.id;
-                // Dedup against the dense per-image byte array: one warm
-                // cache line covers hundreds of ids, where the old Picked
-                // flag cost a cold load into the 768-byte Image slot per
-                // duplicate and the local list cost a linear scan. Semantics
-                // match the flag exactly, including across nested walks -
-                // bits set by an outer walk stay set until its trailing
-                // clear.
+                // Dedup against the dense per-image byte array; semantics match the old Picked
+                // flag exactly, including across nested walks - bits set by an outer walk stay
+                // set until its trailing clear.
                 if (image_picked_[image_id.index]) {
                     continue;
                 }
@@ -489,23 +465,21 @@ private:
     };
     static_assert(sizeof(MemoRange) == 8);
 
-    /// findimg_range_invalidate: the page-packed range a byte range occupies,
-    /// lo rounded down and hi up (and both saturated), so a stored pair is
-    /// never narrower than the bytes it stands for.
+    /// findimg_range_invalidate: the outward-rounded page pair a byte range occupies.
     static MemoRange MemoRangeOf(VAddr addr, u64 size) noexcept;
 
-    /// findimg_range_invalidate: clear the image memo entries whose recorded T#
-    /// range intersects [addr, addr + size). GPU command thread only; while a
-    /// batch is open the range is queued instead and the pass runs once.
+    /// findimg_range_invalidate: clear image memo entries intersecting [addr, addr + size). GPU
+    /// command thread only; queued instead while a batch is open.
     SHAD_NO_INLINE void InvalidateMemoRange(VAddr addr, u64 size);
 
-    /// findimg_range_invalidate: invalidate the memo for one image's range,
-    /// walking it when the caller is the GPU command thread and falling back to
-    /// a global generation bump when it is not.
+    /// findimg_range_invalidate: walks on the GPU command thread, else bumps the memo generation.
     void InvalidateMemoForImage(const ImageInfo& info);
 
     /// Apply every queued range in one pass over the side array.
     SHAD_NO_INLINE void FlushMemoRangeBatch();
+
+    /// One pass over the side array for `count` ranges; `count == 1` is the single-range walk.
+    void MemoRangeWalk(const MemoRange* ranges, u32 count);
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
@@ -534,8 +508,7 @@ private:
     }
     void TouchImageSlow(Image& image, ImageId id);
     // FindTexture's two cold arms: the storage binding's mark-and-update, and
-    // the view resolve with its memo write-back. The header keeps only the
-    // update dispatch and the memoized-handle return.
+    // the view resolve with its memo write-back.
     SHAD_NO_INLINE void FindTextureStorage(Image& image, ImageId image_id);
     SHAD_NO_INLINE vk::ImageView FindTextureSlow(Image& image, ImageId image_id,
                                                  const ImageDesc& desc);
@@ -554,12 +527,13 @@ private:
     // Lock-free tier of UpdateImage: a clean, tracked image touched within the
     // interval proves the locked pass a no-op. Callers gate on image_fast_state.
     static constexpr u64 kTouchIntervalTicks = 8192;
+    static bool FastStateNoop(u64 fast, u64 now_tick) noexcept {
+        return (fast & (Image::kFastStateDirty | Image::kFastStateTracked)) ==
+                   Image::kFastStateTracked &&
+               now_tick - (fast >> Image::kFastStateTouchShift) <= kTouchIntervalTicks;
+    }
     bool UpdateImageFast(const Image& image, u64 now_tick) {
-        const u64 fast = image.ReadFastState();
-        const bool dirty = (fast & Image::kFastStateDirty) != 0;
-        const bool tracked = (fast & Image::kFastStateTracked) != 0;
-        const u64 last_tick = fast >> Image::kFastStateTouchShift;
-        if (dirty || !tracked || now_tick - last_tick > kTouchIntervalTicks) {
+        if (!FastStateNoop(image.ReadFastState(), now_tick)) {
             return false;
         }
         update_fast_ += image_update_direct;
@@ -590,20 +564,6 @@ private:
     u64 sampler_slow_{};
     u64 sampler_touches_{};
 
-public:
-    struct SamplerStats {
-        u64 calls;
-        u64 slow;
-        u64 touches;
-        u64 map;
-    };
-    SamplerStats DrainSamplerStats() {
-        const SamplerStats out{sampler_calls_, sampler_slow_, sampler_touches_, samplers.size()};
-        sampler_calls_ = sampler_slow_ = sampler_touches_ = 0;
-        return out;
-    }
-
-private:
     // Image memo entry: line 0 holds what a probe and a hit read, line 1 what a
     // consumed hit copies out, line 2 the stamps of the locked touch path and
     // the recency stamp the victim scan reads.
@@ -644,11 +604,11 @@ private:
     // deferred << 10 | timed << 11, one register for the probe's verdicts.
     SHAD_NO_INLINE ImageId FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image& tsharp,
                                                  FindImageMemoEntry& e, u64 packed, u64 tex_gen);
-    // findimg_memo_first: the T# validation the rasterizer ran before every
-    // probe, moved to the routes that reach FindImage. A pure function of the
-    // T# bytes; every populate follows a gated FindImage, so a consumed hit
-    // needs no gate, and a new populate site must be gated too.
+    // findimg_memo_first: T# validation. A pure function of the T# bytes; every populate follows a
+    // gated FindImage, so a consumed hit needs no gate, and a new populate site must be gated too.
     SHAD_NO_INLINE bool GateTsharp(const AmdGpu::Image& tsharp);
+    bool MemoEntryMatches(const FindImageMemoEntry& e, const ImageDesc& desc,
+                          ImageId image_id) const;
     u64 tsgate_calls_{};
     u64 tsgate_rejects_{};
     u64 view_memo_hits_{};
@@ -798,6 +758,29 @@ public:
         return out;
     }
 
+    struct SamplerStats {
+        u64 calls;
+        u64 slow;
+        u64 touches;
+        u64 map;
+    };
+    SamplerStats DrainSamplerStats() {
+        const SamplerStats out{sampler_calls_, sampler_slow_, sampler_touches_, samplers.size()};
+        sampler_calls_ = sampler_slow_ = sampler_touches_ = 0;
+        return out;
+    }
+
+    struct InvalidateFilterStats {
+        u64 probes;
+        u64 skips;
+        u64 unsound;
+    };
+    InvalidateFilterStats DrainInvalidateFilterStats() noexcept {
+        return {invfilter_probes_.exchange(0, std::memory_order_relaxed),
+                invfilter_skips_.exchange(0, std::memory_order_relaxed),
+                invfilter_unsound_.exchange(0, std::memory_order_relaxed)};
+    }
+
 private:
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);
@@ -808,7 +791,6 @@ private:
     void GarbageCollectImages();
     void GarbageCollectSamplers();
 
-private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
@@ -853,27 +835,26 @@ private:
     u64 lru_lazy_frees_{};
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
-    // Latched once at construction; gates the lock-free UpdateImage fast path.
+    // All latched once at construction; image_fast_state gates the lock-free
+    // UpdateImage fast path.
     bool image_fast_state;
-    bool view_memo;              // latched once at construction
-    bool sampler_lockfree;       // latched once at construction
-    bool findimg_touch_lockfree; // latched once at construction
-    bool findimg_touch_batch;    // latched once at construction; needs findimg_touch_lockfree
-    bool findimg_trust_gen;      // latched once at construction
-    bool findimg_range_inval;    // latched once at construction; needs findimg_trust_gen
-    bool memo_first;             // latched once at construction
-    bool bind_noop;              // latched once at construction; needs view_memo
-    bool image_update_direct;    // latched once at construction; needs image_fast_state
-    bool lru_log;                // latched once at construction
-    bool lru_lazy_touch;         // latched once at construction; needs !lru_log
-    bool invalidate_filter;      // latched once at construction
+    bool view_memo;
+    bool sampler_lockfree;
+    bool findimg_touch_lockfree;
+    bool findimg_touch_batch; // needs findimg_touch_lockfree
+    bool findimg_trust_gen;
+    bool findimg_range_inval; // needs findimg_trust_gen
+    bool memo_first;
+    bool bind_noop;           // needs view_memo
+    bool image_update_direct; // needs image_fast_state
+    bool lru_log;
+    bool lru_lazy_touch; // needs !lru_log
+    bool invalidate_filter;
     u64 update_fast_{};
     u64 update_relock_{};
     u64 update_full_{};
     u64 bind_noop_records_{};
     u64 bind_noop_zero_{};
-    bool MemoEntryMatches(const FindImageMemoEntry& e, const ImageDesc& desc,
-                          ImageId image_id) const;
     u32 memo_ways;      // findimg_memo_ways, clamped to 0/1/2/4 at construction
     u32 memo_set_shift; // 64 - log2(sets): the mixed T# key's top bits index the set
     std::array<u64, 4> findimg_way_hits_{};
@@ -900,12 +881,10 @@ private:
         MetaType type;
         s32 clear_mask = -1;
     };
-    // Guest addresses are at least 256-byte aligned, and tsl::robin_map
-    // masks the hash with a power-of-two bucket count: the default identity
-    // hash then reaches only every 2^k-th home bucket and robin-hood
-    // displacement builds long clustered probe chains - the chains were
-    // ~75% of FindImage. The splitmix64 finalizer pushes entropy into the
-    // LOW bits the mask keeps.
+    // Guest addresses are at least 256-byte aligned and tsl::robin_map masks
+    // the hash to a power-of-two bucket count, so an identity hash reaches
+    // only every 2^k-th home bucket and clusters. The splitmix64 finalizer
+    // pushes entropy into the LOW bits the mask keeps.
     struct MixedVAddrHash {
         size_t operator()(VAddr addr) const noexcept {
             u64 a = addr;
@@ -924,25 +903,21 @@ private:
     // Dense dedup bits for ForEachImageInRegion, indexed by ImageId; sized to
     // the slot vector's index capacity at walk start.
     std::vector<u8> image_picked_;
-    // Exact-address filter fields, dense and indexed by ImageId. The filter
-    // read them out of each candidate's Image, where guest_size sits 320 bytes
-    // from the extent and format block, so a candidate cost two cold lines of
-    // a 768-byte slot. Every field is fixed while the image is registered.
-    struct AddrFilter {
+    // Exact-address filter fields, dense and indexed by ImageId: a copy of what
+    // the filter otherwise read from two cold lines of the candidate's 768-byte
+    // Image slot. Every field is fixed while the image is registered.
+    struct alignas(32) AddrFilter {
         u32 guest_size;
         vk::Format pixel_format;
         u32 type;
         SubresourceExtent resources;
         Extent3D size;
     };
+    // 32-byte alignment keeps every record inside one 64-byte line.
     static_assert(sizeof(AddrFilter) == 32);
-    // 64-byte storage so no 32-byte record straddles two lines.
-    struct alignas(64) AddrFilterPair {
-        std::array<AddrFilter, 2> records;
-    };
-    std::vector<AddrFilterPair> addr_filter_;
+    std::vector<AddrFilter> addr_filter_;
     AddrFilter& AddrFilterOf(u32 index) {
-        return addr_filter_[index >> 1].records[index & 1];
+        return addr_filter_[index];
     }
     u64 addr_filter_calls_{};
     u64 addr_filter_cands_{};
@@ -956,28 +931,17 @@ private:
     // page table and cleared only once no image is left in it, so a clear
     // bit proves the locked walk would visit nothing. Always maintained, so
     // the probe can be audited with the filter off.
-public:
-    struct InvalidateFilterStats {
-        u64 probes;
-        u64 skips;
-        u64 unsound;
-    };
-    InvalidateFilterStats DrainInvalidateFilterStats() noexcept {
-        return {invfilter_probes_.exchange(0, std::memory_order_relaxed),
-                invfilter_skips_.exchange(0, std::memory_order_relaxed),
-                invfilter_unsound_.exchange(0, std::memory_order_relaxed)};
-    }
-
-private:
     static constexpr u32 CoverGranuleBits = 16;
     static constexpr size_t CoverWords = size_t{1} << (40 - CoverGranuleBits - 6);
+    static constexpr u64 CoverLastGranule = (u64{CoverWords} << 6) - 1;
     bool CoverAny(VAddr addr, size_t size) const noexcept {
         const u64 first = addr >> CoverGranuleBits;
         const u64 last = (addr + size - 1) >> CoverGranuleBits;
+        if (last > CoverLastGranule) {
+            // Past the bitmap: nothing is certified, so the walk must run.
+            return true;
+        }
         for (u64 g = first; g <= last; ++g) {
-            if ((g >> 6) >= CoverWords) {
-                return true;
-            }
             if ((invalidate_cover_[g >> 6].load(std::memory_order_acquire) >> (g & 63)) & 1) {
                 return true;
             }
@@ -987,14 +951,16 @@ private:
     void CoverSet(VAddr addr, size_t size) noexcept {
         const u64 first = addr >> CoverGranuleBits;
         const u64 last = (addr + size - 1) >> CoverGranuleBits;
-        for (u64 g = first; g <= last && (g >> 6) < CoverWords; ++g) {
+        const u64 lim = last < CoverLastGranule ? last : CoverLastGranule;
+        for (u64 g = first; g <= lim; ++g) {
             invalidate_cover_[g >> 6].fetch_or(u64{1} << (g & 63), std::memory_order_release);
         }
     }
     void CoverRecompute(VAddr addr, size_t size) {
         const u64 first = addr >> CoverGranuleBits;
         const u64 last = (addr + size - 1) >> CoverGranuleBits;
-        for (u64 g = first; g <= last && (g >> 6) < CoverWords; ++g) {
+        const u64 lim = last < CoverLastGranule ? last : CoverLastGranule;
+        for (u64 g = first; g <= lim; ++g) {
             // Straight off the page table: the picked dedup of the image walk
             // would hide an image an enclosing walk has already visited.
             const VAddr g_addr = g << CoverGranuleBits;
@@ -1047,6 +1013,20 @@ private:
     // Bumped off the GPU command thread on the unmap and video-out routes,
     // drained on the GPU command thread: atomic for that read alone.
     std::atomic<u64> memo_gen_bumps_{};
+
+    // The memo generation the probe certifies with, plus its drain counter.
+    void BumpImgMemoGen() {
+        img_memo_gen_.fetch_add(1, std::memory_order_release);
+        memo_gen_bumps_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // A rebind changes what a binding must resolve to beyond the T# range, so
+    // the range-scoped arm still invalidates globally.
+    void NoteRebind() {
+        Skipcache::Framework::Instance().BumpTexGen();
+        if (findimg_range_inval) {
+            BumpImgMemoGen();
+        }
+    }
 };
 
 } // namespace VideoCore
