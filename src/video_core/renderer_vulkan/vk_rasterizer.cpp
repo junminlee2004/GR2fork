@@ -1367,6 +1367,12 @@ void Rasterizer::OnSubmit() {
                          "dead={} per300f",
                          ll.pushes, ll.walked, ll.skipped, ll.compactions, ll.size, ll.dead);
             }
+            if (const auto lz = texture_cache.DrainLruLazyStats(); lz.enabled) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] LRULAZY gcruns={} hard={} visits={} maxvisit={} relinks={} "
+                         "frees={} per300f",
+                         lz.gc_runs, lz.hard, lz.visits, lz.maxvisit, lz.relinks, lz.frees);
+            }
             if (const auto fw = texture_cache.DrainFindImageWayStats(); fw.ways) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] FINDIMGWAYS ways={} entries={} hits={}/{}/{}/{} evict={} "

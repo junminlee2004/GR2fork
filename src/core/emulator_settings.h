@@ -469,6 +469,10 @@ struct GPUSettings {
     // invalidate; off keeps the live read. With it on, a mid-run readbacks_mode change from the
     // settings dialog no longer reaches the tracker until restart.
     Setting<bool> tracker_mode_latch{false};
+    // Image touches only stamp the per-image gc tick; the LRU list is relinked when the garbage
+    // collector walk meets an entry touched since its list tick, so a hot image is relinked once
+    // per ticks_to_destroy instead of once per tick. List mode only (ignored with texture_lru_log).
+    Setting<bool> texture_lru_lazy_touch{false};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -830,6 +834,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_copy_gfx_queue),
             make_override<GPUSettings>("submit_thread", &GPUSettings::submit_thread),
             make_override<GPUSettings>("tracker_mode_latch", &GPUSettings::tracker_mode_latch),
+            make_override<GPUSettings>("texture_lru_lazy_touch",
+                                       &GPUSettings::texture_lru_lazy_touch),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -952,6 +958,8 @@ struct GPUSettings {
     window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
     stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, submit_thread, tracker_mode_latch, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, \
+    texture_lru_lazy_touch, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -1261,6 +1269,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackCopyGfxQueue, readback_copy_gfx_queue)
     SETTING_FORWARD_BOOL(m_gpu, SubmitThread, submit_thread)
     SETTING_FORWARD_BOOL(m_gpu, TrackerModeLatch, tracker_mode_latch)
+    SETTING_FORWARD_BOOL(m_gpu, TextureLruLazyTouch, texture_lru_lazy_touch)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)

@@ -60,6 +60,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
       image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
       lru_log{EmulatorSettings.IsTextureLruLog()},
+      lru_lazy_touch{EmulatorSettings.IsTextureLruLazyTouch() && !lru_log},
       invalidate_filter{EmulatorSettings.IsTextureInvalidateFilter()},
       memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
       memo_set_shift{static_cast<u32>(
@@ -85,6 +86,10 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         LOG_WARNING(Render_Vulkan,
                     "batched image touches need findimg_touch_lockfree; the locked touch runs "
                     "unchanged");
+    }
+    if (EmulatorSettings.IsTextureLruLazyTouch() && !lru_lazy_touch) {
+        LOG_WARNING(Render_Vulkan,
+                    "lazy LRU touches apply to the list; texture_lru_log keeps its log");
     }
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -795,7 +800,13 @@ ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& ts
                     image.tick_accessed_last = current_tick;
                     image.gc_tick_accessed_last = gc_tick;
                     if (image.lru_touch_tick != gc_tick) {
-                        if (findimg_touch_batch) {
+                        if (lru_lazy_touch) {
+                            // Lazy mode: the stamp above is the whole touch. The
+                            // list keeps its older tick as a lower bound and the
+                            // GC walk relinks the entry when it meets it, so the
+                            // batch is never appended and never flushed.
+                            image.lru_touch_tick = gc_tick;
+                        } else if (findimg_touch_batch) {
                             // With batching the tick is stamped here and the log
                             // entry lands in the flush.
                             image.lru_touch_tick = gc_tick;
@@ -1934,6 +1945,9 @@ void TextureCache::GarbageCollectImages() {
         return;
     }
     std::scoped_lock lock{mutex};
+    lru_lazy_gc_runs_ += lru_lazy_touch;
+    u64 lazy_visits = 0;
+    bool lazy_hard = false;
     // Up to forty frees under one lock: queue their ranges and clear the memo
     // in a single pass instead of one pass per image. The flush runs before
     // the lock drops, and every memo probe is outside it.
@@ -1957,8 +1971,29 @@ void TextureCache::GarbageCollectImages() {
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        lazy_hard |= pressured || aggresive;
     };
     const auto clean_up = [&](ImageId image_id) {
+        if (lru_lazy_touch) {
+            ++lazy_visits;
+            // The list tick is only a lower bound on the last access in lazy
+            // mode, so an entry touched inside the walk window is relinked here
+            // instead of at every touch. The predicate MUST read
+            // gc_tick_accessed_last: lru_touch_tick starts at ~u64{0} and is
+            // stamped only in the lru_log branch of RegisterImage, so the
+            // unsigned subtract would wrap and protect never-touched images
+            // forever. The relink tick MUST be gc_tick: an older tick appended
+            // at the tail breaks the list's sort order and hence
+            // ForEachItemBelow's early-out. ticks_to_destroy == 0 (gc_tick 0)
+            // makes this never fire, so no entry is ever relinked at or below
+            // the walk threshold.
+            const Image& touched = slot_images[image_id];
+            if (gc_tick - touched.gc_tick_accessed_last < ticks_to_destroy) {
+                lru_cache.Touch(touched.lru_id, gc_tick);
+                ++lru_lazy_relinks_;
+                return false;
+            }
+        }
         if (num_deletions == 0) {
             return true;
         }
@@ -1977,6 +2012,7 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
+        lru_lazy_frees_ += lru_lazy_touch;
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
@@ -2000,6 +2036,11 @@ void TextureCache::GarbageCollectImages() {
         configure(true);
         ForEachLruBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+    // Per-pass worst case: a per300f total cannot tell an amortised pass from a
+    // one-off sweep of the whole live set after a long stretch below the trigger.
+    lru_lazy_visits_ += lazy_visits;
+    lru_lazy_maxvisit_ = std::max(lru_lazy_maxvisit_, lazy_visits);
+    lru_lazy_hard_ += lru_lazy_touch && lazy_hard;
 }
 
 void TextureCache::GarbageCollectSamplers() {
@@ -2097,6 +2138,13 @@ u32 TextureCache::MemoVictim(const FindImageMemoEntry* set, u32 ways) const {
 void TextureCache::TouchImageSlow(Image& image, ImageId id) {
     if (!lru_log) {
         image.lru_touch_tick = gc_tick;
+        if (lru_lazy_touch) {
+            // Two aligned stores of a monotonic tick and no list mutation: the
+            // callers that reach here without the mutex (TouchImageSlowUnlocked)
+            // stop racing on the shared list entirely.
+            image.gc_tick_accessed_last = gc_tick;
+            return;
+        }
         lru_cache.Touch(image.lru_id, gc_tick);
         return;
     }

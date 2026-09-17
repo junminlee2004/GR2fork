@@ -775,6 +775,23 @@ public:
         lru_log_pushes_ = lru_log_walked_ = lru_log_skipped_ = lru_log_compactions_ = 0;
         return out;
     }
+    struct LruLazyStats {
+        bool enabled;
+        u64 gc_runs;
+        u64 hard;
+        u64 visits;
+        u64 maxvisit;
+        u64 relinks;
+        u64 frees;
+    };
+    LruLazyStats DrainLruLazyStats() {
+        const LruLazyStats out{lru_lazy_touch,   lru_lazy_gc_runs_,  lru_lazy_hard_,
+                               lru_lazy_visits_, lru_lazy_maxvisit_, lru_lazy_relinks_,
+                               lru_lazy_frees_};
+        lru_lazy_gc_runs_ = lru_lazy_hard_ = lru_lazy_visits_ = lru_lazy_maxvisit_ =
+            lru_lazy_relinks_ = lru_lazy_frees_ = 0;
+        return out;
+    }
     ViewMemoStats DrainViewMemoStats() {
         const ViewMemoStats out{view_memo_hits_, view_memo_slow_, view_memo_writebacks_};
         view_memo_hits_ = view_memo_slow_ = view_memo_writebacks_ = 0;
@@ -827,6 +844,13 @@ private:
     u64 lru_log_walked_{};
     u64 lru_log_skipped_{};
     u64 lru_log_compactions_{};
+    // Lazy-touch GC-walk accounting; only written with lru_lazy_touch latched on.
+    u64 lru_lazy_gc_runs_{};
+    u64 lru_lazy_hard_{};     // passes configured pressured or aggressive
+    u64 lru_lazy_visits_{};   // clean_up calls
+    u64 lru_lazy_maxvisit_{}; // most clean_up calls in one GarbageCollectImages pass
+    u64 lru_lazy_relinks_{};
+    u64 lru_lazy_frees_{};
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
     // Latched once at construction; gates the lock-free UpdateImage fast path.
@@ -841,6 +865,7 @@ private:
     bool bind_noop;              // latched once at construction; needs view_memo
     bool image_update_direct;    // latched once at construction; needs image_fast_state
     bool lru_log;                // latched once at construction
+    bool lru_lazy_touch;         // latched once at construction; needs !lru_log
     bool invalidate_filter;      // latched once at construction
     u64 update_fast_{};
     u64 update_relock_{};
