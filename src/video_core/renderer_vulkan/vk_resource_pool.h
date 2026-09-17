@@ -73,8 +73,7 @@ private:
 // pipeline maps.
 class PipelineLayoutCache final {
 public:
-    explicit PipelineLayoutCache(const Instance& instance);
-    ~PipelineLayoutCache();
+    explicit PipelineLayoutCache(const Instance& instance_) : instance{instance_} {}
 
     struct Layouts {
         vk::DescriptorSetLayout set;

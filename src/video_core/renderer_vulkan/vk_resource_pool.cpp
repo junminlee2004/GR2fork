@@ -102,10 +102,6 @@ vk::CommandBuffer CommandPool::Commit() {
     return cmd_buffers[index];
 }
 
-PipelineLayoutCache::PipelineLayoutCache(const Instance& instance_) : instance{instance_} {}
-
-PipelineLayoutCache::~PipelineLayoutCache() = default;
-
 PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
     std::span<const vk::DescriptorSetLayoutBinding> bindings,
     vk::DescriptorSetLayoutCreateFlags flags, const vk::PushConstantRange& push_constants,
