@@ -390,8 +390,13 @@ private:
 
     /// Copies islands of another job's share until its cursor is exhausted;
     /// false when none was left. Any thread, once the share is ready. The
-    /// bytes it copied are added to copied_bytes when one is given.
-    bool HelpWriteBack(WriteBackShare& share, u64* copied_bytes = nullptr);
+    /// bytes it copied are added to copied_bytes when one is given. A bail
+    /// predicate, when given, is polled before every claim past the first, and
+    /// a non-zero max_bytes stops claiming once that many bytes were copied;
+    /// either way a claimed island is always finished.
+    bool HelpWriteBack(WriteBackShare& share, u64* copied_bytes = nullptr,
+                       bool (*bail)(void*) = nullptr, void* bail_user = nullptr, u64 max_bytes = 0,
+                       u32* max_island = nullptr);
 
     /// Priority-ops thread, after the share's fence: copies islands until the
     /// cursor is exhausted; gives up as late when a non-coherent owner has not
@@ -413,6 +418,13 @@ private:
     /// Same, from a thread that may not be the GPU command thread: hops over
     /// when it is not, so the parked state stays GPU-command-thread confined.
     void DrainPendingFinishSynced();
+    /// GPU command thread, drained while it has nothing else to do: copies
+    /// islands of a share up to a byte cap, yielding at the first island
+    /// boundary after a submit or command arrives.
+    void HelpAsGpuIdle(WriteBackShare& share);
+
+    /// HelpWriteBack bail for HelpAsGpuIdle; the argument is its bail context.
+    static bool GpuIdleBail(void* user);
 
     using OwnedIslands = boost::container::small_vector<std::pair<VAddr, u32>, 16>;
     /// Islands of in-flight readbacks that overlap [start, end), sorted by
@@ -712,6 +724,24 @@ public:
         u64 excluded;
         u64 copy_ns;
     };
+    struct WbIdleStats {
+        u64 posted;
+        u64 ran;
+        u64 skipped;
+        u64 bailed;
+        u64 late;
+        u64 bytes;
+        u32 max_island;
+    };
+    WbIdleStats DrainWbIdleStats() {
+        return WbIdleStats{wbidle_posted_.exchange(0, std::memory_order_relaxed),
+                           wbidle_ran_.exchange(0, std::memory_order_relaxed),
+                           wbidle_skipped_.exchange(0, std::memory_order_relaxed),
+                           wbidle_bailed_.exchange(0, std::memory_order_relaxed),
+                           wbidle_late_.exchange(0, std::memory_order_relaxed),
+                           wbidle_bytes_.exchange(0, std::memory_order_relaxed),
+                           wbidle_max_island_.exchange(0, std::memory_order_relaxed)};
+    }
     WriteBackOffloadStats DrainWriteBackOffloadStats() {
         const WriteBackOffloadStats out{wboff_guest_, wboff_prio_, wboff_gpucomm_, wboff_excluded_,
                                         wboff_copy_ns_};
@@ -925,6 +955,7 @@ private:
     bool finish_split_{};
     bool writeback_share_{};
     bool writeback_helper_{};
+    bool writeback_gpucomm_idle_{};
     bool texel_sync_noop_{};
     bool vertex_lazy_desc_{};
     bool vinput_fetch_key_{};
@@ -947,6 +978,13 @@ private:
     u64 wboff_gpucomm_{};
     u64 wboff_excluded_{};
     u64 wboff_copy_ns_{};
+    std::atomic<u64> wbidle_posted_{};
+    std::atomic<u64> wbidle_ran_{};
+    std::atomic<u64> wbidle_skipped_{};
+    std::atomic<u64> wbidle_bailed_{};
+    std::atomic<u64> wbidle_late_{};
+    std::atomic<u64> wbidle_bytes_{};
+    std::atomic<u32> wbidle_max_island_{};
     std::array<u64, static_cast<size_t>(ReadArmSite::Count)> rarm_drains_{};
     u64 rarm_regions_{};
     u64 rarm_pages_{};

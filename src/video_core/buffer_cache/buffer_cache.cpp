@@ -76,6 +76,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
     writeback_share_ = writeback_offload_ && EmulatorSettings.IsReadbackWritebackShare();
     writeback_helper_ = writeback_share_ && EmulatorSettings.IsReadbackWritebackHelper();
+    writeback_gpucomm_idle_ =
+        writeback_share_ && writeback_offload_ && EmulatorSettings.IsReadbackWritebackGpucommIdle();
     texel_sync_noop_ = EmulatorSettings.IsTexelSyncNoop();
     vertex_lazy_desc_ = EmulatorSettings.IsVertexInputLazyDesc();
     vinput_fetch_key_ = EmulatorSettings.IsVinputFetchKey() && vertex_lazy_desc_;
@@ -714,6 +716,17 @@ void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
         // every claimed one, so the bytes are all in place when it returns.
         auto& s = *job.share;
         s.ready.store(true, std::memory_order_release);
+        if (writeback_gpucomm_idle_ && !liverpool->OnGpuThread() && !liverpool->HasPendingWork()) {
+            // readback_writeback_gpucomm_idle: the GPU command thread sleeps
+            // through this write-back waiting for the Finish; hand it the same
+            // cursor the priority thread takes from. Posted only while it has
+            // nothing queued, because the help is one-shot: one that lands on a
+            // parsing thread bails at the next packet poll and is lost. The
+            // share is captured, never the job, which the bounded path moves.
+            auto share = job.share;
+            liverpool->SendCommand<false>([this, share] { HelpAsGpuIdle(*share); });
+            wbidle_posted_.fetch_add(1, std::memory_order_relaxed);
+        }
         u64 mine = 0;
         for (u32 idx = s.next.fetch_add(1, std::memory_order_acq_rel); idx < s.total;
              idx = s.next.fetch_add(1, std::memory_order_acq_rel)) {
@@ -744,7 +757,8 @@ void BufferCache::WriteBackFaultDownload(FaultDownloadJob& job, u8 copier) {
     job.copied = true;
 }
 
-bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes) {
+bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes, bool (*bail)(void*),
+                                void* bail_user, u64 max_bytes, u32* max_island) {
     auto* memory = Core::Memory::Instance();
     // The hold comes before the first claim, so no claimed island waits on
     // the map while the owner waits on it.
@@ -764,6 +778,14 @@ bool BufferCache::HelpWriteBack(WriteBackShare& s, u64* copied_bytes) {
         s.done.fetch_add(1, std::memory_order_release);
         ++n;
         bytes += p.size;
+        if (max_island != nullptr && p.size > *max_island) {
+            *max_island = p.size;
+        }
+        // Checked between claims only: a claimed island is always finished, so
+        // the owner's tail wait never blocks on a bailed-out copier.
+        if ((max_bytes != 0 && bytes >= max_bytes) || (bail != nullptr && bail(bail_user))) {
+            break;
+        }
         idx = s.next.fetch_add(1, std::memory_order_acq_rel);
     } while (idx < s.total);
     share_helped_.fetch_add(n, std::memory_order_relaxed);
@@ -785,6 +807,12 @@ inline void SpinRelax() {
     asm("yield");
 #endif
 }
+// Bail state for the GPU command thread's idle help: the parser it must return
+// to, and whether it was the one that stopped the copy.
+struct GpuIdleBailCtx {
+    AmdGpu::Liverpool* liverpool;
+    bool fired;
+};
 } // namespace
 
 void BufferCache::HelpAsPriority(WriteBackShare& s) {
@@ -811,6 +839,42 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
         prio_bytes_.fetch_add(bytes, std::memory_order_relaxed);
     } else {
         prio_late_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool BufferCache::GpuIdleBail(void* user) {
+    auto& ctx = *static_cast<GpuIdleBailCtx*>(user);
+    ctx.fired = ctx.fired || ctx.liverpool->HasPendingWork();
+    return ctx.fired;
+}
+
+void BufferCache::HelpAsGpuIdle(WriteBackShare& s) {
+    // Only guard on the first claim: HelpWriteBack takes island #1 ahead of the
+    // loop the bail predicate sits in.
+    if (liverpool->HasPendingWork()) {
+        wbidle_skipped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // A single island is a contiguous GPU-dirty run with no size cap of its
+    // own, so the yield latency is bounded in bytes too.
+    constexpr u64 IdleHelpBytes = 256_KB;
+    GpuIdleBailCtx ctx{liverpool, false};
+    u64 bytes = 0;
+    u32 max_island = 0;
+    if (!HelpWriteBack(s, &bytes, &GpuIdleBail, &ctx, IdleHelpBytes, &max_island)) {
+        // The owner emptied the cursor before the command was drained.
+        wbidle_late_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    wbidle_ran_.fetch_add(1, std::memory_order_relaxed);
+    wbidle_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    if (ctx.fired || bytes >= IdleHelpBytes) {
+        wbidle_bailed_.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (u32 prev = wbidle_max_island_.load(std::memory_order_relaxed); prev < max_island;) {
+        if (wbidle_max_island_.compare_exchange_weak(prev, max_island, std::memory_order_relaxed)) {
+            break;
+        }
     }
 }
 

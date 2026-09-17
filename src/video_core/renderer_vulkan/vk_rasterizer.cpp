@@ -1126,6 +1126,15 @@ void Rasterizer::OnSubmit() {
                          "per300f",
                          wo.guest, wo.prio, wo.gpucomm, wo.excluded, ms(wo.copy_ns));
             }
+            if (EmulatorSettings.IsReadbackWritebackGpucommIdle()) {
+                if (const auto wi = buffer_cache.DrainWbIdleStats(); wi.posted) {
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] WBIDLE posted={} ran={} skipped={} bailed={} late={} "
+                             "KiB={} max_island_KiB={} per300f",
+                             wi.posted, wi.ran, wi.skipped, wi.bailed, wi.late, wi.bytes >> 10,
+                             wi.max_island >> 10);
+                }
+            }
             if (const auto ws = buffer_cache.DrainWriteBackShareStats(); ws.shares || ws.joins) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] WBSHARE shares={} joins={} fencewaits={} helped={} "

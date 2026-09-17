@@ -124,6 +124,13 @@ public:
         rasterizer = rasterizer_;
     }
 
+    /// True when a submit or a queued command is waiting for the parser. Work
+    /// the GPU command thread runs while otherwise idle polls this to yield.
+    bool HasPendingWork() const noexcept {
+        return num_submits.load(std::memory_order_relaxed) != 0 ||
+               num_commands.load(std::memory_order_relaxed) != 0;
+    }
+
     bool OnGpuThread() const noexcept {
         return std::this_thread::get_id() == gpu_id;
     }

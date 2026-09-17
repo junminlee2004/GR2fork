@@ -584,6 +584,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU submitThread: {}", EmulatorSettings.IsSubmitThread());
     LOG_INFO(Config, "GPU trackerModeLatch: {}", EmulatorSettings.IsTrackerModeLatch());
     LOG_INFO(Config, "GPU textureLruLazyTouch: {}", EmulatorSettings.IsTextureLruLazyTouch());
+    LOG_INFO(Config, "GPU readbackWritebackGpucommIdle: {}",
+             EmulatorSettings.IsReadbackWritebackGpucommIdle());
     LOG_INFO(Config, "GPU readbackBatching: {}", EmulatorSettings.IsReadbackBatchingEnabled());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
