@@ -213,20 +213,21 @@ static const std::unordered_map<vk::Format, CompatibilityClass> FORMAT_TABLE = {
 // candidate in the FindImage match loop. Built once from FORMAT_TABLE so the
 // data stays in one place; formats outside the array keep the original map
 // lookup.
-static CompatibilityClass FormatClass(vk::Format format) {
-    static const auto flat = [] {
-        std::array<CompatibilityClass, 256> table{};
-        for (const auto& [fmt, cls] : FORMAT_TABLE) {
-            const auto index = static_cast<u32>(fmt);
-            if (index < table.size()) {
-                table[index] = cls;
-            }
+static const std::array<CompatibilityClass, 256> FORMAT_CLASS_FLAT = [] {
+    std::array<CompatibilityClass, 256> table{};
+    for (const auto& [fmt, cls] : FORMAT_TABLE) {
+        const auto index = static_cast<u32>(fmt);
+        if (index < table.size()) {
+            table[index] = cls;
         }
-        return table;
-    }();
+    }
+    return table;
+}();
+
+static CompatibilityClass FormatClass(vk::Format format) {
     const auto index = static_cast<u32>(format);
-    if (index < flat.size()) [[likely]] {
-        return flat[index];
+    if (index < FORMAT_CLASS_FLAT.size()) [[likely]] {
+        return FORMAT_CLASS_FLAT[index];
     }
     return FORMAT_TABLE.at(format);
 }
