@@ -524,6 +524,16 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
+bool PageManager::IsWriteWatched(VAddr addr, u64 size) const {
+    const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+    for (size_t page = addr >> PM_PAGE_BITS; page < page_end; ++page) {
+        if (impl->cached_pages[page].num_write_watchers != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <bool track>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
     impl->UpdatePageWatchers<track, false>(addr, size);

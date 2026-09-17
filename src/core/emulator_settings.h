@@ -601,6 +601,11 @@ struct GPUSettings {
     // render pass. Vulkan defines no read-after-read hazard; the next write transition then
     // sources the union of every reader since the last write.
     Setting<bool> buffer_barrier_read_merge{false};
+    // Routes PM4 WriteData and DumpConstRam into a write-armed page through the backing alias,
+    // marking the page CPU-dirty while its write watcher stays: no SIGSEGV, no release, no re-arm.
+    // Only writes that fit inside one 4 KiB page take the path; a range holding GPU-modified pages
+    // keeps the fault path.
+    Setting<bool> cp_write_backing{false};
     // Stream-copy and index-bind memo entries remember the tracker region that
     // covered their range, so a hit re-certifies the word-epoch sum with that
     // region's own loads instead of the tracker walk.
@@ -907,6 +912,7 @@ struct GPUSettings {
                                        &GPUSettings::findimg_range_invalidate),
             make_override<GPUSettings>("buffer_barrier_read_merge",
                                        &GPUSettings::buffer_barrier_read_merge),
+            make_override<GPUSettings>("cp_write_backing", &GPUSettings::cp_write_backing),
             make_override<GPUSettings>("stream_copy_resolved_epoch",
                                        &GPUSettings::stream_copy_resolved_epoch),
             make_override<GPUSettings>("written_range_fast", &GPUSettings::written_range_fast),
@@ -994,21 +1000,11 @@ struct GPUSettings {
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, \
     adaptive_skipcaches_mode, stream_buffer_size_mb, readback_batching_enabled, \
     readback_offload, readback_copy_gfx_queue, submit_thread, tracker_mode_latch, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload, \
-    readback_copy_gfx_queue, texture_lru_lazy_touch, stream_buffer_size_mb, \
-    readback_batching_enabled, readback_offload, readback_copy_gfx_queue, \
-    readback_writeback_gpucomm_idle, stream_buffer_size_mb, readback_batching_enabled, \
-    readback_offload, readback_copy_gfx_queue, gather_input_memo, stream_buffer_size_mb, \
-    readback_batching_enabled, readback_offload, readback_copy_gfx_queue, \
-    tracker_lock_spin_rounds, stream_buffer_size_mb, readback_batching_enabled, \
-    readback_offload, readback_copy_gfx_queue, ring_drain_flush_draws, copy_gpu_buffers, \
-    readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload, \
-    readback_copy_gfx_queue, protect_carry_merge, stream_buffer_prefer_host, \
-    direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, \
-    full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, \
-    rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode
-#define GPU_SETTINGS_JSON_FIELDS_B \
+    texture_lru_lazy_touch, readback_writeback_gpucomm_idle, gather_input_memo, \
+    tracker_lock_spin_rounds, ring_drain_flush_draws, protect_carry_merge, \
+    stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
+    vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
+    rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
     spec_fp_canonical, texture_view_memo, sampler_memo_lockfree, desc_delta_inplace, \
     bind_line_prefetch, guest_copy_hold_segment, findimg_touch_lockfree, \
     findimg_touch_batch, findimg_trust_gen, findimg_range_invalidate, \
@@ -1016,7 +1012,8 @@ struct GPUSettings {
     spec_fp_slot_inplace, spec_fp_front, findimg_memo_ways, findimg_memo_entries, \
     bind_noop_memo, spec_key_fast, gpu_range_set_lockfree, gpu_range_set_flat, \
     readback_writeback_hold, backing_write_memo, image_update_direct, desc_layout_share, \
-    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload, \
+    vertex_input_lazy_desc, runtime_info_input_memo, readback_writeback_offload
+#define GPU_SETTINGS_JSON_FIELDS_B \
     key_reuse_hash_diff, desc_delta_partial, shader_params_memo_entries, dyn_state_stamp, \
     texture_lru_log, texel_sync_noop, deferred_read_arm, static_color_write_mask, \
     spec_key_fused, parser_reg_run, push_const_dedup, stream_copy_idle_us, \
@@ -1026,12 +1023,12 @@ struct GPUSettings {
     finish_release_faulted_first, occlude_all, stream_copy_upload_drain, \
     flush_draw_interval, pipeline_key_stamp_reuse, shader_params_memo, pending_pop_throttle, \
     fault_widen_bytes, stream_copy_workers, stream_findbuffer_elide, dyn_state_memo, \
-    runtime_info_stamp_gate
-#define GPU_SETTINGS_JSON_FIELDS_C \
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
     desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
     draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release, \
-    image_fast_state, guest_copy_lock_batch, spec_fp_cache
+    image_fast_state, guest_copy_lock_batch
+#define GPU_SETTINGS_JSON_FIELDS_C \
+    spec_fp_cache, cp_write_backing, runtime_info_stamp_gate
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1347,6 +1344,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FindimgTrustGen, findimg_trust_gen)
     SETTING_FORWARD_BOOL(m_gpu, FindimgRangeInvalidate, findimg_range_invalidate)
     SETTING_FORWARD_BOOL(m_gpu, BufferBarrierReadMerge, buffer_barrier_read_merge)
+    SETTING_FORWARD_BOOL(m_gpu, CpWriteBacking, cp_write_backing)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyResolvedEpoch, stream_copy_resolved_epoch)
     SETTING_FORWARD(m_gpu, WrittenRangeFast, written_range_fast)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpSlotInplace, spec_fp_slot_inplace)

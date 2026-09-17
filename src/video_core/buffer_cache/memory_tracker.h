@@ -229,6 +229,29 @@ public:
         return region->template PeekRegionModified<Type::GPU>(region_offset, size);
     }
 
+    /// Mark region as CPU modified while its write watchers stay in place: the
+    /// caller is about to put the bytes there itself, through the backing
+    /// alias, so no release and no re-arm is needed and the guest keeps
+    /// faulting on the page. Returns false when the range holds a GPU-modified
+    /// page or a pending read release - the caller must then store normally
+    /// and take the ordinary fault, which runs the readback path unchanged.
+    [[nodiscard]] bool MarkRegionAsCpuModifiedKeepArmed(VAddr dirty_cpu_addr, u64 query_size) {
+        bool ok = true;
+        IteratePages<false>(
+            dirty_cpu_addr, query_size, [&ok](RegionManager* manager, u64 offset, size_t size) {
+                std::scoped_lock lk{manager->lock};
+                if (manager->read_release_pending_ ||
+                    (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                     manager->template IsRegionModified<Type::GPU>(offset, size))) {
+                    ok = false;
+                    return;
+                }
+                manager->template ChangeRegionState<Type::CPU, true, false, true>(
+                    manager->GetCpuAddr() + offset, size);
+            });
+        return ok;
+    }
+
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
         IteratePages<false>(dirty_cpu_addr, query_size,

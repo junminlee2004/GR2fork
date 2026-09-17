@@ -436,8 +436,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            memcpy(dump_const->Address<void*>(),
-                   cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            const void* const dump_src = cblock.constants_heap.data() + dump_const->Offset();
+            if (!rasterizer || !rasterizer->TryCpWriteBacking(dump_const->Address<VAddr>(),
+                                                              dump_src, dump_const->Size())) {
+                memcpy(dump_const->Address<void*>(), dump_src, dump_const->Size());
+            }
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -1190,7 +1193,10 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             u64* address = write_data->Address<u64*>();
             if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(address, write_data->data, data_size);
+                if (!rasterizer || !rasterizer->TryCpWriteBacking(reinterpret_cast<VAddr>(address),
+                                                                  write_data->data, data_size)) {
+                    std::memcpy(address, write_data->data, data_size);
+                }
             } else {
                 UNREACHABLE();
             }
@@ -1577,7 +1583,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                if (!rasterizer || !rasterizer->TryCpWriteBacking(write_data->Address<VAddr>(),
+                                                                  write_data->data, data_size)) {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                }
             } else {
                 UNREACHABLE();
             }

@@ -73,6 +73,7 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
+    bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
@@ -390,6 +391,14 @@ private:
     // Gates the PCARRY telemetry line only; the behaviour is latched in PageManager.
     bool protect_carry_merge_{};
     bool deferred_read_release_{};
+    bool cp_write_backing_{};
+    // CPWRITE census, GPU command thread only: plain adds, drained per300f.
+    u64 cpwrite_seen_{};
+    u64 cpwrite_armed_{};
+    u64 cpwrite_backing_{};
+    u64 cpwrite_gpu_{};
+    u64 cpwrite_nofit_{};
+    u64 cpwrite_nobacking_{};
 
     // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
     void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);

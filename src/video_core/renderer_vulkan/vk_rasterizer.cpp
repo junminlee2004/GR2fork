@@ -126,6 +126,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         pipeline_cache.SetPreCompileHook(&Rasterizer::PreCompileThunk, this);
     }
     protect_carry_merge_ = EmulatorSettings.IsProtectCarryMerge();
+    cp_write_backing_ = EmulatorSettings.IsCpWriteBacking();
     deferred_read_arm_ = EmulatorSettings.IsDeferredReadArm();
     deferred_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     if (deferred_read_arm_) {
@@ -1517,6 +1518,15 @@ void Rasterizer::OnSubmit() {
             if (us.ro_calls || us.w_calls) {
                 LOG_INFO(Render_Skipcache, "[SkipCache] UPLOAD ro={} roMiB={} w={} wMiB={} per300f",
                          us.ro_calls, us.ro_bytes >> 20, us.w_calls, us.w_bytes >> 20);
+            }
+            if (cp_write_backing_ && cpwrite_seen_ != 0) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] CPWRITE writes={} armed={} backing={} gpu={} nofit={} "
+                         "nobacking={} per300f",
+                         cpwrite_seen_, cpwrite_armed_, cpwrite_backing_, cpwrite_gpu_,
+                         cpwrite_nofit_, cpwrite_nobacking_);
+                cpwrite_seen_ = cpwrite_armed_ = cpwrite_backing_ = cpwrite_gpu_ = cpwrite_nofit_ =
+                    cpwrite_nobacking_ = 0;
             }
             if (const auto ra = buffer_cache.DrainReadArmStats();
                 ra.drains[0] + ra.drains[1] + ra.drains[2] + ra.drains[3] + ra.drains[4] != 0) {
@@ -3117,6 +3127,53 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
     Skipcache::Framework::Instance().BumpMemGen();
+    return true;
+}
+
+bool Rasterizer::TryCpWriteBacking(VAddr addr, const void* data, u64 size) {
+    if (!cp_write_backing_ || size == 0) {
+        return false;
+    }
+    ++cpwrite_seen_;
+    // One page only. TryWriteBacking reports success after copying just the
+    // backed prefix of a range that runs into an unbacked VMA; a write inside
+    // a single page cannot do that, since VMAs and their physical areas are
+    // page granular, so there its `true` really means every byte moved.
+    if (VideoCore::PageManager::GetPageAddr(addr) !=
+        VideoCore::PageManager::GetPageAddr(addr + size - 1)) {
+        ++cpwrite_nofit_;
+        return false;
+    }
+    if (!IsMapped(addr, size)) {
+        // Outside any GPU mapping: nothing tracks the page, and the watcher
+        // table is only indexed for mapped addresses.
+        return false;
+    }
+    if (!page_manager.IsWriteWatched(addr, size)) {
+        // Writable page: the plain store neither faults nor marks anything.
+        return false;
+    }
+    ++cpwrite_armed_;
+    // The three locks below are taken and released in sequence, never nested:
+    // the region lock inside the tracker walk, then the texture cache mutex,
+    // then the memory manager's shared lock. A guest unmap takes them in the
+    // opposite order, so hoisting the backing write under the region lock
+    // would deadlock against it. Keep them sequential.
+    if (!buffer_cache.MarkCpuWriteKeepArmed(addr, size)) {
+        ++cpwrite_gpu_;
+        return false;
+    }
+    texture_cache.InvalidateMemory(addr, size);
+    // Today one fault per armed page pays this global bump; keeping the page armed
+    // makes EVERY armed CP write pay it (plus the texture invalidate walk). The arm
+    // is only worth it while cpwrite_armed_ stays near the RW->R pairs it removes -
+    // see the CPWRITE fail condition in the notes.
+    Skipcache::Framework::Instance().BumpMemGen();
+    if (!memory->TryWriteBacking(reinterpret_cast<void*>(addr), data, size)) {
+        ++cpwrite_nobacking_;
+        return false;
+    }
+    ++cpwrite_backing_;
     return true;
 }
 

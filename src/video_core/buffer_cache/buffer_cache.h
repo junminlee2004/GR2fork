@@ -631,6 +631,19 @@ public:
         writeback_loops_ = writeback_islands_ = writeback_bytes_ = 0;
         return out;
     }
+    /// Marks a CP write CPU-dirty without releasing its write watcher; the
+    /// caller writes the bytes through the backing alias afterwards. Refuses
+    /// (false) exactly where the ordinary fault path would do more than mark:
+    /// an unregistered range - InvalidateMemory returns early on those, so the
+    /// tracker must not gain state here either - or a GPU-modified page, which
+    /// owes a readback.
+    [[nodiscard]] bool MarkCpuWriteKeepArmed(VAddr addr, u64 size) {
+        if (!IsRegionRegistered(addr, size)) {
+            return false;
+        }
+        return memory_tracker->MarkRegionAsCpuModifiedKeepArmed(addr, size);
+    }
+
     /// Arms every read watcher left pending since the last drain.
     void DrainPendingReadArms(ReadArmSite site, bool carry) {
         // finish_release_faulted_first: the islands FinishFaultDownload parked

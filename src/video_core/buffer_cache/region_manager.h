@@ -182,7 +182,10 @@ public:
     /// unmark whose caller drains afterwards may leave a release pending. A
     /// pending release keeps the page unreadable, so an undrained one refaults
     /// the guest forever.
-    template <Type type, bool enable, bool DeferRelease = false>
+    /// KeepArmed marks CPU-dirty without touching protection: the caller has
+    /// already written the bytes through the backing alias, so the page keeps
+    /// its write watcher and the guest still faults on it.
+    template <Type type, bool enable, bool DeferRelease = false, bool KeepArmed = false>
     /// Returns whether any bit changed.
     bool ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
         RENDERER_TRACE;
@@ -210,8 +213,12 @@ public:
         // count stable for concurrent lock-free readers.
         if constexpr (enable) {
             // Every set page is armed or already listed for the next drain, so
-            // a range that is entirely set needs no arm of its own.
-            if (bits.AllInRange(start_page, end_page)) {
+            // a range that is entirely set needs no arm of its own - unless a
+            // KeepArmed mark left a CPU-dirty page still armed, in which case a
+            // guest write fault on it must fall through and release it, or the
+            // guest refaults on the same page without end.
+            if (bits.AllInRange(start_page, end_page) &&
+                (type != Type::CPU || KeepArmed || writeable.AllInRange(start_page, end_page))) {
                 return false;
             }
         } else {
@@ -232,13 +239,17 @@ public:
                 // which Protect rejects. Settle the whole region's pending
                 // mask first - it is bounded by one region and the drain has
                 // usually cleared it already.
-                if (read_release_pending_) {
-                    u32 pages = 0;
-                    ReleaseReadWatchers(pages);
+                if constexpr (!KeepArmed) {
+                    if (read_release_pending_) {
+                        u32 pages = 0;
+                        ReleaseReadWatchers(pages);
+                    }
                 }
             }
             RefreshCpuSummary(start_page, end_page);
-            UpdateProtection<!enable>();
+            if constexpr (!KeepArmed) {
+                UpdateProtection<!enable>(start_page, end_page);
+            }
         } else if (ReadbacksModeCounted(enable ? mode_reads_mark_ : mode_reads_unmark_) ==
                    GpuReadbacksMode::Precise) {
             if constexpr (enable) {
@@ -673,13 +684,32 @@ private:
      * @tparam track True when the tracker should start tracking the new pages
      */
     template <bool track>
-    void UpdateProtection() {
+    void UpdateProtection([[maybe_unused]] size_t lo = 0,
+                          [[maybe_unused]] size_t hi = NUM_PAGES_PER_REGION) {
         RENDERER_TRACE;
-        RegionBits mask = cpu ^ writeable;
+        // Directional, not symmetric: the arming pass takes only pages that
+        // lost their CPU bit and are still writable, the releasing pass only
+        // pages that gained it and are still armed. While writeable == cpu
+        // both equal today's cpu ^ writeable; they differ on a page a CPU mark
+        // deliberately left armed (cpu 1, writeable 0), which the arming pass
+        // must skip or it adds a second watcher no release ever returns. The
+        // release form is range-limited so a fault elsewhere in the region
+        // does not un-arm those pages either.
+        RegionBits mask;
+        if constexpr (track) {
+            mask = writeable & ~cpu;
+        } else {
+            mask = RegionBits(cpu & ~writeable, lo, hi);
+        }
         if (mask.None()) {
             return;
         }
-        writeable = cpu;
+        if constexpr (track) {
+            // == writeable & ~mask, without materialising a second bitset.
+            writeable &= cpu;
+        } else {
+            writeable |= mask;
+        }
         tracker->UpdatePageWatchersForRegion<track, false>(cpu_addr, mask);
     }
 
