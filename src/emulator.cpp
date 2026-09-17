@@ -587,6 +587,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbackWritebackGpucommIdle: {}",
              EmulatorSettings.IsReadbackWritebackGpucommIdle());
     LOG_INFO(Config, "GPU gatherInputMemo: {}", EmulatorSettings.IsGatherInputMemo());
+    LOG_INFO(Config, "GPU trackerLockSpinRounds: {}", EmulatorSettings.GetTrackerLockSpinRounds());
     LOG_INFO(Config, "GPU readbackBatching: {}", EmulatorSettings.IsReadbackBatchingEnabled());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());

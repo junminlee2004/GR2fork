@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <optional>
+#include <utility>
 
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
@@ -16,6 +17,12 @@
 #include "common/adaptive_mutex.h"
 #else
 #include "common/spin_lock.h"
+#endif
+#include "common/arch.h"
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(ARCH_X86_64)
+#include <emmintrin.h>
 #endif
 #include "common/assert.h"
 #include "common/debug.h"
@@ -30,6 +37,95 @@ using LockType = Common::AdaptiveMutex;
 #else
 using LockType = Common::SpinLock;
 #endif
+
+/**
+ * The region lock, with a bounded spin in front of the blocking acquire. A
+ * guest write fault holds this lock across its mprotect, far longer than the
+ * adaptive mutex spins, so a contended acquire falls to a futex sleep and pays
+ * a wake round trip on top of the remaining hold.
+ *
+ * Counter invariant: every increment sits inside the `rounds != 0` gate and
+ * must never be hoisted out of it; gpu_spin_rounds is non-zero on the
+ * GpuCommandProcessor thread alone (latched once in Liverpool::Process), and
+ * Drain() is called from Rasterizer::OnSubmit on that same thread. The
+ * counters are therefore GPU-command-thread confined and need no atomics.
+ */
+class RegionLock {
+public:
+    RegionLock() = default;
+    RegionLock(const RegionLock&) = delete;
+    RegionLock& operator=(const RegionLock&) = delete;
+    RegionLock(RegionLock&&) = delete;
+    RegionLock& operator=(RegionLock&&) = delete;
+
+    void lock() noexcept {
+        // The budget is read first: with the setting at 0 this is the plain
+        // blocking acquire, not one extra trylock per region per bind.
+        const u32 rounds = gpu_spin_rounds;
+        if (rounds == 0) {
+            inner_.lock();
+            return;
+        }
+        if (inner_.try_lock()) {
+            return;
+        }
+        ++contended_;
+        for (u32 r = 0; r < rounds; ++r) {
+            for (int p = 0; p < SPINS_PER_ROUND; ++p) {
+                Pause();
+            }
+            if (inner_.try_lock()) {
+                rounds_used_ += r + 1;
+                ++spun_;
+                return;
+            }
+        }
+        rounds_used_ += rounds;
+        ++blocked_;
+        inner_.lock();
+    }
+
+    void unlock() {
+        inner_.unlock();
+    }
+
+    [[nodiscard]] bool try_lock() {
+        return inner_.try_lock();
+    }
+
+    struct Stats {
+        u64 contended;
+        u64 spun;
+        u64 blocked;
+        u64 rounds_used;
+    };
+    static Stats Drain() {
+        return Stats{std::exchange(contended_, u64{0}), std::exchange(spun_, u64{0}),
+                     std::exchange(blocked_, u64{0}), std::exchange(rounds_used_, u64{0})};
+    }
+
+    // Non-zero on the GPU command thread alone. See the counter invariant above.
+    static inline thread_local u32 gpu_spin_rounds{0};
+
+private:
+    static constexpr int SPINS_PER_ROUND = 16;
+
+    static void Pause() {
+#if defined(ARCH_X86_64)
+        _mm_pause();
+#elif defined(ARCH_ARM64) && defined(_MSC_VER)
+        __yield();
+#elif defined(ARCH_ARM64)
+        asm("yield");
+#endif
+    }
+
+    static inline u64 contended_{};
+    static inline u64 spun_{};
+    static inline u64 blocked_{};
+    static inline u64 rounds_used_{};
+    LockType inner_;
+};
 
 /**
  * Allows tracking CPU and GPU modification of pages in a contigious 16MB virtual address region.
@@ -443,7 +539,7 @@ public:
     // GPU bits are set only there; an unmap clears them from a guest thread
     // under the lock, which leaves this count untouched.
     u64 gpu_write_seq{0};
-    LockType lock;
+    RegionLock lock;
     // Copied from the tracker when the region is handed out.
     bool defer_read_arm_{false};
     // A mark that recorded its bits and left the arm to the next drain. Read
@@ -594,5 +690,12 @@ private:
     RegionBits writeable;
     RegionBits readable;
 };
+
+#ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
+// The per-uaddr futex parse that proves or disproves tracker_lock_spin_rounds
+// identifies these locks by the 0x4E8 = 1256 byte stride between them. Keep the
+// size pinned so the next trace still resolves.
+static_assert(sizeof(RegionManager) == 1256);
+#endif
 
 } // namespace VideoCore

@@ -134,6 +134,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
         flush_draw_interval_ = std::max<u32>(interval, 64);
     }
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
+    tracker_lock_spin_ = EmulatorSettings.GetTrackerLockSpinRounds() != 0;
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
     // pinned, and a frozen stamp compares every draw register-identical.
@@ -1082,6 +1083,13 @@ void Rasterizer::OnSubmit() {
                      ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count,
                      ms(ws[2].ns), ws[3].count, ms(ws[3].ns), ws[4].count, ms(ws[4].ns));
             ws = {};
+            if (tracker_lock_spin_) {
+                const auto tl = VideoCore::RegionLock::Drain();
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] TRKLOCK contended={} spun={} blocked={} rounds_used={} "
+                         "per300f",
+                         tl.contended, tl.spun, tl.blocked, tl.rounds_used);
+            }
             const auto off = buffer_cache.DrainOffloadStats();
             if (off.jobs || off.fallbacks) {
                 LOG_INFO(Render_Skipcache,

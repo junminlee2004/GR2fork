@@ -223,6 +223,7 @@ private:
     // readback_offload: inside a run of draws writing readback-prone
     // buffers, and the run's length; flushes it adds, for the log.
     bool readback_offload_{};
+    bool tracker_lock_spin_{};
     bool prone_run_{};
     u32 prone_run_draws_{};
     u64 writer_flushes_{};

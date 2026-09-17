@@ -483,6 +483,13 @@ struct GPUSettings {
     // bindings) in the per-stage slot; a byte-identical repeat for the same program is a slot
     // hit without the gather. Needs spec_key_fused; off while spec_fp_validate is on.
     Setting<bool> gather_input_memo{false};
+    // On the GPU command thread a contended tracker region lock is spun on (a
+    // try_lock every 16 PAUSE) for up to this many rounds before blocking. The
+    // adaptive mutex only spins a few microseconds, while a guest write fault
+    // holds the region lock across its 64KB mprotect, so every contended
+    // acquisition pays a futex sleep plus wake round trip today. 0 keeps the
+    // plain blocking lock on every thread.
+    Setting<u32> tracker_lock_spin_rounds{0};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -849,6 +856,8 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_writeback_gpucomm_idle",
                                        &GPUSettings::readback_writeback_gpucomm_idle),
             make_override<GPUSettings>("gather_input_memo", &GPUSettings::gather_input_memo),
+            make_override<GPUSettings>("tracker_lock_spin_rounds",
+                                       &GPUSettings::tracker_lock_spin_rounds),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -975,6 +984,7 @@ struct GPUSettings {
     texture_lru_lazy_touch, \
     stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, readback_writeback_gpucomm_idle, \
     stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, gather_input_memo, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, tracker_lock_spin_rounds, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -1287,6 +1297,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, TextureLruLazyTouch, texture_lru_lazy_touch)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackGpucommIdle, readback_writeback_gpucomm_idle)
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
+    SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
