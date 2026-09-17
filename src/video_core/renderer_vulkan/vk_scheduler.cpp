@@ -21,7 +21,7 @@ Scheduler::Scheduler(const Instance& instance)
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
-    pop_poll_throttle_ = EmulatorSettings.GetPendingPopThrottle();
+    pop_poll_throttle_ = std::max<u32>(EmulatorSettings.GetPendingPopThrottle(), 1u);
     AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -157,8 +157,8 @@ void Scheduler::PopPendingOperations() {
     // draw would otherwise take the lock and issue a SYNCOBJ_QUERY ioctl;
     // the ops are latency-tolerant (deferred frees - urgent writebacks ride
     // the priority queue), so attempt the pop once per N non-empty polls
-    // instead. An op retires at most N draws late. 0 polls every call.
-    if (pop_poll_throttle_ != 0 && ++pop_poll_counter_ < pop_poll_throttle_) {
+    // instead. An op retires at most N draws late. A 0 setting latches as 1.
+    if (++pop_poll_counter_ < pop_poll_throttle_) {
         return;
     }
     pop_poll_counter_ = 0;
