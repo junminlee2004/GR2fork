@@ -40,6 +40,11 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 
+// Dwords of the flat user-data window the gather-input memo records per stage. Programs with a
+// wider window never arm the memo (they are counted as GIMEMO big=), which caps the probe's cost
+// at one cache line pair until the logged dw= says what the real windows are.
+constexpr u32 kGatherMemoDw = 64;
+
 struct Program {
     struct Module {
         vk::ShaderModule module;
@@ -53,6 +58,10 @@ struct Program {
     // Index of the permutation matched by the previous lookup; probed first when
     // the MRU probe setting is enabled. Always bounds-checked before use.
     u32 last_hit_perm{};
+    // Gather-input memo window verdict, a per-Program constant (descriptor offsets and the flat
+    // buffer size are fixed at compile / Deserialize): 0 not computed, 1 every dword the key's
+    // descriptor sections can read lies inside the recorded window, 2 it can reach outside.
+    u8 gim_window{};
 
     // Fast lookup for shader permutations by specialization signature; a sig-map hit confirmed
     // by sig2 replaces the deep StageSpecialization comparisons on hot paths. Populated only
@@ -452,6 +461,19 @@ private:
         u32 perm_idx{};
         u32 len{};
         alignas(64) std::array<u8, 4096> buf{};
+        // The gather inputs the key in buf was folded from. Tail members on purpose: buf stays at
+        // offset 64 so the slot_prefetch above GetProgram keeps covering the key's first 256 B.
+        // A byte-identical repeat of these under pre_same resolves to the same permutation
+        // without running the gather at all (gather_input_memo). in_program is null when no
+        // record stands; the program is named here rather than inferred from slot.program
+        // because a first lookup of a program with no permutations yet fills the slot without
+        // running the gather, and must not inherit the previous program's record.
+        const Program* in_program{};
+        u32 in_len{};
+        u64 in_pgm_base{};
+        u64 in_ri_hash{};
+        std::array<u32, 3> in_bind{};
+        alignas(64) std::array<u32, kGatherMemoDw> in_flat{};
     };
     std::array<GatherSlot, MaxShaderStages> gather_slots{};
     // The specialization key under construction. A member, not a 4 KB stack
@@ -469,6 +491,7 @@ private:
     bool spec_key_align{};
     bool slot_prefetch{};
     bool spec_key_fused{};
+    bool gather_input_memo{};
     u64 specfp_slot_hits{};
     u64 specfp_mru_hits{};
     u64 specfp_mru2_hits{};
@@ -481,6 +504,17 @@ private:
     u64 specfp_slot_pf{};
     u64 specfp_fused{};
     u64 specfp_fused_miss{};
+    /// Gather-input memo, per window: probes = pre_same calls with an armed record, hits = the
+    /// subset whose inputs were byte-identical, wprobes/whits the same for walker programs, recs
+    /// = records written, big = record-step calls skipped because the flat window exceeds
+    /// kGatherMemoDw, dw = sum of the compared window over probes.
+    u64 gim_probes{};
+    u64 gim_hits{};
+    u64 gim_wprobes{};
+    u64 gim_whits{};
+    u64 gim_recs{};
+    u64 gim_big{};
+    u64 gim_dw{};
     /// Descriptors created with and without the in-place read verdict, cumulative.
     u64 sharp_direct_img{};
     u64 sharp_slow_img{};

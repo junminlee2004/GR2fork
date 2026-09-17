@@ -374,6 +374,64 @@ SHAD_NO_INLINE u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src,
     return diff;
 }
 
+// One past the highest flat-buffer dword this sharp can read. A direct read takes N consecutive
+// dwords from offsets[0]; otherwise Fetch reads offsets[i] one by one and bails on UNKNOWN.
+template <typename Sf>
+u32 SharpFetchTopDw(const Sf& sf) noexcept {
+    if (sf.direct) {
+        return u32{sf.offsets[0]} + static_cast<u32>(Sf::N);
+    }
+    u32 top = 0;
+    for (u32 i = 0; i < Sf::N; ++i) {
+        if (sf.offsets[i] == Shader::UNKNOWN_LOCATION) {
+            continue;
+        }
+        const u32 end = u32{sf.offsets[i]} + 1;
+        top = end > top ? end : top;
+    }
+    return top;
+}
+
+// One past the highest flat-buffer dword any descriptor section of the specialization key can
+// read for this program. The passes place every offset inside the flat window by construction
+// (flatten_extended_userdata_pass sets flattened_bufsize_dw from the last destination), but
+// nothing asserts it, and the gather-input memo turns a stray read into a wrong permutation
+// rather than a garbage key - so the memo only arms when this bound is inside the record.
+u32 ComputeSharpTopDw(const Shader::Info& info) noexcept {
+    u32 top = 0;
+    const auto raise = [&](u32 v) noexcept { top = v > top ? v : top; };
+    for (const auto& d : info.buffers) {
+        raise(SharpFetchTopDw(d.sharp_fetch));
+    }
+    for (const auto& d : info.images) {
+        raise(SharpFetchTopDw(d.sharp_fetch));
+    }
+    for (const auto& d : info.samplers) {
+        raise(SharpFetchTopDw(d.sharp_fetch));
+        // The aniso post-op reads one more dword of the paired T#.
+        if (d.post_op == Shader::SharpFetchPostOp::DisableAnisoIfSingleLod &&
+            d.post_op_tsharp_dw3_off != Shader::UNKNOWN_LOCATION) {
+            raise(u32{d.post_op_tsharp_dw3_off} + 1);
+        }
+    }
+    for (const auto& d : info.fmasks) {
+        // ReadUdSharp<Image>: a whole 8-dword T# in place.
+        raise(u32{d.sharp_idx} + static_cast<u32>(sizeof(AmdGpu::Image) / sizeof(u32)));
+    }
+    return top;
+}
+
+// Per-Program verdict, computed once: may the memo's record stand in for every flat-buffer byte
+// the key's descriptor sections read? Also caps the recorded window at kGatherMemoDw so the
+// probe's compare stays bounded while the logged dw= is still unknown.
+bool GatherMemoWindowOk(Program& program, const Shader::Info& info, u32 flat_dw) noexcept {
+    if (program.gim_window == 0) {
+        const u32 top = ComputeSharpTopDw(info);
+        program.gim_window = (top <= flat_dw && flat_dw <= kGatherMemoDw) ? 1 : 2;
+    }
+    return program.gim_window == 1;
+}
+
 SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
                                       const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
                                       u64 ri_bytes_hash,
@@ -1023,6 +1081,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             spec_key_fused = true;
         }
     }
+    if (EmulatorSettings.IsGatherInputMemo()) {
+        if (!spec_key_fused) {
+            LOG_WARNING(Render_Vulkan, "gather_input_memo needs the fused specialization key; the "
+                                       "gather runs on every call");
+        } else if (spec_fp_validate) {
+            // A memoized hit has no gathered key for ValidateSpecHit to check, so the verify arm
+            // would stop covering exactly the hits the memo introduces.
+            LOG_WARNING(Render_Vulkan, "gather_input_memo is disabled while spec_fp_validate is "
+                                       "on; the verify arm rebuilds every hit");
+        } else {
+            gather_input_memo = true;
+        }
+    }
     share_layouts = EmulatorSettings.IsDescLayoutShare();
     WarmUp();
 
@@ -1258,6 +1329,13 @@ void PipelineCache::DumpSpecFpStats() {
     specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
         specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = specfp_front_hits =
             specfp_slot_pf = specfp_fused = specfp_fused_miss = 0;
+    if (gather_input_memo) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] GIMEMO probes={} hits={} wprobes={} whits={} recs={} big={} dw={} "
+                 "per300f",
+                 gim_probes, gim_hits, gim_wprobes, gim_whits, gim_recs, gim_big, gim_dw);
+        gim_probes = gim_hits = gim_wprobes = gim_whits = gim_recs = gim_big = gim_dw = 0;
+    }
 }
 
 void PipelineCache::NoteSharpVerdicts(const Shader::Info& info) {
@@ -1826,6 +1904,41 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
             // and nothing inside this window resolves the same stage again.
             const bool pre_same = slot.program == program && slot.pipe_gen == lookup_pipe_gen_;
             u64 diff = 0;
+            // The flat window RefreshFlatBuf just produced, read only when the memo is on so the
+            // off arm keeps today's instruction stream. Walker-less programs alias the 16
+            // user-data registers; a walker's first destination dword is NUM_USER_DATA_REGS, so
+            // the window always starts with those same registers either way.
+            bool walker = false;
+            u32 flat_dw = Shader::NUM_USER_DATA_REGS;
+            if (gather_input_memo) {
+                walker = info.srt_info.walker_func != nullptr;
+                if (walker) {
+                    flat_dw = info.srt_info.flattened_bufsize_dw;
+                }
+            }
+            if (gather_input_memo && pre_same && slot.in_program == program) {
+                // Byte identity over every input the key's descriptor sections read is strictly
+                // stronger than the fold's masked compare, so the recorded permutation is the one
+                // the gather would have resolved to. Scalars first: a mismatch there, which is
+                // the common one, costs no wide compare, and memcmp stops at the first differing
+                // dword - the churning UBO-pointer register sits in the low 16.
+                ++gim_probes;
+                gim_wprobes += walker;
+                gim_dw += flat_dw;
+                if (slot.in_len == flat_dw && slot.in_pgm_base == info.pgm_base &&
+                    slot.in_ri_hash == ri_fp_hash && slot.in_bind[0] == binding.unified &&
+                    slot.in_bind[1] == binding.buffer && slot.in_bind[2] == binding.user_data &&
+                    std::memcmp(slot.in_flat.data(), info.flat_ud, size_t{flat_dw} * sizeof(u32)) ==
+                        0) {
+                    ++gim_hits;
+                    gim_whits += walker;
+                    ++specfp_slot_hits;
+                    specfp_slot_pf += slot_prefetch;
+                    info.AddBindings(binding);
+                    return Publish(out_slot, l_stage, &program->info, slot.module, program,
+                                   slot.perm_idx, slot.perm_hash);
+                }
+            }
             if (spec_fp_validate) {
                 // The tripwire keeps the bytes the gather replaces, so the
                 // accumulator is checked against them and not against the
@@ -1838,7 +1951,31 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
             if (key_len == 0) {
                 // A partial key sits in the slot and no field describes it.
                 slot.program = nullptr;
+                slot.in_program = nullptr;
             } else {
+                if (gather_input_memo) {
+                    // Record what this call's key was gathered from, next to the key itself: every
+                    // later exit leaves slot.program either null or describing this permutation,
+                    // so pre_same certifies the record the same way it certifies the key. A
+                    // vertex stage with a fetch shader never arms - its attribute section walks
+                    // the guest fetch table through a pointer in user data, which no flat-byte
+                    // compare covers - and neither does a program whose sharps could reach past
+                    // the recorded window.
+                    const bool attr_key =
+                        info.hw_stage == Shader::HwStage::Vertex && info.has_fetch_shader;
+                    const bool arm = !attr_key && GatherMemoWindowOk(*program, info, flat_dw);
+                    gim_big += !attr_key && flat_dw > kGatherMemoDw;
+                    if (arm) {
+                        std::memcpy(slot.in_flat.data(), info.flat_ud,
+                                    size_t{flat_dw} * sizeof(u32));
+                        slot.in_len = flat_dw;
+                        slot.in_pgm_base = info.pgm_base;
+                        slot.in_ri_hash = ri_fp_hash;
+                        slot.in_bind = {binding.unified, binding.buffer, binding.user_data};
+                        ++gim_recs;
+                    }
+                    slot.in_program = arm ? program : nullptr;
+                }
                 if (spec_fp_validate) {
                     u64 ref = 0;
                     size_t i = 0;
