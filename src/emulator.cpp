@@ -560,6 +560,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU readbackWritebackShare: {}", EmulatorSettings.IsReadbackWritebackShare());
     LOG_INFO(Config, "GPU readbackWritebackHelper: {}",
              EmulatorSettings.IsReadbackWritebackHelper());
+    LOG_INFO(Config, "GPU finishReleaseFaultedFirst: {}",
+             EmulatorSettings.IsFinishReleaseFaultedFirst());
     LOG_INFO(Config, "GPU bindWritePlan: {}", EmulatorSettings.GetBindWritePlan());
     LOG_INFO(Config, "GPU findimgMemoFirst: {}", EmulatorSettings.IsFindimgMemoFirst());
     LOG_INFO(Config, "GPU vinputFetchKey: {}", EmulatorSettings.IsVinputFetchKey());

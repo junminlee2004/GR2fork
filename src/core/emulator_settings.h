@@ -722,6 +722,11 @@ struct GPUSettings {
     // The priority-ops thread joins every offloaded readback as a second copier once
     // the fence signals; a late arrival copies nothing. Needs readback_writeback_share.
     Setting<bool> readback_writeback_helper{false};
+    // FinishFaultDownload settles only the islands covering the faulted range before releasing
+    // the faulting guest thread; the remaining islands are finished on the GPU command thread at
+    // the next read-arm drain site. Needs readback_offload, readback_writeback_offload and
+    // deferred_read_arm.
+    Setting<bool> finish_release_faulted_first{false};
     // 0 off, 1 the per-pipeline descriptor write plan in place of the per-bind rebuild,
     // 2 or more the plan built and compared with the rebuilt list (shadow).
     Setting<u32> bind_write_plan{0};
@@ -908,6 +913,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_writeback_share),
             make_override<GPUSettings>("readback_writeback_helper",
                                        &GPUSettings::readback_writeback_helper),
+            make_override<GPUSettings>("finish_release_faulted_first",
+                                       &GPUSettings::finish_release_faulted_first),
             make_override<GPUSettings>("bind_write_plan", &GPUSettings::bind_write_plan),
             make_override<GPUSettings>("findimg_memo_first", &GPUSettings::findimg_memo_first),
             make_override<GPUSettings>("vinput_fetch_key", &GPUSettings::vinput_fetch_key),
@@ -959,7 +966,7 @@ struct GPUSettings {
     push_const_dedup, stream_copy_idle_us, stream_copy_lane_threads, upload_arm_chunk_bytes, \
     texture_invalidate_filter, rt_state_stamp, push_vp_memo, ri_memo_fused_cmp, \
     br_mem_fast_state, desc_heap_recycle, push_desc_full_limit, readback_writeback_share, \
-    readback_writeback_helper
+    readback_writeback_helper, finish_release_faulted_first
 #define GPU_SETTINGS_JSON_FIELDS_C \
     bind_write_plan, findimg_memo_first, vinput_fetch_key, index_bind_whole, \
     desc_heap_shadow_census, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
@@ -1312,6 +1319,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, PushDescFullLimit, push_desc_full_limit)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackShare, readback_writeback_share)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackHelper, readback_writeback_helper)
+    SETTING_FORWARD_BOOL(m_gpu, FinishReleaseFaultedFirst, finish_release_faulted_first)
     SETTING_FORWARD(m_gpu, BindWritePlan, bind_write_plan)
     SETTING_FORWARD_BOOL(m_gpu, FindimgMemoFirst, findimg_memo_first)
     SETTING_FORWARD_BOOL(m_gpu, VinputFetchKey, vinput_fetch_key)

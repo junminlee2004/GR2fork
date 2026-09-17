@@ -398,6 +398,22 @@ private:
     /// published yet.
     void HelpAsPriority(WriteBackShare& share);
 
+    /// Runs the per-island verdict (write sequence test, write-back when the
+    /// offload is off, unmark or veto re-add) for one span of a job's copies.
+    /// Returns true when at least one island was vetoed. GPU command thread
+    /// only; 'download' is null when the bytes are already in guest memory.
+    bool FinishIslands(std::span<const vk::BufferCopy> copies,
+                       const MemoryTracker::GpuSeqSnapshots& snapshots, VAddr buffer_base,
+                       const u8* download, bool copied);
+
+    /// finish_release_faulted_first: settles every island FinishFaultDownload
+    /// parked after releasing the faulting thread. GPU command thread only.
+    void DrainPendingFinish();
+
+    /// Same, from a thread that may not be the GPU command thread: hops over
+    /// when it is not, so the parked state stays GPU-command-thread confined.
+    void DrainPendingFinishSynced();
+
     using OwnedIslands = boost::container::small_vector<std::pair<VAddr, u32>, 16>;
     /// Islands of in-flight readbacks that overlap [start, end), sorted by
     /// address. GPU command thread only.
@@ -605,6 +621,12 @@ public:
     }
     /// Arms every read watcher left pending since the last drain.
     void DrainPendingReadArms(ReadArmSite site) {
+        // finish_release_faulted_first: the islands FinishFaultDownload parked
+        // when it released the faulting thread are settled here. Every caller
+        // of this function is the GPU command thread, which owns that state.
+        if (!pending_finish_.empty()) {
+            DrainPendingFinish();
+        }
         const auto d = memory_tracker->ArmPendingReadWatchers();
         ++rarm_drains_[static_cast<size_t>(site)];
         rarm_regions_ += d.regions;
@@ -639,8 +661,32 @@ public:
         rrel_drains_ = rrel_regions_ = rrel_pages_ = rrel_calls_ = 0;
         return out;
     }
+    struct FinishSplitStats {
+        u64 jobs;
+        u64 inline_islands;
+        u64 rest_islands;
+        u64 inline_ns;
+        u64 rest_ns;
+        u64 vetoes;
+    };
+    FinishSplitStats DrainFinishSplitStats() {
+        const FinishSplitStats out{finsplit_jobs_,         finsplit_inline_islands_,
+                                   finsplit_rest_islands_, finsplit_inline_ns_,
+                                   finsplit_rest_ns_,      finsplit_vetoes_};
+        finsplit_jobs_ = finsplit_inline_islands_ = finsplit_rest_islands_ = 0;
+        finsplit_inline_ns_ = finsplit_rest_ns_ = finsplit_vetoes_ = 0;
+        return out;
+    }
     /// Clears the GPU bits of a range the guest is unmapping.
     void DropPendingReadArms(VAddr addr, u64 size) {
+        // finish_release_faulted_first: unlike every other drain site this one
+        // is reached from guest threads (MemoryManager::UnmapMemory ->
+        // Rasterizer::UnmapMemory), so the parked islands are settled through
+        // the GPU command thread; leaving a release pending on memory the
+        // guest is giving back is what the unmark below has to avoid.
+        if (pending_finish_any_.load(std::memory_order_acquire)) {
+            DrainPendingFinishSynced();
+        }
         memory_tracker->DropPendingReadArms(addr, size);
         // That unmark defers its own release under deferred_read_release, and a
         // release left pending here would protect memory the guest has already
@@ -763,6 +809,31 @@ private:
     };
     std::vector<InflightDownload> inflight_downloads_;
     u64 next_inflight_id_{1};
+    // finish_release_faulted_first: the islands of one job that did not cover
+    // the faulted range, parked when the guest thread was released and settled
+    // at the next drain site. Written and read on the GPU command thread only;
+    // the flag lets the guest-thread unmap path test for one without touching
+    // the vector. Capped at one entry (the push drains first).
+    struct PendingFinish {
+        // The job's whole island vector, moved in rather than copied (a batched
+        // window carries several hundred), with the partition point kept as an
+        // index: the parked span is [first, copies.size()).
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+        size_t first;
+        MemoryTracker::GpuSeqSnapshots snapshots;
+        VAddr buffer_base;
+        u64 inflight_id;
+        bool vetoed;
+        bool copied;
+    };
+    boost::container::small_vector<PendingFinish, 2> pending_finish_;
+    std::atomic<bool> pending_finish_any_{};
+    u64 finsplit_jobs_{};
+    u64 finsplit_inline_islands_{};
+    u64 finsplit_rest_islands_{};
+    u64 finsplit_inline_ns_{};
+    u64 finsplit_rest_ns_{};
+    u64 finsplit_vetoes_{};
     // Offload counters; wait_ns is written by faulting guest threads.
     std::atomic<u64> offload_jobs_{};
     std::atomic<u64> offload_vetoes_{};
@@ -850,6 +921,7 @@ private:
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
     bool writeback_offload_{};
+    bool finish_split_{};
     bool writeback_share_{};
     bool writeback_helper_{};
     bool texel_sync_noop_{};

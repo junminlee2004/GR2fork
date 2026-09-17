@@ -103,6 +103,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
     defer_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     memory_tracker->SetDeferReadRelease(defer_read_release_);
+    // finish_release_faulted_first: the offloaded write-back is what puts the
+    // bytes in guest memory before the second hop (so the staging can be
+    // released inline), and deferred_read_arm is what makes the rasterizer's
+    // per-packet drain sites - where the parked islands are settled - exist.
+    finish_split_ = EmulatorSettings.IsFinishReleaseFaultedFirst() && writeback_offload_ &&
+                    EmulatorSettings.IsDeferredReadArm();
+    if (EmulatorSettings.IsFinishReleaseFaultedFirst() && !finish_split_) {
+        LOG_WARNING(Render_Vulkan, "finish_release_faulted_first needs "
+                                   "readback_writeback_offload and deferred_read_arm; the "
+                                   "fault download settles every island before releasing");
+    }
 
     std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
 
@@ -560,6 +571,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         offload_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     }
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
+        // finish_release_faulted_first: this path is reached exactly when the
+        // offloaded attempt left the range GPU-dirty, i.e. when a parked rest
+        // may still own islands inside it. Settle it first: the download below
+        // and the CPU mark both read tracker state the rest is about to change.
+        if (!pending_finish_.empty()) {
+            DrainPendingFinish();
+        }
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
         // is widened to a window around the request
@@ -790,6 +808,12 @@ void BufferCache::HelpAsPriority(WriteBackShare& s) {
 
 void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                        bool is_write) {
+    // finish_release_faulted_first: a parked rest still holds tracker bits and
+    // an in-flight registry entry for its islands. Settle it before this
+    // command reads either, so every fault command sees today's state.
+    if (!pending_finish_.empty()) {
+        DrainPendingFinish();
+    }
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
     buffer.readback_prone_tick = gc_tick;
     // Window widening mirrors the synchronous form above.
@@ -966,6 +990,12 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
 
 void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, u64 size,
                                       bool is_write) {
+    // finish_release_faulted_first: this job's own settle must not run on top
+    // of an older parked one - the tracker reads below and the CPU mark expect
+    // a settled window.
+    if (!pending_finish_.empty()) {
+        DrainPendingFinish();
+    }
     auto* memory = Core::Memory::Instance();
     const u8* download = job.staging->mapped_data.data();
     if (!writeback_offload_) {
@@ -996,13 +1026,120 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
     // GPU bits still set would ask for a write-only page, which Protect()
     // rejects).
     // Deferred: DrainPendingReadReleases below settles them before returning.
+    //
+    // finish_release_faulted_first: the faulting thread is blocked on the
+    // pages of its own range only, so those islands are settled here and the
+    // rest is parked for the GPU command thread's next drain site. The split
+    // is by tracker page, not by island: ReadMemory's exit test reads whole
+    // pages, so an island sharing a page with the faulted range has to be
+    // settled inline too or the test would refuse a resolved fault.
+    size_t inline_count = job.copies.size();
+    if (finish_split_) {
+        const VAddr fault_lo = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+        const VAddr fault_hi = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+        const auto intersects = [&](const vk::BufferCopy& copy) {
+            const VAddr lo = job.buffer_base + copy.srcOffset;
+            return Common::AlignDown(lo, TRACKER_BYTES_PER_PAGE) < fault_hi &&
+                   Common::AlignUp(lo + copy.size, TRACKER_BYTES_PER_PAGE) > fault_lo;
+        };
+        // job.copies was appended in strictly ascending, disjoint address order
+        // (ForEachDownloadRange walks ascending, ForEachInRange and
+        // EmitUnownedPieces emit ascending within each range), and the faulted
+        // span is contiguous, so the intersecting islands form exactly one
+        // contiguous run. Rotating that run to the front is O(n) with no
+        // temporary buffer, and leaves both halves in ascending order - which
+        // PendingUnmark's adjacent-island merge relies on to keep the release
+        // count down (a partitioning split would scramble the rest).
+        const auto run_begin = std::find_if(job.copies.begin(), job.copies.end(), intersects);
+        const auto run_end = std::find_if_not(run_begin, job.copies.end(), intersects);
+        DEBUG_ASSERT(std::find_if(run_end, job.copies.end(), intersects) == job.copies.end());
+        std::rotate(job.copies.begin(), run_begin, run_end);
+        inline_count = static_cast<size_t>(run_end - run_begin);
+    }
+    const bool park = inline_count != job.copies.size();
+    const u64 t_inline = Common::FencedRDTSC();
+    bool vetoed_any =
+        FinishIslands(std::span<const vk::BufferCopy>(job.copies.data(), inline_count),
+                      job.snapshots, job.buffer_base, download, job.copied);
+    hold.reset();
+    if (writeback_offload_) {
+        ++writeback_loops_;
+        writeback_islands_ += job.written_islands;
+        writeback_bytes_ += job.written_bytes;
+        wboff_copy_ns_ += job.copy_ns;
+        ++(job.copier == 0 ? wboff_guest_ : job.copier == 1 ? wboff_prio_ : wboff_gpucomm_);
+    }
+    if (park) {
+        // The verdict for the whole job is not in yet, so the caller's exit
+        // test has to be the tracker test on its own range, which the inline
+        // settle above made exact. The registry entry stays until the rest
+        // runs: erasing it early would show a later download ranges that are
+        // neither owned nor in the range set.
+        job.fully_cleared = false;
+        PendingFinish entry;
+        // The whole vector moves (one pointer steal for a heap-sized window);
+        // copying the tail out would memcpy several hundred islands here, on
+        // the GPU command thread, for every split job. job.copies is dead from
+        // this point on - the job's last reader was the inline settle above.
+        entry.first = inline_count;
+        entry.copies = std::move(job.copies);
+        entry.snapshots = std::move(job.snapshots);
+        entry.buffer_base = job.buffer_base;
+        entry.inflight_id = job.inflight_id;
+        entry.vetoed = vetoed_any;
+        entry.copied = job.copied;
+        pending_finish_.push_back(std::move(entry));
+        pending_finish_any_.store(true, std::memory_order_release);
+        // The entry drain above means at most one job is ever parked, so no
+        // burst of fault commands can hand a later guest handshake a backlog.
+        ASSERT(pending_finish_.size() == 1);
+        ++finsplit_jobs_;
+        finsplit_inline_islands_ += inline_count;
+        finsplit_vetoes_ += vetoed_any ? 1 : 0;
+    } else {
+        job.fully_cleared = !vetoed_any;
+        if (vetoed_any) {
+            offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (writeback_offload_) {
+            std::erase_if(inflight_downloads_,
+                          [&](const InflightDownload& d) { return d.id == job.inflight_id; });
+        }
+    }
+    // deferred_read_release: every island cleared above left its read watcher
+    // armed. Settle them here, once per region, so the download costs a
+    // handful of protection calls instead of one per island. It has to precede
+    // the CPU mark: dropping a write watcher on a page whose release is still
+    // pending would ask for a write-only mapping, and the mark's own guard
+    // would otherwise have to flush the whole region from this thread.
+    DrainPendingReadReleases();
+    // Same write-only-protection hazard as the empty path in Prepare: the mark
+    // is only legal once the faulted range's GPU bits are clear. When a veto
+    // kept them set, the caller's retry loop resolves the fault instead.
+    if (is_write && !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    }
+    ReleaseFaultStaging(std::move(job.staging));
+    // Every page this job cleared is one a damping waiter may be blocked on.
+    NotifyWriteBack();
+    if (park) {
+        // Everything above is what the faulting guest thread waits for, so the
+        // measurement ends here and not at the park: inline_us and rest_us are
+        // then the two halves of today's single hop.
+        finsplit_inline_ns_ += Common::FencedRDTSC() - t_inline;
+    }
+}
+
+bool BufferCache::FinishIslands(std::span<const vk::BufferCopy> copies,
+                                const MemoryTracker::GpuSeqSnapshots& snapshots, VAddr buffer_base,
+                                const u8* download, bool copied) {
     PendingUnmark pending{*memory_tracker, defer_read_release_};
     bool vetoed_any = false;
-    for (const auto& copy : job.copies) {
-        const VAddr copy_device_addr = job.buffer_base + copy.srcOffset;
-        if (memory_tracker->GpuWriteSeqMatches(copy_device_addr, copy.size, job.snapshots)) {
+    for (const auto& copy : copies) {
+        const VAddr copy_device_addr = buffer_base + copy.srcOffset;
+        if (memory_tracker->GpuWriteSeqMatches(copy_device_addr, copy.size, snapshots)) {
             if (writeback_offload_) {
-                ASSERT(job.copied);
+                ASSERT(copied);
             } else {
                 ++writeback_islands_;
                 writeback_bytes_ += copy.size;
@@ -1025,36 +1162,54 @@ void BufferCache::FinishFaultDownload(FaultDownloadJob& job, VAddr device_addr, 
         }
     }
     pending.Flush();
-    hold.reset();
-    job.fully_cleared = !vetoed_any;
-    if (vetoed_any) {
-        offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
+    return vetoed_any;
+}
+
+void BufferCache::DrainPendingFinish() {
+    if (pending_finish_.empty()) {
+        return;
     }
-    if (writeback_offload_) {
-        ++writeback_loops_;
-        writeback_islands_ += job.written_islands;
-        writeback_bytes_ += job.written_bytes;
-        wboff_copy_ns_ += job.copy_ns;
-        ++(job.copier == 0 ? wboff_guest_ : job.copier == 1 ? wboff_prio_ : wboff_gpucomm_);
+    // Everything here is what FinishFaultDownload would have run before
+    // releasing the faulting thread, on the same thread it would have run on.
+    const u64 t0 = Common::FencedRDTSC();
+    u64 islands = 0;
+    // The park is emptied and the flag cleared before the loop body runs, so
+    // that a callee which ever reaches a drain site (none does today) sees an
+    // empty park instead of re-entering these entries.
+    auto entries = std::move(pending_finish_);
+    pending_finish_.clear();
+    pending_finish_any_.store(false, std::memory_order_release);
+    for (auto& entry : entries) {
+        // Under this setting the bytes are already in guest memory (the
+        // offloaded write-back put them there before the second hop), so the
+        // island loop only votes and unmarks.
+        const size_t rest = entry.copies.size() - entry.first;
+        const bool vetoed =
+            FinishIslands(std::span<const vk::BufferCopy>(entry.copies.data() + entry.first, rest),
+                          entry.snapshots, entry.buffer_base, nullptr, entry.copied) ||
+            entry.vetoed;
+        islands += rest;
         std::erase_if(inflight_downloads_,
-                      [&](const InflightDownload& d) { return d.id == job.inflight_id; });
+                      [&](const InflightDownload& d) { return d.id == entry.inflight_id; });
+        // One count per job, so OFFLOAD vetoes keeps meaning "jobs vetoed":
+        // the inline half's verdict was carried here instead of counted there.
+        if (vetoed) {
+            offload_vetoes_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
-    // deferred_read_release: every island cleared above left its read watcher
-    // armed. Settle them here, once per region, so the download costs a
-    // handful of protection calls instead of one per island. It has to precede
-    // the CPU mark: dropping a write watcher on a page whose release is still
-    // pending would ask for a write-only mapping, and the mark's own guard
-    // would otherwise have to flush the whole region from this thread.
     DrainPendingReadReleases();
-    // Same write-only-protection hazard as the empty path in Prepare: the mark
-    // is only legal once the faulted range's GPU bits are clear. When a veto
-    // kept them set, the caller's retry loop resolves the fault instead.
-    if (is_write && !memory_tracker->IsRegionGpuModified(device_addr, size)) {
-        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-    }
-    ReleaseFaultStaging(std::move(job.staging));
-    // Every page this job cleared is one a damping waiter may be blocked on.
+    finsplit_rest_islands_ += islands;
+    finsplit_rest_ns_ += Common::FencedRDTSC() - t0;
+    // Pages a damping waiter may still be blocked on were cleared above.
     NotifyWriteBack();
+}
+
+void BufferCache::DrainPendingFinishSynced() {
+    if (liverpool->OnGpuThread()) {
+        DrainPendingFinish();
+        return;
+    }
+    liverpool->SendCommand<true>([this] { DrainPendingFinish(); });
 }
 
 std::unique_ptr<Buffer> BufferCache::AcquireFaultStaging(u64 size) {

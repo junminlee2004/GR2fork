@@ -1089,6 +1089,16 @@ void Rasterizer::OnSubmit() {
                          "empty={} per300f",
                          off.jobs, off.vetoes, off.fallbacks, ms(off.wait_ns), off.empty);
             }
+            if (EmulatorSettings.IsFinishReleaseFaultedFirst()) {
+                if (const auto fs = buffer_cache.DrainFinishSplitStats(); fs.jobs) {
+                    const auto us = [hz](u64 ns) { return hz ? ns * 1000000 / hz : 0; };
+                    LOG_INFO(Render_Skipcache,
+                             "[SkipCache] FINSPLIT jobs={} inline_islands={} rest_islands={} "
+                             "inline_us={} rest_us={} vetoes={} per300f",
+                             fs.jobs, fs.inline_islands, fs.rest_islands, us(fs.inline_ns),
+                             us(fs.rest_ns), fs.vetoes);
+                }
+            }
             if (off.q2_copies || off.q2_open || off.q2_unknown || off.q2_dma || writer_flushes_) {
                 LOG_INFO(Render_Skipcache,
                          "[SkipCache] RBQ2 copies={} open={} unknown={} dma={} wait_ms={} "
