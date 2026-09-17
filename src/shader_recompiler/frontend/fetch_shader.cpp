@@ -51,17 +51,10 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 namespace {
 
 /**
- * Decoding a fetch shader is a pure function of the instruction bytes, but it
- * runs once per pipeline lookup - that is, once per draw - because the code
- * pointer is resolved from per-draw user data. The same handful of fetch
- * shaders repeat all frame, so the decode is re-derived thousands of times a
- * frame for an answer that never changed.
- *
- * A hit is accepted only after comparing every byte the previous decode
- * consumed, so a guest that rewrites shader code in place still gets a fresh
- * parse. That makes the memo exactly equivalent to decoding, not an
- * approximation of it: bytes past the decoded region cannot affect the result
- * because the decode never read them.
+ * Memo of the per-draw fetch shader decode, keyed by the code pointer. A hit is
+ * accepted only after a memcmp over exactly the bytes the previous decode
+ * consumed, so a guest that rewrites shader code in place re-parses, and bytes
+ * past that region cannot matter because the decode never read them.
  */
 struct FetchShaderMemo {
     static constexpr size_t NumEntries = 64; // direct mapped, power of two
@@ -84,16 +77,6 @@ struct FetchShaderMemo {
     }
 };
 
-// Heap backed: only the pointer lives in thread-local storage, since fetch
-// shaders are also parsed from shader compilation workers.
-FetchShaderMemo& GetFetchShaderMemo() {
-    static thread_local std::unique_ptr<FetchShaderMemo> memo;
-    if (!memo) {
-        memo = std::make_unique<FetchShaderMemo>();
-    }
-    return *memo;
-}
-
 } // Anonymous namespace
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
@@ -102,8 +85,13 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
-    auto& memo = GetFetchShaderMemo();
-    auto& entry = memo.entries[FetchShaderMemo::Index(code)];
+    // Heap backed: only the pointer lives in thread-local storage, since fetch
+    // shaders are also parsed from shader compilation workers.
+    static thread_local std::unique_ptr<FetchShaderMemo> memo;
+    if (!memo) {
+        memo = std::make_unique<FetchShaderMemo>();
+    }
+    auto& entry = memo->entries[FetchShaderMemo::Index(code)];
     if (entry.code == code && !entry.words.empty() &&
         std::memcmp(code, entry.words.data(), entry.words.size() * sizeof(u32)) == 0) {
         return entry.data;
@@ -166,10 +154,9 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         }
     }
 
-    if (data.size > 0 && data.size <= FetchShaderMemo::MaxCachedBytes &&
-        data.size % sizeof(u32) == 0) {
-        const size_t num_words = data.size / sizeof(u32);
-        entry.words.assign(code, code + num_words);
+    // Instruction lengths are dword multiples, so this copies exactly the decoded region.
+    if (data.size > 0 && data.size <= FetchShaderMemo::MaxCachedBytes) {
+        entry.words.assign(code, code + data.size / sizeof(u32));
         entry.data = data;
         entry.code = code;
     } else {
