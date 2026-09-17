@@ -516,7 +516,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU findimgRangeInvalidate: {}", EmulatorSettings.IsFindimgRangeInvalidate());
     LOG_INFO(Config, "GPU bufferBarrierReadMerge: {}", EmulatorSettings.IsBufferBarrierReadMerge());
     LOG_INFO(Config, "GPU cpWriteBacking: {}", EmulatorSettings.IsCpWriteBacking());
-    LOG_INFO(Config, "GPU pm4BackingWrites: {}", EmulatorSettings.IsPm4BackingWrites());
     LOG_INFO(Config, "GPU streamCopyResolvedEpoch: {}",
              EmulatorSettings.IsStreamCopyResolvedEpoch());
     LOG_INFO(Config, "GPU writtenRangeFast: {}", EmulatorSettings.GetWrittenRangeFast());

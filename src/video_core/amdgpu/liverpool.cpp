@@ -1194,13 +1194,8 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             u64* address = write_data->Address<u64*>();
             if (!write_data->wr_one_addr.Value()) {
-                if (rasterizer && rasterizer->TryCpWriteBacking(reinterpret_cast<VAddr>(address),
-                                                                write_data->data, data_size)) {
-                    // Stored through the backing alias (cp_write_backing).
-                } else if (rasterizer) {
-                    rasterizer->WriteGuestMemory(std::bit_cast<VAddr>(address), write_data->data,
-                                                 data_size, Vulkan::Pm4WriteSite::GfxWriteData);
-                } else {
+                if (!rasterizer || !rasterizer->TryCpWriteBacking(reinterpret_cast<VAddr>(address),
+                                                                  write_data->data, data_size)) {
                     std::memcpy(address, write_data->data, data_size);
                 }
             } else {
@@ -1589,15 +1584,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                if (rasterizer && rasterizer->TryCpWriteBacking(
-                                      std::bit_cast<VAddr>(write_data->Address<void*>()),
-                                      write_data->data, data_size)) {
-                    // Stored through the backing alias (cp_write_backing).
-                } else if (rasterizer) {
-                    rasterizer->WriteGuestMemory(std::bit_cast<VAddr>(write_data->Address<void*>()),
-                                                 write_data->data, data_size,
-                                                 Vulkan::Pm4WriteSite::ComputeWriteData);
-                } else {
+                if (!rasterizer || !rasterizer->TryCpWriteBacking(
+                                       std::bit_cast<VAddr>(write_data->Address<void*>()),
+                                       write_data->data, data_size)) {
                     std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
                 }
             } else {
@@ -1640,14 +1629,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->ProcessDownloadImages();
             }
             release_mem->SignalFence(
-                [this](void* address, u64 data, u32 num_bytes) {
-                    if (rasterizer) {
-                        rasterizer->WriteGuestMemory(std::bit_cast<VAddr>(address), &data,
-                                                     num_bytes, Vulkan::Pm4WriteSite::ComputeFence);
-                    } else {
-                        memcpy(address, &data, num_bytes);
-                    }
-                },
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
                 },
