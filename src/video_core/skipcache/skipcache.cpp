@@ -9,8 +9,7 @@
 
 namespace VideoCore::Skipcache {
 
-// Controller thresholds. Engineering priors, tuned by field data - each is a
-// named constant so the SESSION reports can be correlated against them.
+// Controller thresholds: engineering priors, tuned by field data.
 namespace {
 constexpr u64 WindowTargetNs = 250'000'000; // 250 ms
 constexpr u32 WindowTargetFlips = 32;
@@ -32,6 +31,16 @@ constexpr u32 AbortSlotInvalidate = 8;
 constexpr u32 ForcedVerifyWindowCap = 32;
 constexpr u64 QuarantineWindowSpan = 32;
 constexpr u32 MaxInvariantViolations = 3;
+constexpr u64 SessionLogIntervalNs = 120'000'000'000ull; // 2 min
+constexpr u32 ReprobeBackoffMax = 1024;
+constexpr u64 TimingStarvedMissSamples = 8;
+constexpr f64 StarvedPromoteHitRate = 0.40;
+constexpr u32 ShadowDemoteStreakLen = 4;
+
+// Window hit rate as a percent; 0 when nothing was eligible.
+f64 HitPct(const CacheCounters& c) {
+    return c.eligible ? 100.0 * f64(c.hits) / f64(c.eligible) : 0.0;
+}
 } // namespace
 
 Framework& Framework::Instance() {
@@ -42,23 +51,17 @@ Framework& Framework::Instance() {
 void Framework::Init(Mode mode) {
     mode_ = mode;
     requested_mode_.store(static_cast<u8>(mode), std::memory_order_relaxed);
-#ifdef _DEBUG
-    gpu_thread_ = std::this_thread::get_id();
-#endif
     if (mode_ == Mode::Disabled) {
         return;
     }
+    if (!dedup_invalidate_registered_) {
+        dedup_invalidate_registered_ = true;
+        RegisterInvalidate([](void* self) { static_cast<Framework*>(self)->DedupInvalidateAll(); },
+                           this);
+    }
     if (mode_ == Mode::Forced) {
-        // Everything decided here, once: consumers pinned Enabled, the
-        // probe-only id (BindingSkipProbe) and the dead
-        // Pipeline id pinned Off so their call sites short-circuit to
-        // nothing. No calibration - nothing ever samples a timer.
+        // Pinned at boot (see Mode in skipcache.h); no calibration, no timer.
         timing_enabled_ = false;
-        if (!dedup_invalidate_registered_) {
-            dedup_invalidate_registered_ = true;
-            RegisterInvalidate(
-                [](void* self) { static_cast<Framework*>(self)->DedupInvalidateAll(); }, this);
-        }
         for (auto& cs : caches_) {
             cs.state = State::Enabled;
         }
@@ -68,16 +71,17 @@ void Framework::Init(Mode mode) {
         return;
     }
     // Startup calibration on the boot path, never lazily on a draw.
-    tsc_hz_ = Common::EstimateRDTSCFrequency();
-    if (tsc_hz_ >= 100'000'000) {
+    const u64 tsc_hz = Common::EstimateRDTSCFrequency();
+    u64 pair_cost = 0;
+    if (tsc_hz >= 100'000'000) {
         u64 best = ~0ull;
         for (int i = 0; i < 4096; ++i) {
             const u64 a = Common::FencedRDTSC();
             const u64 b = Common::FencedRDTSC();
             best = std::min(best, b - a);
         }
-        tsc_pair_cost_ = best;
-        ns_per_cycle_ = 1.0e9 / static_cast<f64>(tsc_hz_);
+        pair_cost = best;
+        ns_per_cycle_ = 1.0e9 / static_cast<f64>(tsc_hz);
         pair_ns_ = static_cast<u64>(static_cast<f64>(best) * ns_per_cycle_);
         timing_enabled_ = true;
     } else {
@@ -87,11 +91,6 @@ void Framework::Init(Mode mode) {
     }
     window_start_ns_ = Now();
     last_session_log_ns_ = window_start_ns_;
-    if (!dedup_invalidate_registered_) {
-        dedup_invalidate_registered_ = true;
-        RegisterInvalidate([](void* self) { static_cast<Framework*>(self)->DedupInvalidateAll(); },
-                           this);
-    }
     for (auto& cs : caches_) {
         cs.state = State::Learning;
         cs.timer_phase = static_cast<u8>(xorshift_state_ & 0xFF);
@@ -99,7 +98,7 @@ void Framework::Init(Mode mode) {
     }
     LOG_INFO(Render_Skipcache, "[SkipCache] init mode={} timing={} tsc={}MHz pair_cost={}cy",
              mode_ == Mode::ValidateOnly ? "ValidateOnly" : "Adaptive",
-             timing_enabled_ ? "on" : "counters-only", tsc_hz_ / 1'000'000, tsc_pair_cost_);
+             timing_enabled_ ? "on" : "counters-only", tsc_hz / 1'000'000, pair_cost);
 }
 
 u64 Framework::Now() const {
@@ -122,9 +121,7 @@ bool Framework::ShouldVerify(CacheId id) {
     if (cs.state != State::Enabled) {
         return false;
     }
-    // Forced verifies: first hit after every populate and >=1 per window,
-    // capped so pass-interleaved repopulation cannot convert every hit into
-    // a verify.
+    // Capped so pass-interleaved repopulation cannot turn every hit into a verify.
     if (cs.force_verify_next_hit && cs.forced_verifies_this_window < ForcedVerifyWindowCap) {
         cs.force_verify_next_hit = false;
         ++cs.forced_verifies_this_window;
@@ -164,14 +161,12 @@ void Framework::RecordDivergence(CacheId id, const char* detail) {
     if (cs.divergences_total >= 2 &&
         window_id_ - cs.last_divergence_window <= QuarantineWindowSpan) {
         Transition(id, cs, State::Quarantined, "second confirmed divergence");
-    } else {
+    } else if (cs.state == State::Enabled) {
         // Output was correct (the slow-path result was served); drop to Shadow
         // to re-earn correctness capital.
-        if (cs.state == State::Enabled) {
-            Transition(id, cs, State::Shadow, "first confirmed divergence");
-            cs.shadow_clean_hits_total = 0;
-            cs.shadow_frames_total = 0;
-        }
+        Transition(id, cs, State::Shadow, "first confirmed divergence");
+        cs.shadow_clean_hits_total = 0;
+        cs.shadow_frames_total = 0;
     }
     cs.last_divergence_window = window_id_;
     InvalidateAll();
@@ -206,8 +201,7 @@ f64 Framework::ProjectedNetPct(const CacheState& cs, u64 window_ns) const {
     const f64 avg_hit = avg(c.hit_ns, c.hit_samples);
     const f64 avg_miss = avg(c.miss_ns, c.miss_samples);
     const f64 avg_guard = avg(c.guard_ns, c.guard_samples);
-    // benefit = hits*(miss-hit) - eligible*guard; shadow burden is baseline
-    // work that would run anyway and is excluded by construction.
+    // Shadow burden is baseline work that would run anyway; excluded by construction.
     const f64 net_ns = f64(c.hits) * (avg_miss - avg_hit) - f64(c.eligible) * avg_guard;
     return 100.0 * net_ns / f64(window_ns);
 }
@@ -222,17 +216,13 @@ u64 Framework::RollingMedianEligible(const CacheState& cs) const {
     return tmp[n / 2];
 }
 
-void Framework::MaybeCloseWindow(bool from_draw_fallback) {
-    const u64 now = Now();
-    const u64 dur = now - window_start_ns_;
+void Framework::MaybeCloseWindow() {
     if (!timing_enabled_) {
-        // Counters-only build: close purely on the draw fallback cadence.
-        if (from_draw_fallback) {
-            CloseWindow();
-        }
+        // Counters-only: the draw cadence is the only clock.
+        CloseWindow();
         return;
     }
-    if (dur >= WindowTargetNs) {
+    if (Now() - window_start_ns_ >= WindowTargetNs) {
         CloseWindow();
     }
 }
@@ -265,7 +255,7 @@ void Framework::OnSubmit(u32 frame_num, bool guest_paused) {
 
 void Framework::CloseWindow() {
     const u64 now = Now();
-    const u64 dur = timing_enabled_ ? now - window_start_ns_ : 1;
+    const u64 dur = now - window_start_ns_;
     const bool overlong = timing_enabled_ && dur > 4 * WindowTargetNs;
     ++window_id_;
 
@@ -298,10 +288,8 @@ void Framework::CloseWindow() {
         CacheCounters& c = cs.counters;
 
         WindowSummary w{};
-        w.window_id = window_id_;
         w.state = cs.state;
         w.c = c;
-        w.duration_ns = dur;
         w.poisoned = window_poisoned_ || overlong;
         if (!c.AccountingHolds()) {
             w.poisoned = true;
@@ -341,8 +329,8 @@ void Framework::CloseWindow() {
             LOG_INFO(Render_Skipcache,
                      "[SkipCache] BSPROBE report win={} elig={} wouldhit%={:.1f} "
                      "veto(pipe/tick/stages/pgm/ud)={},{},{},{},{}",
-                     window_id_, c.eligible, 100.0 * f64(c.hits) / f64(c.eligible), c.veto[0],
-                     c.veto[1], c.veto[2], c.veto[3], c.veto[4]);
+                     window_id_, c.eligible, HitPct(c), c.veto[0], c.veto[1], c.veto[2], c.veto[3],
+                     c.veto[4]);
         }
         last_window_[i] = w;
 
@@ -378,8 +366,7 @@ void Framework::CloseWindow() {
         }
     }
 
-    // SESSION block every ~10 minutes.
-    if (timing_enabled_ && now - last_session_log_ns_ > 120'000'000'000ull) {
+    if (timing_enabled_ && now - last_session_log_ns_ > SessionLogIntervalNs) {
         last_session_log_ns_ = now;
         LogSessionSummary();
     }
@@ -394,7 +381,7 @@ void Framework::Transition(CacheId id, CacheState& cs, State next, const char* r
         return;
     }
     const CacheCounters& tc = cs.counters;
-    const f64 thr = tc.eligible ? 100.0 * f64(tc.hits) / f64(tc.eligible) : 0.0;
+    const f64 thr = HitPct(tc);
     LOG_INFO(Render_Skipcache,
              "[SkipCache] {} {}->{} win={} reason={} elig={} hit%={:.1f} samples={}/{}/{} "
              "vfy={}/{}/{}",
@@ -417,7 +404,7 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
     switch (cs.state) {
     case State::Off: {
         if (cs.reprobe_countdown > 0 && --cs.reprobe_countdown == 0) {
-            cs.reprobe_backoff = std::min<u32>(cs.reprobe_backoff * 2, 1024);
+            cs.reprobe_backoff = std::min<u32>(cs.reprobe_backoff * 2, ReprobeBackoffMax);
             Transition(id, cs, State::Learning, "re-probe");
             cs.promote_streak = 0;
         }
@@ -434,13 +421,14 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         // A window with too few timing samples cannot price the trade; promote
         // on strong hit-rate evidence alone and let Shadow (which probes at
         // full rate and consumes nothing) price it properly.
-        const bool timing_starved = c.miss_samples < 8;
+        const bool timing_starved = c.miss_samples < TimingStarvedMissSamples;
         // A cache Shadow already priced below the floor may not re-enter on
         // hit rate alone; only a real profit reading reopens the door.
-        const bool qualifies = cs.windows_in_state >= 1 &&
-                               (w.net_pct >= PromoteFloorPct
-                                    ? hit_rate >= MinHitRate
-                                    : timing_starved && hit_rate >= 0.40 && !cs.shadow_priced_low);
+        const bool qualifies =
+            cs.windows_in_state >= 1 &&
+            (w.net_pct >= PromoteFloorPct
+                 ? hit_rate >= MinHitRate
+                 : timing_starved && hit_rate >= StarvedPromoteHitRate && !cs.shadow_priced_low);
         cs.promote_streak = qualifies ? cs.promote_streak + 1 : 0;
         if (cs.promote_streak >= PromoteStreak && cs.windows_in_state >= LearningMinWindows) {
             // Shadow entry does not cold-clear: nothing was being consumed.
@@ -460,7 +448,7 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         cs.shadow_frames_total += WindowTargetFlips; // approximation: frames per window
         if (w.net_pct < ShadowExitFloorPct) {
             cs.demote_streak++;
-            if (cs.demote_streak >= 4) {
+            if (cs.demote_streak >= ShadowDemoteStreakLen) {
                 cs.shadow_priced_low = true;
                 Transition(id, cs, State::Learning, "below shadow floor");
                 cs.demote_streak = 0;
@@ -506,7 +494,7 @@ void Framework::LogSessionSummary() {
     for (size_t i = 0; i < NumCaches; ++i) {
         const WindowSummary& w = last_window_[i];
         const CacheCounters& c = w.c;
-        const f64 hr = c.eligible ? 100.0 * f64(c.hits) / f64(c.eligible) : 0.0;
+        const f64 hr = HitPct(c);
         LOG_INFO(Render_Skipcache,
                  "[SkipCache] SESSION {} state={} elig={} hit%={:.1f} cold={} key={} "
                  "gen={},{},{},{},{},{} veto={},{},{},{},{},{},{},{} vfy={}/{}/{} net%={:.3f}",

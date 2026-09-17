@@ -5,7 +5,6 @@
 
 #include <array>
 #include <atomic>
-#include <thread>
 #include "common/types.h"
 
 namespace VideoCore::Skipcache {
@@ -47,10 +46,9 @@ namespace VideoCore::Skipcache {
 // thread reader, asserted not narrated.
 // =============================================================================
 
-// Forced pins every cache with a real consumer to Enabled once at boot: no
-// learning windows, no verify tripwire, no pricing, no telemetry, no timer
-// sampling - OnSubmit returns immediately, so the framework runs zero
-// per-frame code. The probe-only and dead ids stay Off. There is no
+// Forced pins every cache with a real consumer to Enabled once at boot and
+// leaves the probe-only and dead ids Off; timing is off and OnSubmit returns
+// immediately, so the framework runs zero per-frame code. There is no
 // divergence safety net in this mode; the setting itself is the valve.
 enum class Mode : u8 { Disabled = 0, Adaptive = 1, Forced = 2, ValidateOnly = 3 };
 enum class CacheId : u8 {
@@ -151,15 +149,14 @@ struct CacheCounters {
     u64 verify_clean{};
     u64 verify_diverged{};
     u64 verify_aborted{};
-    // Sampled timing (ns, decimated); shadow burden is attributed separately
-    // and never feeds the hit/miss cost models.
+    // Sampled timing (ns, decimated). The shadow burden is tracked separately
+    // in CacheState::shadow_residency_ns and never feeds the hit/miss cost models.
     u64 guard_ns{};
     u64 guard_samples{};
     u64 hit_ns{};
     u64 hit_samples{};
     u64 miss_ns{};
     u64 miss_samples{};
-    u64 shadow_ns{};
 
     u64 Misses() const {
         u64 g = 0;
@@ -178,10 +175,8 @@ struct CacheCounters {
 };
 
 struct WindowSummary {
-    u64 window_id{};
     State state{State::Off};
     CacheCounters c{};
-    u64 duration_ns{};
     bool poisoned{};
     bool low_signal{};
     f64 net_pct{}; // projected steady-state net as % of window
@@ -231,9 +226,10 @@ public:
     }
 
     // ---- Probe gating -------------------------------------------------------
-    // Learning runs the predicate in randomized contiguous 64-call bursts every
-    // 512 eligible calls (would-hit rates depend on call adjacency; stride
+    // Learning runs the predicate in contiguous 64-call bursts every 512
+    // eligible calls (would-hit rates depend on call adjacency; stride
     // decimation biases them low). Shadow/Enabled probe every call.
+    static constexpr u32 kLearningBurstStride = 512;
     bool ShouldProbe(CacheId id) {
         auto& cs = caches_[static_cast<size_t>(id)];
         switch (cs.state) {
@@ -245,9 +241,8 @@ public:
                 --cs.burst_remaining;
                 return true;
             }
-            if (++cs.burst_countdown >= cs.burst_next) {
+            if (++cs.burst_countdown >= kLearningBurstStride) {
                 cs.burst_countdown = 0;
-                cs.burst_next = 512;
                 cs.burst_remaining = 63;
                 return true;
             }
@@ -281,15 +276,15 @@ public:
     }
 
     // ---- Timing (sampled, N=256 with per-window xorshift phase) ------------
-    bool TimingEnabled() const {
-        return timing_enabled_;
-    }
     bool SampleTimer(CacheId id) {
+        if (!timing_enabled_) {
+            return false;
+        }
         auto& cs = caches_[static_cast<size_t>(id)];
         // Learning probes only ~12.5% of calls in bursts; at 1/256 on top the
         // cost model would starve. Sample 1/16 inside bursts, 1/256 elsewhere.
         const u32 mask = cs.state == State::Learning ? 0xF : 0xFF;
-        return timing_enabled_ && ((++cs.timer_decim & mask) == (cs.timer_phase & mask));
+        return (++cs.timer_decim & mask) == (cs.timer_phase & mask);
     }
     u64 Now() const; // FencedRDTSC in ns (calibrated at Init)
     // Remove the fenced-pair overhead from a timed interval so tiny sections
@@ -303,16 +298,15 @@ public:
     // elapsed or >=32 flips, whichever first.
     void OnSubmit(u32 frame_num, bool guest_paused);
     // Masked fallback for titles that rarely reach submit-done. Adaptive-only:
-    // in Forced mode states are pinned at boot, and letting this drive the
-    // window controller prices every cache at zero (timing is off) and demotes
-    // it, silently turning Forced into all-caches-Off within minutes.
+    // Forced pins states at boot and has timing off, so driving the window
+    // controller from here would price every cache at zero and demote it.
     void OnDraw() {
         if (mode_ != Mode::Adaptive) {
             return;
         }
         ++window_draws_;
         if ((++draw_counter_ & 0x1FFF) == 0) {
-            MaybeCloseWindow(true);
+            MaybeCloseWindow();
         }
     }
 
@@ -332,9 +326,6 @@ public:
         }
     }
 
-    // Session summary (called from shutdown path; reads the last snapshot).
-    void LogSessionSummary();
-
     // ---- Descriptor delta storage: the serialized form of the last
     // descriptor push per bind point (graphics, compute). Fixed capacity;
     // an oversized serialization fails closed as a veto. ----
@@ -351,10 +342,9 @@ public:
         u32 desc_count{};
         u32 desc_changed{};
         bool header_changed{};
-        // Per-write verdicts of the last mapped walk, valid up to write_count;
-        // a write recorded unchanged has no per-descriptor verdicts.
+        // Per-write verdicts of the last mapped walk, one entry per write in the
+        // walked list; a write recorded unchanged has no per-descriptor verdicts.
         std::array<u8, 128> write_changed{};
-        u32 write_count{};
         // desc_delta_flat: the blob form (0 serialized stream, bit 63 tagged
         // (nb, ni) flat payloads) and the last flat walk's change bits.
         u64 flat_shape{};
@@ -402,29 +392,28 @@ public:
     };
     DescDeltaStats DrainDescDeltaStats() {
         DescDeltaStats out{};
+        const auto take = [](u64& dst, u64& src) {
+            dst += src;
+            src = 0;
+        };
         for (DescDeltaSlot& slot : desc_delta_) {
-            out.probes += slot.probes;
-            out.hits += slot.hits;
-            out.partial += slot.partial;
-            out.flat += slot.flat;
-            out.unflat += slot.unflat;
-            out.extmiss += slot.extmiss;
-            out.descs += slot.descs;
-            out.pushed += slot.pushed;
-            out.split += slot.split;
-            out.runs += slot.runs;
-            out.heap += slot.heap;
-            out.heap_descs += slot.heap_descs;
+            take(out.probes, slot.probes);
+            take(out.hits, slot.hits);
+            take(out.partial, slot.partial);
+            take(out.flat, slot.flat);
+            take(out.unflat, slot.unflat);
+            take(out.extmiss, slot.extmiss);
+            take(out.descs, slot.descs);
+            take(out.pushed, slot.pushed);
+            take(out.split, slot.split);
+            take(out.runs, slot.runs);
+            take(out.heap, slot.heap);
+            take(out.heap_descs, slot.heap_descs);
             for (size_t i = 0; i < slot.heap_hist.size(); ++i) {
-                out.heap_hist[i] += slot.heap_hist[i];
+                take(out.heap_hist[i], slot.heap_hist[i]);
             }
-            out.heap_images += slot.heap_images;
-            out.heap_samplers += slot.heap_samplers;
-            slot.probes = slot.hits = slot.partial = slot.descs = slot.pushed = slot.split =
-                slot.runs = slot.heap = slot.heap_descs = 0;
-            slot.flat = slot.unflat = slot.extmiss = 0;
-            slot.heap_hist = {};
-            slot.heap_images = slot.heap_samplers = 0;
+            take(out.heap_images, slot.heap_images);
+            take(out.heap_samplers, slot.heap_samplers);
         }
         return out;
     }
@@ -531,7 +520,6 @@ private:
         CacheCounters counters{};
         // Learning burst sampler
         u32 burst_countdown{};
-        u32 burst_next{512};
         u32 burst_remaining{};
         // Verify machinery
         u32 tripwire_decim{};
@@ -551,7 +539,6 @@ private:
         u32 shadow_frames_total{};
         u32 shadow_extensions{};
         u64 shadow_residency_ns{};
-        bool lane_bump_survived{};
         bool shadow_priced_low{};
         u32 divergences_total{};
         u64 last_divergence_window{};
@@ -562,10 +549,12 @@ private:
         u32 eligible_ring_n{};
     };
 
-    void MaybeCloseWindow(bool from_draw_fallback);
+    void MaybeCloseWindow();
     void CloseWindow();
     void StepController(CacheState& cs, CacheId id, const WindowSummary& w);
     void Transition(CacheId id, CacheState& cs, State next, const char* reason);
+    // Periodic SESSION dump; reads last_window_.
+    void LogSessionSummary();
     f64 ProjectedNetPct(const CacheState& cs, u64 window_ns) const;
     u64 RollingMedianEligible(const CacheState& cs) const;
 
@@ -611,15 +600,9 @@ private:
 
     bool dedup_invalidate_registered_{};
     bool timing_enabled_{};
-    u64 tsc_hz_{};
-    u64 tsc_pair_cost_{};
     u64 pair_ns_{};
     f64 ns_per_cycle_{};
     u32 xorshift_state_{0x9E3779B9u};
-
-#ifdef _DEBUG
-    std::thread::id gpu_thread_{};
-#endif
 };
 
 } // namespace VideoCore::Skipcache

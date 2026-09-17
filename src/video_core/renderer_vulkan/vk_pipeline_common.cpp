@@ -130,16 +130,7 @@ u64 DiffWords(const void* a, const void* b, size_t bytes) noexcept {
 template <size_t N>
 u64 DiffFixed(const void* a, const void* b) noexcept {
     static_assert(N % 8 == 0);
-    const u8* pa = static_cast<const u8*>(a);
-    const u8* pb = static_cast<const u8*>(b);
-    u64 acc = 0;
-    for (size_t i = 0; i < N; i += 8) {
-        u64 x, y;
-        std::memcpy(&x, pa + i, 8);
-        std::memcpy(&y, pb + i, 8);
-        acc |= x ^ y;
-    }
-    return acc;
+    return DiffWords(a, b, N);
 }
 
 // One descriptor of a compile-time stride, copied without ever forming the
@@ -190,19 +181,7 @@ SHAD_NO_INLINE u64 SyncDescriptors24(const u8* src, u8* dst, u32 n) noexcept {
     }
 #endif
     for (; i < n; ++i, src += 24, dst += 24) {
-        u64 x0;
-        u64 x1;
-        u64 x2;
-        u64 y0;
-        u64 y1;
-        u64 y2;
-        std::memcpy(&x0, src, 8);
-        std::memcpy(&x1, src + 8, 8);
-        std::memcpy(&x2, src + 16, 8);
-        std::memcpy(&y0, dst, 8);
-        std::memcpy(&y1, dst + 8, 8);
-        std::memcpy(&y2, dst + 16, 8);
-        const u64 d = (x0 ^ y0) | (x1 ^ y1) | (x2 ^ y2);
+        const u64 d = DiffFixed<24>(src, dst);
         CopyFixed<24>(dst, src);
         mask |= u64{d != 0} << i;
     }
@@ -217,8 +196,7 @@ SHAD_NO_INLINE u64 SyncDescriptors24(const u8* src, u8* dst, u32 n) noexcept {
 // The mapped form also records a per-write verdict and, for changed writes,
 // a per-descriptor verdict in the slot, which a partial push consumes; the
 // unmapped form is the plain walk.
-// Inlined at every call site: with a second caller (the heap shadow census)
-// the walk was outlined and its loop lost its registers.
+// Force-inlined: a second caller outlines the walk and its loop loses its registers.
 template <bool kMap>
 SHAD_FORCE_INLINE size_t MatchDescriptorWrites(std::span<const vk::WriteDescriptorSet> writes,
                                                Skipcache::Framework::DescDeltaSlot& slot,
@@ -228,9 +206,8 @@ SHAD_FORCE_INLINE size_t MatchDescriptorWrites(std::span<const vk::WriteDescript
     const u8* const limit = blob.data() + blob.size();
     u64 diff = 0;
     // The verdict counters live in locals: they share the slot with the blob
-    // the cursor stores into, so a slot-resident counter is reloaded after
-    // every store. Every exit writes them back, so a bail leaves the slot as
-    // before.
+    // the cursor stores into, so a slot-resident counter would reload after
+    // every store; every exit writes them back, so a bail leaves the slot as before.
     [[maybe_unused]] u8* const verdicts = kMap ? slot.changed.data() : nullptr;
     [[maybe_unused]] u8* const write_verdicts = kMap ? slot.write_changed.data() : nullptr;
     [[maybe_unused]] u32 n = 0;
@@ -242,7 +219,6 @@ SHAD_FORCE_INLINE size_t MatchDescriptorWrites(std::span<const vk::WriteDescript
             slot.desc_count = n;
             slot.desc_changed = n_changed;
             slot.header_changed = hdr_diff != 0;
-            slot.write_count = w_idx;
         }
     };
     const auto sync_payload = [&]<size_t Stride>(const void* payload, u32 count) {
@@ -395,16 +371,10 @@ size_t CompactDescriptorWrites(std::span<const vk::WriteDescriptorSet> in,
             break;
         }
         default: {
-            bool any = false;
-            for (u32 i = 0; i < count; ++i) {
-                any |= map.changed[k + i] != 0;
+            if (out.size() >= Pipeline::NUM_DESCRIPTOR_WRITES) {
+                return kRunsOverflow;
             }
-            if (any) {
-                if (out.size() >= Pipeline::NUM_DESCRIPTOR_WRITES) {
-                    return kRunsOverflow;
-                }
-                out.push_back(MakeRun(w, 0, count));
-            }
+            out.push_back(MakeRun(w, 0, count));
             break;
         }
         }
@@ -475,7 +445,7 @@ SHAD_FORCE_INLINE void PushSet(vk::CommandBuffer cmdbuf, bool direct,
 
 // Out of line and externally linked: the header's inline Next() calls it from
 // every translation unit that fills a descriptor write list.
-void DescWriteOverflow() {
+[[noreturn]] void DescWriteOverflow() {
     UNREACHABLE_MSG("Descriptor write list is full");
 }
 
@@ -484,6 +454,7 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
                    PipelineLayoutCache* layouts_, bool is_compute_ /*= false*/)
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       layouts{layouts_}, is_compute{is_compute_}, direct_push{instance_.IsMaintenance6Supported()} {
+    image_memo_hint.fill(0xFFFF);
 }
 
 void Pipeline::AssignLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
@@ -557,15 +528,10 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
     } else if (VideoCore::Buffer::barrier_read_merge && scheduler.IsRendering() &&
                VideoCore::Buffer::barrier_rr_merged.load(std::memory_order_relaxed) !=
                    VideoCore::Buffer::barrier_rr_mark.load(std::memory_order_relaxed)) {
-        // buffer_barrier_read_merge telemetry: this bind merged at least one
-        // read-after-read transition and still ended up with an empty barrier
-        // list, and a render pass is open, so the EndRendering the non-empty
-        // branch would have run -- and the restart it costs -- is what the
-        // merge removed. The IsRendering test is what excludes every merge
-        // that cannot save a restart: the compute dispatch paths
-        // (vk_rasterizer.cpp:931, :972), RefreshImage (texture_cache.cpp:1412)
-        // and JoinOverlap (buffer_cache.cpp:2231) all call EndRendering
-        // themselves before reaching here, so the pass is already closed.
+        // buffer_barrier_read_merge telemetry: an empty barrier list after a
+        // merged read-after-read, with a pass still open, is a restart the
+        // merge removed. IsRendering excludes the callers that close the pass
+        // themselves (compute dispatch, RefreshImage, JoinOverlap).
         VideoCore::Buffer::barrier_rr_saved.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -645,11 +611,12 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
             static const bool inplace = EmulatorSettings.IsDescDeltaInplace();
             static const bool partial_enabled = [] {
                 const bool partial = EmulatorSettings.IsDescDeltaPartial();
-                if (partial && !EmulatorSettings.IsDescDeltaInplace()) {
+                const bool inplace_ok = EmulatorSettings.IsDescDeltaInplace();
+                if (partial && !inplace_ok) {
                     LOG_WARNING(Render_Vulkan, "partial descriptor pushes need desc_delta_inplace; "
                                                "every content miss pushes the whole set");
                 }
-                return partial;
+                return partial && inplace_ok;
             }();
             static const bool flat_enabled = [] {
                 const bool f = EmulatorSettings.IsDescDeltaFlat();
@@ -670,8 +637,8 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
             // compared, as 24-byte descriptors against the blob's flat form.
             // The extents fail closed to the walk if an emission ever drifts.
             const bool plan_hit = set_writes.data() == bind_plan.writes.get();
-            const bool flat = flat_enabled && bind_plan.flat && plan_hit &&
-                              buffer_info_n == bind_plan.buffer_descs &&
+            const bool plan_flat = flat_enabled && bind_plan.flat && plan_hit;
+            const bool flat = plan_flat && buffer_info_n == bind_plan.buffer_descs &&
                               image_info_n == bind_plan.image_descs;
             u64 shape = 0;
             size_t size;
@@ -696,7 +663,7 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                                       : MatchDescriptorWrites<false>(set_writes, slot, changed))
                                : SerializeDescriptorWrites(set_writes, scratch);
                 ++slot.unflat;
-                if (flat_enabled && bind_plan.flat && plan_hit) {
+                if (plan_flat) {
                     ++slot.extmiss;
                 }
             }
@@ -722,8 +689,8 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 // Same command buffer, foreign gen and layout: the driver's
                 // set still holds the last push, so only the changed
                 // descriptors need to go. Near-total changes push whole.
-                partial_ok = inplace && partial_enabled && size == slot.size &&
-                             !slot.header_changed && slot.desc_changed * 4 <= slot.desc_count * 3;
+                partial_ok = partial_enabled && size == slot.size && !slot.header_changed &&
+                             slot.desc_changed * 4 <= slot.desc_count * 3;
                 if (partial_ok) {
                     ++slot.partial;
                     slot.descs += slot.desc_count;
@@ -742,6 +709,8 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
             if (would_hit && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
                 return; // identical set already pushed on this command buffer
             }
+            const vk::WriteDescriptorSet* push_writes = set_writes.data();
+            u32 push_count = static_cast<u32>(set_writes.size());
             const bool timed_miss = timed && !would_hit;
             const u64 m0 = timed_miss ? sc.Now() : 0;
             if (partial_ok && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
@@ -754,17 +723,14 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                          : CompactDescriptorWrites(set_writes, slot, partial_scratch);
                 if (runs <= set_writes.size() + (slot.desc_count - slot.desc_changed) / 2) {
                     slot.runs += runs;
-                    PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
-                            static_cast<u32>(partial_scratch.size()), partial_scratch.data());
+                    push_writes = partial_scratch.data();
+                    push_count = static_cast<u32>(partial_scratch.size());
                 } else {
                     ++slot.split;
-                    PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
-                            static_cast<u32>(set_writes.size()), set_writes.data());
                 }
-            } else {
-                PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point,
-                        static_cast<u32>(set_writes.size()), set_writes.data());
             }
+            PushSet(cmdbuf, direct_push, stage_flags, pipeline_layout, bind_point, push_count,
+                    push_writes);
             if (timed_miss) {
                 ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
                 ++ctr.miss_samples;
@@ -799,37 +765,30 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
     }
 
     const auto desc_set = desc_heap.Commit(desc_layout);
-    {
-        // The heap leg is the delta-free stream; its size prices any future
-        // second push set. DescDeltaState is ungated.
-        auto& hs = VideoCore::Skipcache::Framework::Instance().DescDeltaState(
-            bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0);
-        ++hs.heap;
-        u32 descs = 0;
-        u32 images = 0;
-        u32 samplers = 0;
-        for (const auto& set_write : set_writes) {
-            descs += set_write.descriptorCount;
-            if (set_write.descriptorType == vk::DescriptorType::eSampledImage ||
-                set_write.descriptorType == vk::DescriptorType::eStorageImage) {
-                images += set_write.descriptorCount;
-            } else if (set_write.descriptorType == vk::DescriptorType::eSampler) {
-                samplers += set_write.descriptorCount;
-            }
-        }
-        hs.heap_descs += descs;
-        hs.heap_images += images;
-        hs.heap_samplers += samplers;
-        const u32 limit = instance.MaxPushDescriptors();
-        ++hs.heap_hist[descs <= limit ? 0
-                       : descs <= 40  ? 1
-                       : descs <= 48  ? 2
-                       : descs <= 64  ? 3
-                                      : 4];
-    }
+    auto& sc = Skipcache::Framework::Instance();
+    const size_t idx = IsCompute() ? 1 : 0;
+    // The heap leg is the delta-free stream; its size prices any future
+    // second push set. DescDeltaState is ungated.
+    auto& hs = sc.DescDeltaState(idx);
+    ++hs.heap;
+    u32 descs = 0;
+    u32 images = 0;
+    u32 samplers = 0;
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
+        descs += set_write.descriptorCount;
+        if (set_write.descriptorType == vk::DescriptorType::eSampledImage ||
+            set_write.descriptorType == vk::DescriptorType::eStorageImage) {
+            images += set_write.descriptorCount;
+        } else if (set_write.descriptorType == vk::DescriptorType::eSampler) {
+            samplers += set_write.descriptorCount;
+        }
     }
+    hs.heap_descs += descs;
+    hs.heap_images += images;
+    hs.heap_samplers += samplers;
+    const u32 limit = instance.MaxPushDescriptors();
+    ++hs.heap_hist[descs <= limit ? 0 : descs <= 40 ? 1 : descs <= 48 ? 2 : descs <= 64 ? 3 : 4];
     instance.GetDevice().updateDescriptorSets(
         vk::ArrayProxy<const vk::WriteDescriptorSet>(static_cast<uint32_t>(set_writes.size()),
                                                      set_writes.data()),
@@ -837,8 +796,7 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
     cmdbuf.bindDescriptorSets(bind_point, pipeline_layout, 0, desc_set, {});
     // The heap set replaces this bind point's set 0 behind the delta cache;
     // the bump makes its next probe miss.
-    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(
-        bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0);
+    sc.BumpForeignPushGen(idx);
 }
 
 std::string Pipeline::GetDebugString() const {

@@ -30,14 +30,7 @@ class Scheduler;
 class DescriptorHeap;
 class PipelineLayoutCache;
 
-template <size_t N>
-constexpr std::array<u16, N> NoImageMemoHints() {
-    std::array<u16, N> hints{};
-    hints.fill(0xFFFF);
-    return hints;
-}
-
-void DescWriteOverflow();
+[[noreturn]] void DescWriteOverflow();
 
 class Pipeline {
 public:
@@ -82,18 +75,12 @@ public:
 
     static constexpr u32 NUM_DESCRIPTOR_WRITES = 128;
 
-    /// Permanent, value-initialised once. The old vector re-value-initialised
-    /// every element it grew into on every draw, while the fill sites overwrite
-    /// all but sType, pNext and pTexelBufferView, which are constant for the
-    /// life of the process. begin/end are bounded by count, never by capacity,
-    /// so a stale tail entry is unreachable.
-    class DescriptorWriteList {
+    /// Value-initialised once: the fill sites overwrite every field but sType, pNext
+    /// and pTexelBufferView, which stay constant; entries past size() are unreachable.
+    class DescriptorWrites {
     public:
         void clear() noexcept {
             count = 0;
-        }
-        bool empty() const noexcept {
-            return count == 0;
         }
         std::size_t size() const noexcept {
             return count;
@@ -101,27 +88,10 @@ public:
         vk::WriteDescriptorSet* data() noexcept {
             return writes.data();
         }
-        const vk::WriteDescriptorSet* data() const noexcept {
-            return writes.data();
-        }
-        vk::WriteDescriptorSet* begin() noexcept {
-            return writes.data();
-        }
-        vk::WriteDescriptorSet* end() noexcept {
-            return writes.data() + count;
-        }
-        const vk::WriteDescriptorSet* begin() const noexcept {
-            return writes.data();
-        }
-        const vk::WriteDescriptorSet* end() const noexcept {
-            return writes.data() + count;
-        }
-        /// Fails closed: the assert helpers in this tree return, so running
-        /// past the array would write into whatever follows it.
+        /// Fails closed: DescWriteOverflow aborts, so overflow never returns.
         vk::WriteDescriptorSet& Next() noexcept {
             if (count >= NUM_DESCRIPTOR_WRITES) [[unlikely]] {
                 DescWriteOverflow();
-                return overflow_slot;
             }
             return writes[count++];
         }
@@ -131,10 +101,8 @@ public:
 
     private:
         std::array<vk::WriteDescriptorSet, NUM_DESCRIPTOR_WRITES> writes{};
-        vk::WriteDescriptorSet overflow_slot{};
         u32 count{};
     };
-    using DescriptorWrites = DescriptorWriteList;
     using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
     // buffer_info_n / image_info_n: the rasterizer's info array extents this
@@ -169,7 +137,7 @@ public:
     // findimg_slot_hint: the memo entry each image binding ordinal's T# last
     // matched or populated, 0xFFFF none. Never serialized.
     static constexpr u32 kImageMemoHints = 32;
-    mutable std::array<u16, kImageMemoHints> image_memo_hint{NoImageMemoHints<kImageMemoHints>()};
+    mutable std::array<u16, kImageMemoHints> image_memo_hint;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
