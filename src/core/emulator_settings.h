@@ -501,7 +501,9 @@ struct GPUSettings {
     // GpuComm drain/release loop into a single cross-region call.
     Setting<bool> protect_carry_merge{false};
     Setting<bool> stream_buffer_prefer_host{false};
-    // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
+    // 1 keys the stream-copy and index-bind memos on the tracker's word-epoch sums and
+    // maintains those epochs from the protect and backing-write observers; 0 keys them on
+    // the memory generation instead.
     Setting<u32> stream_upload_mirror_mode{0};
     // Widens a guest write fault's dirty marking to this power-of-two block
     // size when the block holds no GPU-modified pages (page-exact semantics

@@ -50,7 +50,7 @@ void Framework::Init(Mode mode) {
     }
     if (mode_ == Mode::Forced) {
         // Everything decided here, once: consumers pinned Enabled, the
-        // probe-only ids (BindingSkipProbe, StreamMirror) and the dead
+        // probe-only id (BindingSkipProbe) and the dead
         // Pipeline id pinned Off so their call sites short-circuit to
         // nothing. No calibration - nothing ever samples a timer.
         timing_enabled_ = false;
@@ -64,7 +64,6 @@ void Framework::Init(Mode mode) {
         }
         caches_[static_cast<size_t>(CacheId::BindingSkipProbe)].state = State::Off;
         caches_[static_cast<size_t>(CacheId::Pipeline)].state = State::Off;
-        caches_[static_cast<size_t>(CacheId::StreamMirror)].state = State::Off;
         LOG_INFO(Render_Skipcache, "[SkipCache] init mode=Forced");
         return;
     }
@@ -425,7 +424,7 @@ void Framework::StepController(CacheState& cs, CacheId id, const WindowSummary& 
         break;
     }
     case State::Learning: {
-        if (id == CacheId::BindingSkipProbe || id == CacheId::StreamMirror) {
+        if (id == CacheId::BindingSkipProbe) {
             break; // measurement-only: never promotes, never exhausts a budget
         }
         if (!warmed_up_ || w.low_signal) {

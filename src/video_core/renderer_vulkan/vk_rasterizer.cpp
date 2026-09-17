@@ -1590,7 +1590,7 @@ void Rasterizer::OnSubmit() {
                          ls.barrier_wait_ns / 1000000, ls.mwaits, ls.mwait_wakes, ls.worker_jobs[0],
                          ls.worker_jobs[1], ls.worker_jobs[2], ls.worker_jobs[3], ls.helper_jobs);
             }
-            buffer_cache.EmitMirrorTelemetry();
+            buffer_cache.EmitTrackerTelemetry();
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());

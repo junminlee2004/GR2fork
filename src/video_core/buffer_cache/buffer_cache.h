@@ -901,66 +901,13 @@ private:
     u64 index_genwalk_{};
 
 public:
-    /// Emits and resets the phase-1 stream mirror telemetry. Logs nothing when
-    /// the mirror mode is off.
-    void EmitMirrorTelemetry();
+    /// Emits and resets the tracker telemetry lines of this window.
+    void EmitTrackerTelemetry();
 
 private:
     static void MirrorProtectThunk(void* user, VAddr addr, u64 size, bool write_granted,
                                    bool tracker_origin);
     static void MirrorBackingThunk(void* user, VAddr addr, u64 size);
-    /// Inline gate: with the mirror instrumentation quarantined or the mode
-    /// off, draw-rate callers pay two loads instead of a call per probe.
-    void MirrorOracleProbe(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty) {
-        if (!mirror_mode_ ||
-            !Skipcache::Framework::Instance().ShouldProbe(Skipcache::CacheId::StreamMirror)) {
-            return;
-        }
-        MirrorOracleProbeSlow(device_addr, size, tick_hit, gpu_dirty);
-    }
-    void MirrorOracleProbeSlow(VAddr device_addr, u32 size, bool tick_hit, bool gpu_dirty);
-
-    // Phase-1 observe-only stream mirror instrumentation. The sink counters
-    // are written from guest threads and the fault path; the oracle counters
-    // are GPU command thread only.
-    struct MirrorSinkCounters {
-        std::atomic<u64> bump_tracker{};
-        std::atomic<u64> bump_guestapi{};
-        std::atomic<u64> bump_backing{};
-        std::atomic<u64> poisoned{};
-    };
-    struct MirrorOracleCounters {
-        u64 elig{};
-        u64 elig_bytes{};
-        u64 tick_miss{};
-        u64 clean{};
-        u64 clean_tm{};
-        u64 clean_bytes{};
-        u64 clean_tm_bytes{};
-        u64 hit_clean{};
-        u64 hit_clean_tm{};
-        u64 div{};
-        u64 alias256{};
-        u64 alias64{};
-        u64 changed{};
-        u64 dirty_stable{};
-        u64 dirty_stable_chg{};
-        u64 dirty_moved{};
-        u64 gpu_dirty{};
-        u64 cpu_dirty{};
-        u64 cpu_dirty_bytes{};
-        u64 cold{};
-        u64 evict{};
-        u64 ws_keys{};
-        u64 ws_bytes{};
-        u64 sum_unresolved{};
-        u64 tierA_walks{};
-        u64 tierA_hits{};
-        u64 tierA_elig_walks{};
-        u64 tierA_span_le64{};
-    };
-    MirrorSinkCounters mirror_sink_;
-    MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
     bool tracker_mode_latch_{};
     bool stream_copy_resolved_epoch_{};
@@ -1009,10 +956,8 @@ private:
     u64 upload_ro_bytes_{};
     u64 upload_w_calls_{};
     u64 upload_w_bytes_{};
-    u64 texel_ro_walks_{};
     u64 texel_noop_hits_{};
     u64 texel_noop_probes_{};
-    u64 texel_ro_regions_{};
     u64 dmasync_calls_{};
     u64 dmasync_buffers_{};
     u64 dmasync_bytes_{};

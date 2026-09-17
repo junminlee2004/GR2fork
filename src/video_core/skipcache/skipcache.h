@@ -62,8 +62,7 @@ enum class CacheId : u8 {
     Pipeline = 5,
     Sampler = 6,
     DescDelta = 7,
-    StreamMirror = 8,
-    DynState = 9,
+    DynState = 8,
     Count
 };
 enum class State : u8 { Off = 0, Learning, Shadow, Enabled, Quarantined };
@@ -85,8 +84,6 @@ constexpr const char* CacheName(CacheId id) {
         return "PIPEKEY";
     case CacheId::Sampler:
         return "SAMPLER";
-    case CacheId::StreamMirror:
-        return "MIRROR";
     case CacheId::DescDelta:
         return "DESCDELTA";
     case CacheId::DynState:
