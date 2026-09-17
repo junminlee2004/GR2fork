@@ -98,8 +98,7 @@ private:
 /// the next guest fault in that region.
 class ProtectCarryScope {
 public:
-    explicit ProtectCarryScope(const PageManager& pm_, bool enable_ = true)
-        : pm{pm_}, enable{enable_} {
+    explicit ProtectCarryScope(const PageManager& pm_, bool enable_) : pm{pm_}, enable{enable_} {
         if (enable) {
             pm.BeginProtectCarry();
         }
