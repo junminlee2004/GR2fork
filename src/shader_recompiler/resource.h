@@ -21,9 +21,6 @@ using SharpLocation = u16;
 
 constexpr SharpLocation UNKNOWN_LOCATION = std::numeric_limits<u16>::max();
 
-// Readers take the sharp through Info::flat_ud, never flattened_ud_buf: the fork's
-// RefreshFlatBuf leaves that vector empty for walker-less shaders and aliases flat_ud
-// to the user-data registers instead of copying them per bind.
 template <typename T>
 struct SharpFetch {
     static constexpr std::size_t N = sizeof(T) / sizeof(u32);
@@ -71,6 +68,12 @@ struct SharpFetch {
         }
         return true;
     }
+
+    // Sets direct from the owner's eligibility. The offset bound keeps the in-place read inside
+    // the flat buffer, where Fetch's UNKNOWN_LOCATION check would have rejected the last dwords.
+    constexpr void ResolveDirect(bool eligible) noexcept {
+        direct = eligible && IsContiguousLoad() && offsets[0] < UNKNOWN_LOCATION - N;
+    }
 };
 
 enum class SharpFetchPostOp : u8 {
@@ -110,11 +113,8 @@ struct BufferResource {
         return buffer_type != BufferType::Guest;
     }
 
-    // Derives sharp_fetch.direct; the offset bound keeps the in-place read inside the flat
-    // buffer where Fetch's UNKNOWN_LOCATION check would have rejected the last dwords.
     void ResolveDirectRead() noexcept {
-        sharp_fetch.direct = post_op == SharpFetchPostOp::None && sharp_fetch.IsContiguousLoad() &&
-                             sharp_fetch.offsets[0] < UNKNOWN_LOCATION - decltype(sharp_fetch)::N;
+        sharp_fetch.ResolveDirect(post_op == SharpFetchPostOp::None);
     }
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
@@ -131,9 +131,8 @@ struct BufferResource {
                 buffer.base_address += info.pgm_base;
             }
         }
-        // No logging here: the fmt machinery a log line drags in makes this
-        // function too big to inline, and it runs once per descriptor per
-        // draw across every bind site.
+        // No logging here: a log line's fmt machinery would stop this from inlining on a
+        // per-descriptor-per-draw path.
         if (!buffer.Valid()) [[unlikely]] {
             return AmdGpu::Buffer::Null();
         }
@@ -159,11 +158,9 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
-    // Derives sharp_fetch.direct; an r128 T# is half a sharp and always assembles.
+    // An r128 T# is half a sharp and always assembles.
     void ResolveDirectRead() noexcept {
-        sharp_fetch.direct = !is_r128 && post_op == SharpFetchPostOp::None &&
-                             sharp_fetch.IsContiguousLoad() &&
-                             sharp_fetch.offsets[0] < UNKNOWN_LOCATION - decltype(sharp_fetch)::N;
+        sharp_fetch.ResolveDirect(!is_r128 && post_op == SharpFetchPostOp::None);
     }
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
@@ -205,11 +202,9 @@ struct ImageResource {
         return true;
     }
 
-    // Bind sites that only read the T# take this form: the by-value read
-    // forces a 32-byte stack copy whose 8-byte reloads cannot forward. The
-    // reference is only valid when the fetch is one contiguous load with no
-    // post-op; scratch carries the value on every other arm and for the null
-    // fixups, which build the same Null objects the by-value form builds.
+    // Read-only bind sites take this form to skip the by-value 32-byte stack copy. The returned
+    // reference aliases flat_ud only when sharp_fetch.direct; on every other arm, null fixups
+    // included, scratch holds the value.
     const AmdGpu::Image& GetSharpRef(const auto& info, AmdGpu::Image& scratch) const noexcept {
         if (!sharp_fetch.direct) [[unlikely]] {
             scratch = GetSharp(info);
@@ -232,8 +227,7 @@ struct ImageResource {
         return raw;
     }
 
-    // Bind sites already holding the decoded T# take this form: the other one
-    // re-reads 32 bytes of user data per image per draw to reach the same count.
+    // For bind sites already holding the T#; the forwarder below re-reads it per image per draw.
     u32 NumBindings(const AmdGpu::Image& tsharp) const {
         // A malformed or rejected T# carries unordered 4-bit level fields; the promoted
         // subtraction is signed, so an inverted pair would wrap this u32 to ~4e9 descriptors.
@@ -254,10 +248,8 @@ struct SamplerResource {
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
 
-    // Derives sharp_fetch.direct; see BufferResource::ResolveDirectRead.
     void ResolveDirectRead() noexcept {
-        sharp_fetch.direct = post_op == SharpFetchPostOp::None && sharp_fetch.IsContiguousLoad() &&
-                             sharp_fetch.offsets[0] < UNKNOWN_LOCATION - decltype(sharp_fetch)::N;
+        sharp_fetch.ResolveDirect(post_op == SharpFetchPostOp::None);
     }
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
