@@ -235,8 +235,6 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
             .pBufferInfo = &params_buffer_info,
         },
     }};
-    // A push outside the delta-cached path rewrites this bind point's set 0
-    // behind the cache; the bump makes its next probe miss.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
@@ -323,8 +321,6 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
             .pBufferInfo = &params_buffer_info,
         },
     }};
-    // A push outside the delta-cached path rewrites this bind point's set 0
-    // behind the cache; the bump makes its next probe miss.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
