@@ -442,6 +442,32 @@ public:
         return GetRegionBits<type>().AllInRange(start_page, end_page);
     }
 
+    /// Diagnostic, lock-free: does any page of the range still carry its write
+    /// watcher (writeable clear = armed PROT_READ)? Answers with the same
+    /// seqlock protocol as the peeks above and gives up rather than lock, since
+    /// the only caller is the PM4WRITE census. A racing arm or release makes
+    /// the answer stale, never unsafe.
+    [[nodiscard]] bool PeekAnyWriteProtected(u64 offset, u64 size) noexcept {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return false;
+        }
+        for (u32 attempt = 0; attempt < 4; ++attempt) {
+            const u64 before = state.load(std::memory_order_acquire);
+            if (before & SEQ_ONE) {
+                continue; // writer in flight
+            }
+            const bool result = !writeable.AllInRange(start_page, end_page);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (state.load(std::memory_order_relaxed) == before) {
+                return result;
+            }
+        }
+        return false;
+    }
+
     /// Arms the read watcher of every GPU-dirty page that still lacks one and
     /// returns the protection calls issued. A page with gpu and readable both
     /// set awaits its arm; the arm and release masks are disjoint, so a

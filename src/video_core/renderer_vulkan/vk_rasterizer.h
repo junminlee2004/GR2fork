@@ -28,6 +28,10 @@ SHAD_NO_INLINE void ImageBindingsOverflow();
 
 class GraphicsPipeline;
 
+// Which PM4 packet a guest-memory write by the parser came from; the PM4WRITE
+// census counts the three sites apart.
+enum class Pm4WriteSite : u8 { GfxWriteData, ComputeWriteData, ComputeFence };
+
 class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler,
@@ -75,6 +79,9 @@ public:
     bool InvalidateMemory(VAddr addr, u64 size);
     bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
+    // Guest-memory store issued by the PM4 parser. Default-off setting; when
+    // off this is the plain store the call sites did before.
+    void WriteGuestMemory(VAddr addr, const void* data, u64 size, Pm4WriteSite site);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -229,6 +236,13 @@ private:
     // buffers, and the run's length; flushes it adds, for the log.
     bool readback_offload_{};
     bool tracker_lock_spin_{};
+    // pm4_backing_writes: latched setting and the PM4WRITE census. Counts are
+    // GpuComm-confined (the PM4 parser is single-threaded per queue set).
+    bool pm4_backing_writes_{};
+    struct Pm4WriteStats {
+        u64 gfx_wd, cs_wd, fence, prot, pm_prot, backed, nobacking, untracked;
+    };
+    Pm4WriteStats pm4w_{};
     bool prone_run_{};
     u32 prone_run_draws_{};
     u64 writer_flushes_{};

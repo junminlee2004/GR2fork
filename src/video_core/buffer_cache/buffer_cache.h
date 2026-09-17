@@ -119,6 +119,11 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size);
 
+    /// Diagnostic: write-watch state of a range, for the PM4WRITE census.
+    WriteWatchPeek PeekWriteWatchState(VAddr device_addr, u64 size) noexcept {
+        return memory_tracker->PeekWriteWatchState(device_addr, size);
+    }
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 

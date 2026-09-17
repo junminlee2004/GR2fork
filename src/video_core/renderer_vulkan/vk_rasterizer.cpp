@@ -151,6 +151,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     }
     readback_offload_ = EmulatorSettings.IsReadbackOffload();
     tracker_lock_spin_ = EmulatorSettings.GetTrackerLockSpinRounds() != 0;
+    pm4_backing_writes_ = EmulatorSettings.IsPm4BackingWrites();
     // The register stamp is armed once from the boot value of the skip-cache
     // mode; enabling the framework later from the settings dialog leaves it
     // pinned, and a frozen stamp compares every draw register-identical.
@@ -1238,6 +1239,14 @@ void Rasterizer::OnSubmit() {
                          hold_drops_wait_, hold_drops_cmd_, hold_compiles_);
                 hold_arms_ = hold_draws_covered_ = hold_drops_run_ = hold_drops_flush_ =
                     hold_drops_wait_ = hold_drops_cmd_ = hold_compiles_ = 0;
+            }
+            if (pm4_backing_writes_) {
+                LOG_INFO(Render_Skipcache,
+                         "[SkipCache] PM4WRITE gfxwd={} cswd={} fence={} pmprot={} protected={} "
+                         "backed={} nobacking={} untracked={} per300f",
+                         pm4w_.gfx_wd, pm4w_.cs_wd, pm4w_.fence, pm4w_.pm_prot, pm4w_.prot,
+                         pm4w_.backed, pm4w_.nobacking, pm4w_.untracked);
+                pm4w_ = {};
             }
             if (const auto bw = Core::MemoryManager::DrainBackingWriteStats(); bw.calls) {
                 LOG_INFO(Render_Skipcache,
@@ -3185,6 +3194,55 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     buffer_cache.ReadMemory(addr, size);
     Skipcache::Framework::Instance().BumpMemGen();
     return true;
+}
+
+void Rasterizer::WriteGuestMemory(VAddr addr, const void* data, u64 size, Pm4WriteSite site) {
+    if (!pm4_backing_writes_) {
+        std::memcpy(reinterpret_cast<void*>(addr), data, size);
+        return;
+    }
+    switch (site) {
+    case Pm4WriteSite::GfxWriteData:
+        ++pm4w_.gfx_wd;
+        break;
+    case Pm4WriteSite::ComputeWriteData:
+        ++pm4w_.cs_wd;
+        break;
+    case Pm4WriteSite::ComputeFence:
+        ++pm4w_.fence;
+        break;
+    }
+    // Census only: was any page the store touches still write-watched when the
+    // parser stored to it? This is what decides whether the parser writes are
+    // the ones taking GpuComm's own page faults. pm_prot is the authoritative
+    // answer (the page manager's own watcher refcount, i.e. exactly what the
+    // mprotect state is); prot below asks the same whole-range question of the
+    // buffer tracker only, so the two fields are directly comparable.
+    if (page_manager.IsWriteWatched(addr, size)) {
+        ++pm4w_.pm_prot;
+    }
+    switch (buffer_cache.PeekWriteWatchState(addr, size)) {
+    case VideoCore::WriteWatchPeek::Protected:
+        ++pm4w_.prot;
+        break;
+    case VideoCore::WriteWatchPeek::NoRegion:
+        ++pm4w_.untracked;
+        break;
+    default:
+        break;
+    }
+    // Only the compute fence takes the backing alias, mirroring the gfx
+    // EOP/EOS fences that already write that way. WriteData can target bytes
+    // the GPU reads later (indirect draw args), so it would need a CPU-dirty
+    // mark and keeps its guest-page store - and its fault - for now.
+    if (site == Pm4WriteSite::ComputeFence) {
+        if (memory->TryWriteBacking(reinterpret_cast<void*>(addr), data, size)) {
+            ++pm4w_.backed;
+            return;
+        }
+        ++pm4w_.nobacking;
+    }
+    std::memcpy(reinterpret_cast<void*>(addr), data, size);
 }
 
 void Rasterizer::ProcessDownloadImages() {

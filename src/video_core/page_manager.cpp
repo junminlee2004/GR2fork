@@ -525,8 +525,18 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 }
 
 bool PageManager::IsWriteWatched(VAddr addr, u64 size) const {
-    const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
-    for (size_t page = addr >> PM_PAGE_BITS; page < page_end; ++page) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 first_page = addr >> PM_PAGE_BITS;
+    if (first_page >= Impl::NUM_ADDRESS_PAGES) {
+        // cached_pages only covers the low 40 bits of the address space; a
+        // packet pointing above it is not tracked here at all.
+        return false;
+    }
+    const u64 end_page =
+        std::min<u64>(Common::DivCeil(addr + size, PM_PAGE_SIZE), Impl::NUM_ADDRESS_PAGES);
+    for (u64 page = first_page; page < end_page; ++page) {
         if (impl->cached_pages[page].num_write_watchers != 0) {
             return true;
         }

@@ -606,6 +606,10 @@ struct GPUSettings {
     // Only writes that fit inside one 4 KiB page take the path; a range holding GPU-modified pages
     // keeps the fault path.
     Setting<bool> cp_write_backing{false};
+    // Compute ReleaseMem fence writes go through the physical backing alias instead of storing
+    // through the write-watched guest page, and both PM4 WriteData sites are counted, so the
+    // PM4WRITE line shows whether the parser writes are the ones faulting on GpuComm.
+    Setting<bool> pm4_backing_writes{false};
     // Stream-copy and index-bind memo entries remember the tracker region that
     // covered their range, so a hit re-certifies the word-epoch sum with that
     // region's own loads instead of the tracker walk.
@@ -913,6 +917,7 @@ struct GPUSettings {
             make_override<GPUSettings>("buffer_barrier_read_merge",
                                        &GPUSettings::buffer_barrier_read_merge),
             make_override<GPUSettings>("cp_write_backing", &GPUSettings::cp_write_backing),
+            make_override<GPUSettings>("pm4_backing_writes", &GPUSettings::pm4_backing_writes),
             make_override<GPUSettings>("stream_copy_resolved_epoch",
                                        &GPUSettings::stream_copy_resolved_epoch),
             make_override<GPUSettings>("written_range_fast", &GPUSettings::written_range_fast),
@@ -1028,7 +1033,7 @@ struct GPUSettings {
     draw_glue_memo, readback_wait_notify, readback_window_kb, deferred_read_release, \
     image_fast_state, guest_copy_lock_batch
 #define GPU_SETTINGS_JSON_FIELDS_C \
-    spec_fp_cache, cp_write_backing, runtime_info_stamp_gate
+    spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, pm4_backing_writes
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1345,6 +1350,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FindimgRangeInvalidate, findimg_range_invalidate)
     SETTING_FORWARD_BOOL(m_gpu, BufferBarrierReadMerge, buffer_barrier_read_merge)
     SETTING_FORWARD_BOOL(m_gpu, CpWriteBacking, cp_write_backing)
+    SETTING_FORWARD_BOOL(m_gpu, Pm4BackingWrites, pm4_backing_writes)
     SETTING_FORWARD_BOOL(m_gpu, StreamCopyResolvedEpoch, stream_copy_resolved_epoch)
     SETTING_FORWARD(m_gpu, WrittenRangeFast, written_range_fast)
     SETTING_FORWARD_BOOL(m_gpu, SpecFpSlotInplace, spec_fp_slot_inplace)

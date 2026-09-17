@@ -67,12 +67,10 @@ public:
     };
     ProtectCarryStats DrainProtectCarryStats() const;
 
-    /// True when any page touching the range still holds a write watcher, i.e.
-    /// a store into it would take a SIGSEGV. Read without the range lock;
-    /// writers hold it (page_manager.cpp:238) and the guest fault path is one
-    /// of them, so this can observe a stale count. Both outcomes are benign: a
-    /// stale "unwatched" takes the ordinary fault path, a stale "armed" costs
-    /// one extra region-lock mark.
+    /// Returns true if any page touched by [addr, addr + size) currently holds a
+    /// write watcher (i.e. it is mapped PROT_READ and a guest store to it would
+    /// fault). An address outside the tracked low 40 bits answers false.
+    /// Diagnostic only: raced against concurrent arms/releases, never branched on.
     bool IsWriteWatched(VAddr addr, u64 size) const;
 
     /// Returns page aligned address.

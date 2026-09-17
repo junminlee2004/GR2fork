@@ -21,6 +21,13 @@
 
 namespace VideoCore {
 
+/// Answer of the diagnostic write-watch peek below.
+enum class WriteWatchPeek : u8 {
+    NoRegion, // no tracker region covers the range
+    Writable, // every covered page is released (PROT_READ|WRITE)
+    Protected // at least one covered page still carries its write watcher
+};
+
 class MemoryTracker {
 public:
     static constexpr size_t MAX_CPU_PAGE_BITS = 40;
@@ -357,6 +364,23 @@ public:
                 return manager->template PeekRegionModified<Type::CPU>(offset, size);
             });
         return dirty || covered != query_size;
+    }
+
+    /// Diagnostic census for the PM4WRITE line: is any tracked page of the
+    /// range still write-watched right now? Never creates a region, never
+    /// locks.
+    WriteWatchPeek PeekWriteWatchState(VAddr query_cpu_addr, u64 query_size) noexcept {
+        u64 covered = 0;
+        bool protect = false;
+        IteratePages<false>(query_cpu_addr, query_size,
+                            [&covered, &protect](RegionManager* manager, u64 offset, size_t size) {
+                                covered += size;
+                                protect |= manager->PeekAnyWriteProtected(offset, size);
+                            });
+        if (covered == 0) {
+            return WriteWatchPeek::NoRegion;
+        }
+        return protect ? WriteWatchPeek::Protected : WriteWatchPeek::Writable;
     }
 
     struct EpochSum256 {
