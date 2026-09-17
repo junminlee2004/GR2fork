@@ -12,43 +12,31 @@
 namespace Common {
 
 /**
- * Like std::shared_mutex, but reader has priority over writer.
+ * Like std::shared_mutex, but a reader outranks a writer: a writer that is only
+ * waiting has not taken the word, so it never holds off an incoming reader.
+ * Writers can therefore be starved by busy readers - the intended trade.
  *
- * Ownership lives in one atomic word: the high bit means a writer holds the
- * lock, the remaining bits count readers. A writer takes ownership only by
- * moving that word from exactly zero to the writer bit, which gives the two
- * properties this type exists for:
+ * Shared acquisition is consequently recursive, which this codebase needs: guest
+ * read faults re-enter the memory manager's lock, and std::shared_mutex deadlocks
+ * there on MSVC's SRWLock and on libc++ (both admit a waiting writer ahead of a
+ * new reader) while glibc's reader-preferring rwlock does not, so the failure
+ * would appear only off Linux.
  *
- *  - Readers outrank writers. A writer that is merely *waiting* has not set the
- *    bit, so it never holds off an incoming reader. Writers can therefore be
- *    starved by a busy reader, which is the intended trade.
- *  - Shared acquisition is recursive. A thread already holding a read keeps the
- *    word non-zero, so no writer can acquire underneath it, so the same thread
- *    can take another read without deadlocking. Guest read faults re-enter the
- *    memory manager's lock this way, and std::shared_mutex is unusable here for
- *    that reason - MSVC's SRWLock and libc++ both admit a waiting writer ahead
- *    of a new reader and deadlock, while glibc's reader-preferring rwlock does
- *    not, so the failure would appear only off Linux.
- *
- * The mutex and condition variable below are the slow path only: contended
- * acquisition, and waking a writer once the last reader leaves. An uncontended
- * lock_shared is a load and a compare-exchange, which matters because the GPU
- * command thread takes this lock thousands of times per frame.
+ * mtx and cv are the contended slow path only; an uncontended lock_shared is a
+ * load plus a CAS, which matters because the GPU command thread takes this lock
+ * thousands of times per frame.
  */
 class SharedFirstMutex {
 public:
     void lock() {
         std::unique_lock<std::mutex> lock(mtx);
-        // Publishing the intent to write does not block readers; it only asks
-        // the last reader out to wake us. Ordering with unlock_shared's check
-        // is sequentially consistent so exactly one of the two sees the other.
+        // seq_cst pairs with unlock_shared's waiting_writers load: one always sees the other.
         waiting_writers.fetch_add(1, std::memory_order_seq_cst);
         std::uint32_t expected = 0;
         while (!state.compare_exchange_weak(expected, WRITER_BIT, std::memory_order_acq_rel,
                                             std::memory_order_relaxed)) {
             expected = 0;
-            // Notifications are issued while holding mtx, which we hold here
-            // until wait() releases it, so a wakeup cannot be missed.
+            // notify_all is issued under mtx, held until wait() releases it: no wakeup is lost.
             cv.wait(lock);
         }
         waiting_writers.fetch_sub(1, std::memory_order_release);
@@ -56,6 +44,7 @@ public:
 
     bool try_lock() {
         std::lock_guard<std::mutex> lock(mtx);
+        // The CAS must run under mtx: lock_shared's slow path increments after its predicate.
         std::uint32_t expected = 0;
         return state.compare_exchange_strong(expected, WRITER_BIT, std::memory_order_acq_rel,
                                              std::memory_order_relaxed);
@@ -72,7 +61,6 @@ public:
             expected = 0;
             if (cv.wait_until(lock, abs_time) == std::cv_status::timeout) {
                 // The deadline may still coincide with the lock falling free.
-                expected = 0;
                 acquired = state.compare_exchange_strong(
                     expected, WRITER_BIT, std::memory_order_acq_rel, std::memory_order_relaxed);
                 break;
@@ -95,8 +83,7 @@ public:
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait(lock,
                 [this]() { return (state.load(std::memory_order_acquire) & WRITER_BIT) == 0; });
-        // A writer only sets its bit while holding mtx, which we hold, so the
-        // word cannot gain one between the predicate and this increment.
+        // A writer only sets its bit under mtx, which we hold.
         state.fetch_add(1, std::memory_order_acq_rel);
     }
 
@@ -124,9 +111,8 @@ public:
         if ((prev & READER_MASK) != 1) {
             return; // other readers remain; no writer can proceed yet
         }
-        // Last reader out. Only a writer waits on the drain, so with none
-        // pending there is nobody to wake and the mutex can be skipped - the
-        // whole point of the fast path, since this runs per guest memory copy.
+        // Last reader out. Only a writer waits on the drain, so skip mtx when none is pending -
+        // this runs per guest memory copy.
         if (waiting_writers.load(std::memory_order_seq_cst) != 0) {
             std::lock_guard<std::mutex> lock(mtx);
             cv.notify_all();
@@ -137,9 +123,7 @@ private:
     static constexpr std::uint32_t WRITER_BIT = 1u << 31;
     static constexpr std::uint32_t READER_MASK = WRITER_BIT - 1u;
 
-    /// Adds one reader unless a writer currently holds the lock. The exchange
-    /// makes the test and the increment one step, so a writer acquiring
-    /// concurrently either loses the race or is seen.
+    /// Adds a reader unless a writer holds the lock; the test and the increment are one CAS.
     bool TryAddReader() noexcept {
         std::uint32_t cur = state.load(std::memory_order_acquire);
         while ((cur & WRITER_BIT) == 0) {
