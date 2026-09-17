@@ -430,8 +430,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                                 spin = 400;
                                 break;
                             }
-                            scheduler.GetMasterSemaphore()->WaitFor(job.join_tick,
-                                                                    kDampBudgetNs - el);
+                            // The damp budget pays for GPU work, not for a
+                            // hand-off: join the submit FIFO first, bounded by
+                            // the same budget so a stalled worker cannot make
+                            // this wait any longer than it already was.
+                            scheduler.EnsureSubmitted(job.join_tick, kDampBudgetNs - el);
+                            const u64 el_join = elapsed_ns();
+                            if (el_join < kDampBudgetNs) {
+                                scheduler.GetMasterSemaphore()->WaitFor(job.join_tick,
+                                                                        kDampBudgetNs - el_join);
+                            }
                             if (job.join_copy_queue_tick != 0) {
                                 // The owners' copies retire on the second queue.
                                 const u64 el_copy = elapsed_ns();
@@ -524,6 +532,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             if (job.on_copy_queue) {
                 copy_queue_->Wait(job.copy_queue_tick);
             } else {
+                // Hot host wait: joining the submit FIFO first keeps the
+                // block inside the driver wait instead of ahead of it.
+                scheduler.EnsureSubmitted(job.wait_tick);
                 scheduler.GetMasterSemaphore()->Wait(job.wait_tick);
             }
             offload_wait_ns_.fetch_add(Common::FencedRDTSC() - t0, std::memory_order_relaxed);
@@ -889,6 +900,12 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     const bool copy_queue_ok =
         copy_queue_ && writer_tick != 0 && writer_tick < scheduler.CurrentTick();
     if (copy_queue_ok) {
+        // SubmitCopy requires the signalling batch to be submitted already
+        // (an in-order-ring hang otherwise), which the submit thread no longer
+        // guarantees. The copy may still overtake closed-but-unsubmitted draw
+        // batches: writer_tick is by construction the latest batch that wrote
+        // this buffer, so none of those writes the copy source.
+        scheduler.EnsureSubmitted(writer_tick);
         job.copy_queue_tick = copy_queue_->SubmitCopy(
             writer_tick, buffer.Handle(), job.staging->Handle(),
             std::span<const vk::BufferCopy>(job.copies.data(), job.copies.size()));
