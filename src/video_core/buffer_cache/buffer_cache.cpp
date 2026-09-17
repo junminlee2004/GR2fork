@@ -101,6 +101,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     memory_tracker = std::make_unique<MemoryTracker>(tracker);
     memory_tracker->SetDeferReadArm(EmulatorSettings.IsDeferredReadArm());
+    tracker_mode_latch_ = EmulatorSettings.IsTrackerModeLatch();
+    memory_tracker->SetModeLatch(tracker_mode_latch_);
     defer_read_release_ = EmulatorSettings.IsDeferredReadRelease();
     memory_tracker->SetDeferReadRelease(defer_read_release_);
     // finish_release_faulted_first: the offloaded write-back is what puts the
@@ -351,6 +353,12 @@ void BufferCache::EmitMirrorTelemetry() {
         memory_tracker->arm_chunk_walks = 0;
         memory_tracker->arm_chunk_widened = 0;
         memory_tracker->arm_chunk_pages = 0;
+    }
+    if (tracker_mode_latch_) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] TRKMODE marks={} unmarks={} faults={} per300f",
+                 RegionManager::mode_reads_mark_.exchange(0, std::memory_order_relaxed),
+                 RegionManager::mode_reads_unmark_.exchange(0, std::memory_order_relaxed),
+                 RegionManager::mode_reads_fault_.exchange(0, std::memory_order_relaxed));
     }
     if (const u64 de = damp_entries_.exchange(0, std::memory_order_relaxed); de != 0) {
         LOG_INFO(Render_Skipcache, "[SkipCache] DAMP entries={} iters={} stuck={} per300f", de,

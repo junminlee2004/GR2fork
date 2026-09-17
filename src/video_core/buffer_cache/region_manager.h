@@ -143,7 +143,8 @@ public:
             }
             RefreshCpuSummary(start_page, end_page);
             UpdateProtection<!enable>();
-        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+        } else if (ReadbacksModeCounted(enable ? mode_reads_mark_ : mode_reads_unmark_) ==
+                   GpuReadbacksMode::Precise) {
             if constexpr (enable) {
                 if (defer_read_arm_) {
                     read_arm_pending_ = true;
@@ -194,7 +195,7 @@ public:
             if constexpr (type == Type::CPU) {
                 RefreshCpuSummary(start_page, end_page);
                 UpdateProtection<true>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+            } else if (ReadbacksMode() != GpuReadbacksMode::Disabled) {
                 // The bind path, deliberately never deferred: it is gated on
                 // any readbacks mode, not Precise alone, and its caller is not
                 // the download completion the drain hangs off.
@@ -378,6 +379,36 @@ public:
         release_runs_.fetch_add(runs, std::memory_order_relaxed);
         ++release_batches_;
         return calls;
+    }
+
+    /// Readbacks mode latched once before any region exists (see
+    /// MemoryTracker::SetModeLatch). A live EmulatorSettings read is a global
+    /// mutex pair plus a shared_ptr refcount round trip, and it sits on every
+    /// GPU mark/unmark and every fault invalidate; latched, it is one load.
+    /// Written on the ctor thread before the reader threads exist and constant
+    /// afterwards; atomic+relaxed only to keep that publication race-free.
+    static inline std::atomic<bool> mode_latched_{false};
+    static inline std::atomic<u32> readbacks_mode_{GpuReadbacksMode::Disabled};
+
+    static u32 ReadbacksMode() noexcept {
+        return mode_latched_.load(std::memory_order_relaxed)
+                   ? readbacks_mode_.load(std::memory_order_relaxed)
+                   : EmulatorSettings.GetReadbacksMode();
+    }
+
+    /// Census of the reads the latch removes, counted at the read site: a call
+    /// that early-returns never reaches the read and takes no mutex today.
+    /// Only counted while latched, so the off arm keeps the live read alone.
+    static inline std::atomic<u64> mode_reads_mark_{};
+    static inline std::atomic<u64> mode_reads_unmark_{};
+    static inline std::atomic<u64> mode_reads_fault_{};
+
+    static u32 ReadbacksModeCounted(std::atomic<u64>& counter) noexcept {
+        if (!mode_latched_.load(std::memory_order_relaxed)) {
+            return EmulatorSettings.GetReadbacksMode();
+        }
+        counter.fetch_add(1, std::memory_order_relaxed);
+        return readbacks_mode_.load(std::memory_order_relaxed);
     }
 
     /// Read-watcher release census. Static because a release happens from any

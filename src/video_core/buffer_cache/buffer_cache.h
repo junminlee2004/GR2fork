@@ -918,6 +918,7 @@ private:
     MirrorSinkCounters mirror_sink_;
     MirrorOracleCounters mirror_oracle_;
     bool mirror_mode_{};
+    bool tracker_mode_latch_{};
     bool stream_copy_resolved_epoch_{};
     bool writeback_hold_{};
     bool writeback_offload_{};

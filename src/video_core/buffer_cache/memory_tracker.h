@@ -41,6 +41,16 @@ public:
         defer_read_release_ = value;
     }
 
+    /// Latched once before any region exists, on the thread that builds the
+    /// buffer cache: the tracker's readbacks-mode reads stop taking the global
+    /// settings mutex. A mid-run mode change then no longer reaches the
+    /// tracker, matching the cache's own latched readback state.
+    void SetModeLatch(bool on) {
+        RegionManager::readbacks_mode_.store(EmulatorSettings.GetReadbacksMode(),
+                                             std::memory_order_relaxed);
+        RegionManager::mode_latched_.store(on, std::memory_order_relaxed);
+    }
+
     struct ReadReleaseDrain {
         u32 regions;
         u32 pages;
@@ -471,7 +481,8 @@ public:
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
                     std::scoped_lock lk{manager->lock};
-                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                    if (RegionManager::ReadbacksModeCounted(RegionManager::mode_reads_fault_) !=
+                            GpuReadbacksMode::Disabled &&
                         manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
                     }
@@ -501,7 +512,8 @@ public:
                 {
                     std::scoped_lock lk{manager->lock};
                     const bool readbacks =
-                        EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled;
+                        RegionManager::ReadbacksModeCounted(RegionManager::mode_reads_fault_) !=
+                        GpuReadbacksMode::Disabled;
                     if (!readbacks ||
                         !manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         manager->template ChangeRegionState<Type::CPU, true>(chunk_addr, size);

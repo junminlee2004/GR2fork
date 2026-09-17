@@ -464,6 +464,11 @@ struct GPUSettings {
     // thread that issues vkQueueSubmit and the semaphore refresh; the GPU
     // command thread records the next batch meanwhile. Logs SUBMITQ.
     Setting<bool> submit_thread{false};
+    // Latches readbacks_mode into the memory tracker at construction. The live read is a global
+    // mutex plus a shared_ptr copy per call and sits on every GPU mark/unmark and every fault
+    // invalidate; off keeps the live read. With it on, a mid-run readbacks_mode change from the
+    // settings dialog no longer reaches the tracker until restart.
+    Setting<bool> tracker_mode_latch{false};
     Setting<bool> stream_buffer_prefer_host{false};
     // Phase-1 instrumentation mode; 0 keeps the hot paths byte-identical.
     Setting<u32> stream_upload_mirror_mode{0};
@@ -824,6 +829,7 @@ struct GPUSettings {
             make_override<GPUSettings>("readback_copy_gfx_queue",
                                        &GPUSettings::readback_copy_gfx_queue),
             make_override<GPUSettings>("submit_thread", &GPUSettings::submit_thread),
+            make_override<GPUSettings>("tracker_mode_latch", &GPUSettings::tracker_mode_latch),
             make_override<GPUSettings>("stream_buffer_prefer_host",
                                        &GPUSettings::stream_buffer_prefer_host),
             make_override<GPUSettings>("stream_upload_mirror_mode",
@@ -945,7 +951,7 @@ struct GPUSettings {
 #define GPU_SETTINGS_JSON_FIELDS_A \
     window_width, window_height, internal_screen_width, internal_screen_height, null_gpu, \
     copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled, adaptive_skipcaches_mode, \
-    stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, submit_thread, \
+    stream_buffer_size_mb, readback_batching_enabled, readback_offload, readback_copy_gfx_queue, submit_thread, tracker_mode_latch, \
     stream_buffer_prefer_host, direct_memory_access_enabled, dump_shaders, patch_shaders, \
     vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, \
     rcas_enabled, rcas_attenuation, spec_mru_perm_probe, stream_upload_mirror_mode, \
@@ -1254,6 +1260,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackCopyGfxQueue, readback_copy_gfx_queue)
     SETTING_FORWARD_BOOL(m_gpu, SubmitThread, submit_thread)
+    SETTING_FORWARD_BOOL(m_gpu, TrackerModeLatch, tracker_mode_latch)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
     SETTING_FORWARD(m_gpu, StreamUploadMirrorMode, stream_upload_mirror_mode)
     SETTING_FORWARD(m_gpu, FaultWidenBytes, fault_widen_bytes)
