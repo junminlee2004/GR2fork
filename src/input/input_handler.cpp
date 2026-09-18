@@ -125,6 +125,8 @@ analog_deadzone = rightjoystick, 5, 127
 
 override_controller_color = false, 0, 0, 255
 
+# touchpad_two_finger presses the touchpad with one finger on each half (a two-finger click)
+# touchpad_two_finger = unmapped
 # Mouse-to-joystick sensitivity: global, horizontal, vertical (all default 1.0)
 # mouse_sensitivity = 1.0, 1.0, 1.0
 # Touchscreen/mouse swipes played back as touchpad swipes; toggle with
@@ -303,6 +305,7 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER:
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_BACK:
         return OPBDO::TouchPad;
@@ -965,6 +968,11 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN:
             controller->SetTouchpadState(0, new_button_state, 0.5f, 0.75f);
+            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER:
+            controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
+            controller->SetTouchpadState(1, new_button_state, 0.75f, 0.5f);
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
         // The synthetic swipes fire on the rising edge only (state_changed gates this switch);
