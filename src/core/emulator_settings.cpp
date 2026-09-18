@@ -266,6 +266,64 @@ void EmulatorSettingsImpl::ResetGameSpecificValue(const std::string& key) {
     LOG_WARNING(Config, "ResetGameSpecificValue: key '{}' not found", key);
 }
 
+namespace {
+// The Qt launcher keeps the gyro toggles in its private "GR2Fork" section under camelCase names,
+// in both config.json and the per-game files. That section is treated as the canonical source
+// when present, and the emulator mirrors its own values back into it on save.
+constexpr std::pair<const char*, const char*> kLauncherGyroKeys[] = {
+    {"gyroSwapYawRoll", "gyro_swap_yaw_roll"},
+    {"gyroInvertYaw", "gyro_invert_yaw"},
+    {"gyroInvertX", "gyro_invert_x"},
+    {"gyroInvertRoll", "gyro_invert_roll"},
+};
+
+json TranslateLauncherGyroKeys(const json& root) {
+    json out = json::object();
+    if (!root.contains("GR2Fork") || !root.at("GR2Fork").is_object()) {
+        return out;
+    }
+    const json& section = root.at("GR2Fork");
+    for (const auto& [launcher_key, key] : kLauncherGyroKeys) {
+        if (section.contains(launcher_key) && section.at(launcher_key).is_boolean()) {
+            out[key] = section.at(launcher_key);
+        }
+    }
+    return out;
+}
+
+void MirrorGyroKeysForLauncher(json& root, const json& input) {
+    for (const auto& [launcher_key, key] : kLauncherGyroKeys) {
+        if (input.contains(key)) {
+            root["GR2Fork"][launcher_key] = input.at(key);
+        }
+    }
+}
+
+// Merges the freshly serialized sections over the file's current contents so keys and sections
+// unknown to this build (the launcher's) survive a save.
+json MergeOverExisting(const std::filesystem::path& path, const json& fresh) {
+    json existing = json::object();
+    if (std::ifstream existingIn{path}; existingIn.good()) {
+        try {
+            existingIn >> existing;
+        } catch (...) {
+            existing = json::object();
+        }
+    }
+    if (!existing.is_object()) {
+        existing = json::object();
+    }
+    for (auto& [section, val] : fresh.items()) {
+        if (existing.contains(section) && existing[section].is_object() && val.is_object()) {
+            existing[section].update(val); // overwrites known keys, keeps unknown ones
+        } else {
+            existing[section] = val;
+        }
+    }
+    return existing;
+}
+} // namespace
+
 bool EmulatorSettingsImpl::Save(const std::string& serial) {
     try {
         if (!serial.empty()) {
@@ -309,12 +367,15 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
             SaveGroupGameSpecific(m_vulkan, vulkanObj);
             j["Vulkan"] = vulkanObj;
 
+            json merged = MergeOverExisting(path, j);
+            MirrorGyroKeysForLauncher(merged, merged["Input"]);
+
             std::ofstream out(path);
             if (!out) {
                 LOG_ERROR(Config, "Failed to open game config for writing: {}", path.string());
                 return false;
             }
-            out << std::setw(2) << j;
+            out << std::setw(2) << merged;
             return !out.fail();
 
         } else {
@@ -333,23 +394,10 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
             j["GPU"] = m_gpu;
             j["Vulkan"] = m_vulkan;
 
-            // Read the existing file so we can preserve keys unknown to this build
-            json existing = json::object();
-            if (std::ifstream existingIn{path}; existingIn.good()) {
-                try {
-                    existingIn >> existing;
-                } catch (...) {
-                    existing = json::object();
-                }
-            }
-
-            // Merge: update each section's known keys, but leave unknown keys intact
-            for (auto& [section, val] : j.items()) {
-                if (existing.contains(section) && existing[section].is_object() && val.is_object())
-                    existing[section].update(val); // overwrites known keys, keeps unknown ones
-                else
-                    existing[section] = val;
-            }
+            // Preserve keys unknown to this build and keep the launcher's copy of the gyro
+            // toggles in step with ours.
+            json existing = MergeOverExisting(path, j);
+            MirrorGyroKeysForLauncher(existing, existing["Input"]);
 
             std::ofstream out(path);
             if (!out) {
@@ -396,6 +444,12 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 mergeGroup(m_audio, "Audio");
                 mergeGroup(m_gpu, "GPU");
                 mergeGroup(m_vulkan, "Vulkan");
+
+                if (const json launcher = TranslateLauncherGyroKeys(gj); !launcher.empty()) {
+                    json current = m_input;
+                    current.update(launcher);
+                    m_input = current.get<InputSettings>();
+                }
             } else {
                 if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
                                             "config.toml")) {
@@ -471,6 +525,8 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 ApplyGroupOverrides(m_debug, gj.at("Debug"), changed);
             if (gj.contains("Input"))
                 ApplyGroupOverrides(m_input, gj.at("Input"), changed);
+            if (const json launcher = TranslateLauncherGyroKeys(gj); !launcher.empty())
+                ApplyGroupOverrides(m_input, launcher, changed);
             if (gj.contains("Audio"))
                 ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
             // Windows static guest red-zone protection

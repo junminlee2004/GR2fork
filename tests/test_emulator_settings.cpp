@@ -841,3 +841,51 @@ TEST_F(EmulatorSettingsTest, DestructorSavesAfterSuccessfulLoad) {
     verify->Load();
     EXPECT_EQ(verify->GetWindowWidth(), 2560);
 }
+
+// The Qt launcher keeps the gyro toggles in its private "GR2Fork" section under camelCase names;
+// the emulator reads them from both files and mirrors its own values back on save.
+TEST_F(EmulatorSettingsTest, LauncherGyroKeysLoadFromGlobalAndGameFiles) {
+    json global;
+    global["GR2Fork"]["gyroSwapYawRoll"] = true;
+    global["GR2Fork"]["gyroInvertX"] = true;
+    WriteJson(ConfigJson(), global);
+    temp_settings->Load();
+    EXPECT_TRUE(temp_settings->IsGyroSwapYawRoll());
+    EXPECT_TRUE(temp_settings->IsGyroInvertX());
+    EXPECT_FALSE(temp_settings->IsGyroInvertYaw());
+
+    json game;
+    game["GR2Fork"]["gyroSwapYawRoll"] = false;
+    game["GR2Fork"]["gyroInvertYaw"] = true;
+    WriteJson(GameConfig("CUSA00001"), game);
+    temp_settings->Load("CUSA00001");
+    temp_settings->SetConfigMode(ConfigMode::Default);
+    EXPECT_FALSE(temp_settings->IsGyroSwapYawRoll());
+    EXPECT_TRUE(temp_settings->IsGyroInvertYaw());
+    EXPECT_TRUE(temp_settings->IsGyroInvertX()); // untouched by the game file
+}
+
+TEST_F(EmulatorSettingsTest, SaveMirrorsGyroKeysIntoLauncherSectionAndKeepsItsOtherKeys) {
+    json global;
+    global["GR2Fork"]["disableMotionBlur"] = true; // a launcher-only key
+    WriteJson(ConfigJson(), global);
+    temp_settings->Load();
+    temp_settings->SetGyroInvertRoll(true);
+    ASSERT_TRUE(temp_settings->Save());
+    const json saved = ReadJson(ConfigJson());
+    EXPECT_TRUE(saved["GR2Fork"]["gyroInvertRoll"].get<bool>());
+    EXPECT_FALSE(saved["GR2Fork"]["gyroSwapYawRoll"].get<bool>());
+    EXPECT_TRUE(saved["GR2Fork"]["disableMotionBlur"].get<bool>());
+    EXPECT_TRUE(saved["Input"]["gyro_invert_roll"].get<bool>());
+
+    json game;
+    game["GR2Fork"]["padSpkOutputDisabled"] = true;
+    WriteJson(GameConfig("CUSA00001"), game);
+    temp_settings->Load("CUSA00001");
+    temp_settings->SetGyroInvertYaw(true, true);
+    ASSERT_TRUE(temp_settings->Save("CUSA00001"));
+    const json saved_game = ReadJson(GameConfig("CUSA00001"));
+    EXPECT_TRUE(saved_game["GR2Fork"]["gyroInvertYaw"].get<bool>());
+    EXPECT_TRUE(saved_game["GR2Fork"]["padSpkOutputDisabled"].get<bool>());
+    EXPECT_TRUE(saved_game["Input"]["gyro_invert_yaw"].get<bool>());
+}
