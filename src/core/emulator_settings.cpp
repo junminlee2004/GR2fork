@@ -588,6 +588,10 @@ bool EmulatorSettingsImpl::TransferSettings() {
         setFromToml(s.use_special_pad, input, "useSpecialPad");
         setFromToml(s.special_pad_class, input, "specialPadClass");
         setFromToml(s.motion_controls_enabled, input, "isMotionControlsEnabled");
+        setFromToml(s.gyro_swap_yaw_roll, input, "gyroSwapYawRoll");
+        setFromToml(s.gyro_invert_yaw, input, "gyroInvertYaw");
+        setFromToml(s.gyro_invert_x, input, "gyroInvertX");
+        setFromToml(s.gyro_invert_roll, input, "gyroInvertRoll");
         setFromToml(s.use_unified_input_config, input, "useUnifiedInputConfig");
         setFromToml(s.background_controller_input, input, "backgroundControllerInput");
         setFromToml(s.ime_accessibility_enabled, input, "imeAccessibilityEnabled");

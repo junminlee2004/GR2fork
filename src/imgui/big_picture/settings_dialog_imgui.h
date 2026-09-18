@@ -144,6 +144,10 @@ private:
 
     // Input tab
     bool motionControlsSetting;
+    bool gyroSwapYawRollSetting;
+    bool gyroInvertYawSetting;
+    bool gyroInvertXSetting;
+    bool gyroInvertRollSetting;
     bool backgroundControllerSetting;
     int cursorStateSetting;
     int cursorTimeoutSetting;

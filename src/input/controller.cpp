@@ -26,10 +26,14 @@ namespace {
 void CalculateOrientation(const Libraries::Pad::OrbisFVector3& angular_velocity, float delta_time,
                           const Libraries::Pad::OrbisFQuaternion& last_orientation,
                           Libraries::Pad::OrbisFQuaternion& orientation) {
-    if (delta_time > 1.0f) {
+    // The first poll and frame stalls produce a huge step, and a first-order Euler step then
+    // dwarfs q so the attitude snaps to the angular-velocity direction. Clamp the step instead.
+    constexpr float kMaxDeltaTime = 0.05f;
+    if (!(delta_time > 0.0f)) {
         orientation = last_orientation;
         return;
     }
+    delta_time = std::min(delta_time, kMaxDeltaTime);
     Libraries::Pad::OrbisFQuaternion q = last_orientation;
     const Libraries::Pad::OrbisFQuaternion omega = {angular_velocity.x, angular_velocity.y,
                                                     angular_velocity.z, 0.0f};

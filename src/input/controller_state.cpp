@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/pad/pad.h"
 #include "input/controller.h"
 
@@ -55,15 +56,24 @@ void State::OnTouchpad(int touch_index, bool is_down, float x, float y) {
 }
 
 void State::OnGyro(const float gyro[3]) {
-    angularVelocity.x = gyro[0];
-    angularVelocity.y = gyro[1];
-    angularVelocity.z = gyro[2];
+    // A handheld held upright (Steam Deck, ROG Ally) instead of flat like a DualShock measures
+    // the game's yaw on its roll channel and vice versa; the swap puts them back. Each inversion
+    // negates its resolved channel, so they compose with the swap.
+    const bool swap = EmulatorSettings.IsGyroSwapYawRoll();
+    const float yaw = swap ? gyro[2] : gyro[1];
+    const float roll = swap ? gyro[1] : gyro[2];
+    angularVelocity.x = EmulatorSettings.IsGyroInvertX() ? -gyro[0] : gyro[0];
+    angularVelocity.y = EmulatorSettings.IsGyroInvertYaw() ? -yaw : yaw;
+    angularVelocity.z = EmulatorSettings.IsGyroInvertRoll() ? -roll : roll;
 }
 
 void State::OnAccel(const float accel[3]) {
+    // Mirror the yaw/roll swap so the motion frame stays consistent for titles that read the
+    // raw acceleration; the accelerometer cannot sense rotation about gravity, so no inversions.
+    const bool swap = EmulatorSettings.IsGyroSwapYawRoll();
     acceleration.x = accel[0];
-    acceleration.y = accel[1];
-    acceleration.z = accel[2];
+    acceleration.y = swap ? accel[2] : accel[1];
+    acceleration.z = swap ? accel[1] : accel[2];
 }
 
 void State::UpdateAxisSmoothing(u64 timestamp) {

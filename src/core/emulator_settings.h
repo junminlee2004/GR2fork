@@ -334,6 +334,12 @@ struct InputSettings {
     Setting<bool> use_special_pad{false};
     Setting<int> special_pad_class{1};
     Setting<bool> motion_controls_enabled{true}; // specific
+    // Handheld gyro fixes: a device held upright (Steam Deck, ROG Ally) measures the game's yaw
+    // on its roll channel and vice versa; the inversions compose with the swap.
+    Setting<bool> gyro_swap_yaw_roll{false}; // specific
+    Setting<bool> gyro_invert_yaw{false};    // specific
+    Setting<bool> gyro_invert_x{false};      // specific
+    Setting<bool> gyro_invert_roll{false};   // specific
     Setting<bool> use_unified_input_config{true};
     Setting<std::string> default_controller_id{""};
     Setting<bool> background_controller_input{false}; // specific
@@ -351,6 +357,10 @@ struct InputSettings {
             make_override<InputSettings>("usb_device_backend", &InputSettings::usb_device_backend),
             make_override<InputSettings>("motion_controls_enabled",
                                          &InputSettings::motion_controls_enabled),
+            make_override<InputSettings>("gyro_swap_yaw_roll", &InputSettings::gyro_swap_yaw_roll),
+            make_override<InputSettings>("gyro_invert_yaw", &InputSettings::gyro_invert_yaw),
+            make_override<InputSettings>("gyro_invert_x", &InputSettings::gyro_invert_x),
+            make_override<InputSettings>("gyro_invert_roll", &InputSettings::gyro_invert_roll),
             make_override<InputSettings>("background_controller_input",
                                          &InputSettings::background_controller_input),
             make_override<InputSettings>("ime_accessibility_enabled",
@@ -364,7 +374,8 @@ struct InputSettings {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
                                    usb_device_backend, use_special_pad, special_pad_class,
-                                   motion_controls_enabled, use_unified_input_config,
+                                   motion_controls_enabled, gyro_swap_yaw_roll, gyro_invert_yaw,
+                                   gyro_invert_x, gyro_invert_roll, use_unified_input_config,
                                    default_controller_id, background_controller_input,
                                    ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
                                    is_circle_enter, use_mice_as_mice)
@@ -1385,6 +1396,10 @@ public:
     SETTING_FORWARD(m_input, CursorHideTimeout, cursor_hide_timeout)
     SETTING_FORWARD(m_input, UsbDeviceBackend, usb_device_backend)
     SETTING_FORWARD_BOOL(m_input, MotionControlsEnabled, motion_controls_enabled)
+    SETTING_FORWARD_BOOL(m_input, GyroSwapYawRoll, gyro_swap_yaw_roll)
+    SETTING_FORWARD_BOOL(m_input, GyroInvertYaw, gyro_invert_yaw)
+    SETTING_FORWARD_BOOL(m_input, GyroInvertX, gyro_invert_x)
+    SETTING_FORWARD_BOOL(m_input, GyroInvertRoll, gyro_invert_roll)
     SETTING_FORWARD_BOOL(m_input, BackgroundControllerInput, background_controller_input)
     SETTING_FORWARD_BOOL(m_input, ImeAccessibilityEnabled, ime_accessibility_enabled)
     SETTING_FORWARD_BOOL(m_input, ImeUrlMailShortPanel, ime_url_mail_short_panel)

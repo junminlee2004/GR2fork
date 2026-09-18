@@ -62,6 +62,10 @@ void SettingsWindow::LoadSettings(std::string profile) {
 
     /////////// Input Tab
     motionControlsSetting = EmulatorSettings.IsMotionControlsEnabled();
+    gyroSwapYawRollSetting = EmulatorSettings.IsGyroSwapYawRoll();
+    gyroInvertYawSetting = EmulatorSettings.IsGyroInvertYaw();
+    gyroInvertXSetting = EmulatorSettings.IsGyroInvertX();
+    gyroInvertRollSetting = EmulatorSettings.IsGyroInvertRoll();
     backgroundControllerSetting = EmulatorSettings.IsBackgroundControllerInput();
     cursorStateSetting = EmulatorSettings.GetCursorState();
     cursorTimeoutSetting = EmulatorSettings.GetCursorHideTimeout();
@@ -128,6 +132,10 @@ void SettingsWindow::SaveSettings(std::string profile) {
 
     /////////// Input Tab
     EmulatorSettings.SetMotionControlsEnabled(motionControlsSetting, isSpecific);
+    EmulatorSettings.SetGyroSwapYawRoll(gyroSwapYawRollSetting, isSpecific);
+    EmulatorSettings.SetGyroInvertYaw(gyroInvertYawSetting, isSpecific);
+    EmulatorSettings.SetGyroInvertX(gyroInvertXSetting, isSpecific);
+    EmulatorSettings.SetGyroInvertRoll(gyroInvertRollSetting, isSpecific);
     EmulatorSettings.SetBackgroundControllerInput(backgroundControllerSetting, isSpecific);
     EmulatorSettings.SetCursorState(cursorStateSetting, isSpecific);
     EmulatorSettings.SetCursorHideTimeout(cursorTimeoutSetting, isSpecific);
@@ -725,6 +733,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::TableSetupColumn("Value");
 
             AddSettingCheckbox("Enable Motion Controls", motionControlsSetting);
+            AddSettingCheckbox("Gyro: Swap Yaw and Roll (handheld held upright)",
+                               gyroSwapYawRollSetting);
+            AddSettingCheckbox("Gyro: Invert Yaw", gyroInvertYawSetting);
+            AddSettingCheckbox("Gyro: Invert Pitch", gyroInvertXSetting);
+            AddSettingCheckbox("Gyro: Invert Roll", gyroInvertRollSetting);
             AddSettingCheckbox("Enable Background Controller Input", backgroundControllerSetting);
             AddSettingCombo("Hide Cursor", cursorStateSetting, hideCursorOptions);
 
