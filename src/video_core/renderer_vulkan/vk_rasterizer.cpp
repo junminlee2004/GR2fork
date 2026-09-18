@@ -2351,7 +2351,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     const u32 first_sampler_binding = binding.unified;
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
-        const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
+        const auto vk_sampler =
+            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
         AppendImageInfo(image_infos, vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
     }
 

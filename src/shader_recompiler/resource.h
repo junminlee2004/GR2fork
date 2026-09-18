@@ -247,6 +247,7 @@ struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
+    bool is_depth{}; // true for the _C (compare) opcodes
 
     void ResolveDirectRead() noexcept {
         sharp_fetch.ResolveDirect(post_op == SharpFetchPostOp::None);

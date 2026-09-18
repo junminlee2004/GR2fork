@@ -1479,13 +1479,18 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
-                                     AmdGpu::BorderColorBuffer border_color_base) {
+                                     AmdGpu::BorderColorBuffer border_color_base,
+                                     const bool is_depth) {
     using namespace VideoCore::Skipcache;
     auto& sc = Framework::Instance();
     constexpr auto kCache = CacheId::Sampler;
     static_assert(sizeof(AmdGpu::Sampler) == 16);
     ++sampler_calls_;
-    const auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
+    // Compare and plain uses of one S# need separate samplers, so the key carries
+    // is_depth in the S#'s reserved word-3 bits (unused1), which are masked out.
+    constexpr u64 kReservedBits = u64{0x3FFFF} << 42;
+    auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
+    raw[1] = (raw[1] & ~kReservedBits) | (u64{is_depth} << 42);
     // Every S# field reaches the set index: the filters, max_lod, border color
     // and clamp modes all sit above the low bits of either word.
     const u64 mix = (raw[0] ^ (raw[1] * 0x9E3779B97F4A7C15ULL)) * 0xC2B2AE3D27D4EB4FULL;
@@ -1525,7 +1530,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         ++ctr.eligible;
         timed = sc.SampleTimer(kCache);
         t0 = timed ? sc.Now() : 0;
-        // The memo mirrors the map key exactly (the raw S# bytes).
+        // The memo mirrors the map key exactly (the S# bytes plus the compare flag).
         if (e) {
             would_hit = true;
             ++ctr.hits;
@@ -1551,12 +1556,13 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     }
     const u64 m0 = timed && !would_hit ? sc.Now() : 0;
     ++sampler_slow_;
-    const u64 hash = XXH3_64bits(&sampler, sizeof(sampler));
+    const u64 hash = XXH3_64bits(raw.data(), sizeof(raw));
 
     if (!sampler_lockfree) {
         lock.lock();
     }
-    const auto [it, new_sampler] = samplers.try_emplace(hash, instance, sampler, border_color_base);
+    const auto [it, new_sampler] =
+        samplers.try_emplace(hash, instance, sampler, border_color_base, is_depth);
     if (new_sampler) {
         samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
     } else {
