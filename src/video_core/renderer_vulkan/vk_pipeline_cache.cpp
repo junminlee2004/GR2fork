@@ -1130,12 +1130,26 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (pre_compile_hook_) {
             pre_compile_hook_(pre_compile_user_);
         }
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader =
+            fetch_shader_ref ? fetch_shader_ref.Get()
+                             : std::optional<Shader::Gcn::FetchShaderData>{};
+        if (!fetch_shader) {
+            // A vertex stage that reads its attributes through a fetch shader must never get a
+            // pipeline with no vertex input: the draw faults the GPU. Decode the live fetch
+            // shader when the permutation resolve handed over none.
+            const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+            if (vs_info && vs_info->has_fetch_shader) {
+                fetch_shader = Shader::Gcn::ParseFetchShader(*vs_info);
+                LOG_WARNING(Render_Vulkan,
+                            "Vertex shader {:#x} resolved without fetch shader data; decoded "
+                            "live ({} attributes)",
+                            vs_info->pgm_hash, fetch_shader ? fetch_shader->attributes.size() : 0);
+            }
+        }
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
-            graphics_key, *pipeline_cache, infos, runtime_infos,
-            fetch_shader_ref ? fetch_shader_ref.Get()
-                             : std::optional<Shader::Gcn::FetchShaderData>{},
-            modules, sdata, false);
+            graphics_key, *pipeline_cache, infos, runtime_infos, std::move(fetch_shader), modules,
+            sdata, false);
         constexpr auto full_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                                    vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
         for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
@@ -2152,6 +2166,16 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
                 if (ms.sig == spec.sig && ms.sig2 == spec.sig2) {
                     hit_idx = i;
                     break;
+                }
+            }
+            if (hit_idx == std::numeric_limits<size_t>::max()) {
+                // The signatures hash more bytes than the structural compare tests, so a
+                // permutation can go unrecognised by (sig, sig2) while being the same
+                // specialization; compiling it again stores a duplicate the warm-up later
+                // refuses to preload. Settle a miss structurally before compiling.
+                const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+                if (it != program->modules.end()) {
+                    hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
                 }
             }
             if (hit_idx != std::numeric_limits<size_t>::max()) {
