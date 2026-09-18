@@ -53,7 +53,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     batch_copy_lock_ = EmulatorSettings.IsGuestCopyLockBatch();
     upload_drain_ = EmulatorSettings.IsStreamCopyUploadDrain();
     stream_copy_resolved_epoch_ = EmulatorSettings.IsStreamCopyResolvedEpoch();
-    Buffer::barrier_read_merge = EmulatorSettings.IsBufferBarrierReadMerge();
+    // The coverage rule behind the merge (Buffer::CoveredReads) describes RADV's cache flushes;
+    // other drivers invalidate per access type, so the setting only takes effect on RADV.
+    const bool merge_wanted = EmulatorSettings.IsBufferBarrierReadMerge();
+    Buffer::barrier_read_merge = merge_wanted && instance.GetDriverID() == vk::DriverId::eMesaRadv;
+    if (merge_wanted && !Buffer::barrier_read_merge) {
+        LOG_INFO(Render_Vulkan, "buffer_barrier_read_merge is RADV-only; off on this driver");
+    }
     writeback_hold_ = EmulatorSettings.IsReadbackWritebackHold();
     writeback_offload_ = EmulatorSettings.IsReadbackWritebackOffload();
     wait_notify_ = EmulatorSettings.IsReadbackWaitNotify();
