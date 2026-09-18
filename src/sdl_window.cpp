@@ -184,6 +184,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
 
+    // Apply the mouse mode requested by mouse_default_mode in the input config.
+    const auto default_mouse_mode = Input::GetMouseMode();
+    if (default_mouse_mode == Input::MouseMode::Joystick ||
+        default_mouse_mode == Input::MouseMode::Gyro) {
+        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), true);
+    }
+
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
@@ -298,6 +305,9 @@ void WindowSDL::WaitEvent() {
                                        Input::ToggleMouseModeTo(Input::MouseMode::Touchpad));
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
         break;
+    case SDL_EVENT_MOUSE_TO_TOUCHPAD_SWIPE:
+        Input::EnableTouchpadSwipe(!Input::IsTouchpadSwipeEnabled());
+        break;
     case SDL_EVENT_ADD_VIRTUAL_USER:
         for (int i = 0; i < 4; i++) {
             if (controllers[i]->user_id == -1) {
@@ -379,6 +389,19 @@ Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
 
 void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
     using Libraries::Pad::OrbisPadButtonDataOffset;
+
+    // Touchpad swipe emulation intercepts left-button (touchscreen) presses on the first pad,
+    // independent of the mouse mode. Everything else passes through.
+    if (Input::IsTouchpadSwipeEnabled() &&
+        (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN || event->type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+        event->button.button == SDL_BUTTON_LEFT) {
+        if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            Input::TouchpadSwipeOnFingerDown(controllers[0], event->button.x, event->button.y);
+        } else {
+            Input::TouchpadSwipeOnFingerUp(controllers[0], event->button.x, event->button.y);
+        }
+        return;
+    }
 
     // get the event's id, if it's keyup or keydown
     const bool input_down = event->type == SDL_EVENT_KEY_DOWN ||

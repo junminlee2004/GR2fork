@@ -124,6 +124,25 @@ analog_deadzone = leftjoystick, 5, 127
 analog_deadzone = rightjoystick, 5, 127
 
 override_controller_color = false, 0, 0, 255
+
+# Mouse-to-joystick sensitivity: global, horizontal, vertical (all default 1.0)
+# mouse_sensitivity = 1.0, 1.0, 1.0
+# Touchscreen/mouse swipes played back as touchpad swipes; toggle with
+# hotkey_toggle_mouse_to_touchpad_swipe. Threshold is the minimum drag in pixels.
+# touchpad_swipe_enabled = false
+# touchpad_swipe_threshold = 15
+# touchpad_swipe_button_delay = 200
+# Hold-combo swipes: while the hold input is held, the four inputs play back touchpad swipes
+# instead of their normal mappings (hold_passthrough keeps the hold input's own mappings live)
+# touchpad_swipe_combo_enabled = false
+# touchpad_swipe_combo_hold = l3
+# touchpad_swipe_combo_up = triangle
+# touchpad_swipe_combo_down = cross
+# touchpad_swipe_combo_left = square
+# touchpad_swipe_combo_right = circle
+# touchpad_swipe_combo_hold_passthrough = false
+# Mouse mode at startup: off, joystick, gyro, touchpad or touchpad_swipe
+# mouse_default_mode = off
 )";
 }
 std::filesystem::path GetInputConfigFile(const std::string& game_id) {
@@ -178,6 +197,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_add_virtual_user", "f5"},
             {"hotkey_remove_virtual_user", "f4"},
             {"hotkey_toggle_mouse_to_touchpad", "delete"},
+            {"hotkey_toggle_mouse_to_touchpad_swipe", "unmapped"},
             {"hotkey_quit", "lctrl, lshift, end"},
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
@@ -277,6 +297,13 @@ static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT:
         return OPBDO::TouchPad;
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_UP:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+    case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+        return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_BACK:
         return OPBDO::TouchPad;
     case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
@@ -356,6 +383,73 @@ std::optional<int> parseInt(const std::string& s) {
     }
 };
 
+// Hold-combo touchpad swipes: while the configured hold input is held, the four direction inputs
+// play back touchpad swipes instead of their normal mappings (default hold-L3 + face buttons).
+// Keys: touchpad_swipe_combo_{enabled,hold,up,down,left,right,hold_passthrough}.
+struct TouchpadSwipeComboConfig {
+    bool enabled = false;
+    // When true the hold input keeps driving its normal mappings while held; when false
+    // (default) it is a dedicated modifier whose mappings are suppressed while held.
+    bool hold_passthrough = false;
+    InputID hold = InputID(InputType::Controller, SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    // Indexed by ButtonSwipeDirection.
+    InputID dir_keys[4] = {
+        InputID(InputType::Controller, SDL_GAMEPAD_BUTTON_NORTH), // up    = triangle
+        InputID(InputType::Controller, SDL_GAMEPAD_BUTTON_SOUTH), // down  = cross
+        InputID(InputType::Controller, SDL_GAMEPAD_BUTTON_WEST),  // left  = square
+        InputID(InputType::Controller, SDL_GAMEPAD_BUTTON_EAST),  // right = circle
+    };
+    // Runtime state, reset on every config (re)load.
+    bool dir_was_down[4] = {false, false, false, false};
+    bool dir_swipe_owned[4] = {false, false, false, false};
+};
+static TouchpadSwipeComboConfig swipe_combo;
+static const char* const swipe_combo_dir_names[4] = {"up", "down", "left", "right"};
+
+// Parses a single-input token for a touchpad_swipe_combo_* slot; "unmapped", empty or invalid
+// tokens return an invalid InputID (slot off).
+static InputID ParseSwipeComboInput(const std::string& token, const char* slot_name,
+                                    int line_number) {
+    if (token.empty() || token == "unmapped") {
+        return InputID();
+    }
+    std::string token_copy = token;
+    InputBinding binding = GetBindingFromString(token_copy);
+    if (binding.KeyCount() != 1) {
+        LOG_WARNING(Input,
+                    "touchpad_swipe_combo_{} at line {} must be a single input, got \"{}\"; "
+                    "treating it as unmapped",
+                    slot_name, line_number, token);
+        return InputID();
+    }
+    InputID id;
+    for (const auto& key : binding.keys) {
+        if (key.IsValid()) {
+            id = key;
+            break;
+        }
+    }
+    if (id.sdl_id == SDL_UNMAPPED) {
+        return InputID();
+    }
+    if (id.type == InputType::Axis && id.sdl_id != SDL_GAMEPAD_AXIS_LEFT_TRIGGER &&
+        id.sdl_id != SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+        LOG_WARNING(Input,
+                    "touchpad_swipe_combo_{} at line {}: stick axes are not supported as combo "
+                    "inputs, only buttons and triggers; treating \"{}\" as unmapped",
+                    slot_name, line_number, token);
+        return InputID();
+    }
+    if (id.type == InputType::Controller && id.sdl_id >= SDL_GAMEPAD_BUTTON_COUNT) {
+        LOG_WARNING(Input,
+                    "touchpad_swipe_combo_{} at line {}: \"{}\" is an output-only name and "
+                    "cannot be used as a combo input; treating it as unmapped",
+                    slot_name, line_number, token);
+        return InputID();
+    }
+    return id;
+}
+
 void ParseInputConfig(const std::string game_id = "") {
     std::string game_id_or_default =
         EmulatorSettings.IsUseUnifiedInputConfig() ? "default" : game_id;
@@ -365,6 +459,7 @@ void ParseInputConfig(const std::string game_id = "") {
     // we reset these here so in case the user fucks up or doesn't include some of these,
     // we can fall back to default
     connections.clear();
+    swipe_combo = TouchpadSwipeComboConfig{};
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
@@ -486,6 +581,93 @@ void ParseInputConfig(const std::string game_id = "") {
                 return;
             }
             SetMouseParams(mouse_deadzone_offset, mouse_speed, mouse_speed_offset);
+            return;
+        } else if (output_string == "mouse_sensitivity") {
+            std::stringstream ss(input_string);
+            char comma;
+            float global_sens = 1.0f, horizontal_sens = 1.0f, vertical_sens = 1.0f;
+            ss >> global_sens >> comma >> horizontal_sens >> comma >> vertical_sens;
+            if (ss.fail()) {
+                LOG_WARNING(Input, "Failed to parse mouse sensitivity from line: {}", line);
+                return;
+            }
+            SetMouseSensitivity(global_sens, horizontal_sens, vertical_sens);
+            return;
+        } else if (output_string == "touchpad_swipe_speed") {
+            std::stringstream ss(input_string);
+            float speed;
+            ss >> speed;
+            if (ss.fail() || speed <= 0.0f) {
+                LOG_WARNING(Input, "Failed to parse touchpad swipe speed from line: {}", line);
+                return;
+            }
+            SetTouchpadSwipeSpeed(speed);
+            return;
+        } else if (output_string == "touchpad_swipe_threshold") {
+            std::stringstream ss(input_string);
+            float threshold;
+            ss >> threshold;
+            if (ss.fail() || threshold <= 0.0f) {
+                LOG_WARNING(Input, "Failed to parse touchpad swipe threshold from line: {}", line);
+                return;
+            }
+            SetTouchpadSwipeThreshold(threshold);
+            return;
+        } else if (output_string == "touchpad_swipe_enabled") {
+            EnableTouchpadSwipe(input_string == "true" || input_string == "1");
+            return;
+        } else if (output_string == "touchpad_swipe_button_delay") {
+            auto delay = parseInt(input_string);
+            if (!delay || *delay < 1) {
+                LOG_WARNING(Input,
+                            "Invalid touchpad_swipe_button_delay at line {}: \"{}\", skipping.",
+                            lineCount, line);
+                return;
+            }
+            SetTouchpadSwipeButtonDelay(*delay);
+            return;
+        } else if (output_string == "touchpad_swipe_combo_enabled") {
+            swipe_combo.enabled = (input_string == "true" || input_string == "1");
+            return;
+        } else if (output_string == "touchpad_swipe_combo_hold_passthrough") {
+            swipe_combo.hold_passthrough = (input_string == "true" || input_string == "1");
+            return;
+        } else if (output_string == "touchpad_swipe_combo_hold") {
+            swipe_combo.hold = ParseSwipeComboInput(input_string, "hold", lineCount);
+            return;
+        } else if (output_string == "touchpad_swipe_combo_up") {
+            swipe_combo.dir_keys[BUTTON_SWIPE_UP] =
+                ParseSwipeComboInput(input_string, "up", lineCount);
+            return;
+        } else if (output_string == "touchpad_swipe_combo_down") {
+            swipe_combo.dir_keys[BUTTON_SWIPE_DOWN] =
+                ParseSwipeComboInput(input_string, "down", lineCount);
+            return;
+        } else if (output_string == "touchpad_swipe_combo_left") {
+            swipe_combo.dir_keys[BUTTON_SWIPE_LEFT] =
+                ParseSwipeComboInput(input_string, "left", lineCount);
+            return;
+        } else if (output_string == "touchpad_swipe_combo_right") {
+            swipe_combo.dir_keys[BUTTON_SWIPE_RIGHT] =
+                ParseSwipeComboInput(input_string, "right", lineCount);
+            return;
+        } else if (output_string == "mouse_default_mode") {
+            if (input_string == "joystick") {
+                SetMouseMode(MouseMode::Joystick);
+            } else if (input_string == "gyro") {
+                SetMouseMode(MouseMode::Gyro);
+            } else if (input_string == "touchpad") {
+                SetMouseMode(MouseMode::Touchpad);
+            } else if (input_string == "touchpad_swipe") {
+                // Independent of the mouse mode.
+                EnableTouchpadSwipe(true);
+            } else if (input_string == "off" || input_string == "none") {
+                SetMouseMode(MouseMode::Off);
+                EnableTouchpadSwipe(false);
+            } else {
+                LOG_WARNING(Input, "Invalid mouse_default_mode value: {}", input_string);
+                SetMouseMode(MouseMode::Off);
+            }
             return;
         } else if (output_string == "analog_deadzone") {
             std::stringstream ss(input_string);
@@ -610,6 +792,32 @@ void ParseInputConfig(const std::string game_id = "") {
         ProcessLine();
     }
     config_stream.close();
+
+    // Sanity-check the hold-combo swipe layer now that both files have been parsed.
+    for (int dir = 0; dir < 4; dir++) {
+        if (swipe_combo.dir_keys[dir].IsValid() && swipe_combo.dir_keys[dir] == swipe_combo.hold) {
+            LOG_WARNING(Input,
+                        "touchpad_swipe_combo_{} is mapped to the same input as the hold "
+                        "button; unmapping it",
+                        swipe_combo_dir_names[dir]);
+            swipe_combo.dir_keys[dir] = InputID();
+        }
+        for (int prev = 0; prev < dir; prev++) {
+            if (swipe_combo.dir_keys[dir].IsValid() &&
+                swipe_combo.dir_keys[dir] == swipe_combo.dir_keys[prev]) {
+                LOG_WARNING(Input,
+                            "touchpad_swipe_combo_{} duplicates touchpad_swipe_combo_{}; "
+                            "unmapping the {} slot",
+                            swipe_combo_dir_names[dir], swipe_combo_dir_names[prev],
+                            swipe_combo_dir_names[dir]);
+                swipe_combo.dir_keys[dir] = InputID();
+            }
+        }
+    }
+    if (swipe_combo.enabled && !swipe_combo.hold.IsValid()) {
+        LOG_WARNING(Input, "touchpad_swipe_combo_enabled is true but the hold input is unmapped; "
+                           "the combo layer is inert");
+    }
     std::sort(connections.begin(), connections.end());
     for (auto& c : connections) {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
@@ -751,6 +959,36 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_UP:
+            controller->SetTouchpadState(0, new_button_state, 0.5f, 0.25f);
+            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_DOWN:
+            controller->SetTouchpadState(0, new_button_state, 0.5f, 0.75f);
+            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+            break;
+        // The synthetic swipes fire on the rising edge only (state_changed gates this switch);
+        // the SDL timer chain in input_mouse.cpp owns the playback.
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_UP);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_DOWN);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_LEFT);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+            if (new_button_state) {
+                TriggerButtonSwipe(controller, BUTTON_SWIPE_RIGHT);
+            }
+            break;
         case LEFTJOYSTICK_HALFMODE:
             leftjoystick_halfmode = new_button_state;
             break;
@@ -777,6 +1015,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD:
             PushSDLEvent(SDL_EVENT_MOUSE_TO_TOUCHPAD);
+            break;
+        case HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD_SWIPE:
+            PushSDLEvent(SDL_EVENT_MOUSE_TO_TOUCHPAD_SWIPE);
             break;
         case HOTKEY_RENDERDOC:
             PushSDLEvent(SDL_EVENT_RDOC_CAPTURE);
@@ -986,6 +1227,60 @@ InputEvent BindingConnection::ProcessBinding() {
     return event; // All keys are active
 }
 
+// Pre-pass for the hold-combo swipe layer: while the hold input is held, fresh presses of the
+// combo direction inputs play back touchpad swipes on the first pad and have their normal
+// mappings suppressed until release.
+static void ProcessTouchpadSwipeCombo() {
+    if (!swipe_combo.enabled || !swipe_combo.hold.IsValid()) {
+        return;
+    }
+    auto FindPressed = [](const InputID& id) {
+        return std::find_if(
+            pressed_keys.begin(), pressed_keys.end(),
+            [&id](const std::pair<InputEvent, bool>& entry) { return entry.first.input == id; });
+    };
+    // Axis entries persist in the list with a live axis_value, so triggers are gated on the
+    // same 0x40 threshold the normal button-from-axis path uses.
+    auto IsHeld = [](std::list<std::pair<InputEvent, bool>>::iterator it) {
+        if (it == pressed_keys.end()) {
+            return false;
+        }
+        if (it->first.input.type == InputType::Axis) {
+            return std::abs(it->first.axis_value) > 0x40;
+        }
+        return true;
+    };
+
+    auto hold_it = FindPressed(swipe_combo.hold);
+    const bool hold_down = IsHeld(hold_it);
+    if (hold_down && !swipe_combo.hold_passthrough) {
+        // Dedicated modifier: consume the hold input so its normal mappings stay off.
+        hold_it->second = true;
+    }
+    for (int dir = 0; dir < 4; dir++) {
+        if (!swipe_combo.dir_keys[dir].IsValid()) {
+            continue;
+        }
+        auto dir_it = FindPressed(swipe_combo.dir_keys[dir]);
+        const bool dir_down = IsHeld(dir_it);
+        if (dir_down && !swipe_combo.dir_was_down[dir] && hold_down) {
+            // A fresh press while the hold is down belongs to the combo: play back the swipe
+            // and latch ownership until release.
+            TriggerButtonSwipe(ControllerOutput::controllers[0], dir);
+            swipe_combo.dir_swipe_owned[dir] = true;
+        }
+        if (!dir_down) {
+            swipe_combo.dir_swipe_owned[dir] = false;
+        }
+        if (swipe_combo.dir_swipe_owned[dir] && dir_it != pressed_keys.end()) {
+            // Suppress the normal mapping while the combo owns this press, even if the hold
+            // input was released first.
+            dir_it->second = true;
+        }
+        swipe_combo.dir_was_down[dir] = dir_down;
+    }
+}
+
 void ActivateOutputsFromInputs() {
 
     // todo find a better solution
@@ -1001,6 +1296,7 @@ void ActivateOutputsFromInputs() {
 
         // Check for input blockers
         ApplyMouseInputBlockers();
+        ProcessTouchpadSwipeCombo();
 
         // Iterate over all inputs, and update their respecive outputs accordingly
         for (auto& it : connections) {
