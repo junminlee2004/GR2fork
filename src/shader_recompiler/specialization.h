@@ -219,6 +219,10 @@ struct StageSpecialization {
         return info != nullptr;
     }
 
+    [[nodiscard]] bool UsesUserData() const noexcept {
+        return info != nullptr && info->ud_mask.NumRegs() != 0;
+    }
+
     // Fills sig/sig2 from every field operator== consults (plus the program identity), so two
     // specs with equal signatures are interchangeable up to a ~2^-128 collision. Called explicitly
     // by the pipeline cache while the spec_fp_cache setting is on.
@@ -242,7 +246,10 @@ struct StageSpecialization {
         step(static_cast<u64>(info ? static_cast<u32>(info->hw_stage) : 0));
         step(static_cast<u64>(info ? static_cast<u32>(info->sw_stage) : 0));
         step(XXH3_64bits(&runtime_info, sizeof(runtime_info)));
-        step(XXH3_64bits(&start, sizeof(start)));
+        // Mirrors operator==: the user-data start counts whenever the stage reads registers,
+        // the descriptor starts only when it binds descriptors.
+        step(UsesUserData() ? start.user_data : 0u);
+        step(bitset.any() ? (u64{start.unified} << 32) | start.buffer : 0u);
         // bitset is the single source of truth (Deserialize restores only it), so the two words
         // are derived here rather than stored.
         static_assert(MaxStageResources == 128);
@@ -284,6 +291,12 @@ struct StageSpecialization {
 
         // Cheap scalar rejects run before the vector walks; every compare is a
         // side-effect-free const compare, so the reorder cannot change the result.
+        // The module reads its user-data registers at the push-constant offset compiled from
+        // start.user_data, so that start is part of the identity of every stage that reads any;
+        // the descriptor starts only matter once the stage binds descriptors.
+        if (UsesUserData() && start.user_data != other.start.user_data) {
+            return false;
+        }
         const bool no_bindings = bitset.none() && other.bitset.none();
         if (!no_bindings && start != other.start) {
             return false;

@@ -286,6 +286,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
+        // The permutation joins the cached program; its spec must point at that program's info,
+        // not at the temporary one this load built.
+        spec.info = &it_pgm.value()->info;
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means
