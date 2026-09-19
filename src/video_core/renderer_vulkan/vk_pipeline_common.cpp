@@ -559,11 +559,14 @@ void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                 diff |= words[i] ^ slot.words[i];
                 slot.words[i] = words[i];
             }
+            const u64 foreign = sc.ForeignPipelineGen(0) + sc.ForeignPipelineGen(1);
             diff |= slot.layout ^ layout_bits;
             diff |= slot.stage_flags ^ flag_bits;
+            diff |= slot.foreign_gen ^ foreign;
             const bool same = slot.valid && diff == 0;
             slot.layout = layout_bits;
             slot.stage_flags = flag_bits;
+            slot.foreign_gen = foreign;
             slot.valid = true;
             sc.CountPushConst(same);
             push_same = same && sc.ActiveMode() != Mode::ValidateOnly;

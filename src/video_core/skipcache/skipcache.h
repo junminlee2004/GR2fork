@@ -473,6 +473,10 @@ public:
     struct alignas(64) PushConstSlot {
         std::array<u64, 16> words;
         u64 layout;
+        // Sum of both foreign pipeline gens: a pipeline bound outside the dedup path may have a
+        // layout that is not push-constant compatible, after which the pushed values are
+        // undefined by the spec even if a driver happens to keep them.
+        u64 foreign_gen;
         u32 stage_flags;
         bool valid;
     };

@@ -195,6 +195,8 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     scheduler.EndRendering();
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    // A layout without push constants: the compute dedup slots must not outlive this bind.
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(1);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -281,6 +283,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const auto cmdbuf = scheduler.CommandBuffer();
     in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
 
+    // A layout without push constants: the compute dedup slots must not outlive this bind.
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(1);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
