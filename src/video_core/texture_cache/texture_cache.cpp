@@ -121,16 +121,79 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    if (readback_linear_images && EmulatorSettings.IsReadbackLinearImagesLazy()) {
+        readback_linear_images_lazy =
+            EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
+        if (!readback_linear_images_lazy) {
+            LOG_WARNING(Render_Vulkan, "readback_linear_images_lazy needs readbacks_mode Precise; "
+                                       "the eager linear image readbacks stay on");
+        }
+    }
 }
 
 TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
-    for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+    if (!readback_linear_images_lazy) {
+        for (const ImageId image_id : download_images) {
+            DownloadImageMemory(image_id, true);
+        }
+        download_images.clear();
+        return;
     }
+    // The marking walks the buffer cache, which can unregister images and take this mutex.
+    boost::container::small_vector<ImageId, 16> queued(download_images.begin(),
+                                                       download_images.end());
     download_images.clear();
+    lk.unlock();
+    for (const ImageId image_id : queued) {
+        MarkImageForLazyReadback(image_id);
+    }
+}
+
+void TextureCache::MarkImageForLazyReadback(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.info.guest_address == 0) {
+        return;
+    }
+    const u32 size = image.info.pitch * image.info.size.height * image.info.size.depth *
+                     image.info.resources.layers * (image.info.num_bits / 8);
+    if (size == 0 || size > image.info.guest_size) {
+        return;
+    }
+    const VAddr addr = image.info.guest_address;
+    // The tracker read-watches the range like any GPU-written buffer; the buffer that backs it
+    // is filled from the image only when a read faults (SyncLazyReadbackImages).
+    buffer_cache.MarkRangeForLazyReadback(addr, size);
+    std::unique_lock lk{download_images_mutex};
+    for (auto& e : lazy_readback_images) {
+        if (e.image_id == image_id) {
+            e.addr = addr;
+            e.size = size;
+            return;
+        }
+    }
+    lazy_readback_images.push_back({addr, size, image_id});
+}
+
+bool TextureCache::SyncLazyReadbackImages(VAddr start, u64 size) {
+    boost::container::small_vector<LazyReadbackImage, 8> hits;
+    {
+        std::unique_lock lk{download_images_mutex};
+        const VAddr end = start + size;
+        std::erase_if(lazy_readback_images, [&](const LazyReadbackImage& e) {
+            const bool overlaps = e.addr < end && start < e.addr + e.size;
+            if (overlaps) {
+                hits.push_back(e);
+            }
+            return overlaps;
+        });
+    }
+    for (const auto& e : hits) {
+        buffer_cache.SynchronizeLazyImage(e.addr, e.size);
+    }
+    return !hits.empty();
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
@@ -2190,6 +2253,8 @@ void TextureCache::DeleteImage(ImageId image_id) {
         if (download_images.contains(image_id)) {
             download_images.erase(image_id);
         }
+        std::erase_if(lazy_readback_images,
+                      [image_id](const LazyReadbackImage& e) { return e.image_id == image_id; });
     }
 
     // Reclaim image and any image views it references.

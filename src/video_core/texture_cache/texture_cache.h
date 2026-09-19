@@ -184,6 +184,15 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+    /// readback_linear_images_lazy: fills the buffer of every lazily tracked image overlapping
+    /// [start, start + size) from the image and returns whether any was. GPU command thread only.
+    bool SyncLazyReadbackImages(VAddr start, u64 size);
+
+    [[nodiscard]] bool HasLazyReadbackImages() {
+        std::scoped_lock lk{download_images_mutex};
+        return !lazy_readback_images.empty();
+    }
+
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
@@ -444,6 +453,7 @@ private:
 
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void MarkImageForLazyReadback(ImageId image_id);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -803,6 +813,15 @@ private:
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
+    // readback_linear_images_lazy: images whose guest range a fence handed to the tracker. The
+    // download that follows a CPU read fills their buffer from the image first. Guarded by
+    // download_images_mutex like download_images; UnregisterImage drops entries.
+    struct LazyReadbackImage {
+        VAddr addr;
+        u32 size;
+        ImageId image_id;
+    };
+    std::vector<LazyReadbackImage> lazy_readback_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
@@ -836,6 +855,7 @@ private:
     u64 lru_lazy_frees_{};
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     bool readback_linear_images;
+    bool readback_linear_images_lazy{};
     // All latched once at construction; image_fast_state gates the lock-free
     // UpdateImage fast path.
     bool image_fast_state;

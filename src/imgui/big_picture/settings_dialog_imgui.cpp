@@ -86,6 +86,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
         readbacksModeSetting = EmulatorSettings.GetReadbacksMode();
         adaptiveSkipCachesSetting = EmulatorSettings.GetAdaptiveSkipCachesMode();
         readbackLinearImagesSetting = EmulatorSettings.IsReadbackLinearImagesEnabled();
+        readbackLinearImagesLazySetting = EmulatorSettings.IsReadbackLinearImagesLazy();
         directMemoryAccessSetting = EmulatorSettings.IsDirectMemoryAccessEnabled();
         // Windows static guest red-zone protection
         windowsGuestRedZoneProtectionModeSetting =
@@ -157,6 +158,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
         VideoCore::Skipcache::Framework::Instance().SetRequestedMode(
             static_cast<VideoCore::Skipcache::Mode>(adaptiveSkipCachesSetting));
         EmulatorSettings.SetReadbackLinearImagesEnabled(readbackLinearImagesSetting, true);
+        EmulatorSettings.SetReadbackLinearImagesLazy(readbackLinearImagesLazySetting, true);
         EmulatorSettings.SetDirectMemoryAccessEnabled(directMemoryAccessSetting, true);
         // Windows static guest red-zone protection
         EmulatorSettings.SetWindowsGuestRedZoneProtectionMode(
@@ -786,6 +788,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCombo("Adaptive Skip Caches (Experimental)", adaptiveSkipCachesSetting,
                             adaptiveSkipCachesOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
+            AddSettingCheckbox("Lazy Readback Linear Images (needs Precise readbacks)",
+                               readbackLinearImagesLazySetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
 #ifdef _WIN32
             // Windows static guest red-zone protection

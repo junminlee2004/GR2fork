@@ -122,6 +122,14 @@ public:
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
+    /// readback_linear_images_lazy: hands a linear image's guest range to the tracker as a GPU
+    /// write on a buffer that covers it; nothing is copied until a CPU read faults.
+    void MarkRangeForLazyReadback(VAddr addr, u32 size);
+    /// Fills the buffer covering a lazily tracked image with the image's content ahead of a
+    /// download; the image must still start at addr.
+    void SynchronizeLazyImage(VAddr addr, u32 size);
+    /// Pulls every lazily tracked image inside a fault's readback window into its buffer.
+    void SyncLazyReadbackImagesForFault(VAddr device_addr, u64 size);
 
     struct OffloadStats {
         u64 jobs;

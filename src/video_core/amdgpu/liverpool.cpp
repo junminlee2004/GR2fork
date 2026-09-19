@@ -98,11 +98,12 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
     stamp.FlushAtDraw();
 }
 
-// Drain the read arms before the downloads, so a fence sees both.
+// Downloads (or the lazy marks, which queue read arms) first, then the drain, so a fence sees
+// both.
 static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
     if (rasterizer) {
-        rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
         rasterizer->ProcessDownloadImages();
+        rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
     }
 }
 

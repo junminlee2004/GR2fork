@@ -166,6 +166,7 @@ private:
     int readbacksModeSetting;
     int adaptiveSkipCachesSetting;
     bool readbackLinearImagesSetting;
+    bool readbackLinearImagesLazySetting;
     bool directMemoryAccessSetting;
     // Windows static guest red-zone protection
     int windowsGuestRedZoneProtectionModeSetting;

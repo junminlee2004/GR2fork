@@ -330,6 +330,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         if (!pending_finish_.empty()) {
             DrainPendingFinish();
         }
+        SyncLazyReadbackImagesForFault(device_addr, size);
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         const auto [window_start, window_end] = ComputeReadbackWindow(buffer, device_addr, size);
         DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
@@ -749,6 +750,7 @@ void BufferCache::PrepareFaultDownload(FaultDownloadJob& job, VAddr device_addr,
     if (!pending_finish_.empty()) {
         DrainPendingFinish();
     }
+    SyncLazyReadbackImagesForFault(device_addr, size);
     Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
     buffer.readback_prone_tick = gc_tick;
     const auto [window_start, window_end] = ComputeReadbackWindow(buffer, device_addr, size);
@@ -2597,6 +2599,45 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
     buffer.gpu_write_tick = scheduler.CurrentTick();
     return true;
+}
+
+void BufferCache::MarkRangeForLazyReadback(VAddr addr, u32 size) {
+    Buffer& buffer = slot_buffers[FindBuffer(addr, size)];
+    // As a GPU write through the buffer: CPU-dirty pages upload first so the tracker's CPU bits
+    // clear, then the range is marked GPU-modified and its read watchers arm on the next drain.
+    SynchronizeBuffer(buffer, addr, size, true, false);
+    buffer.gpu_write_tick = scheduler.CurrentTick();
+    if (!GpuModifiedRangesContain(addr, size)) {
+        ++gpu_dirty_generation_;
+        AddWrittenRange(addr, size);
+    }
+}
+
+void BufferCache::SynchronizeLazyImage(VAddr addr, u32 size) {
+    const ImageId image_id = texture_cache.FindImageFromRange(addr, size);
+    if (!image_id || texture_cache.GetImage(image_id).info.guest_address != addr) {
+        LOG_WARNING(Render_Vulkan,
+                    "Lazy linear image readback at {:#x} lost its image; the download reads "
+                    "the buffer as is",
+                    addr);
+        return;
+    }
+    Buffer& buffer = slot_buffers[FindBuffer(addr, size)];
+    SynchronizeBufferFromImage(buffer, addr, size);
+}
+
+void BufferCache::SyncLazyReadbackImagesForFault(VAddr device_addr, u64 size) {
+    if (!texture_cache.HasLazyReadbackImages()) {
+        return;
+    }
+    // A sync can merge buffers and widen the window, so settle until the window holds none.
+    for (int pass = 0; pass < 4; ++pass) {
+        Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+        const auto [window_start, window_end] = ComputeReadbackWindow(buffer, device_addr, size);
+        if (!texture_cache.SyncLazyReadbackImages(window_start, window_end - window_start)) {
+            return;
+        }
+    }
 }
 
 void BufferCache::SynchronizeBuffersInRange(VAddr device_addr, u64 size) {
