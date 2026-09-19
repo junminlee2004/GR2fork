@@ -16,6 +16,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -98,9 +99,11 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
     stamp.FlushAtDraw();
 }
 
-// Downloads (or the lazy marks, which queue read arms) first, then the drain, so a fence sees
-// both.
+// Every queued lane copy still reads guest memory that the fence tells the guest it may reuse,
+// so the lanes drain before anything guest-visible is written. Then the downloads (or the lazy
+// marks, which queue read arms) and the drain, so a fence sees both.
 static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer) {
         rasterizer->ProcessDownloadImages();
         rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
@@ -254,6 +257,10 @@ static_assert(RegBlocksInRange(kRtRegBlocks));
 
 SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void* dst,
                                             const void* src, u64 size) {
+    // A CP write lands in guest memory at parse time. On hardware every earlier draw has read
+    // its inputs by then; here those reads may still be queued on the copy lanes, and the write
+    // may also be a label the guest polls before reusing buffers. Drain first.
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (!rasterizer || !rasterizer->TryCpWriteBacking(std::bit_cast<VAddr>(dst), src, size)) {
         std::memcpy(dst, src, size);
     }
