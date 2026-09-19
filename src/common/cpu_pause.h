@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/arch.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -20,6 +21,18 @@ inline void CpuPause() {
     __yield();
 #elif defined(ARCH_ARM64)
     asm("yield");
+#endif
+}
+
+// Makes every prior store of this thread globally visible, including stores
+// to write-combined memory: on x86 a partial WC line otherwise stays in the
+// core's WC buffer until a fence, a locked instruction or an interrupt, and a
+// plain release store flushes nothing.
+inline void StoreFence() {
+#if defined(ARCH_X86_64)
+    _mm_sfence();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
 }
 

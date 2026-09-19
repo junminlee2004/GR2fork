@@ -144,6 +144,12 @@ bool StreamCopyLane::ClaimAndCopy() {
     // store, which every drain waiter reads with acquire.
     slot->seq.store(pos + kRingSlots, std::memory_order_release);
     std::memcpy(job.dst, job.src, job.size);
+    // dst is the write-combined staging ring. The tail of the copy can sit in
+    // this core's WC buffer past the completion store below (a plain mov that
+    // flushes nothing), and an idle worker then pause-spins with no fence or
+    // locked instruction while the drained submit already has the GPU reading
+    // the ring. Fence before the completion is published.
+    Common::StoreFence();
     return true;
 }
 
