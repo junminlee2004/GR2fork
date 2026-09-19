@@ -216,8 +216,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
-    // Accumulates across stages like the runtime lookup does; a key with no
-    // nonzero stage hashes yields disengaged fetch data.
+    // Set by the one stage that owns a fetch shader, as at runtime; a key with no such stage
+    // yields disengaged fetch data.
     std::optional<Shader::Gcn::FetchShaderData> fetch_data{};
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
@@ -237,6 +237,18 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         if (!LoadPipelineStage(meta_ar, stage_idx, fetch_data)) {
             return false;
         }
+    }
+    if (const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+        vs_info && vs_info->has_fetch_shader && !fetch_data) {
+        // Never preload a pipeline that would draw without vertex input; it compiles at runtime
+        // from the live fetch shader instead.
+        LOG_WARNING(Render_Vulkan,
+                    "Skipping preload of a pipeline: vertex shader {:#x} has a fetch shader but "
+                    "the cache carries no fetch data for it",
+                    vs_info->pgm_hash);
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return false;
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -258,8 +270,15 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_out, spec, perm_idx)) {
+    std::optional<Shader::Gcn::FetchShaderData> stage_fetch{};
+    if (!LoadShaderMeta(ar, program->info, stage_fetch, spec, perm_idx)) {
         return false;
+    }
+    // As Publish does at runtime: only the stage that owns a fetch shader (the logical vertex
+    // stage) sets the pipeline's fetch data. Stages after it in load order, geometry above all,
+    // carry none and must not clear it.
+    if (stage_fetch) {
+        fetch_out = std::move(stage_fetch);
     }
     NoteSharpVerdicts(program->info);
     if (spec_fp_cache) {
