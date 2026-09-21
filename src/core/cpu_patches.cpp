@@ -904,23 +904,6 @@ static bool TryPatchJit(void* code_address) {
     return TryPatch(code, module).first;
 }
 
-static void TryPatchAot(void* code_address, u64 code_size) {
-    auto* code = static_cast<u8*>(code_address);
-    auto* module = GetModule(code);
-    if (module == nullptr) {
-        return;
-    }
-
-    std::unique_lock lock{module->mutex};
-
-    const auto* end = code + code_size;
-    while (code < end) {
-        code += TryPatch(code, module).second;
-    }
-}
-
-#if defined(_WIN32) && defined(ARCH_X86_64)
-
 // sse4a_aot_patch. The lazy path patches an SSE4a site only after it has trapped once, and never
 // patches the 4-byte register forms of EXTRQ/INSERTQ: a trampoline needs a 5-byte jump, so those
 // go through the exception handler on every execution, which on Windows costs thousands of
@@ -934,11 +917,6 @@ struct Sse4aAotCounts {
     u64 skipped_rip_relative{};
     u64 skipped_other{};
 };
-
-static bool IsSSE4aMnemonic(ZydisMnemonic mnemonic) {
-    return mnemonic == ZYDIS_MNEMONIC_EXTRQ || mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
-           mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
-}
 
 static bool IsBranchOrCall(const ZydisDecodedInstruction& inst) {
     switch (inst.meta.category) {
@@ -1036,6 +1014,63 @@ static std::pair<bool, u64> TryRelocate4ByteSse4a(u8* code, PatchModule* module,
     return std::make_pair(true, window);
 }
 
+static void LogSse4aAotCounts(const void* code_address, u64 code_size,
+                              const Sse4aAotCounts& counts) {
+    if (counts.patched + counts.relocated + counts.skipped_branch + counts.skipped_rip_relative +
+            counts.skipped_other ==
+        0) {
+        return;
+    }
+    // `patched` counts the longer SSE4a forms and is only tracked by the Windows pass; elsewhere
+    // the full pass patches them along with everything else.
+    LOG_INFO(Core,
+             "sse4a_aot_patch: segment {} +{:#x}: patched={} relocated={} left to the exception "
+             "handler: next is a branch={} rip-relative={} other={}",
+             fmt::ptr(code_address), code_size, counts.patched, counts.relocated,
+             counts.skipped_branch, counts.skipped_rip_relative, counts.skipped_other);
+}
+
+#if !defined(_WIN32)
+
+/// The full ahead-of-time pass. With sse4a_aot_patch it also relocates the 4-byte EXTRQ/INSERTQ
+/// forms the ordinary patcher has to decline.
+static void TryPatchAot(void* code_address, u64 code_size) {
+    auto* code = static_cast<u8*>(code_address);
+    auto* module = GetModule(code);
+    if (module == nullptr) {
+        return;
+    }
+
+    std::unique_lock lock{module->mutex};
+
+    const bool relocate = EmulatorSettings.IsSse4aAotPatch() && FilterNoSSE4a(nullptr);
+    Sse4aAotCounts counts;
+    const auto* end = code + code_size;
+    while (code < end) {
+        auto result = TryPatch(code, module);
+        if (!result.first && relocate && code + 4 <= end && Is4ByteExtrqOrInsertq(code)) {
+            ZydisDecodedInstruction instruction;
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+            if (ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                    instruction, operands, code, module->end - code)) &&
+                instruction.length == 4 &&
+                (instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
+                 instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ)) {
+                result = TryRelocate4ByteSse4a(code, module, instruction, operands, counts);
+            }
+        }
+        code += result.second;
+    }
+    LogSse4aAotCounts(code_address, code_size, counts);
+}
+
+#else
+
+static bool IsSSE4aMnemonic(ZydisMnemonic mnemonic) {
+    return mnemonic == ZYDIS_MNEMONIC_EXTRQ || mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
+           mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
+}
+
 static std::pair<bool, u64> TryPatchSSE4aOnly(u8* code, PatchModule* module,
                                               Sse4aAotCounts& counts) {
     ZydisDecodedInstruction instruction;
@@ -1075,15 +1110,7 @@ static void TryPatchAotSSE4aOnly(void* code_address, u64 code_size) {
     while (code < end) {
         code += TryPatchSSE4aOnly(code, module, counts).second;
     }
-    if (counts.patched + counts.relocated + counts.skipped_branch + counts.skipped_rip_relative +
-            counts.skipped_other !=
-        0) {
-        LOG_INFO(Core,
-                 "sse4a_aot_patch: segment {} +{:#x}: patched={} relocated={} left to the "
-                 "exception handler: next is a branch={} rip-relative={} other={}",
-                 fmt::ptr(code_address), code_size, counts.patched, counts.relocated,
-                 counts.skipped_branch, counts.skipped_rip_relative, counts.skipped_other);
-    }
+    LogSse4aAotCounts(code_address, code_size, counts);
 }
 
 #endif
@@ -2368,7 +2395,7 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
     if (!Patches.empty()) {
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
     }
-#elif defined(_WIN32) && defined(ARCH_X86_64)
+#elif defined(_WIN32)
     // Not together with the static red-zone patcher, which rewrites the same segments afterwards
     // from its own decode of them.
     if (EmulatorSettings.IsSse4aAotPatch() && FilterNoSSE4a(nullptr) &&

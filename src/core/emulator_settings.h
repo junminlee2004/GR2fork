@@ -208,11 +208,12 @@ struct GeneralSettings {
     Setting<int> volume_slider{100};
     Setting<bool> neo_mode{false};
     Setting<bool> dev_kit_mode{false};
-    // Windows on CPUs without SSE4a (every Intel CPU). Patch EXTRQ, INSERTQ, MOVNTSS and MOVNTSD
-    // when a module loads instead of on their first trap, and relocate the 4-byte register forms
-    // of EXTRQ/INSERTQ, which are too short for a jump and are otherwise emulated inside the
-    // exception handler on every execution. The relocation overwrites the following instruction
-    // too, so a guest branch that targets that instruction would break; off by default.
+    // CPUs without SSE4a (every Intel CPU). Relocate the 4-byte register forms of EXTRQ/INSERTQ,
+    // which are too short for a jump and are otherwise emulated inside the exception or signal
+    // handler on every execution; on Windows, where patching is otherwise lazy, also patch EXTRQ,
+    // INSERTQ, MOVNTSS and MOVNTSD when a module loads instead of on their first trap. The
+    // relocation overwrites the following instruction too, so a guest branch that targets that
+    // instruction would break; off by default.
     Setting<bool> sse4a_aot_patch{false};
     Setting<int> extra_dmem_in_mbytes{0};
     Setting<int> extra_fmem_in_mbytes{0};
