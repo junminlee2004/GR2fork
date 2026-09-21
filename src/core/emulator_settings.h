@@ -208,6 +208,12 @@ struct GeneralSettings {
     Setting<int> volume_slider{100};
     Setting<bool> neo_mode{false};
     Setting<bool> dev_kit_mode{false};
+    // Windows on CPUs without SSE4a (every Intel CPU). Patch EXTRQ, INSERTQ, MOVNTSS and MOVNTSD
+    // when a module loads instead of on their first trap, and relocate the 4-byte register forms
+    // of EXTRQ/INSERTQ, which are too short for a jump and are otherwise emulated inside the
+    // exception handler on every execution. The relocation overwrites the following instruction
+    // too, so a guest branch that targets that instruction would break; off by default.
+    Setting<bool> sse4a_aot_patch{false};
     Setting<int> extra_dmem_in_mbytes{0};
     Setting<int> extra_fmem_in_mbytes{0};
     Setting<bool> shad_net_enabled{false};
@@ -231,6 +237,7 @@ struct GeneralSettings {
             make_override<GeneralSettings>("volume_slider", &GeneralSettings::volume_slider),
             make_override<GeneralSettings>("neo_mode", &GeneralSettings::neo_mode),
             make_override<GeneralSettings>("dev_kit_mode", &GeneralSettings::dev_kit_mode),
+            make_override<GeneralSettings>("sse4a_aot_patch", &GeneralSettings::sse4a_aot_patch),
             make_override<GeneralSettings>("extra_dmem_in_mbytes",
                                            &GeneralSettings::extra_dmem_in_mbytes),
             make_override<GeneralSettings>("extra_fmem_in_mbytes",
@@ -256,8 +263,9 @@ struct GeneralSettings {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_dir, home_dir,
                                    sys_modules_dir, font_dir, volume_slider, neo_mode, dev_kit_mode,
-                                   extra_dmem_in_mbytes, extra_fmem_in_mbytes, shad_net_enabled,
-                                   trophy_popup_disabled, trophy_notification_duration, show_splash,
+                                   sse4a_aot_patch, extra_dmem_in_mbytes, extra_fmem_in_mbytes,
+                                   shad_net_enabled, trophy_popup_disabled,
+                                   trophy_notification_duration, show_splash,
                                    trophy_notification_side, connected_to_network,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
@@ -1212,6 +1220,7 @@ public:
     // General settings
     SETTING_FORWARD(m_general, VolumeSlider, volume_slider)
     SETTING_FORWARD_BOOL(m_general, Neo, neo_mode)
+    SETTING_FORWARD_BOOL(m_general, Sse4aAotPatch, sse4a_aot_patch)
     SETTING_FORWARD_BOOL(m_general, DevKit, dev_kit_mode)
     SETTING_FORWARD(m_general, ExtraDmemInMBytes, extra_dmem_in_mbytes)
     SETTING_FORWARD(m_general, ExtraFmemInMBytes, extra_fmem_in_mbytes)

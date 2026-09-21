@@ -22,6 +22,7 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "core/tls.h"
 #include "cpu_patches.h"
@@ -917,6 +918,175 @@ static void TryPatchAot(void* code_address, u64 code_size) {
         code += TryPatch(code, module).second;
     }
 }
+
+#if defined(_WIN32) && defined(ARCH_X86_64)
+
+// sse4a_aot_patch. The lazy path patches an SSE4a site only after it has trapped once, and never
+// patches the 4-byte register forms of EXTRQ/INSERTQ: a trampoline needs a 5-byte jump, so those
+// go through the exception handler on every execution, which on Windows costs thousands of
+// cycles each. The relocator claims the following instruction's bytes as well: the trampoline
+// emulates the SSE4a instruction, replays the next one and jumps back past both.
+
+struct Sse4aAotCounts {
+    u64 patched{};
+    u64 relocated{};
+    u64 skipped_branch{};
+    u64 skipped_rip_relative{};
+    u64 skipped_other{};
+};
+
+static bool IsSSE4aMnemonic(ZydisMnemonic mnemonic) {
+    return mnemonic == ZYDIS_MNEMONIC_EXTRQ || mnemonic == ZYDIS_MNEMONIC_INSERTQ ||
+           mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
+}
+
+static bool IsBranchOrCall(const ZydisDecodedInstruction& inst) {
+    switch (inst.meta.category) {
+    case ZYDIS_CATEGORY_UNCOND_BR:
+    case ZYDIS_CATEGORY_COND_BR:
+    case ZYDIS_CATEGORY_CALL:
+    case ZYDIS_CATEGORY_RET:
+    case ZYDIS_CATEGORY_SYSCALL:
+    case ZYDIS_CATEGORY_SYSRET:
+    case ZYDIS_CATEGORY_INTERRUPT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool UsesRipRelative(const ZydisDecodedInstruction& inst,
+                            const ZydisDecodedOperand* operands) {
+    for (u8 i = 0; i < inst.operand_count_visible; ++i) {
+        if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            operands[i].mem.base == ZYDIS_REGISTER_RIP) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Relocates the 4-byte EXTRQ/INSERTQ at `code` together with the instruction after it.
+/// Returns whether it did and how far the caller advances.
+static std::pair<bool, u64> TryRelocate4ByteSse4a(u8* code, PatchModule* module,
+                                                  const ZydisDecodedInstruction& inst,
+                                                  const ZydisDecodedOperand* operands,
+                                                  Sse4aAotCounts& counts) {
+    u8* const next = code + inst.length;
+    ZydisDecodedInstruction next_inst;
+    ZydisDecodedOperand next_operands[ZYDIS_MAX_OPERAND_COUNT];
+    if (next >= module->end || module->trampoline_exhausted ||
+        !ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(next_inst, next_operands, next,
+                                                                     module->end - next))) {
+        ++counts.skipped_other;
+        return std::make_pair(false, inst.length);
+    }
+    // The replay runs at another address, so it must not depend on its own.
+    if (IsBranchOrCall(next_inst)) {
+        ++counts.skipped_branch;
+        return std::make_pair(false, inst.length);
+    }
+    if (UsesRipRelative(next_inst, next_operands)) {
+        ++counts.skipped_rip_relative;
+        return std::make_pair(false, inst.length);
+    }
+    const u64 window = inst.length + next_inst.length;
+
+    auto& trampoline_gen = module->trampoline_gen;
+    const size_t trampoline_offset = trampoline_gen.getSize();
+    const auto* trampoline_ptr = trampoline_gen.getCurr();
+    try {
+        if (inst.mnemonic == ZYDIS_MNEMONIC_EXTRQ) {
+            GenerateEXTRQ(code, operands, trampoline_gen);
+        } else {
+            GenerateINSERTQ(code, operands, trampoline_gen);
+        }
+        // A verbatim SSE4a copy would trap from inside the trampoline.
+        if (next_inst.mnemonic == ZYDIS_MNEMONIC_EXTRQ) {
+            GenerateEXTRQ(next, next_operands, trampoline_gen);
+        } else if (next_inst.mnemonic == ZYDIS_MNEMONIC_INSERTQ) {
+            GenerateINSERTQ(next, next_operands, trampoline_gen);
+        } else {
+            // MOVNTSS/MOVNTSD are rewritten in place to MOVSS/MOVSD first (same length), and the
+            // copy below then carries the rewritten bytes.
+            if (next_inst.mnemonic == ZYDIS_MNEMONIC_MOVNTSS) {
+                ReplaceMOVNTSS(next, next_operands, trampoline_gen);
+            } else if (next_inst.mnemonic == ZYDIS_MNEMONIC_MOVNTSD) {
+                ReplaceMOVNTSD(next, next_operands, trampoline_gen);
+            }
+            trampoline_gen.db(next, next_inst.length);
+        }
+        trampoline_gen.jmp(code + window);
+    } catch (const Xbyak::Error& error) {
+        trampoline_gen.setSize(trampoline_offset);
+        if (HandleTrampolineError(module, error)) {
+            ++counts.skipped_other;
+            return std::make_pair(false, inst.length);
+        }
+        throw;
+    }
+
+    auto& patch_gen = module->patch_gen;
+    patch_gen.reset();
+    patch_gen.setSize(code - patch_gen.getCode());
+    patch_gen.jmp(trampoline_ptr, Xbyak::CodeGenerator::LabelType::T_NEAR);
+    patch_gen.nop(window - NearJumpSize);
+    module->patched.insert(code);
+    ++counts.relocated;
+    return std::make_pair(true, window);
+}
+
+static std::pair<bool, u64> TryPatchSSE4aOnly(u8* code, PatchModule* module,
+                                              Sse4aAotCounts& counts) {
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    const auto status = Common::Decoder::Instance()->decodeInstruction(instruction, operands, code,
+                                                                       module->end - code);
+    if (!ZYAN_SUCCESS(status)) {
+        return std::make_pair(false, 1);
+    }
+    if (!IsSSE4aMnemonic(instruction.mnemonic)) {
+        return std::make_pair(false, instruction.length);
+    }
+    // The 5-byte-and-longer forms go through the ordinary patcher.
+    const auto result = TryPatch(code, module);
+    if (result.first) {
+        ++counts.patched;
+        return result;
+    }
+    if (instruction.length == 4 && (instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
+                                    instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ)) {
+        return TryRelocate4ByteSse4a(code, module, instruction, operands, counts);
+    }
+    return std::make_pair(false, instruction.length);
+}
+
+/// Only SSE4a: the FS-segment patches stay lazy on Windows, since they depend on the guest TLS
+/// layout that is set up after the module has loaded.
+static void TryPatchAotSSE4aOnly(void* code_address, u64 code_size) {
+    auto* code = static_cast<u8*>(code_address);
+    auto* module = GetModule(code);
+    if (module == nullptr) {
+        return;
+    }
+    std::unique_lock lock{module->mutex};
+    Sse4aAotCounts counts;
+    const auto* end = code + code_size;
+    while (code < end) {
+        code += TryPatchSSE4aOnly(code, module, counts).second;
+    }
+    if (counts.patched + counts.relocated + counts.skipped_branch + counts.skipped_rip_relative +
+            counts.skipped_other !=
+        0) {
+        LOG_INFO(Core,
+                 "sse4a_aot_patch: segment {} +{:#x}: patched={} relocated={} left to the "
+                 "exception handler: next is a branch={} rip-relative={} other={}",
+                 fmt::ptr(code_address), code_size, counts.patched, counts.relocated,
+                 counts.skipped_branch, counts.skipped_rip_relative, counts.skipped_other);
+    }
+}
+
+#endif
 
 // ============================================================================
 // Windows static guest red-zone protection
@@ -2197,6 +2367,13 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
     // ahead-of-time patching for now until a better solution is worked out.
     if (!Patches.empty()) {
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
+    }
+#elif defined(_WIN32) && defined(ARCH_X86_64)
+    // Not together with the static red-zone patcher, which rewrites the same segments afterwards
+    // from its own decode of them.
+    if (EmulatorSettings.IsSse4aAotPatch() && FilterNoSSE4a(nullptr) &&
+        !WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
+        TryPatchAotSSE4aOnly(reinterpret_cast<void*>(segment_addr), segment_size);
     }
 #endif
 }
