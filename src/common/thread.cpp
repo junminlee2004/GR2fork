@@ -357,6 +357,12 @@ bool SetCurrentThreadAffinityMask(u64 mask) {
         return false;
     }
 #ifdef _WIN32
+    // A thread mask has to be a subset of the process mask (one_thread_per_core narrows it).
+    DWORD_PTR process_mask = 0, system_mask = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) &&
+        (mask & process_mask) != 0) {
+        mask &= process_mask;
+    }
     if (SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask)) == 0) {
         LOG_WARNING(Common, "SetThreadAffinityMask({:#x}) failed: {}", mask, GetLastErrorMsg());
         return false;
@@ -731,6 +737,30 @@ void StartPeriodicAffinityRewalk() {
             }
         }).detach();
     });
+}
+
+void RestrictProcessToOneThreadPerCore() {
+#ifdef _WIN32
+    const auto cores = EnumeratePhysicalCores(0);
+    u64 mask = 0;
+    u64 all = 0;
+    for (const auto& core : cores) {
+        mask |= core.mask & (~core.mask + 1); // lowest logical CPU of the core
+        all |= core.mask;
+    }
+    if (cores.size() < 4 || mask == all) {
+        LOG_INFO(Common, "one_thread_per_core: {} physical cores, mask {:#x}: nothing to do",
+                 cores.size(), all);
+        return;
+    }
+    if (SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask))) {
+        LOG_INFO(Common, "one_thread_per_core: process affinity {:#x} of {:#x} ({} cores)", mask,
+                 all, cores.size());
+    } else {
+        LOG_ERROR(Common, "one_thread_per_core: SetProcessAffinityMask({:#x}) failed: {}", mask,
+                  GetLastErrorMsg());
+    }
+#endif
 }
 
 } // namespace Common

@@ -47,6 +47,10 @@ unsigned ExcludeReservedCoresFromAllOtherThreads();
 /// Re-runs the walk every 5 s: Windows threads do not inherit their creator's affinity.
 void StartPeriodicAffinityRewalk();
 
+/// one_thread_per_core: Windows only, a no-op elsewhere. Restricts the process to the first
+/// logical CPU of every physical core. Call before the emulator's threads exist.
+void RestrictProcessToOneThreadPerCore();
+
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);
 

@@ -511,6 +511,11 @@ struct GPUSettings {
     // which costs it a quarter to a third of its speed. Hosts with fewer than 6 logical CPUs or
     // 4 physical cores are left alone.
     Setting<bool> gpu_thread_core_reserve{false};
+    // Windows only. Restrict the whole process to the first logical CPU of every physical core,
+    // the same thing as ticking only the even CPUs in Task Manager: no two emulator or guest
+    // threads can then share a core. Windows otherwise packs busy threads onto both hyperthreads
+    // of a few cores while others idle. Works together with gpu_thread_core_reserve.
+    Setting<bool> one_thread_per_core{false};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -887,6 +892,7 @@ struct GPUSettings {
             GPU_OVERRIDE(gather_input_memo),
             GPU_OVERRIDE(tracker_lock_spin_rounds),
             GPU_OVERRIDE(gpu_thread_core_reserve),
+            GPU_OVERRIDE(one_thread_per_core),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(protect_carry_merge),
             GPU_OVERRIDE(stream_buffer_prefer_host),
@@ -1013,7 +1019,7 @@ struct GPUSettings {
     findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, \
     readback_wait_notify, readback_window_kb, deferred_read_release, image_fast_state, \
     guest_copy_lock_batch, spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, \
-    userfaultfd, gpu_thread_core_reserve
+    userfaultfd, gpu_thread_core_reserve, one_thread_per_core
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1301,6 +1307,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
     SETTING_FORWARD_BOOL(m_gpu, GpuThreadCoreReserve, gpu_thread_core_reserve)
+    SETTING_FORWARD_BOOL(m_gpu, OneThreadPerCore, one_thread_per_core)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD_BOOL(m_gpu, ProtectCarryMerge, protect_carry_merge)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
