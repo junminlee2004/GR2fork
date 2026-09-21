@@ -26,13 +26,6 @@ void SetCurrentThreadName(const char* name);
 
 void SetThreadName(void* thread, const char* name);
 
-/// Windows only (no-ops elsewhere); see the smt_core_isolation setting.
-/// Mode 1 restricts the process to the first logical CPU of every physical core.
-void ApplyProcessSmtIsolation(u32 mode);
-/// Mode 2, called by the thread that wants it: reserves one physical core for the calling
-/// thread and keeps every other thread of the process off both of its logical CPUs.
-void ClaimPhysicalCoreForCurrentThread(u32 mode);
-
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);
 

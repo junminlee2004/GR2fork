@@ -496,12 +496,6 @@ struct GPUSettings {
     // try_lock every 16 PAUSE) for up to this many rounds before blocking.
     // 0 keeps the plain blocking lock on every thread.
     Setting<u32> tracker_lock_spin_rounds{0};
-    // Windows only. The Windows scheduler packs saturated emulator threads onto both
-    // hyperthreads of one physical core while whole cores sit idle, which costs the GPU
-    // command thread a quarter of its speed; Linux spreads them, so this does nothing there.
-    // 1 keeps the process on one logical CPU per physical core. 2 gives the GPU command
-    // thread a physical core to itself and leaves every other logical CPU to the rest.
-    Setting<u32> smt_core_isolation{0};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -877,7 +871,6 @@ struct GPUSettings {
             GPU_OVERRIDE(readback_writeback_gpucomm_idle),
             GPU_OVERRIDE(gather_input_memo),
             GPU_OVERRIDE(tracker_lock_spin_rounds),
-            GPU_OVERRIDE(smt_core_isolation),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(protect_carry_merge),
             GPU_OVERRIDE(stream_buffer_prefer_host),
@@ -1004,7 +997,7 @@ struct GPUSettings {
     findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, \
     readback_wait_notify, readback_window_kb, deferred_read_release, image_fast_state, \
     guest_copy_lock_batch, spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, \
-    userfaultfd, smt_core_isolation
+    userfaultfd
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1290,7 +1283,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackWritebackGpucommIdle, readback_writeback_gpucomm_idle)
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
-    SETTING_FORWARD(m_gpu, SmtCoreIsolation, smt_core_isolation)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD_BOOL(m_gpu, ProtectCarryMerge, protect_carry_merge)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)
