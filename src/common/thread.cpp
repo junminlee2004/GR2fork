@@ -3,9 +3,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
@@ -185,7 +187,126 @@ void SetThreadName(void* thread, const char* name) {
     SetThreadDescription(thread, UTF8ToUTF16W(name).data());
 }
 
+namespace {
+
+struct CpuSetEntry {
+    ULONG id;
+    u8 logical_index;
+    u8 core_index;
+    u8 efficiency_class;
+};
+
+// Group 0 only: affinity masks cannot span processor groups, and a machine with more than 64
+// logical CPUs is left alone.
+std::vector<CpuSetEntry> QueryCpuSets() {
+    std::vector<CpuSetEntry> sets;
+    ULONG length = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+    if (length == 0) {
+        return sets;
+    }
+    std::vector<u8> buffer(length);
+    if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                                    length, &length, GetCurrentProcess(), 0)) {
+        return sets;
+    }
+    for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
+        const auto* info =
+            reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (info->Size == 0) {
+            break;
+        }
+        if (info->Type == CpuSetInformation) {
+            if (info->CpuSet.Group != 0) {
+                return {};
+            }
+            sets.push_back({info->CpuSet.Id, info->CpuSet.LogicalProcessorIndex,
+                            info->CpuSet.CoreIndex, info->CpuSet.EfficiencyClass});
+        }
+        offset += info->Size;
+    }
+    return sets;
+}
+
+} // Anonymous namespace
+
+void ApplyProcessSmtIsolation(u32 mode) {
+    if (mode != 1) {
+        return;
+    }
+    const auto sets = QueryCpuSets();
+    DWORD_PTR mask = 0;
+    u32 cores = 0;
+    for (const auto& set : sets) {
+        // CoreIndex is the lowest logical index of the core, so this picks one CPU per core.
+        if (set.logical_index == set.core_index && set.logical_index < 64) {
+            mask |= DWORD_PTR{1} << set.logical_index;
+            ++cores;
+        }
+    }
+    if (cores < 4 || cores == sets.size()) {
+        LOG_INFO(Common, "smt_core_isolation 1: {} cores, {} logical CPUs, nothing to do", cores,
+                 sets.size());
+        return;
+    }
+    if (SetProcessAffinityMask(GetCurrentProcess(), mask)) {
+        LOG_INFO(Common, "smt_core_isolation 1: process affinity {:#x} ({} physical cores)",
+                 static_cast<u64>(mask), cores);
+    } else {
+        LOG_ERROR(Common, "smt_core_isolation 1: SetProcessAffinityMask failed: {}",
+                  GetLastErrorMsg());
+    }
+}
+
+void ClaimPhysicalCoreForCurrentThread(u32 mode) {
+    if (mode != 2) {
+        return;
+    }
+    const auto sets = QueryCpuSets();
+    u8 best_class = 0;
+    for (const auto& set : sets) {
+        best_class = std::max(best_class, set.efficiency_class);
+    }
+    // The second fastest-class core: core 0 takes most interrupts and DPCs.
+    int chosen = -1;
+    u32 seen = 0;
+    for (const auto& set : sets) {
+        if (set.efficiency_class == best_class && set.logical_index == set.core_index &&
+            seen++ == 1) {
+            chosen = set.core_index;
+            break;
+        }
+    }
+    if (chosen < 0 || sets.size() < 8) {
+        LOG_INFO(Common, "smt_core_isolation 2: too few cores, nothing to do");
+        return;
+    }
+    std::vector<ULONG> others;
+    ULONG own = 0;
+    for (const auto& set : sets) {
+        if (set.core_index != chosen) {
+            others.push_back(set.id);
+        } else if (set.logical_index == set.core_index) {
+            own = set.id;
+        }
+    }
+    // A thread's selected sets override the process default, so the order does not matter.
+    const bool ok = SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(),
+                                             static_cast<ULONG>(others.size())) &&
+                    SetThreadSelectedCpuSets(GetCurrentThread(), &own, 1);
+    if (ok) {
+        LOG_INFO(Common, "smt_core_isolation 2: {} owns physical core {}, {} logical CPUs left",
+                 GetCurrentThreadName(), chosen, others.size());
+    } else {
+        LOG_ERROR(Common, "smt_core_isolation 2: CPU set call failed: {}", GetLastErrorMsg());
+    }
+}
+
 #else // !_WIN32, so must be POSIX threads
+
+void ApplyProcessSmtIsolation(u32) {}
+
+void ClaimPhysicalCoreForCurrentThread(u32) {}
 
 // MinGW with the POSIX threading model does not support pthread_setname_np
 #if !defined(_WIN32) || defined(_MSC_VER)

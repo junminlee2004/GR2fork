@@ -323,6 +323,7 @@ void Liverpool::DrainCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    Common::ClaimPhysicalCoreForCurrentThread(EmulatorSettings.GetSmtCoreIsolation());
     gpu_id = std::this_thread::get_id();
     // The only thread that spins on a contended tracker region lock.
     VideoCore::RegionLock::gpu_spin_rounds = EmulatorSettings.GetTrackerLockSpinRounds();

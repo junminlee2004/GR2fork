@@ -587,6 +587,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              EmulatorSettings.IsReadbackWritebackGpucommIdle());
     LOG_INFO(Config, "GPU gatherInputMemo: {}", EmulatorSettings.IsGatherInputMemo());
     LOG_INFO(Config, "GPU trackerLockSpinRounds: {}", EmulatorSettings.GetTrackerLockSpinRounds());
+    LOG_INFO(Config, "GPU smtCoreIsolation: {}", EmulatorSettings.GetSmtCoreIsolation());
+    Common::ApplyProcessSmtIsolation(EmulatorSettings.GetSmtCoreIsolation());
     LOG_INFO(Config, "GPU ringDrainFlushDraws: {}", EmulatorSettings.GetRingDrainFlushDraws());
     LOG_INFO(Config, "GPU protectCarryMerge: {}", EmulatorSettings.IsProtectCarryMerge());
     LOG_INFO(Config, "GPU readbackBatching: {}", EmulatorSettings.IsReadbackBatchingEnabled());
