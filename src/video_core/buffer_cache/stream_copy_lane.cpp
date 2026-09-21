@@ -163,6 +163,10 @@ u64 StreamCopyLane::Completed() const {
 
 void StreamCopyLane::WorkerLoop(u32 rank) {
     Common::SetCurrentThreadName("shadPS4:CopyLane");
+    // A spinning worker on the GPU command thread's reserved core would be the worst neighbour.
+    if (const u64 strip = Common::GetExclusionStripMask()) {
+        Common::SetCurrentThreadAffinityMask(~strip);
+    }
     u32 idle_rounds = 0;
     const u32 idle_ticks = idle_ticks_;
     Cell& cell = cells_[rank];

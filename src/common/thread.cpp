@@ -3,9 +3,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
@@ -20,6 +28,8 @@
 #include <pthread.h>
 #elif defined(_WIN32)
 #include <windows.h>
+// windows.h first
+#include <tlhelp32.h>
 #include "common/string_util.h"
 #else
 #if defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -28,6 +38,10 @@
 #include <pthread.h>
 #endif
 #include <sched.h>
+#endif
+#ifdef __linux__
+#include <dirent.h>
+#include <sys/syscall.h>
 #endif
 #ifndef _WIN32
 #include <unistd.h>
@@ -274,6 +288,449 @@ std::string GetCurrentThreadName() {
     }
     return std::string{name};
 #endif
+}
+
+namespace {
+
+std::atomic<bool> g_core_reservation_enabled{false};
+
+#if defined(__linux__)
+// Parses a Linux cpu list ("0,8", "0-3", "0-3,8-11"). Returns 0 on a parse error.
+u64 ParseCpuListLinux(const std::string& s) {
+    u64 mask = 0;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && (s[i] == ',' || s[i] == ' ' || s[i] == '\t' || s[i] == '\n')) {
+            ++i;
+        }
+        if (i >= s.size()) {
+            break;
+        }
+        u64 lo = 0;
+        bool got_digit = false;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            lo = lo * 10 + static_cast<u64>(s[i] - '0');
+            ++i;
+            got_digit = true;
+        }
+        if (!got_digit) {
+            return 0;
+        }
+        u64 hi = lo;
+        if (i < s.size() && s[i] == '-') {
+            ++i;
+            hi = 0;
+            got_digit = false;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+                hi = hi * 10 + static_cast<u64>(s[i] - '0');
+                ++i;
+                got_digit = true;
+            }
+            if (!got_digit) {
+                return 0;
+            }
+        }
+        if (lo >= 64 || hi >= 64 || hi < lo) {
+            return 0;
+        }
+        for (u64 cpu = lo; cpu <= hi; ++cpu) {
+            mask |= 1ULL << cpu;
+        }
+    }
+    return mask;
+}
+#endif
+
+u64 HostCpuMask(unsigned hw) {
+    return hw >= 64 ? ~0ULL : (1ULL << hw) - 1ULL;
+}
+
+} // Anonymous namespace
+
+bool SetCurrentThreadAffinityMask(u64 mask) {
+    const unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) {
+        return false;
+    }
+    mask &= HostCpuMask(hw);
+    if (mask == 0) {
+        return false;
+    }
+#ifdef _WIN32
+    if (SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(mask)) == 0) {
+        LOG_WARNING(Common, "SetThreadAffinityMask({:#x}) failed: {}", mask, GetLastErrorMsg());
+        return false;
+    }
+    return true;
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (unsigned cpu = 0; cpu < std::min(64u, static_cast<unsigned>(CPU_SETSIZE)); ++cpu) {
+        if (mask & (1ULL << cpu)) {
+            CPU_SET(cpu, &set);
+        }
+    }
+    const int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        LOG_WARNING(Common, "pthread_setaffinity_np({:#x}) failed: errno={}", mask, rc);
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+namespace {
+
+// The pin mask (0 = host too small), whether it is a dedicated physical core the walk may
+// isolate, and the bits taken from the guest's CPU 0..6 range.
+struct ReservedCoreDecision {
+    u64 mask;
+    bool is_dedicated_physical_core;
+    u64 steal_from_guest;
+};
+
+// Sorted by (efficiency class, lowest logical CPU) so back() is the highest-indexed core of the
+// fastest class: on hybrid CPUs the highest-indexed cores are the slow ones.
+struct CoreInfo {
+    u64 mask;
+    u8 efficiency_class; // 0 = least performant
+};
+
+bool CoreInfoLess(const CoreInfo& a, const CoreInfo& b) {
+    if (a.efficiency_class != b.efficiency_class) {
+        return a.efficiency_class < b.efficiency_class;
+    }
+    return std::countr_zero(a.mask) < std::countr_zero(b.mask);
+}
+
+#if defined(__linux__)
+// "intel_atom" / "intel_core" on hybrid kernels 5.18+; -1 when there is no hybrid signal.
+int ReadCoreTypeLinux(unsigned cpu) {
+    char path[160];
+    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/topology/core_type", cpu);
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        return -1;
+    }
+    std::string s;
+    if (!std::getline(in, s)) {
+        return -1;
+    }
+    while (!s.empty() &&
+           (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
+    }
+    if (s == "intel_atom") {
+        return 0;
+    }
+    if (s == "intel_core") {
+        return 1;
+    }
+    return -1;
+}
+
+std::vector<CoreInfo> EnumeratePhysicalCores(unsigned hw) {
+    std::vector<CoreInfo> cores;
+    if (hw == 0 || hw > 64) {
+        return cores;
+    }
+    std::vector<bool> visited(hw, false);
+    for (unsigned cpu = 0; cpu < hw; ++cpu) {
+        if (visited[cpu]) {
+            continue;
+        }
+        char path[160];
+        std::snprintf(path, sizeof(path),
+                      "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", cpu);
+        std::ifstream in(path);
+        u64 sibs = 0;
+        if (in.is_open()) {
+            std::string line;
+            if (std::getline(in, line)) {
+                sibs = ParseCpuListLinux(line);
+            }
+        }
+        if (sibs == 0) {
+            sibs = 1ULL << cpu;
+        }
+        const int ec = ReadCoreTypeLinux(cpu);
+        cores.push_back(CoreInfo{sibs, ec < 0 ? u8{0} : static_cast<u8>(ec)});
+        for (unsigned c = 0; c < hw; ++c) {
+            if (sibs & (1ULL << c)) {
+                visited[c] = true;
+            }
+        }
+    }
+    std::sort(cores.begin(), cores.end(), CoreInfoLess);
+    return cores;
+}
+#elif defined(_WIN32)
+std::vector<CoreInfo> EnumeratePhysicalCores(unsigned) {
+    std::vector<CoreInfo> cores;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        return cores;
+    }
+    std::vector<std::byte> buf(len);
+    auto* base = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, base, &len)) {
+        return cores;
+    }
+    auto* p = base;
+    while (reinterpret_cast<std::byte*>(p) < buf.data() + len) {
+        if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount > 0) {
+            const u64 m = static_cast<u64>(p->Processor.GroupMask[0].Mask);
+            if (m != 0) {
+                cores.push_back(CoreInfo{m, static_cast<u8>(p->Processor.EfficiencyClass)});
+            }
+        }
+        p = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+            reinterpret_cast<std::byte*>(p) + p->Size);
+    }
+    std::sort(cores.begin(), cores.end(), CoreInfoLess);
+    return cores;
+}
+#else
+std::vector<CoreInfo> EnumeratePhysicalCores(unsigned) {
+    return {};
+}
+#endif
+
+ReservedCoreDecision DecideReservedCores() {
+    ReservedCoreDecision result{0, false, 0};
+    if (!g_core_reservation_enabled.load(std::memory_order_acquire)) {
+        return result;
+    }
+    const unsigned hw = std::thread::hardware_concurrency();
+    if (hw < 6) {
+        // 4c/4t and below: taking a physical core would leave the guest too few.
+        return result;
+    }
+    constexpr u64 GUEST_MASK = (1ULL << 7) - 1; // the guest's CPUs 0..6
+    const std::vector<CoreInfo> cores = EnumeratePhysicalCores(hw);
+    const u8 top_efficiency = cores.empty() ? u8{0} : cores.back().efficiency_class;
+
+    {
+        static std::once_flag log_once;
+        std::call_once(log_once, [&] {
+            unsigned fast = 0, slow = 0;
+            u64 fast_mask = 0, slow_mask = 0;
+            for (const auto& ci : cores) {
+                if (ci.efficiency_class >= top_efficiency) {
+                    ++fast;
+                    fast_mask |= ci.mask;
+                } else {
+                    ++slow;
+                    slow_mask |= ci.mask;
+                }
+            }
+            LOG_INFO(Common,
+                     "CPU topology: {} performant cores (mask={:#x}, class {}), {} efficient "
+                     "cores (mask={:#x})",
+                     fast, fast_mask, top_efficiency, slow, slow_mask);
+        });
+    }
+
+    // First choice: CPU 7's physical core when it lies wholly outside the guest range (Linux
+    // numbering {7, 15}) and is of the fastest class.
+    u64 cpu7_phys = 0;
+    u8 cpu7_efficiency = 0;
+    for (const auto& ci : cores) {
+        if (ci.mask & (1ULL << 7)) {
+            cpu7_phys = ci.mask;
+            cpu7_efficiency = ci.efficiency_class;
+            break;
+        }
+    }
+
+    if (cpu7_phys != 0 && (cpu7_phys & GUEST_MASK) == 0 && cpu7_efficiency >= top_efficiency) {
+        result.mask = cpu7_phys;
+        result.is_dedicated_physical_core = true;
+    } else if (cores.size() < 4) {
+        // Too few physical cores to take one: pin without isolating, if CPU 7 exists at all.
+        if (cpu7_phys != 0) {
+            result.mask = cpu7_phys;
+        }
+    } else {
+        // CPU 7 shares a core with the guest range (Windows numbering {6, 7}) or is a slow
+        // core: take the highest fast core and strip it from the guest.
+        const u64 highest = cores.back().mask;
+        if (highest != 0) {
+            result.mask = highest;
+            result.is_dedicated_physical_core = true;
+            result.steal_from_guest = highest & GUEST_MASK;
+        }
+    }
+    return result;
+}
+
+} // Anonymous namespace
+
+void SetCoreReservationEnabled(bool enabled) {
+    g_core_reservation_enabled.store(enabled, std::memory_order_release);
+}
+
+u64 GetReservedCoreMask() {
+    return DecideReservedCores().mask;
+}
+
+u64 GetExclusionStripMask() {
+    // Same gates as the walk below; keep the two in step.
+    const auto decision = DecideReservedCores();
+    if (decision.mask == 0 || !decision.is_dedicated_physical_core) {
+        return 0;
+    }
+    return decision.mask;
+}
+
+unsigned ExcludeReservedCoresFromAllOtherThreads() {
+    const auto decision = DecideReservedCores();
+    if (decision.mask == 0) {
+        return 0;
+    }
+    if (!decision.is_dedicated_physical_core) {
+        LOG_INFO(Common,
+                 "ExcludeReservedCores: reserved={:#x} is not a dedicated physical core, no walk",
+                 decision.mask);
+        return 0;
+    }
+    const u64 reserved = decision.mask;
+    const unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) {
+        return 0;
+    }
+    const u64 host_cpus = HostCpuMask(hw);
+
+#if defined(__linux__)
+    // sched_setaffinity on a thread of the calling process needs no privilege.
+    const pid_t self_tid = static_cast<pid_t>(syscall(SYS_gettid));
+    DIR* d = opendir("/proc/self/task");
+    if (d == nullptr) {
+        LOG_WARNING(Common, "ExcludeReservedCores: opendir(/proc/self/task) failed: {}", errno);
+        return 0;
+    }
+    unsigned narrowed = 0;
+    unsigned already_narrow = 0;
+    while (const dirent* ent = readdir(d)) {
+        if (ent->d_name[0] == '.') {
+            continue;
+        }
+        const pid_t tid = static_cast<pid_t>(std::atoi(ent->d_name));
+        if (tid <= 0 || tid == self_tid) {
+            continue;
+        }
+        cpu_set_t cur_set;
+        CPU_ZERO(&cur_set);
+        if (sched_getaffinity(tid, sizeof(cur_set), &cur_set) != 0) {
+            continue; // the thread exited between readdir and here
+        }
+        u64 cur_mask = 0;
+        for (unsigned c = 0; c < std::min(64u, static_cast<unsigned>(CPU_SETSIZE)); ++c) {
+            if (CPU_ISSET(c, &cur_set)) {
+                cur_mask |= 1ULL << c;
+            }
+        }
+        if ((cur_mask & reserved) == 0) {
+            ++already_narrow;
+            continue;
+        }
+        const u64 next_mask = cur_mask & ~reserved;
+        if (next_mask == 0) {
+            continue; // stripping would strand it with no CPU
+        }
+        cpu_set_t new_set;
+        CPU_ZERO(&new_set);
+        for (unsigned c = 0; c < std::min(64u, static_cast<unsigned>(CPU_SETSIZE)); ++c) {
+            if (next_mask & (1ULL << c)) {
+                CPU_SET(c, &new_set);
+            }
+        }
+        if (sched_setaffinity(tid, sizeof(new_set), &new_set) == 0) {
+            ++narrowed;
+        }
+    }
+    closedir(d);
+    if (narrowed != 0) {
+        LOG_INFO(Common, "ExcludeReservedCores: reserved={:#x} host={:#x} narrowed={} already={}",
+                 reserved, host_cpus, narrowed, already_narrow);
+    }
+    return narrowed;
+#elif defined(_WIN32)
+    // Threads created after the snapshot are caught by the periodic walk.
+    const DWORD self_pid = GetCurrentProcessId();
+    const DWORD self_tid = GetCurrentThreadId();
+    if ((host_cpus & ~reserved) == 0) {
+        return 0;
+    }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        LOG_WARNING(Common, "ExcludeReservedCores: CreateToolhelp32Snapshot failed: {}",
+                    GetLastErrorMsg());
+        return 0;
+    }
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    if (!Thread32First(snap, &te)) {
+        CloseHandle(snap);
+        return 0;
+    }
+    unsigned narrowed = 0;
+    do {
+        if (te.th32OwnerProcessID != self_pid || te.th32ThreadID == self_tid) {
+            continue;
+        }
+        HANDLE h =
+            OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (h == nullptr) {
+            continue;
+        }
+        GROUP_AFFINITY ga{};
+        u64 cur_mask = host_cpus;
+        if (GetThreadGroupAffinity(h, &ga)) {
+            cur_mask = static_cast<u64>(ga.Mask);
+        } else {
+            ga.Group = 0;
+            ga.Mask = static_cast<KAFFINITY>(host_cpus);
+        }
+        const u64 next_mask = cur_mask & ~reserved;
+        if ((cur_mask & reserved) != 0 && next_mask != 0) {
+            ga.Mask = static_cast<KAFFINITY>(next_mask);
+            if (SetThreadGroupAffinity(h, &ga, nullptr)) {
+                ++narrowed;
+            }
+        }
+        CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    if (narrowed != 0) {
+        LOG_INFO(Common, "ExcludeReservedCores: reserved={:#x} host={:#x} narrowed={}", reserved,
+                 host_cpus, narrowed);
+    }
+    return narrowed;
+#else
+    (void)host_cpus;
+    return 0;
+#endif
+}
+
+void StartPeriodicAffinityRewalk() {
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            SetCurrentThreadName("shadPS4:AffinityW");
+            // Linux births this thread on the caller's pin and the walk skips its own thread.
+            if (const u64 hot = GetReservedCoreMask()) {
+                SetCurrentThreadAffinityMask(~hot);
+            }
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                ExcludeReservedCoresFromAllOtherThreads();
+            }
+        }).detach();
+    });
 }
 
 } // namespace Common

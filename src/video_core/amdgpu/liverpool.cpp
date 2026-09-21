@@ -299,6 +299,7 @@ Liverpool::Liverpool() {
     gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     reg_run_ = EmulatorSettings.IsParserRegRun();
+    Common::SetCoreReservationEnabled(EmulatorSettings.IsGpuThreadCoreReserve());
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -324,6 +325,13 @@ void Liverpool::DrainCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    // gpu_thread_core_reserve: own a physical core, strip it from every other thread, and keep
+    // stripping, since Windows threads do not inherit their creator's affinity.
+    if (const u64 mask = Common::GetReservedCoreMask()) {
+        Common::SetCurrentThreadAffinityMask(mask);
+        Common::ExcludeReservedCoresFromAllOtherThreads();
+        Common::StartPeriodicAffinityRewalk();
+    }
     // The only thread that spins on a contended tracker region lock.
     VideoCore::RegionLock::gpu_spin_rounds = EmulatorSettings.GetTrackerLockSpinRounds();
 

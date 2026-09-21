@@ -257,6 +257,11 @@ static void* RunThread(void* arg) {
     auto* curthread = static_cast<Pthread*>(arg);
     g_curthread = curthread;
     Common::SetCurrentThreadName(curthread->name.c_str());
+    // A new guest thread stays off the GPU command thread's reserved core from birth; the
+    // periodic walk would otherwise leave it there for up to 5 s.
+    if (const u64 strip = Common::GetExclusionStripMask()) {
+        Common::SetCurrentThreadAffinityMask(~strip);
+    }
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
 
