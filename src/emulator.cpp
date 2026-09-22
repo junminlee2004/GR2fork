@@ -483,6 +483,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isNeo: {}", EmulatorSettings.IsNeo());
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
     LOG_INFO(Config, "General sse4aAotPatch: {}", EmulatorSettings.IsSse4aAotPatch());
+    LOG_INFO(Config, "General staticCpuPatching: {}", EmulatorSettings.IsStaticCpuPatching());
+    if (EmulatorSettings.IsStaticCpuPatching() && EmulatorSettings.IsSse4aAotPatch()) {
+        LOG_WARNING(Config, "sse4a_aot_patch is ignored while static_cpu_patching is on");
+    }
     LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
     LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
     LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());

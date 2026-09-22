@@ -215,6 +215,12 @@ struct GeneralSettings {
     // relocation overwrites the following instruction too, so a guest branch that targets that
     // instruction would break; off by default.
     Setting<bool> sse4a_aot_patch{false};
+    // Apply the CPU patches (SSE4a on CPUs without it, and the FS reads) when a module loads by
+    // following every function its EH frame table lists, instead of reading the code straight
+    // through. A site too short for a jump moves a neighbour only when no known branch targets
+    // it. Code outside those functions keeps in-place patching from the straight-through pass on
+    // Linux and the trap handler elsewhere. Takes over from sse4a_aot_patch; off by default.
+    Setting<bool> static_cpu_patching{false};
     Setting<int> extra_dmem_in_mbytes{0};
     Setting<int> extra_fmem_in_mbytes{0};
     Setting<bool> shad_net_enabled{false};
@@ -239,6 +245,8 @@ struct GeneralSettings {
             make_override<GeneralSettings>("neo_mode", &GeneralSettings::neo_mode),
             make_override<GeneralSettings>("dev_kit_mode", &GeneralSettings::dev_kit_mode),
             make_override<GeneralSettings>("sse4a_aot_patch", &GeneralSettings::sse4a_aot_patch),
+            make_override<GeneralSettings>("static_cpu_patching",
+                                           &GeneralSettings::static_cpu_patching),
             make_override<GeneralSettings>("extra_dmem_in_mbytes",
                                            &GeneralSettings::extra_dmem_in_mbytes),
             make_override<GeneralSettings>("extra_fmem_in_mbytes",
@@ -264,8 +272,8 @@ struct GeneralSettings {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_dir, home_dir,
                                    sys_modules_dir, font_dir, volume_slider, neo_mode, dev_kit_mode,
-                                   sse4a_aot_patch, extra_dmem_in_mbytes, extra_fmem_in_mbytes,
-                                   shad_net_enabled, trophy_popup_disabled,
+                                   sse4a_aot_patch, static_cpu_patching, extra_dmem_in_mbytes,
+                                   extra_fmem_in_mbytes, shad_net_enabled, trophy_popup_disabled,
                                    trophy_notification_duration, show_splash,
                                    trophy_notification_side, connected_to_network,
                                    discord_rpc_enabled, show_fps_counter, console_language,
@@ -1228,6 +1236,7 @@ public:
     SETTING_FORWARD(m_general, VolumeSlider, volume_slider)
     SETTING_FORWARD_BOOL(m_general, Neo, neo_mode)
     SETTING_FORWARD_BOOL(m_general, Sse4aAotPatch, sse4a_aot_patch)
+    SETTING_FORWARD_BOOL(m_general, StaticCpuPatching, static_cpu_patching)
     SETTING_FORWARD_BOOL(m_general, DevKit, dev_kit_mode)
     SETTING_FORWARD(m_general, ExtraDmemInMBytes, extra_dmem_in_mbytes)
     SETTING_FORWARD(m_general, ExtraFmemInMBytes, extra_fmem_in_mbytes)

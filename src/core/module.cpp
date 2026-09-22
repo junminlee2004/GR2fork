@@ -10,6 +10,7 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/cpu_patches.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
@@ -178,10 +179,17 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         }
     };
 
-#if defined(ARCH_X86_64) && defined(_WIN32)
+#if defined(ARCH_X86_64)
+#if defined(_WIN32)
     // Windows static guest red-zone protection
     const bool use_static_windows_guest_red_zone_protection =
         WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+#else
+    constexpr bool use_static_windows_guest_red_zone_protection = false;
+#endif
+    // The red-zone pass applies the same CPU patches itself.
+    const bool use_static_cpu_patching =
+        EmulatorSettings.IsStaticCpuPatching() && !use_static_windows_guest_red_zone_protection;
     std::vector<std::pair<VAddr, u64>> executable_segments;
     std::vector<uintptr_t> function_starts;
 #endif
@@ -209,12 +217,10 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 #ifdef ARCH_X86_64
             if (elf_pheader[i].p_flags & PF_EXEC) {
                 PrePatchInstructions(segment_addr, segment_file_size);
-#ifdef _WIN32
-                // Windows static guest red-zone protection
-                if (use_static_windows_guest_red_zone_protection) {
+                // Windows static guest red-zone protection, static_cpu_patching
+                if (use_static_windows_guest_red_zone_protection || use_static_cpu_patching) {
                     executable_segments.emplace_back(segment_addr, segment_file_size);
                 }
-#endif
             }
 #endif
             break;
@@ -257,9 +263,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             const VAddr eh_hdr_end = eh_hdr_start + eh_frame_hdr_size;
             Dwarf::EHHeaderInfo hdr_info;
             if (Dwarf::DecodeEHHdr(eh_hdr_start, eh_hdr_end, hdr_info)) {
-#if defined(ARCH_X86_64) && defined(_WIN32)
-                // Windows static guest red-zone protection
-                if (use_static_windows_guest_red_zone_protection &&
+#if defined(ARCH_X86_64)
+                // Windows static guest red-zone protection, static_cpu_patching
+                if ((use_static_windows_guest_red_zone_protection || use_static_cpu_patching) &&
                     !Dwarf::DecodeEHHdrTable(hdr_info, eh_hdr_end, function_starts)) {
                     LOG_ERROR(Core_Linker, "Failed to decode EH frame search table for {}", name);
                 }
@@ -342,6 +348,55 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::OnGameLoaded();
         }
     }
+
+#if defined(ARCH_X86_64)
+    // After the game's memory patches, so the pass decodes the code the game will run.
+    if (use_static_cpu_patching) {
+        RedZonePatchResult total{};
+        [[maybe_unused]] GapPatchResult gaps{};
+        std::vector<std::pair<uintptr_t, uintptr_t>> decoded_ranges;
+        for (const auto& [segment_addr, segment_size] : executable_segments) {
+            const auto result = PatchCpuInstructionsStatically(segment_addr, segment_size,
+                                                               function_starts, decoded_ranges);
+            total.function_count += result.function_count;
+            total.inplace_cpu_patch_instruction_count += result.inplace_cpu_patch_instruction_count;
+            total.cpu_patch_instruction_count += result.cpu_patch_instruction_count;
+            total.patched_cpu_patch_instruction_count += result.patched_cpu_patch_instruction_count;
+            total.unsupported_cpu_patch_instruction_count +=
+                result.unsupported_cpu_patch_instruction_count;
+#if !defined(_WIN32) && !defined(__APPLE__)
+            // The FS reads never trap here, so the bytes outside every decoded function still
+            // take the straight-through pass, limited to in-place patches.
+            const auto gap = PrePatchInstructionGaps(segment_addr, segment_size, decoded_ranges);
+            gaps.patched += gap.patched;
+            gaps.left_to_handler += gap.left_to_handler;
+#endif
+        }
+        if (!executable_segments.empty() && total.function_count == 0) {
+            LOG_WARNING(Core_Linker,
+                        "static_cpu_patching found no function entries for {}; only the "
+                        "fallback patching applies",
+                        name);
+        }
+#if !defined(_WIN32) && !defined(__APPLE__)
+        LOG_INFO(Core_Linker,
+                 "static_cpu_patching {}: {} functions, {} patched in place, {}/{} short sites "
+                 "relocated ({} left to the trap handler); outside functions: {} patched in "
+                 "place, {} left to the trap handler",
+                 name, total.function_count, total.inplace_cpu_patch_instruction_count,
+                 total.patched_cpu_patch_instruction_count, total.cpu_patch_instruction_count,
+                 total.unsupported_cpu_patch_instruction_count, gaps.patched, gaps.left_to_handler);
+#else
+        LOG_INFO(Core_Linker,
+                 "static_cpu_patching {}: {} functions, {} patched in place, {}/{} short sites "
+                 "relocated ({} left to the trap handler); code outside functions is left to the "
+                 "trap handler",
+                 name, total.function_count, total.inplace_cpu_patch_instruction_count,
+                 total.patched_cpu_patch_instruction_count, total.cpu_patch_instruction_count,
+                 total.unsupported_cpu_patch_instruction_count);
+#endif
+    }
+#endif
 }
 
 void Module::LoadDynamicInfo() {
