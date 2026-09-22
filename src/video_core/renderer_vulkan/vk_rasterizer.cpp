@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -883,6 +884,11 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        return;
+    }
+
     // One shared-lock hold for the whole setup; placement rationale: see Draw.
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
     if (segment_copy_hold_ && in_packet_run_) {
@@ -1015,6 +1021,7 @@ void Rasterizer::OnSubmit() {
     }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
+    runtime.TickFrame();
 }
 
 void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
@@ -1909,7 +1916,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     vk::DescriptorBufferInfo{gds_buf->Handle(), 0, gds_buf->SizeBytes()};
                 needs_barrier |= runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
-                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryType::Stream);
+                auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.srt_info.flattened_bufsize_dw * sizeof(u32);
                 const u64 offset = vk_buffer.Copy(stage.flat_ud, ubo_size, alignment);
                 buffer_infos[info_n++] =
@@ -1921,7 +1928,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     buffer_infos[info_n++] =
                         vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
                 } else {
-                    auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryType::Stream);
+                    auto& vk_buffer = buffer_cache.GetStreamBuffer();
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
                     for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
                         const auto& plane = liverpool->regs.clip_user_data[i];
@@ -1944,7 +1951,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{fault_buffer->Handle(), 0, fault_buffer->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
-                auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryType::Stream);
+                auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);

@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -51,7 +52,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : find_image_memo_(ClampMemoEntries(EmulatorSettings.GetFindimgMemoEntries())),
       instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
-      tile_manager{instance, scheduler, runtime, buffer_cache.GetUtilityBuffer(MemoryType::Stream)},
+      tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
       image_fast_state{EmulatorSettings.IsImageFastState()},
       view_memo{EmulatorSettings.IsTextureViewMemo()},
@@ -142,14 +143,13 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
-    auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryType::HostCached);
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
-    const auto [download, offset] = download_buffer.Map(download_size);
-    download_buffer.Commit();
+    const auto download =
+        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
-        .bufferOffset = offset,
+        .bufferOffset = download.offset,
         .bufferRowLength = image.info.pitch,
         .bufferImageHeight = image.info.size.height,
         .imageSubresource =
@@ -163,21 +163,24 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         .imageOffset = {0, 0, 0},
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
-    runtime.DownloadImage(&image, &download_buffer, std::span{&image_download, 1});
+    runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
     if (sync) {
         const u64 t0 = Common::FencedRDTSC();
         scheduler.Finish();
         scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
                              Common::FencedRDTSC() - t0);
+        download.Invalidate();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
+                                                  download.mapped, download_size);
         Skipcache::Framework::Instance().BumpMemGen();
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
+                download.Invalidate();
+                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                          download.mapped, download_size);
                 Skipcache::Framework::Instance().BumpMemGen();
+                runtime.GetStagingPool().FreeDeferred(download);
             });
     }
 }

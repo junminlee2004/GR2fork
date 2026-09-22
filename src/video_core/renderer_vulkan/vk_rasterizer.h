@@ -6,13 +6,13 @@
 #include "common/assert.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
-#include "vulkan/vulkan.hpp"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -36,8 +36,8 @@ public:
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
 
-    [[nodiscard]] Scheduler& GetScheduler() noexcept {
-        return scheduler;
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
     }
 
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
