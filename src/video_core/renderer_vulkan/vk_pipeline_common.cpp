@@ -16,7 +16,6 @@
 
 #include "core/emulator_settings.h"
 #include "shader_recompiler/resource.h"
-#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -510,30 +509,11 @@ Pipeline::~Pipeline() {
 }
 
 void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
-                             const BufferBarriers& buffer_barriers,
                              const Shader::PushData& push_data, u32 buffer_info_n,
                              u32 image_info_n) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
-
-    if (!buffer_barriers.empty()) {
-        const auto dependencies = vk::DependencyInfo{
-            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-            .bufferMemoryBarrierCount = u32(buffer_barriers.size()),
-            .pBufferMemoryBarriers = buffer_barriers.data(),
-        };
-        scheduler.EndRendering();
-        cmdbuf.pipelineBarrier2(dependencies);
-    } else if (VideoCore::Buffer::barrier_read_merge && scheduler.IsRendering() &&
-               VideoCore::Buffer::barrier_rr_merged.load(std::memory_order_relaxed) !=
-                   VideoCore::Buffer::barrier_rr_mark.load(std::memory_order_relaxed)) {
-        // buffer_barrier_read_merge telemetry: an empty barrier list after a
-        // merged read-after-read, with a pass still open, is a restart the
-        // merge removed. IsRendering excludes the callers that close the pass
-        // themselves (compute dispatch, RefreshImage, JoinOverlap).
-        VideoCore::Buffer::barrier_rr_saved.fetch_add(1, std::memory_order_relaxed);
-    }
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     static const bool push_const_dedup = EmulatorSettings.IsPushConstDedup();

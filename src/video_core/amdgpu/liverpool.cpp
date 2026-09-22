@@ -16,6 +16,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -100,13 +101,12 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
 }
 
 // Every queued lane copy still reads guest memory that the fence tells the guest it may reuse,
-// so the lanes drain before anything guest-visible is written. Then the downloads (or the lazy
-// marks, which queue read arms) and the drain, so a fence sees both.
+// so the lanes drain before anything guest-visible is written. Then the downloads, so a fence
+// sees them.
 static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer) {
         rasterizer->ProcessDownloadImages();
-        rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Fence);
     }
 }
 
@@ -266,13 +266,6 @@ SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void
     }
 }
 
-SHAD_FORCE_INLINE static void DrainReadArms(Vulkan::Rasterizer* rasterizer,
-                                            VideoCore::ReadArmSite site) {
-    if (rasterizer) {
-        rasterizer->DrainPendingReadArms(site);
-    }
-}
-
 Liverpool::Liverpool() {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // Stamp dormancy is decided before the process thread can observe work;
@@ -367,7 +360,6 @@ void Liverpool::Process(std::stop_token stoken) {
             task.resume();
 
             if (task.done()) {
-                DrainReadArms(rasterizer, VideoCore::ReadArmSite::Idle);
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -393,7 +385,6 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
-        DrainReadArms(rasterizer, VideoCore::ReadArmSite::Idle);
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -1130,9 +1121,6 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::PfpSyncMe: {
-            if (rasterizer) {
-                rasterizer->CpSync();
-            }
             break;
         }
         case PM4ItOpcode::StrmoutBufferUpdate: {
@@ -1154,7 +1142,6 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             if (cond_exec->command.Value() != 0) {
                 LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
             }
-            DrainReadArms(rasterizer, VideoCore::ReadArmSite::Wait);
             const auto skip = *cond_exec->Address() == false;
             if (skip) {
                 dcb = NextPacket(dcb, count + 1 + cond_exec->exec_count.Value());
@@ -1391,7 +1378,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
-            rasterizer->DrainPendingReadArms(VideoCore::ReadArmSite::Wait);
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -1486,7 +1472,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
-                DrainReadArms(rasterizer, VideoCore::ReadArmSite::Wait);
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -1497,7 +1482,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            DrainReadArms(rasterizer, VideoCore::ReadArmSite::Wait);
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }

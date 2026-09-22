@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "vulkan/vulkan.hpp"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -27,10 +28,11 @@ namespace Vulkan {
 SHAD_NO_INLINE void BindAssertFailed();
 
 class GraphicsPipeline;
+class Runtime;
 
 class Rasterizer {
 public:
-    explicit Rasterizer(const Instance& instance, Scheduler& scheduler,
+    explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
 
@@ -80,7 +82,6 @@ public:
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
-    void CpSync();
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -106,19 +107,6 @@ public:
     private:
         Rasterizer* r_;
     };
-    /// Arms every read watcher a written bind left pending. GPU command thread.
-    void DrainPendingReadArms(VideoCore::ReadArmSite site) {
-        if (deferred_read_arm_) {
-            // Every drain site but Submit is reached from the command processor.
-            // The submit hook also fires from Scheduler::Flush, which a guest
-            // thread can reach through Rasterizer::ReadMemory when the download
-            // is not offloaded, so that one never carries.
-            buffer_cache.DrainPendingReadArms(site, site != VideoCore::ReadArmSite::Submit);
-        }
-    }
-    static void PreSubmitThunk(void* self) {
-        static_cast<Rasterizer*>(self)->DrainPendingReadArms(VideoCore::ReadArmSite::Submit);
-    }
     void BeginPacketRun();
     void EndPacketRun();
     /// The command drain runs fault-download hops inline; none may run under the hold.
@@ -161,12 +149,10 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
-    void ResetBindings() {
-        for (auto& image_id : bound_images) {
-            texture_cache.GetImage(image_id).binding = {};
-        }
-        bound_images.clear();
-    }
+    void BindVertexBuffers(const GraphicsPipeline* pipeline);
+    void BindIndexBuffer(u32 index_offset = 0);
+
+    void ResetBindings(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -226,7 +212,6 @@ private:
     u64 flush_tick_{};
     // readback_offload: inside a run of draws writing readback-prone
     // buffers, and the run's length; flushes it adds, for the log.
-    bool readback_offload_{};
     bool tracker_lock_spin_{};
     bool prone_run_{};
     u32 prone_run_draws_{};
@@ -261,7 +246,6 @@ private:
     /// Flushes at the draw interval, or now when the prone-write run the
     /// draw just recorded belongs to is due for its flush (readback_offload).
     void MaybeIntervalFlush(bool prone_write);
-    bool elide_findbuffer_{};
     bool bind_prefetch_{};
     // One guest-copy shared hold per packet run (guest_copy_hold_segment).
     // The hold may cover GPU waits, never a wait on a guest thread; every
@@ -391,9 +375,6 @@ private:
     DynStateMemo dyn_memo_{};
     bool dyn_memo_enabled_{};
     bool dyn_class_stamp_{};
-    bool deferred_read_arm_{};
-    bool deferred_read_release_{};
-    bool cp_write_backing_{};
     // CPWRITE census, GPU command thread only: plain adds, drained per300f.
     u64 cpwrite_seen_{};
     u64 cpwrite_armed_{};
@@ -413,6 +394,7 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
+    Runtime& runtime;
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
@@ -431,9 +413,15 @@ private:
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    struct BoundBuffer {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u32 size;
+        bool is_written;
+    };
+    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
 
     Pipeline::DescriptorWrites set_writes;
-    Pipeline::BufferBarriers buffer_barriers;
     // 120 bytes: unaligned it straddles three cache lines, so every draw's
     // rebuild touches a third line for eight bytes of it.
     alignas(64) Shader::PushData push_data{};
@@ -483,20 +471,6 @@ private:
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 
-    // Pass 1 hands pass 2 the guest base, the clamped size and the id it
-    // resolved; the rest of the V# is dead after pass 1, so a new pass-2
-    // consumer must re-read the sharp. The guest/special discriminant rides in
-    // a caller-held bitmask: with FindBuffer elision a guest binding can carry
-    // a null id, and a clamped guest size can legitimately be zero, so neither
-    // field can double as the sentinel. Declared last so no hot member moves.
-    struct BufferBindingInfo {
-        VAddr base;
-        u64 size;
-        u32 id;
-    };
-    static_assert(sizeof(BufferBindingInfo) == 24);
-    static_assert(Shader::NUM_BUFFERS <= 64, "the guest mask is one u64");
-    std::array<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings{};
     std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos{};
     u32 buffer_info_n_{};
 
@@ -566,6 +540,7 @@ private:
     u64 glue_dyn_miss_{};
     u64 glue_arms_{};
     u64 glue_div_{};
+    bool needs_barrier{};
 };
 
 } // namespace Vulkan

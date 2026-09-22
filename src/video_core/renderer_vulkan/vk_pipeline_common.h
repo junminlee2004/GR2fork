@@ -103,13 +103,12 @@ public:
         std::array<vk::WriteDescriptorSet, NUM_DESCRIPTOR_WRITES> writes{};
         u32 count{};
     };
-    using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
 
     // buffer_info_n / image_info_n: the rasterizer's info array extents this
     // bind filled, which the flat descriptor delta checks against its plan.
     void BindResources(std::span<vk::WriteDescriptorSet> set_writes,
-                       const BufferBarriers& buffer_barriers, const Shader::PushData& push_data,
-                       u32 buffer_info_n, u32 image_info_n) const;
+                       const Shader::PushData& push_data, u32 buffer_info_n,
+                       u32 image_info_n) const;
 
     // bind_write_plan: the set-0 write list of a bind is a pure function of
     // the stage lists (binding numbers, counts, types and the fixed slots of

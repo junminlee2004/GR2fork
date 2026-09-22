@@ -3,24 +3,20 @@
 
 #pragma once
 
-#include <algorithm>
-#include <array>
-#include <atomic>
 #include <cstddef>
 #include <optional>
 #include <utility>
 #include <vector>
-#include "common/assert.h"
 #include "common/types.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
-#include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/vk_common.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "vulkan/vulkan.hpp"
 
 namespace Vulkan {
 class Instance;
 class Scheduler;
+struct BarrierTracker;
 } // namespace Vulkan
 
 VK_DEFINE_HANDLE(VmaAllocation)
@@ -31,17 +27,18 @@ struct VmaAllocationInfo;
 namespace VideoCore {
 
 /// Hints and requirements for the backing memory type of a commit
-enum class MemoryUsage {
-    DeviceLocal, ///< Requests device local buffer.
-    Upload,      ///< Requires a host visible memory type optimized for CPU to GPU uploads
-    Download,    ///< Requires a host visible memory type optimized for GPU to CPU readbacks
-    Stream,      ///< Requests device local host visible buffer, falling back host memory.
+enum class MemoryType : u8 {
+    DeviceLocal,  ///< Requests device local buffer.
+    HostUncached, ///< Requires a host visible memory type optimized for CPU to GPU uploads
+    HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
+    Stream,       ///< Requests device local host visible buffer, falling back host memory.
+    Sparse,       ///< Requires an unbacked sparse resident buffer.
 };
 
 constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
-    vk::BufferUsageFlagBits::eIndirectBuffer;
+    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
 
 constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
@@ -53,58 +50,36 @@ struct UniqueBuffer {
     UniqueBuffer(const UniqueBuffer&) = delete;
     UniqueBuffer& operator=(const UniqueBuffer&) = delete;
 
-    // Moves must carry device and bda_addr: a dropped bda_addr leaves the
-    // moved buffer with address zero (the assert in BufferDeviceAddress is
-    // compiled out under NDEBUG), the BDA page table gets near-null entries
-    // and shader writes through them fault. A Buffer moves whenever
-    // slot_buffers grows on new resource creation.
     UniqueBuffer(UniqueBuffer&& other)
-        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
-          bda_addr{std::exchange(other.bda_addr, 0)} {}
+          buffer{std::exchange(other.buffer, VK_NULL_HANDLE)} {}
     UniqueBuffer& operator=(UniqueBuffer&& other) {
-        device = other.device;
         buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
-        bda_addr = std::exchange(other.bda_addr, 0);
         return *this;
     }
 
-    void Create(const vk::BufferCreateInfo& image_ci, MemoryUsage usage,
+    void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                 VmaAllocationInfo* out_alloc_info);
 
-    operator vk::Buffer() const {
-        return buffer;
-    }
-
     vk::Device device;
-    VmaAllocator allocator;
-    VmaAllocation allocation;
     vk::Buffer buffer{};
-    vk::DeviceAddress bda_addr = 0;
+    vk::DeviceAddress bda_addr{};
+    VmaAllocator allocator;
+    VmaAllocation allocation{};
 };
 
-class Buffer {
-public:
-    explicit Buffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                    MemoryUsage usage, VAddr cpu_addr_, vk::BufferUsageFlags flags,
-                    u64 size_bytes_);
+struct Buffer {
+    explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+                    MemoryType mem_type, std::string_view debug_name = "");
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
 
     Buffer& operator=(Buffer&&) = default;
     Buffer(Buffer&&) = default;
-
-    void IncreaseStreamScore(int score) noexcept {
-        stream_score += score;
-    }
-
-    [[nodiscard]] int StreamScore() const noexcept {
-        return stream_score;
-    }
 
     [[nodiscard]] bool IsInBounds(VAddr addr, u64 size) const noexcept {
         return addr >= cpu_addr && addr + size <= cpu_addr + SizeBytes();
@@ -122,16 +97,8 @@ public:
         return size_bytes;
     }
 
-    void SetLRUId(u64 id) noexcept {
-        lru_id = id;
-    }
-
-    u64 LRUId() const noexcept {
-        return lru_id;
-    }
-
     vk::Buffer Handle() const noexcept {
-        return buffer;
+        return buffer.buffer;
     }
 
     vk::DeviceAddress BufferDeviceAddress() const noexcept {
@@ -139,230 +106,29 @@ public:
         return buffer.bda_addr;
     }
 
-    // Positive list: an access bit not listed here counts as a write.
-    static constexpr vk::AccessFlags2 kReadOnlyAccess =
-        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eVertexAttributeRead |
-        vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eIndirectCommandRead |
-        vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eUniformRead |
-        vk::AccessFlagBits2::eMemoryRead;
-
-    static constexpr bool IsReadOnlyAccess(vk::AccessFlags2 mask) noexcept {
-        return !!mask && !(mask & ~kReadOnlyAccess);
-    }
-
-    // Reads whose cache invalidation a barrier with `mask` as its destination
-    // already performed on RADV: a shader read flushes the vector and scalar
-    // caches and so covers a later vertex or index fetch; a fetch flushes only
-    // the vector cache and covers only fetches. Indirect/transfer never.
-    static constexpr vk::AccessFlags2 kShaderReads = vk::AccessFlagBits2::eShaderRead |
-                                                     vk::AccessFlagBits2::eUniformRead |
-                                                     vk::AccessFlagBits2::eMemoryRead;
-    static constexpr vk::AccessFlags2 kFetchReads =
-        vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eIndexRead;
-    static constexpr vk::AccessFlags2 CoveredReads(vk::AccessFlags2 mask) noexcept {
-        if (mask & kShaderReads) {
-            return vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eUniformRead |
-                   kFetchReads;
-        }
-        return mask & kFetchReads;
-    }
-
-    std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
-                                                       vk::PipelineStageFlagBits2 dst_stage,
-                                                       u32 offset = 0) {
-        if (dst_acess_mask == access_mask && stage == dst_stage) {
-            return {};
-        }
-
-        // buffer_barrier_read_merge: Vulkan defines no read-after-read hazard,
-        // so readers are accumulated instead of barriered and the next write
-        // transition sources their union -- a superset of the single tracked
-        // reader. Only a reader the last barrier already invalidated
-        // (CoveredReads) merges; a new read type outside that set gets its own.
-        if (barrier_read_merge) {
-            if (IsReadOnlyAccess(access_mask) && IsReadOnlyAccess(dst_acess_mask) &&
-                !(dst_acess_mask & ~CoveredReads(access_mask))) {
-                access_mask |= dst_acess_mask;
-                stage |= dst_stage;
-                barrier_rr_merged.fetch_add(1, std::memory_order_relaxed);
-                return {};
-            }
-            barrier_emitted.fetch_add(1, std::memory_order_relaxed);
-        }
-
-        DEBUG_ASSERT(offset < size_bytes);
-
-        const auto barrier = vk::BufferMemoryBarrier2{
-            .srcStageMask = stage,
-            .srcAccessMask = access_mask,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_acess_mask,
-            .buffer = buffer.buffer,
-            .offset = offset,
-            .size = size_bytes - offset,
-        };
-        access_mask = dst_acess_mask;
-        stage = dst_stage;
-        return barrier;
-    }
-
-    void Fill(u64 offset, u32 num_bytes, u32 value);
-
-    /// Makes device writes visible to host reads on non-coherent memory.
-    void InvalidateForRead(u64 offset, u64 num_bytes);
-
-public:
     VAddr cpu_addr = 0;
-    bool is_picked{};
-    bool is_coherent{};
-    bool is_deleted{};
-    int stream_score = 0;
     size_t size_bytes = 0;
-    u64 lru_id = 0;
-    // readback_offload: master tick of the open batch when a GPU write to
-    // this buffer was last recorded, 0 for never; and the copy-queue tick of
-    // the last readback copy that read it, which deletion waits out.
-    u64 gpu_write_tick = 0;
-    u64 copy_queue_read_tick = 0;
-    // readback_offload: gc period of the last fault download, 0 = never; only
-    // writes within kProneWindow gc periods of it submit early.
-    u64 readback_prone_tick = 0;
-    std::span<u8> mapped_data;
-    const Vulkan::Instance* instance;
-    Vulkan::Scheduler* scheduler;
-    MemoryUsage usage;
+    std::span<u8> mapped_data{};
+    bool is_coherent{};
+    MemoryType mem_type{MemoryType::DeviceLocal};
     UniqueBuffer buffer;
-    vk::Flags<vk::AccessFlagBits2> access_mask{
-        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
-        vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
-    // A set, not one bit: with buffer_barrier_read_merge on it accumulates the
-    // stages that have read since the last write transition. Same 8 bytes.
-    vk::PipelineStageFlags2 stage{vk::PipelineStageFlagBits2::eAllCommands};
-    // buffer_barrier_read_merge: latched once by the BufferCache constructor,
-    // before any command recording. The counters it gates are written from
-    // more than one thread, hence relaxed atomics; off, none is touched.
-    static inline bool barrier_read_merge{false};
-    static inline std::atomic<u64> barrier_rr_merged{};
-    static inline std::atomic<u64> barrier_emitted{};
-    static inline std::atomic<u64> barrier_rr_mark{};
-    static inline std::atomic<u64> barrier_rr_saved{};
-    // Memos of recent read-only upload queries that found nothing to upload.
-    // While the key is unchanged the guest bytes still equal the device-buffer
-    // bytes for a recorded range, so eliding the upload is byte-identical; a
-    // query contained in a recorded range hits, since a clean range has no
-    // dirty subrange. The key is the host-memory generation, or the range's
-    // word-epoch sum under the stream mirror mode, where a clean range keeps
-    // every page write-protected and any write bumps the sum through the
-    // protection grant. Entries wider than the epoch-sum span key on the
-    // generation either way. Zero size = empty.
-    struct SyncNoop {
-        VAddr addr = 0;
-        u32 size = 0;
-        u64 mem_key = 0;
-    };
-    std::array<SyncNoop, 3> sync_noop{};
-    u32 sync_noop_next = 0;
 };
-// The memo array sits last so the fields every bind reads keep the front
-// of the object as entries are added.
-static_assert(offsetof(Buffer, sync_noop) > offsetof(Buffer, stage));
 
-// Guest lines are cold (written on other cores, read once here) and prefetch
-// never faults, so protected or unmapped pages in sparse ranges are safe;
-// issuing it before the ring bookkeeping and address resolution is deliberate,
-// to overlap the latency.
-inline void PrefetchGuestSource(VAddr device_addr, u64 size) {
-    constexpr u64 prefetch_bytes = 1024;
-    for (u64 i = 0; i < std::min<u64>(size, prefetch_bytes); i += 64) {
-        __builtin_prefetch(reinterpret_cast<const void*>(device_addr + i), 0, 3);
-    }
-}
-
-// Queues each backing span on the lane, falling back to an inline copy from the
-// first span the ring refuses; dst advances span by span.
-SHAD_FORCE_INLINE void PushBackingSpans(StreamCopyLane& lane,
-                                        const Core::MemoryManager::BackingSpan* spans,
-                                        u32 num_spans, u8* dst, bool hardened) {
-    bool queued = true;
-    for (u32 i = 0; i < num_spans; ++i) {
-        if (queued) {
-            queued = lane.Push(spans[i].ptr, dst, static_cast<u32>(spans[i].size));
-        }
-        if (!queued) {
-            std::memcpy(dst, spans[i].ptr, spans[i].size);
-        }
-        dst += spans[i].size;
-    }
-    if (hardened) {
-        Core::MemoryManager::EndBackingPush();
-    }
-}
-
-class StreamBuffer : public Buffer {
-public:
+struct StreamBuffer : public Buffer {
     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                          MemoryUsage usage, u64 size_bytes_);
+                          MemoryType mem_type, u64 size_bytes);
 
     /// Reserves a region of memory from the stream buffer.
     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
 
-    /// Ring statistics reported per window by the skip cache framework;
-    /// blocked_ns is time spent waiting for the GPU to drain the previous lap.
-    struct RingStats {
-        u64 wraps{};
-        u64 blocked_ns{};
-        u64 bytes{};
-        u64 maps{};
-        // Maps that reached the drain call. Last, so the maps/bytes pair the
-        // map path folds into one vector add keeps its pairing.
-        u64 armed{};
-    };
-    RingStats& Stats() {
-        return ring_stats_;
-    }
-
-    /// Ensures reserved bytes are available to the GPU. The inline arm is
-    /// CommitSlow's own same-tick collapse, kept inline for the per-bind path.
-    void Commit() {
-        if (is_coherent && current_watch_cursor != 0) {
-            auto& last = current_watches[current_watch_cursor - 1];
-            if (last.tick == scheduler->CurrentTick()) {
-                offset += mapped_size;
-                last.upper_bound = offset;
-                return;
-            }
-        }
-        CommitSlow();
-    }
-    void CommitSlow();
+    /// Ensures that reserved bytes of memory are available to the GPU.
+    void Commit();
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
-        const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
-        // Deferred drain lane: large guest-addressed sources are copied by
-        // workers reading the never-protected physical backing view, so a
-        // worker cannot fault; host-pointer sources die with the caller and
-        // must stay inline. 64-byte alignment keeps a job's lines to one core.
-        if (auto& lane = StreamCopyLane::Instance();
-            lane.Enabled() && size >= StreamCopyLane::kMinLaneBytes) {
-            auto* memory = Core::Memory::Instance();
-            if (memory->IsValidMapping(src_vaddr)) {
-                Core::MemoryManager::BackingSpan spans[2];
-                const bool hardened = lane.Hardened();
-                const u32 num_spans =
-                    memory->ResolveBackingSpans(src_vaddr, size, spans, 2, hardened);
-                if (num_spans != 0) {
-                    const auto [data, offset] = Map(size, alignment < 64 ? 64 : alignment);
-                    PushBackingSpans(lane, spans, num_spans, data, hardened);
-                    Commit();
-                    return offset;
-                }
-                lane.NoteInlineUnresolved();
-            }
-        }
-        PrefetchGuestSource(src_vaddr, size);
         const auto [data, offset] = Map(size, alignment);
         auto* memory = Core::Memory::Instance();
+        const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
         if (memory->IsValidMapping(src_vaddr)) {
             memory->CopySparseMemory(src_vaddr, data, size);
         } else {
@@ -381,14 +147,12 @@ private:
     /// Increases the amount of watches available.
     void ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size);
 
-    /// Starts a new ring lap when a map does not fit in the remaining space
-    /// and arms the watch drain for the previous lap.
-    SHAD_NO_INLINE void MapWrap();
-
-    /// Waits pending watches until requested upper bound; invalidation_mark must be engaged.
+    /// Waits pending watches until requested upper bound.
     bool WaitPendingOperations(u64 requested_upper_bound, bool allow_wait);
 
 private:
+    Vulkan::Scheduler& scheduler;
+    vk::DeviceSize non_coherent_atom_size{};
     u64 offset{};
     u64 mapped_size{};
     std::vector<Watch> current_watches;
@@ -396,7 +160,6 @@ private:
     std::optional<size_t> invalidation_mark;
     std::vector<Watch> previous_watches;
     std::size_t wait_cursor{};
-    RingStats ring_stats_{};
     u64 wait_bound{};
 };
 

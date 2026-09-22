@@ -17,10 +17,10 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 
-class MasterSemaphore {
+class Semaphore {
 public:
-    explicit MasterSemaphore(const Instance& instance_);
-    ~MasterSemaphore();
+    explicit Semaphore(const Instance& instance_);
+    ~Semaphore();
 
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return current_tick.load(std::memory_order_acquire);
@@ -67,7 +67,7 @@ protected:
 /// batch recorded after the fault, rather than beside them on a starved ring.
 class TransferQueue {
 public:
-    explicit TransferQueue(const Instance& instance, MasterSemaphore& master, bool on_graphics);
+    explicit TransferQueue(const Instance& instance, Semaphore& master, bool on_graphics);
     ~TransferQueue();
 
     /// Submits one buffer copy after master tick `wait_master_tick`, which must
@@ -87,7 +87,7 @@ public:
 private:
     static constexpr size_t NumSlots = 8;
     const Instance& instance;
-    MasterSemaphore& master;
+    Semaphore& master;
     const bool on_graphics_; ///< Copies ride the graphics queue, in order.
     vk::UniqueCommandPool command_pool;
     std::array<vk::CommandBuffer, NumSlots> cmdbufs{};

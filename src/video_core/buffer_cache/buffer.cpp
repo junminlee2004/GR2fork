@@ -1,12 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <bit>
-
+#include "common/alignment.h"
 #include "common/assert.h"
-#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
-#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -15,90 +12,97 @@
 
 namespace VideoCore {
 
-std::string_view BufferTypeName(MemoryUsage type) {
+std::string_view BufferTypeName(MemoryType type) {
     switch (type) {
-    case MemoryUsage::Upload:
-        return "Upload";
-    case MemoryUsage::Download:
-        return "Download";
-    case MemoryUsage::Stream:
+    case MemoryType::HostUncached:
+        return "HostUncached";
+    case MemoryType::HostCached:
+        return "HostCached";
+    case MemoryType::Stream:
         return "Stream";
-    case MemoryUsage::DeviceLocal:
+    case MemoryType::DeviceLocal:
         return "DeviceLocal";
+    case MemoryType::Sparse:
+        return "Sparse";
     default:
         return "Invalid";
     }
 }
 
-[[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryUsage usage) {
-    return usage != MemoryUsage::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                             : VkMemoryPropertyFlagBits{};
+[[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
+    return type != MemoryType::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                           : VkMemoryPropertyFlagBits{};
 }
 
-[[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryUsage usage) {
-    switch (usage) {
-    case MemoryUsage::Upload:
-    case MemoryUsage::Stream:
+[[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {
+    switch (type) {
+    case MemoryType::HostUncached:
+    case MemoryType::Stream:
         return VMA_ALLOCATION_CREATE_MAPPED_BIT |
                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-    case MemoryUsage::Download:
+    case MemoryType::HostCached:
         return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-    case MemoryUsage::DeviceLocal:
+    case MemoryType::DeviceLocal:
+    default:
         return {};
     }
-    return {};
 }
 
-[[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryUsage usage) {
-    switch (usage) {
-    case MemoryUsage::Stream:
-        // On an APU the host-visible device heap is the same write-combining
-        // DRAM, so a cached ring can be the cheaper trade; off by default,
-        // PREFER_DEVICE stays right for discrete parts.
-        return EmulatorSettings.IsStreamBufferPreferHost() ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST
-                                                           : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    case MemoryUsage::DeviceLocal:
+[[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryType type) {
+    switch (type) {
+    case MemoryType::DeviceLocal:
+    case MemoryType::Stream:
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    case MemoryUsage::Upload:
-    case MemoryUsage::Download:
+    case MemoryType::HostUncached:
+    case MemoryType::HostCached:
         return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    default:
+        return VMA_MEMORY_USAGE_UNKNOWN;
     }
-    return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 }
 
 UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
     : device{device_}, allocator{allocator_} {}
 
 UniqueBuffer::~UniqueBuffer() {
-    if (buffer) {
+    if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
+    } else if (buffer) {
+        device.destroyBuffer(buffer);
     }
 }
 
-void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usage,
+void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
-    const VmaAllocationCreateFlags bda_flag =
-        with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-    const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(usage),
-        .usage = MemoryUsageVma(usage),
-        .requiredFlags = 0,
-        .preferredFlags = MemoryUsagePreferredVmaFlags(usage),
-        .pool = VK_NULL_HANDLE,
-        .pUserData = nullptr,
-    };
+    if (mem_type != MemoryType::Sparse) {
+        const VmaAllocationCreateFlags bda_flag =
+            with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+        const VmaAllocationCreateInfo alloc_ci = {
+            .flags =
+                VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
+            .usage = MemoryUsageVma(mem_type),
+            .requiredFlags = 0,
+            .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
+            .pool = VK_NULL_HANDLE,
+            .pUserData = nullptr,
+        };
 
-    const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
-    VkBuffer unsafe_buffer{};
-    VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
-                                      &allocation, out_alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
-               vk::to_string(vk::Result{result}));
-    buffer = vk::Buffer{unsafe_buffer};
+        const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
+        VkBuffer unsafe_buffer{};
+        VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                          &allocation, out_alloc_info);
+        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+                   vk::to_string(vk::Result{result}));
+        buffer = vk::Buffer{unsafe_buffer};
+    } else {
+        buffer_ci.flags |=
+            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
+            buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+    }
 
     if (with_bda) {
-        vk::BufferDeviceAddressInfo bda_info{
+        const vk::BufferDeviceAddressInfo bda_info = {
             .buffer = buffer,
         };
         auto bda_result = device.getBufferAddress(bda_info);
@@ -107,167 +111,98 @@ void UniqueBuffer::Create(const vk::BufferCreateInfo& buffer_ci, MemoryUsage usa
     }
 }
 
-Buffer::Buffer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_, MemoryUsage usage_,
-               VAddr cpu_addr_, vk::BufferUsageFlags flags, u64 size_bytes_)
-    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, instance{&instance_}, scheduler{&scheduler_},
-      usage{usage_}, buffer{instance->GetDevice(), instance->GetAllocator()} {
-    // Create buffer object. A readback copy queue reads buffers from a second
-    // family, so they are shared between both.
-    const std::array<u32, 2> families = {instance->GetGraphicsQueueFamilyIndex(),
-                                         instance->GetTransferQueueFamilyIndex()};
-    const bool shared = instance->HasTransferQueue();
-    const vk::BufferCreateInfo buffer_ci = {
+Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+               MemoryType mem_type_, std::string_view debug_name)
+    : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
+      buffer{instance.GetDevice(), instance.GetAllocator()} {
+
+    vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
-        .usage = flags,
-        .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
-        .queueFamilyIndexCount = shared ? 2u : 0u,
-        .pQueueFamilyIndices = shared ? families.data() : nullptr,
+        .usage = AllFlags,
+        .sharingMode = vk::SharingMode::eExclusive,
     };
     VmaAllocationInfo alloc_info{};
-    buffer.Create(buffer_ci, usage, &alloc_info);
+    buffer.Create(buffer_ci, mem_type, &alloc_info);
 
-    const auto device = instance->GetDevice();
-    Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
-
-    // Map it if it is host visible.
-    VkMemoryPropertyFlags property_flags{};
-    vmaGetAllocationMemoryProperties(instance->GetAllocator(), buffer.allocation, &property_flags);
-    if (alloc_info.pMappedData) {
-        mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+    const auto device = instance.GetDevice();
+    if (!debug_name.empty()) {
+        Vulkan::SetObjectName(device, Handle(), debug_name);
+    } else {
+        Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
     }
-    is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-}
 
-void Buffer::InvalidateForRead(u64 offset, u64 num_bytes) {
-    if (!is_coherent) {
-        vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset, num_bytes);
+    if (mem_type != MemoryType::Sparse) {
+        VkMemoryPropertyFlags property_flags{};
+        vmaGetAllocationMemoryProperties(instance.GetAllocator(), buffer.allocation,
+                                         &property_flags);
+        if (alloc_info.pMappedData) {
+            mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+        }
+        is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     }
-}
-
-void Buffer::Fill(u64 offset, u32 num_bytes, u32 value) {
-    scheduler->EndRendering();
-    ASSERT_MSG(offset % 4 == 0 && num_bytes % 4 == 0,
-               "FillBuffer size must be a multiple of 4 bytes");
-    const auto cmdbuf = scheduler->CommandBuffer();
-    const vk::BufferMemoryBarrier2 pre_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .buffer = buffer,
-        .offset = offset,
-        .size = num_bytes,
-    };
-    const vk::BufferMemoryBarrier2 post_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .buffer = buffer,
-        .offset = offset,
-        .size = num_bytes,
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &pre_barrier,
-    });
-    cmdbuf.fillBuffer(buffer, offset, num_bytes, value);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &post_barrier,
-    });
 }
 
 constexpr u64 WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr u64 WATCHES_RESERVE_CHUNK = 0x1000;
 
-StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                           MemoryUsage usage, u64 size_bytes)
-    : Buffer{instance, scheduler, usage, 0, AllFlags, size_bytes} {
+StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
+                           MemoryType mem_type, u64 size_bytes)
+    : Buffer{instance, 0, size_bytes, mem_type}, scheduler{scheduler_},
+      non_coherent_atom_size{instance.NonCoherentAtomSize()} {
     ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
     ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
-    const auto device = instance.GetDevice();
-    Vulkan::SetObjectName(device, Handle(), "StreamBuffer({}):{:#x}", BufferTypeName(usage),
-                          size_bytes);
-}
-
-// Alignments on the map path are Vulkan device limits, which the spec
-// defines as power-of-two values; the mask form avoids a divide per map.
-static u64 AlignUpPow2(u64 value, u64 alignment) {
-    DEBUG_ASSERT(std::has_single_bit(alignment));
-    return (value + alignment - 1) & ~(alignment - 1);
+    Vulkan::SetObjectName(instance.GetDevice(), Handle(), "StreamBuffer({}):{:#x}",
+                          BufferTypeName(mem_type), size_bytes);
 }
 
 std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) {
-    if (!is_coherent && usage == MemoryUsage::Stream) {
-        size = AlignUpPow2(size, instance->NonCoherentAtomSize());
+    if (!is_coherent && mem_type == MemoryType::Stream) {
+        size = Common::AlignUp(size, non_coherent_atom_size);
     }
 
-    if (size > this->size_bytes) [[unlikely]] {
+    if (size > this->size_bytes) {
         return {nullptr, 0};
     }
 
     mapped_size = size;
 
     if (alignment > 0) {
-        offset = AlignUpPow2(offset, alignment);
+        offset = Common::AlignUp(offset, alignment);
     }
 
-    ++ring_stats_.maps;
-    ring_stats_.bytes += size;
-    if (offset + size > this->size_bytes) [[unlikely]] {
-        MapWrap();
+    if (offset + size > this->size_bytes) {
+        // The buffer would overflow, save the amount of used watches and reset the state.
+        invalidation_mark = current_watch_cursor;
+        current_watch_cursor = 0;
+        offset = 0;
+
+        // Swap watches and reset waiting cursors.
+        std::swap(previous_watches, current_watches);
+        wait_cursor = 0;
+        wait_bound = 0;
     }
 
     const u64 mapped_upper_bound = offset + size;
-    // The callee's own first loop condition, hoisted: with the bound already
-    // drained past this map the loop cannot run and the call returns true, so
-    // testing it here elides all but the maps that advance the drain. The mark
-    // stays engaged from the first wrap until a lap is fully drained below.
-    if (invalidation_mark && mapped_upper_bound > wait_bound) {
-        ++ring_stats_.armed;
-        if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
-            return {nullptr, 0};
-        }
+    if (!WaitPendingOperations(mapped_upper_bound, allow_wait)) {
+        return {nullptr, 0};
     }
 
     return {mapped_data.data() + offset, offset};
 }
 
-void StreamBuffer::MapWrap() {
-    // The new lap reuses offsets this lap's queued jobs may still be writing.
-    StreamCopyLane::Instance().DrainProducer();
-    ++ring_stats_.wraps;
-    // The buffer would overflow, save the amount of used watches and reset the state.
-    invalidation_mark = current_watch_cursor;
-    current_watch_cursor = 0;
-    offset = 0;
-
-    // Swap watches and reset waiting cursors.
-    std::swap(previous_watches, current_watches);
-    wait_cursor = 0;
-    wait_bound = 0;
-}
-
-void StreamBuffer::CommitSlow() {
+void StreamBuffer::Commit() {
     if (!is_coherent) {
-        if (usage == MemoryUsage::Download) {
-            vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation, offset,
-                                    mapped_size);
+        if (mem_type == MemoryType::HostCached) {
+            vmaInvalidateAllocation(buffer.allocator, buffer.allocation, offset, mapped_size);
         } else {
-            vmaFlushAllocation(instance->GetAllocator(), buffer.allocation, offset, mapped_size);
+            vmaFlushAllocation(buffer.allocator, buffer.allocation, offset, mapped_size);
         }
     }
 
     offset += mapped_size;
-    const u64 tick = scheduler->CurrentTick();
-    // Watches only order ring reuse against submissions, so commits within one
-    // tick collapse into the last appended watch: waiting out that tick frees
-    // every region committed under it.
-    if (current_watch_cursor != 0 && current_watches[current_watch_cursor - 1].tick == tick) {
-        current_watches[current_watch_cursor - 1].upper_bound = offset;
+    if (current_watch_cursor != 0 &&
+        current_watches[current_watch_cursor].tick == scheduler.CurrentTick()) {
+        current_watches[current_watch_cursor].upper_bound = offset;
         return;
     }
 
@@ -278,7 +213,7 @@ void StreamBuffer::CommitSlow() {
 
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
-    watch.tick = tick;
+    watch.tick = scheduler.CurrentTick();
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
@@ -286,26 +221,17 @@ void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_
 }
 
 bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_wait) {
-    DEBUG_ASSERT(invalidation_mark.has_value());
+    if (!invalidation_mark) {
+        return true;
+    }
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        // allow_wait first: IsFree costs a semaphore query, and when waiting is
-        // permitted WaitTagged performs the same check itself.
-        if (!allow_wait && !scheduler->IsFree(watch.tick)) {
+        if (!scheduler.IsFree(watch.tick) && !allow_wait) {
             return false;
         }
-        // WaitTagged only times ticks not already known free, so blocked_ns
-        // counts real stalls, not the drain walk.
-        ring_stats_.blocked_ns +=
-            scheduler->WaitTagged(watch.tick, Vulkan::Scheduler::WaitSite::StreamRing);
+        scheduler.Wait(watch.tick);
         wait_bound = watch.upper_bound;
         ++wait_cursor;
-    }
-    // The lap is retired once its last watch is consumed: nothing this mark
-    // guards can block again, so disarm it. A refused wait returned above, so
-    // a live drain can never be disarmed by a caller that would not wait.
-    if (wait_cursor == *invalidation_mark) {
-        invalidation_mark.reset();
     }
     return true;
 }
