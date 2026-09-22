@@ -3,6 +3,8 @@
 
 #include "input_handler.h"
 
+#include <atomic>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -928,6 +930,25 @@ void ControllerOutput::AddUpdate(InputEvent event) {
     }
 }
 
+// touchpad_two_finger: a real two-finger press lands both fingers first and clicks a moment
+// later, near the two ends of the pad. The click follows the touches after this delay; a release
+// before it fires bumps the generation so the stale timer does nothing.
+static constexpr float kTwoFingerLeftX = 0.08f;
+static constexpr float kTwoFingerRightX = 0.92f;
+static constexpr Uint32 kTwoFingerClickDelayMs = 50;
+static std::atomic<u32> g_two_finger_gen{0};
+static std::atomic<GameController*> g_two_finger_controller{nullptr};
+
+static Uint32 TwoFingerClickCallback(void* param, SDL_TimerID, Uint32) {
+    const u32 gen = static_cast<u32>(reinterpret_cast<uintptr_t>(param));
+    auto* controller = g_two_finger_controller.load(std::memory_order_acquire);
+    if (controller != nullptr && g_two_finger_gen.load(std::memory_order_acquire) == gen) {
+        controller->Button(Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, true);
+        LOG_INFO(Input, "[two-finger diag] click down (gen {})", gen); // TEMPORARY
+    }
+    return 0; // one-shot
+}
+
 void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
     auto PushSDLEvent = [&](u32 event_type) {
         if (new_button_state) {
@@ -970,11 +991,25 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             controller->SetTouchpadState(0, new_button_state, 0.5f, 0.75f);
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
-        case SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER:
-            controller->SetTouchpadState(0, new_button_state, 0.25f, 0.5f);
-            controller->SetTouchpadState(1, new_button_state, 0.75f, 0.5f);
-            controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER: {
+            const u32 gen = g_two_finger_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+            LOG_INFO(Input, "[two-finger diag] {} (gen {})", // TEMPORARY
+                     new_button_state ? "press: fingers down" : "release", gen);
+            if (new_button_state) {
+                controller->SetTouchpadState(0, true, kTwoFingerLeftX, 0.5f);
+                controller->SetTouchpadState(1, true, kTwoFingerRightX, 0.5f);
+                g_two_finger_controller.store(controller, std::memory_order_release);
+                if (SDL_AddTimer(kTwoFingerClickDelayMs, TwoFingerClickCallback,
+                                 reinterpret_cast<void*>(static_cast<uintptr_t>(gen))) == 0) {
+                    controller->Button(SDLGamepadToOrbisButton(button), true);
+                }
+            } else {
+                controller->Button(SDLGamepadToOrbisButton(button), false);
+                controller->SetTouchpadState(1, false, kTwoFingerRightX, 0.5f);
+                controller->SetTouchpadState(0, false, kTwoFingerLeftX, 0.5f);
+            }
             break;
+        }
         // The synthetic swipes fire on the rising edge only (state_changed gates this switch);
         // the SDL timer chain in input_mouse.cpp owns the playback.
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
