@@ -1140,8 +1140,8 @@ bool IsStaticPatchingEnabled() noexcept {
 
 } // namespace WindowsGuestRedZoneProtection
 
-#if defined(_WIN32)
-
+// The function-aware decoder and relocator below also serve static_cpu_patching, on every
+// platform.
 namespace {
 
 constexpr size_t GuestRedZoneSize = 128;
@@ -1303,7 +1303,7 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
         const s64 access_start = operand.mem.disp.value;
         const s64 access_size = std::max<s64>(operand.size / 8, 1);
         const s64 range_start = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
-        const s64 range_end = std::min(access_start + access_size, 0LL);
+        const s64 range_end = std::min<s64>(access_start + access_size, 0);
         for (s64 offset = range_start; offset < range_end; ++offset) {
             const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
             if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
@@ -1792,8 +1792,11 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
 
 } // namespace
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+/// protect_red_zone false applies only the CPU patches (static_cpu_patching). decoded_ranges, when
+/// given, receives the byte range of every instruction the function walk proved.
+static RedZonePatchResult PatchSegmentStatically(
+    u64 segment_addr, u64 segment_size, std::span<const uintptr_t> function_starts,
+    bool protect_red_zone, std::vector<std::pair<uintptr_t, uintptr_t>>* decoded_ranges) {
     RedZonePatchResult result{};
     auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
     if (module == nullptr || function_starts.empty()) {
@@ -1823,7 +1826,14 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
         ++result.function_count;
         auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
-        AnalyzeRedZoneLiveness(function);
+        if (decoded_ranges != nullptr) {
+            for (const auto& [address, decoded] : function.instructions) {
+                decoded_ranges->emplace_back(address, address + decoded.instruction.length);
+            }
+        }
+        if (protect_red_zone) {
+            AnalyzeRedZoneLiveness(function);
+        }
         result.instruction_count += function.instructions.size();
 
         std::map<uintptr_t, InstructionRewrite> rewrite_sites;
@@ -1834,6 +1844,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
         for (auto& [address, decoded] : function.instructions) {
             const PatchInfo* matching_patch = FindMatchingPatch(decoded);
             const auto [patched, _] = TryPatch(reinterpret_cast<u8*>(address), module);
+            result.inplace_cpu_patch_instruction_count += patched;
             if (IsInPlaceMemoryPatch(decoded.instruction.mnemonic)) {
                 const RedZoneMask red_zone_live = decoded.red_zone_live;
                 decoded = DecodeCodeInstruction(address, function_end);
@@ -1847,7 +1858,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             }
         }
 
-        if (function.uses_red_zone) {
+        if (protect_red_zone && function.uses_red_zone) {
             ++result.red_zone_function_count;
             result.indirect_red_zone_function_count += function.has_indirect_branch;
             for (const auto& [address, decoded] : function.instructions) {
@@ -2313,13 +2324,81 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
     return result;
 }
 
-#else
-
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
-    return {};
+RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
+                                                  std::span<const uintptr_t> function_starts) {
+    return PatchSegmentStatically(segment_addr, segment_size, function_starts, true, nullptr);
 }
 
-#endif
+RedZonePatchResult PatchCpuInstructionsStatically(
+    u64 segment_addr, u64 segment_size, std::span<const uintptr_t> function_starts,
+    std::vector<std::pair<uintptr_t, uintptr_t>>& decoded_ranges) {
+    decoded_ranges.clear();
+    const auto result =
+        PatchSegmentStatically(segment_addr, segment_size, function_starts, false, &decoded_ranges);
+    // Sorted and merged, so the gap pass walks them in one forward sweep.
+    std::ranges::sort(decoded_ranges);
+    size_t merged = 0;
+    for (const auto& range : decoded_ranges) {
+        if (merged != 0 && range.first <= decoded_ranges[merged - 1].second) {
+            decoded_ranges[merged - 1].second =
+                std::max(decoded_ranges[merged - 1].second, range.second);
+        } else {
+            decoded_ranges[merged++] = range;
+        }
+    }
+    decoded_ranges.resize(merged);
+    return result;
+}
+
+GapPatchResult PrePatchInstructionGaps(
+    u64 segment_addr, u64 segment_size,
+    std::span<const std::pair<uintptr_t, uintptr_t>> decoded_ranges) {
+    GapPatchResult result{};
+    auto* code = reinterpret_cast<u8*>(segment_addr);
+    auto* module = GetModule(code);
+    if (module == nullptr || Patches.empty()) {
+        return result;
+    }
+    std::unique_lock lock{module->mutex};
+    const u8* const end = code + segment_size;
+    auto range = decoded_ranges.begin();
+    while (code < end) {
+        const auto address = reinterpret_cast<uintptr_t>(code);
+        while (range != decoded_ranges.end() && address >= range->second) {
+            ++range;
+        }
+        const u8* gap_end = end;
+        if (range != decoded_ranges.end()) {
+            if (address >= range->first) {
+                code = reinterpret_cast<u8*>(range->second);
+                continue;
+            }
+            gap_end = std::min(end, reinterpret_cast<const u8*>(range->first));
+        }
+        // Bounded by the next proven range, so a gap decode never reaches into verified code.
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(instruction, operands,
+                                                                         code, gap_end - code))) {
+            ++code;
+            continue;
+        }
+        // In place only: no relocation where no function walk has proved the neighbours.
+        const auto patches = Patches.find(instruction.mnemonic);
+        if (patches != Patches.end() &&
+            std::ranges::any_of(patches->second, [&operands](const PatchInfo& patch) {
+                return patch.filter(operands);
+            })) {
+            if (TryPatch(code, module).first) {
+                ++result.patched;
+            } else {
+                ++result.left_to_handler;
+            }
+        }
+        code += instruction.length;
+    }
+    return result;
+}
 
 // ============================================================================
 // End Windows static guest red-zone protection
@@ -2389,6 +2468,10 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
 }
 
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
+    // The module loader runs the function-aware pass and its gap pass once it has the EH table.
+    if (EmulatorSettings.IsStaticCpuPatching()) {
+        return;
+    }
 #if !defined(_WIN32) && !defined(__APPLE__)
     // Linux and others have an FS segment pointing to valid memory, so continue to do full
     // ahead-of-time patching for now until a better solution is worked out.
