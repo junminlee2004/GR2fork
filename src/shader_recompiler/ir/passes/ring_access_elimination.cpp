@@ -99,10 +99,6 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                         dwords_per_vertex, info.gs_copy_data.num_comps);
             dwords_per_vertex = info.gs_copy_data.num_comps;
         }
-        // A copy shader that exports only the position does not encode the vertex count.
-        const u32 copy_vertices = info.gs_copy_data.output_vertices
-                                      ? info.gs_copy_data.output_vertices
-                                      : gs_info.output_vertices;
 
         ForEachInstruction([&](IR::IREmitter& ir, IR::Inst& inst) {
             const auto opcode = inst.GetOpcode();
@@ -137,7 +133,7 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
 
                 const auto offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
-                const auto comp_ofs = copy_vertices * sizeof(u32);
+                const auto comp_ofs = info.gs_copy_data.output_vertices * sizeof(u32);
                 const auto output_size = gs_info.output_vertices * dwords_per_vertex * sizeof(u32);
 
                 const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
