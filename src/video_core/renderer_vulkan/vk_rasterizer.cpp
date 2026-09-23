@@ -322,17 +322,19 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
-    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
-        return;
-    }
-
     if (!BindResources(pipeline)) {
         return;
     }
 
     if (needs_barrier) {
         runtime.FlushBarriers();
+    }
+
+    // Runs after binding so the copy shader's buffers get the same cache handling as a dispatch.
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        ResetBindings(true);
+        return;
     }
 
     scheduler.EndRendering();
