@@ -45,6 +45,10 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
     }
 
+    // As for any written formatted buffer, images at the destination are reuploaded on next use.
+    rasterizer.GetTextureCache().InvalidateMemoryFromGPU(dst_buf_sharp.base_address,
+                                                         dst_buf_sharp.GetSize());
+
     static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
     u32 batch_start = 0;
     u32 batch_end = 0;
@@ -79,9 +83,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             dst_offset_max = new_dst_offset_max;
         }
 
-        // Obtain buffers for the total source and destination ranges.
-        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
-            src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
+        // Obtain buffers for the total source and destination ranges. The source is formatted, so
+        // image data aliasing it is synchronized first.
+        const auto [src_buf, src_buf_offset] =
+            buffer_cache.ObtainBuffer(src_buf_sharp.base_address + src_offset_min,
+                                      src_offset_max - src_offset_min, false, true);
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
             dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, true);
 
