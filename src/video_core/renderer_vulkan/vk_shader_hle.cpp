@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -11,6 +13,32 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+
+static bool SourceOverlapsDestination(u64 src_base, u64 dst_base,
+                                      std::span<const vk::BufferCopy> copies) {
+    static std::vector<std::pair<u64, u64>> src_ranges;
+    static std::vector<std::pair<u64, u64>> dst_ranges;
+    src_ranges.clear();
+    dst_ranges.clear();
+    for (const auto& copy : copies) {
+        src_ranges.emplace_back(src_base + copy.srcOffset, src_base + copy.srcOffset + copy.size);
+        dst_ranges.emplace_back(dst_base + copy.dstOffset, dst_base + copy.dstOffset + copy.size);
+    }
+    std::ranges::sort(src_ranges);
+    std::ranges::sort(dst_ranges);
+    size_t src = 0;
+    size_t dst = 0;
+    while (src < src_ranges.size() && dst < dst_ranges.size()) {
+        if (src_ranges[src].second <= dst_ranges[dst].first) {
+            ++src;
+        } else if (dst_ranges[dst].second <= src_ranges[src].first) {
+            ++dst;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer) {
@@ -43,6 +71,17 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         const u32 local_src_offset = src_idx * buf_stride;
         const u32 local_size = (end + 1) * buf_stride;
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
+    }
+
+    // vkCmdCopyBuffer requires source and destination regions not to overlap in memory, which the
+    // copy shader does not, so overlapping copies are left to the shader.
+    if (SourceOverlapsDestination(src_buf_sharp.base_address, dst_buf_sharp.base_address, copies)) {
+        static bool logged = false;
+        if (!logged) {
+            LOG_WARNING(Render_Vulkan, "Copy shader HLE skipped: source and destination overlap");
+            logged = true;
+        }
+        return false;
     }
 
     static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
