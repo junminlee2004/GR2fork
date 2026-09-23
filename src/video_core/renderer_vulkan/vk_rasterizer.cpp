@@ -322,6 +322,13 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    // Texture cache shortcuts take precedence over the HLE, a metadata clear done as a copy
+    // must be tracked as a clear.
+    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+        IsComputeImageClear(pipeline)) {
+        return;
+    }
+
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
