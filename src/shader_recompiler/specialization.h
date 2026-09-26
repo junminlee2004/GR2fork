@@ -86,12 +86,12 @@ struct StageSpecialization {
     const Info* info{};
     RuntimeInfo runtime_info{};
     std::bitset<MaxStageResources> bitset{};
-    std::optional<Gcn::FetchShaderData> fetch_shader_data{};
-    boost::container::small_vector<VsAttribSpecialization, 32> vs_attribs;
-    boost::container::small_vector<BufferSpecialization, 16> buffers;
-    boost::container::small_vector<ImageSpecialization, 16> images;
-    boost::container::small_vector<FMaskSpecialization, 8> fmasks;
-    boost::container::small_vector<SamplerSpecialization, 16> samplers;
+    Gcn::FetchShaderData fetch_shader_data{};
+    SmallVector<VsAttribSpecialization, 32> vs_attribs;
+    SmallVector<BufferSpecialization, 16> buffers;
+    SmallVector<ImageSpecialization, 16> images;
+    SmallVector<FMaskSpecialization, 8> fmasks;
+    SmallVector<SamplerSpecialization, 16> samplers;
     Backend::Bindings start{};
     // 128-bit signature pair over the fields operator== consults. Computed only while the
     // spec_fp_cache setting is on: sig == 0 doubles as the "never computed" sentinel, and such
@@ -122,10 +122,13 @@ struct StageSpecialization {
         images.clear();
         fmasks.clear();
         samplers.clear();
-        fetch_shader_data = Gcn::ParseFetchShader(info_);
-        if (info_.sw_stage == SwStage::Vertex && fetch_shader_data) {
+        fetch_shader_data.size = 0;
+        fetch_shader_data.attributes.clear();
+        fetch_shader_data.vertex_offset_sgpr = -1;
+        fetch_shader_data.instance_offset_sgpr = -1;
+        if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
             // Specialize shader on VS input number types to follow spec.
-            ForEachSharp(vs_attribs, fetch_shader_data->attributes,
+            ForEachSharp(vs_attribs, fetch_shader_data.attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                              using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
                              if (const auto step_rate = desc.GetStepRate();
@@ -210,7 +213,7 @@ struct StageSpecialization {
                 binding++;
                 continue;
             }
-            bitset.set(binding++);
+            bitset[binding++] = true;
             func(spec, desc, sharp);
         }
     }
@@ -255,16 +258,15 @@ struct StageSpecialization {
         static_assert(MaxStageResources == 128);
         step(((bitset << 64) >> 64).to_ullong());
         step((bitset >> 64).to_ullong());
-        step(fetch_shader_data.has_value() ? 1ULL : 0ULL);
-        if (fetch_shader_data) {
+        step(fetch_shader_data.Empty() ? 0ULL : 1ULL);
+        if (!fetch_shader_data.Empty()) {
             const u64 fs_packed =
-                static_cast<u64>(fetch_shader_data->attributes.size()) |
-                (static_cast<u64>(static_cast<u8>(fetch_shader_data->vertex_offset_sgpr)) << 16) |
-                (static_cast<u64>(static_cast<u8>(fetch_shader_data->instance_offset_sgpr)) << 24);
+                static_cast<u64>(fetch_shader_data.attributes.size()) |
+                (static_cast<u64>(static_cast<u8>(fetch_shader_data.vertex_offset_sgpr)) << 16) |
+                (static_cast<u64>(static_cast<u8>(fetch_shader_data.instance_offset_sgpr)) << 24);
             step(fs_packed);
-            for (const auto& a : fetch_shader_data->attributes) {
+            for (const auto& a : fetch_shader_data.attributes) {
                 u64 w = 0;
-                w |= static_cast<u64>(a.semantic) << 0;
                 w |= static_cast<u64>(a.dest_vgpr) << 8;
                 w |= static_cast<u64>(a.num_elements) << 16;
                 w |= static_cast<u64>(a.sgpr_base) << 24;

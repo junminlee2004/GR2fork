@@ -76,7 +76,7 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
     s32 extra_fmem = EmulatorSettings.GetExtraFmemInMBytes();
     if (extra_fmem != 0) {
         LOG_WARNING(Kernel_Vmm, "extraFmemInMbytes is {} MB! Old Size: {:#x} -> New Size: {:#x}",
-                    extra_dmem, ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE,
+                    extra_fmem, ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE,
                     ORBIS_KERNEL_FLEXIBLE_MEMORY_SIZE + extra_fmem * 1_MB);
         total_size += extra_fmem * 1_MB;
         flexible_size += extra_fmem * 1_MB;
@@ -145,55 +145,19 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
-    // A GuestCopyScope on this thread already holds the shared lock for the batch; re-taking it is
-    // legal (recursive-shared) but pays the contended reader-count RMW the scope exists to elide.
-    std::shared_lock lk{mutex, std::defer_lock};
-    if (!tls_in_guest_copy_scope) {
-        lk.lock();
-    }
-    ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
-               virtual_addr);
-
-    // Memoised FindVMA. Safe under the shared lock: the map only mutates under the
-    // exclusive lock, so a generation read here cannot go stale before the scope ends.
-    // Entries are thread local. Only fully-mapped areas are recorded - a sparse hole
-    // still needs the zero-filling walk below.
-    struct MappedAreaMemo {
-        u64 generation;
-        VAddr base;
-        VAddr end;
-    };
-    static constexpr size_t NumMemoEntries = 4;
-    static thread_local std::array<MappedAreaMemo, NumMemoEntries> memo{};
-    static thread_local size_t memo_next = 0;
-
-    for (const auto& entry : memo) {
-        if (entry.generation == vma_generation && virtual_addr >= entry.base &&
-            virtual_addr + size <= entry.end) {
-            std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), size);
-            return;
-        }
-    }
-
-    auto vma = FindVMA(virtual_addr);
-    if (vma->second.IsMapped()) {
-        const VAddr area_end = vma->first + vma->second.size;
-        if (virtual_addr + size <= area_end) {
-            memo[memo_next] = MappedAreaMemo{vma_generation, vma->first, area_end};
-            memo_next = (memo_next + 1) % NumMemoEntries;
-        }
-    }
+    const auto& backing_pages = impl.BackingPages();
     while (size) {
-        u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
-        if (vma->second.IsMapped()) {
-            std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), copy_size);
+        const u64 page = virtual_addr >> 14;
+        const u64 offset_in_page = virtual_addr % 16_KB;
+        const u64 copy_size = std::min<u64>(16_KB - offset_in_page, size);
+        if (auto* entry = backing_pages.find(page); entry && *entry) {
+            std::memcpy(dest, *entry + offset_in_page, copy_size);
         } else {
             std::memset(dest, 0, copy_size);
         }
         size -= copy_size;
         virtual_addr += copy_size;
         dest += copy_size;
-        ++vma;
     }
 }
 
@@ -242,13 +206,13 @@ void MemoryManager::RegisterUnmapDrain(void (*drain)()) {
 
 u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out,
                                        u32 max_spans, bool open_push_window) {
-    // Shared lock unless a GuestCopyScope already holds it (see CopySparseMemory); the vma map
+    // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope); the vma map
     // and phys_areas are stable under either hold.
     std::shared_lock lk{mutex, std::defer_lock};
     if (!tls_in_guest_copy_scope) {
         lk.lock();
     }
-    // Chunk memo, generation-keyed like CopySparseMemory's area memo: the
+    // Chunk memo, keyed on the map generation: the
     // stream lane resolves thousands of small ranges per frame and nearly all
     // of them land in the same few backing chunks.
     static constexpr size_t NumMemoEntries = 4;
@@ -319,7 +283,7 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
-    // Shared lock unless a GuestCopyScope already holds it (see CopySparseMemory).
+    // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope).
     std::shared_lock lk{mutex, std::defer_lock};
     if (!tls_in_guest_copy_scope) {
         lk.lock();
@@ -330,8 +294,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
         observer(g_backing_observer_user.load(std::memory_order_acquire), virtual_addr, size);
     }
     if (backing_write_memo_) {
-        // Per-thread chunk memo, revalidated by the map generation under the shared lock (see
-        // CopySparseMemory).
+        // Per-thread chunk memo, revalidated by the map generation under the shared lock; the
+        // map only mutates under the exclusive lock.
         auto& memo = tls_backing_write_memo;
         ++memo.calls;
         for (const auto& e : memo.entries) {
@@ -646,6 +610,8 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
 
         // Perform an address space mapping for each physical area
         void* out_addr = impl.Map(current_addr, size_to_map, new_dmem_area.base);
+        rasterizer->RegisterMemory(current_addr, size_to_map);
+
         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
         // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
 
@@ -819,6 +785,8 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
 
             // Perform an address space mapping for each physical area
             void* out_addr = impl.Map(current_addr, size_to_map, new_fmem_area.base, is_exec);
+            rasterizer->RegisterMemory(current_addr, size_to_map);
+
             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
             // TRACK_ALLOC(out_addr, size_to_map, "VMEM");
 
@@ -875,6 +843,7 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         // Flexible address space mappings were performed while finding direct memory areas.
         if (type != VMAType::Flexible) {
             impl.Map(mapped_addr, size, phys_addr, is_exec);
+            rasterizer->RegisterMemory(mapped_addr, size);
             // Tracy memory tracking breaks from merging memory areas. Disabled for now.
             // TRACK_ALLOC(mapped_addr, size, "VMEM");
         }
@@ -1007,6 +976,10 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 
     file->handle->Map(reinterpret_cast<u8*>(mapped_addr), size, phys_addr, std::bit_cast<u32>(prot),
                       map_ctx);
+    if (prot != Core::MemoryProt::CpuRead) {
+        // read-only mappings cannot be registered with userfaultfd in writeprotect mode
+        rasterizer->RegisterMemory(mapped_addr, size);
+    }
 
     *out_addr = std::bit_cast<void*>(mapped_addr);
     return ORBIS_OK;
@@ -1088,7 +1061,10 @@ s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
     }
 
     // Unmap from address space
-    impl.Unmap(virtual_addr, size);
+    u64 size_to_unmap = size;
+    VAddr unmapped_addr = impl.Unmap(virtual_addr, &size_to_unmap);
+    rasterizer->RegisterMemory(unmapped_addr, size_to_unmap);
+
     // Tracy memory tracking breaks from merging memory areas. Disabled for now.
     // TRACK_FREE(virtual_addr, "VMEM");
 
@@ -1182,7 +1158,10 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 
     if (vma_type != VMAType::Reserved && vma_type != VMAType::PoolReserved) {
         // Unmap the memory region.
-        impl.Unmap(virtual_addr, size_in_vma);
+        u64 size_to_unmap = size_in_vma;
+        VAddr unmapped_addr = impl.Unmap(virtual_addr, &size_to_unmap);
+        rasterizer->RegisterMemory(unmapped_addr, size_to_unmap);
+
         // Tracy memory tracking breaks from merging memory areas. Disabled for now.
         // TRACK_FREE(virtual_addr, "VMEM");
     }

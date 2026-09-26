@@ -12,8 +12,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 6u;
-static constexpr u32 ShaderMetaVersion = 7u;
+static constexpr u32 ShaderBinaryVersion = 8u;
+static constexpr u32 ShaderMetaVersion = 8u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
@@ -92,7 +92,6 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
     Serialization::Reader meta{ar};
 
@@ -114,8 +113,6 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     spec.Deserialize(ar);
     info.Deserialize(ar);
-
-    fetch_shader_data = spec.fetch_shader_data;
     return true;
 }
 
@@ -156,7 +153,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
     // Compute stages carry no fetch shader; the loaded value is discarded.
-    std::optional<Shader::Gcn::FetchShaderData> fetch_data{};
+    Shader::Gcn::FetchShaderData fetch_data{};
     if (!LoadPipelineStage(meta_ar, 0, fetch_data)) {
         return false;
     }
@@ -217,8 +214,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     sdata.Deserialize(ar);
 
     // Set by the one stage that owns a fetch shader, as at runtime; a key with no such stage
-    // yields disengaged fetch data.
-    std::optional<Shader::Gcn::FetchShaderData> fetch_data{};
+    // yields empty fetch data.
+    Shader::Gcn::FetchShaderData fetch_data{};
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
         if (!hash) {
@@ -239,7 +236,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         }
     }
     if (const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
-        vs_info && vs_info->has_fetch_shader && !fetch_data) {
+        vs_info && vs_info->has_fetch_shader && fetch_data.Empty()) {
         // Never preload a pipeline that would draw without vertex input; it compiles at runtime
         // from the live fetch shader instead.
         LOG_WARNING(Render_Vulkan,
@@ -256,7 +253,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile, graphics_key,
-        *pipeline_cache, infos, runtime_infos, std::move(fetch_data), modules, sdata, true);
+        *pipeline_cache, infos, runtime_infos, fetch_data.Empty() ? nullptr : &fetch_data, modules,
+        sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -265,20 +263,19 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 }
 
 bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
-                                      std::optional<Shader::Gcn::FetchShaderData>& fetch_out) {
+                                      Shader::Gcn::FetchShaderData& fetch_out) {
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    std::optional<Shader::Gcn::FetchShaderData> stage_fetch{};
-    if (!LoadShaderMeta(ar, program->info, stage_fetch, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false;
     }
     // As Publish does at runtime: only the stage that owns a fetch shader (the logical vertex
     // stage) sets the pipeline's fetch data. Stages after it in load order, geometry above all,
     // carry none and must not clear it.
-    if (stage_fetch) {
-        fetch_out = std::move(stage_fetch);
+    if (!spec.fetch_shader_data.Empty()) {
+        fetch_out = spec.fetch_shader_data;
     }
     NoteSharpVerdicts(program->info);
     if (spec_fp_cache) {
@@ -490,9 +487,9 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
 
     spec.Write(bitset.to_string());
 
-    if (fetch_shader_data) {
-        spec.Write(sizeof(*fetch_shader_data));
-        fetch_shader_data->Serialize(ar);
+    if (!fetch_shader_data.Empty()) {
+        spec.Write(sizeof(fetch_shader_data));
+        fetch_shader_data.Serialize(ar);
     } else {
         spec.Write(size_t{0});
     }

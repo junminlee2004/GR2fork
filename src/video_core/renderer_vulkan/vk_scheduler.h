@@ -18,6 +18,7 @@
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "vulkan/vulkan.hpp"
 
 namespace tracy {
 class VkCtxScope;
@@ -409,6 +410,7 @@ struct DynamicState {
     }
 };
 
+using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 class Scheduler {
@@ -483,6 +485,17 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// Starts a new session.
+    void BeginSession();
+
+    /// Returns the current command buffer used for uploads.
+    vk::CommandBuffer UploadCommandBuffer();
+
+    /// Sets a function to be called on every session finalization.
+    void SetSessionCallback(SessionFunc&& on_session) {
+        this->on_session = std::move(on_session);
+    }
+
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
         this->on_submit = std::move(on_submit);
@@ -500,7 +513,7 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
-        return current_cmdbuf;
+        return sessions.back().primary;
     }
 
     /// Returns the current command buffer tick.
@@ -558,7 +571,7 @@ public:
     static std::mutex submit_mutex;
 
 private:
-    void AllocateWorkerCommandBuffers();
+    void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
 
@@ -571,8 +584,13 @@ private:
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
+    SessionFunc on_session{};
     SubmitFunc on_submit{};
-    vk::CommandBuffer current_cmdbuf;
+    struct Session {
+        vk::CommandBuffer upload{};
+        vk::CommandBuffer primary{};
+    };
+    std::vector<Session> sessions;
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

@@ -36,6 +36,10 @@ public:
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
 
+    [[nodiscard]] Scheduler& GetScheduler() noexcept {
+        return scheduler;
+    }
+
     [[nodiscard]] Runtime& GetRuntime() noexcept {
         return runtime;
     }
@@ -74,17 +78,18 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
-    bool InvalidateMemory(VAddr addr, u64 size);
+    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
-    bool ReadMemory(VAddr addr, u64 size);
-    void ProcessDownloadImages();
+    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
+    void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
     void Finish();
     void OnSubmit();
+    void OnFence();
 
     // Scopes a guest-copy hold to one packet run: the caller yields to guest
     // threads between runs and the submit loop sleeps, so the hold must not
@@ -124,6 +129,11 @@ public:
             func(mapped_range);
         }
     }
+
+    std::thread::id GetGpuCommandProcessorThread();
+#ifdef __linux__
+    u32 GetGpuCommandProcessorThreadId();
+#endif
 
 private:
     // Returns whether the memo it consumed or refilled may certify the next
@@ -468,7 +478,6 @@ private:
     ImageBindingList image_bindings;
     // Constructed and destroyed two or three times per draw as a local.
     boost::container::static_vector<u32, Shader::NUM_IMAGES> image_descriptor_array_sizes;
-    bool fault_process_pending{};
     bool attachment_feedback_loop{};
 
     std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos{};

@@ -4,9 +4,12 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <utility>
+#include <vector>
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
+#include "shader_recompiler/frontend/opcodes.h"
 
 namespace Shader::Gcn {
 
@@ -34,13 +37,6 @@ namespace Shader::Gcn {
  * using input semantics on cpu side. Load instructions can either be separate or interleaved
  * We take the reverse way, extract the original input semantics from these instructions.
  **/
-
-static bool IsTypedBufferLoad(const Gcn::GcnInst& inst) {
-    return inst.opcode == Opcode::TBUFFER_LOAD_FORMAT_X ||
-           inst.opcode == Opcode::TBUFFER_LOAD_FORMAT_XY ||
-           inst.opcode == Opcode::TBUFFER_LOAD_FORMAT_XYZ ||
-           inst.opcode == Opcode::TBUFFER_LOAD_FORMAT_XYZW;
-}
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     const u32* code;
@@ -79,9 +75,9 @@ struct FetchShaderMemo {
 
 } // Anonymous namespace
 
-std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
     if (!info.has_fetch_shader) {
-        return std::nullopt;
+        return false;
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
@@ -94,12 +90,14 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     auto& entry = memo->entries[FetchShaderMemo::Index(code)];
     if (entry.code == code && !entry.words.empty() &&
         std::memcmp(code, entry.words.data(), entry.words.size() * sizeof(u32)) == 0) {
-        return entry.data;
+        out_fetch_data = entry.data;
+        return true;
     }
 
-    FetchShaderData data{};
-    GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
-    GcnDecodeContext decoder;
+    // Overwrite every field a hit would, so the result never depends on the memo state.
+    out_fetch_data.attributes.clear();
+    out_fetch_data.vertex_offset_sgpr = -1;
+    out_fetch_data.instance_offset_sgpr = -1;
 
     struct VsharpLoad {
         u32 dword_offset{};
@@ -107,63 +105,94 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     };
     std::array<VsharpLoad, 104> loads{};
 
-    u32 semantic_index = 0;
-    while (!code_slice.atEnd()) {
-        const auto inst = decoder.decodeInstruction(code_slice);
-        data.size += inst.length;
+    const u32* ptr = code;
+    while (true) {
+        const u32 word0 = *(ptr++);
+        const auto encoding = GetInstructionEncoding(word0);
 
-        if (inst.opcode == Opcode::S_SETPC_B64) {
+        if (encoding == InstEncoding::SOP1) {
+            const auto opcode = OpcodeSOP1((word0 >> 8) & 0xff);
+            ASSERT(opcode == OpcodeSOP1::S_SETPC_B64);
             break;
-        }
-
-        if (inst.inst_class == InstClass::ScalarMemRd) {
-            loads[inst.dst[0].code] = VsharpLoad{inst.control.smrd.offset, inst.src[0].code * 2};
-            continue;
-        }
-
-        if (inst.opcode == Opcode::V_ADD_I32) {
-            const auto vgpr = inst.dst[0].code;
-            const auto sgpr = s8(inst.src[0].code);
-            switch (vgpr) {
-            case 0: // V0 is always the vertex offset
-                data.vertex_offset_sgpr = sgpr;
-                break;
-            case 3: // V3 is always the instance offset
-                data.instance_offset_sgpr = sgpr;
-                break;
-            default:
+        } else if (encoding == InstEncoding::SMRD) {
+            const auto opcode = OpcodeSMRD((word0 >> 22) & 0x1f);
+            const u32 sdst = (word0 >> 15) & 0x7f;
+            const u32 sbase = (word0 >> 9) & 0x3f;
+            const u32 offset = word0 & 0xff;
+            ASSERT(opcode == OpcodeSMRD::S_LOAD_DWORDX4);
+            loads[sdst] = VsharpLoad{offset, sbase * 2};
+        } else if (encoding == InstEncoding::VOP2) {
+            const auto opcode = OpcodeVOP2((word0 >> 25) & 0x3f);
+            const u32 src0 = word0 & 0x1ff;
+            const u32 vsrc1 = (word0 >> 9) & 0xff;
+            const u32 vdst = (word0 >> 17) & 0xff;
+            ASSERT(opcode == OpcodeVOP2::V_ADD_I32 && src0 < 16 && vsrc1 == vdst);
+            if (vdst == 0) {
+                // V0 is always the vertex offset
+                out_fetch_data.vertex_offset_sgpr = src0;
+            } else if (vdst == 3) {
+                // V3 is always the instance offset
+                out_fetch_data.instance_offset_sgpr = src0;
+            } else {
                 UNREACHABLE();
             }
-        }
-
-        if (inst.inst_class == InstClass::VectorMemBufFmt) {
+        } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
-            const u32 base_sgpr = inst.src[2].code * 4;
-            auto& attrib = data.attributes.emplace_back();
-            attrib.semantic = semantic_index++;
-            attrib.dest_vgpr = inst.src[1].code;
-            attrib.num_elements = inst.control.mubuf.count;
-            attrib.sgpr_base = loads[base_sgpr].base_sgpr;
-            attrib.dword_offset = loads[base_sgpr].dword_offset;
-            attrib.inst_offset = inst.control.mtbuf.offset;
-            attrib.instance_data = inst.src[0].code;
-            if (IsTypedBufferLoad(inst)) {
-                attrib.data_format = inst.control.mtbuf.dfmt;
-                attrib.num_format = inst.control.mtbuf.nfmt;
+            const u32 word1 = *(ptr++);
+            const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;
+            auto& attrib = out_fetch_data.attributes.emplace_back();
+            attrib.dest_vgpr = (word1 >> 8) & 0xff;
+            if (encoding == InstEncoding::MUBUF) {
+                const auto opcode = OpcodeMUBUF((word0 >> 18) & 0x7f);
+                ASSERT(opcode >= OpcodeMUBUF::BUFFER_LOAD_FORMAT_X &&
+                       opcode <= OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW);
+                attrib.num_elements = (std::to_underlying(opcode) -
+                                       std::to_underlying(OpcodeMUBUF::BUFFER_LOAD_FORMAT_X)) +
+                                      1;
+            } else {
+                const auto opcode = OpcodeMTBUF((word0 >> 16) & 0x7);
+                ASSERT(opcode >= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X &&
+                       opcode <= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW);
+                attrib.num_elements = (std::to_underlying(opcode) -
+                                       std::to_underlying(OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X)) +
+                                      1;
             }
+            attrib.sgpr_base = loads[srsrc].base_sgpr;
+            attrib.dword_offset = loads[srsrc].dword_offset;
+            attrib.inst_offset = word0 & 0xfff;
+            attrib.instance_data = word1 & 0xff;
+            if (encoding == InstEncoding::MTBUF) {
+                attrib.data_format = (word0 >> 19) & 0xf;
+                attrib.num_format = (word0 >> 23) & 0x7;
+            } else {
+                attrib.data_format = 0;
+                attrib.num_format = 0;
+            }
+        } else if (encoding == InstEncoding::SOPP) {
+            const auto opcode = OpcodeSOPP((word0 >> 16) & 0x7f);
+            ASSERT(opcode == OpcodeSOPP::S_WAITCNT);
+        } else if (encoding == InstEncoding::VOP1) {
+            const auto opcode = OpcodeVOP1((word0 >> 9) & 0xff);
+            const u32 src0 = word0 & 0x1ff;
+            const u32 vdst = (word0 >> 17) & 0xff;
+            ASSERT(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242);
+            LOG_WARNING(Render_Recompiler, "Fetch shader has V{} = 1.0 which is ignored", vdst);
+        } else {
+            UNREACHABLE_MSG("Unexpected instruction encoding in fetch shader {}", u32(encoding));
         }
     }
 
+    out_fetch_data.size = (ptr - code) * sizeof(u32);
     // Instruction lengths are dword multiples, so this copies exactly the decoded region.
-    if (data.size > 0 && data.size <= FetchShaderMemo::MaxCachedBytes) {
-        entry.words.assign(code, code + data.size / sizeof(u32));
-        entry.data = data;
+    if (out_fetch_data.size <= FetchShaderMemo::MaxCachedBytes) {
+        entry.words.assign(code, ptr);
+        entry.data = out_fetch_data;
         entry.code = code;
     } else {
         entry.code = nullptr;
         entry.words.clear();
     }
-    return data;
+    return true;
 }
 
 } // namespace Shader::Gcn

@@ -32,10 +32,13 @@ GraphicsPipeline::GraphicsPipeline(
     PipelineLayoutCache* layouts, const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
-    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, layouts}, key{key_},
-      fetch_shader{std::move(fetch_shader_)} {
+    const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
+    SerializationSupport& sdata, bool preloading)
+    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, layouts}, key{key_} {
+    if (fetch_shader_) {
+        fetch_shader = *fetch_shader_;
+    }
+
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     const auto debug_str = GetDebugString();
@@ -420,11 +423,11 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
         return;
     }
     const auto& vs_info = GetStage(Shader::SwStage::Vertex);
-    for (const auto& attrib : fetch_shader->attributes) {
+    for (const auto& attrib : fetch_shader.attributes) {
         guest_buffers.emplace_back(attrib.GetSharp(vs_info));
     }
     GetVertexInputs(attributes, bindings, divisors,
@@ -438,21 +441,21 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     std::span<const AmdGpu::Buffer> sharps, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
         return;
     }
-    size_t i = 0;
-    for (const auto& attrib : fetch_shader->attributes) {
+    for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
+        const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
-        const AmdGpu::Buffer& buffer = sharps[i++];
+        const AmdGpu::Buffer& buffer = sharps[semantic];
         attributes.push_back(Attribute{
-            .location = attrib.semantic,
-            .binding = attrib.semantic,
+            .location = semantic,
+            .binding = semantic,
             .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
             .offset = 0,
         });
         bindings.push_back(Binding{
-            .binding = attrib.semantic,
+            .binding = semantic,
             .stride = buffer.GetStride(),
             .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
                                                            : vk::VertexInputRate::eInstance,
@@ -464,7 +467,7 @@ void GraphicsPipeline::GetVertexInputs(
             bindings.back().divisor = divisor;
         } else if (step_rate != InstanceIdType::None) {
             divisors.push_back(vk::VertexInputBindingDivisorDescriptionEXT{
-                .binding = attrib.semantic,
+                .binding = semantic,
                 .divisor = divisor,
             });
         }

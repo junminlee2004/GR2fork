@@ -100,8 +100,7 @@ const ImWchar* GetPrimaryTextRanges(ImFontAtlas* atlas) {
         rb.AddRanges(atlas->GetGlyphRangesVietnamese());
         rb.AddRanges(kLatinExtendedRanges);
         rb.AddRanges(kSymbolsRanges);
-        // The keyboard labels the IME draws, so they are baked rather than
-        // requested from a frozen font at draw time.
+        // The keyboard labels the IME draws, so the primary font supplies them.
         Libraries::Ime::AddImeKeyboardGlyphsToFontRanges(rb);
         rb.BuildRanges(&ranges);
     }
@@ -135,12 +134,6 @@ void AddMergedFont(ImFontAtlas* atlas, const CompressedFontBlob blob, const floa
 } // namespace
 
 namespace ImGui::FontStack {
-
-void FreezeBakedFonts(ImFontAtlas* atlas) {
-    for (ImFont* font : atlas->Fonts) {
-        font->Flags |= ImFontFlags_NoLoadGlyphs | ImFontFlags_LockBakedSizes;
-    }
-}
 
 ImFont* AddPrimaryUiFont(ImFontAtlas* atlas, const float font_size, const int console_language,
                          const ImFontConfig& base_cfg, const bool include_cjk_fallback) {

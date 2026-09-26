@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "vulkan/vulkan.hpp"
 
 template <>
 struct std::hash<vk::ShaderModule> {
@@ -93,8 +94,8 @@ struct Program {
     void SwapMru() {
         std::swap(mru, mru2);
     }
-    // Bit i set = modules[i].spec.fetch_shader_data is engaged. ASSIGNED, never OR-ed:
-    // InsertPermut's resize leaves gap Modules disengaged and a rewritten slot must not keep a
+    // Bit i set = modules[i].spec.fetch_shader_data is non-empty. ASSIGNED, never OR-ed:
+    // InsertPermut's resize leaves gap Modules empty and a rewritten slot must not keep a
     // stale bit.
     u64 fetch_mask{};
     // Direct-mapped, indexed by spec_fp & (kSpecFpCacheSize - 1), 16 B/entry. Heap-backed and
@@ -147,8 +148,8 @@ struct Program {
     void NotePermut(size_t perm_idx, u64 sig) {
         if (perm_idx < 64) {
             const u64 bit = u64{1} << perm_idx;
-            fetch_mask = modules[perm_idx].spec.fetch_shader_data.has_value() ? fetch_mask | bit
-                                                                              : fetch_mask & ~bit;
+            fetch_mask = !modules[perm_idx].spec.fetch_shader_data.Empty() ? fetch_mask | bit
+                                                                           : fetch_mask & ~bit;
         }
         if (sig != 0) {
             perm_index_by_sig.try_emplace(sig, perm_idx);
@@ -162,14 +163,14 @@ struct FetchShaderRef {
     const Program* program{};
     u32 perm_idx{};
 
-    const std::optional<Shader::Gcn::FetchShaderData>& Get() const {
+    const Shader::Gcn::FetchShaderData& Get() const {
         return program->modules[perm_idx].spec.fetch_shader_data;
     }
 
     explicit operator bool() const {
         // Indices past the mask width fall back to the direct check.
         return program != nullptr &&
-               (perm_idx < 64 ? ((program->fetch_mask >> perm_idx) & 1) != 0 : Get().has_value());
+               (perm_idx < 64 ? ((program->fetch_mask >> perm_idx) & 1) != 0 : !Get().Empty());
     }
 };
 
@@ -190,7 +191,7 @@ public:
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
-                           std::optional<Shader::Gcn::FetchShaderData>& fetch_out);
+                           Shader::Gcn::FetchShaderData& fetch_out);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 

@@ -329,7 +329,7 @@ size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 r
         put(&fetch_addr, sizeof(fetch_addr));
         valid = 0;
         n = 0;
-        for (const auto& a : fetch->attributes) {
+        for (const auto& a : fetch.attributes) {
             const AmdGpu::Buffer s = a.GetSharp(info);
             const u64 keep = s.num_records != 0 ? ~u64{0} : 0;
             valid |= (keep & 1) << n++;
@@ -357,7 +357,8 @@ SHAD_NO_INLINE u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src,
 }
 
 // One past the highest flat-buffer dword this sharp can read. A direct read takes N consecutive
-// dwords from offsets[0]; otherwise Fetch reads offsets[i] one by one and bails on UNKNOWN.
+// dwords from offsets[0]; otherwise Fetch reads the offsets[i] dwords (a SingleLoad run is exactly
+// those) and bails on UNKNOWN.
 template <typename Sf>
 u32 SharpFetchTopDw(const Sf& sf) noexcept {
     if (sf.direct) {
@@ -420,7 +421,7 @@ bool GatherMemoWindowOk(Program& program, const Shader::Info& info, u32 flat_dw)
 // reuse. Callers exclude HS/DS (their spec folds tess constant-buffer contents read from guest
 // memory). ri_bytes_hash is the raw-byte hash of the stage's persistent RuntimeInfo member.
 SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
-                                      const std::optional<Shader::Gcn::FetchShaderData>& fetch_data,
+                                      const Shader::Gcn::FetchShaderData& fetch_data,
                                       u64 ri_bytes_hash,
                                       const Shader::Backend::Bindings& start) noexcept {
     u64 h = 0x84222325cbf29ce4ULL;
@@ -434,8 +435,8 @@ SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
         std::memcpy(buf + len, p, n);
         len += n;
     };
-    const size_t attrib_bytes = (info.hw_stage == Shader::HwStage::Vertex && fetch_data)
-                                    ? fetch_data->attributes.size() * sizeof(AmdGpu::Buffer)
+    const size_t attrib_bytes = (info.hw_stage == Shader::HwStage::Vertex && !fetch_data.Empty())
+                                    ? fetch_data.attributes.size() * sizeof(AmdGpu::Buffer)
                                     : 0;
     const size_t needed = sizeof(start) + info.buffers.size() * sizeof(AmdGpu::Buffer) +
                           info.images.size() * sizeof(AmdGpu::Image) +
@@ -477,7 +478,7 @@ SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
         // vs_attribs are specialized only for the Vertex stage (see StageSpecialization);
         // fold the vertex-buffer sharps that feed them.
         if (attrib_bytes != 0) {
-            for (const auto& a : fetch_data->attributes) {
+            for (const auto& a : fetch_data.attributes) {
                 AmdGpu::Buffer s = a.GetSharp(info);
                 s.base_address = 0;
                 put(&s, sizeof(s));
@@ -513,8 +514,8 @@ SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
         AmdGpu::Sampler s = d.GetSharp(info);
         mix(XXH3_64bits(&s, sizeof(s)));
     }
-    if (info.hw_stage == Shader::HwStage::Vertex && fetch_data) {
-        for (const auto& a : fetch_data->attributes) {
+    if (info.hw_stage == Shader::HwStage::Vertex && !fetch_data.Empty()) {
+        for (const auto& a : fetch_data.attributes) {
             AmdGpu::Buffer s = a.GetSharp(info);
             s.base_address = 0;
             mix(XXH3_64bits(&s, sizeof(s)));
@@ -668,6 +669,11 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.en_flags = regs.ps_input_ena;
         info.hw.fs.addr_flags = regs.ps_input_addr;
         info.hw.fs.num_inputs = regs.num_interp;
+        info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
+        info.hw.fs.num_samples =
+            regs.ps_input_addr.sample_coverage_ena && regs.ps_input_ena.sample_coverage_ena
+                ? regs.aa_config.NumSamples()
+                : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
@@ -765,7 +771,7 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
                                                         u64* diff) const {
     const auto& regs = liverpool->regs;
     u32 n = 0;
-    // Two accumulators: a single OR chain over up to 59 words is a latency
+    // Two accumulators: a single OR chain over up to 61 words is a latency
     // chain the core cannot overlap. Words are read from the source through
     // memcpy, never through an aliasing pointer, so padding reaches the entry
     // exactly as the block copy wrote it.
@@ -818,6 +824,8 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
         put(regs.ps_program.settings);
         put(regs.ps_input_ena);
         put(regs.ps_input_addr);
+        put(regs.barycentric_control);
+        put(regs.aa_config);
         const u32 num_interp = regs.num_interp;
         put(num_interp);
         put(regs.z_export_format);
@@ -1131,16 +1139,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (pre_compile_hook_) {
             pre_compile_hook_(pre_compile_user_);
         }
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader =
-            fetch_shader_ref ? fetch_shader_ref.Get()
-                             : std::optional<Shader::Gcn::FetchShaderData>{};
+        const Shader::Gcn::FetchShaderData* fetch_shader =
+            fetch_shader_ref ? &fetch_shader_ref.Get() : nullptr;
+        Shader::Gcn::FetchShaderData live_fetch{};
         if (!fetch_shader) {
             // A vertex stage that reads its attributes through a fetch shader must never get a
             // pipeline with no vertex input: the draw faults the GPU. Decode the live fetch
             // shader when the permutation resolve handed over none.
             const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
             if (vs_info && vs_info->has_fetch_shader) {
-                fetch_shader = Shader::Gcn::ParseFetchShader(*vs_info);
+                if (Shader::Gcn::ParseFetchShader(*vs_info, live_fetch)) {
+                    fetch_shader = &live_fetch;
+                }
                 LOG_WARNING(Render_Vulkan,
                             "Vertex shader {:#x} resolved without fetch shader data; decoded "
                             "live ({} attributes)",
@@ -1149,8 +1159,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
-            graphics_key, *pipeline_cache, infos, runtime_infos, std::move(fetch_shader), modules,
-            sdata, false);
+            graphics_key, *pipeline_cache, infos, runtime_infos, fetch_shader, modules, sdata,
+            false);
         constexpr auto full_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                                    vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
         for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
@@ -1171,7 +1181,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 }
             }
         }
-        fetch_shader_ref = {};
     }
     // memcpy keeps the padding bytes deterministic for the memcmp-based compare.
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
@@ -1706,7 +1715,8 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         bind_stage(HwStage::Vertex, SwStage::Vertex);
         break;
     default:
-        UNREACHABLE_MSG("unhandled stage_en: {}", (u32)regs.stage_enable.raw);
+        LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
+        return false;
     }
 
     const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
@@ -1714,7 +1724,7 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
-        for (const auto& attrib : fetch_shader_ref.Get()->attributes) {
+        for (const auto& attrib : fetch_shader_ref.Get().attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,

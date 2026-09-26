@@ -246,6 +246,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
+    bool marked = false;
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
@@ -255,8 +256,13 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
         image.MarkFastStateDirty();
+        marked = true;
     });
-    Skipcache::Framework::Instance().BumpImgDirtyGen();
+    // Every written storage buffer binding lands here; with no image marked
+    // nothing the dirty generation guards has changed.
+    if (marked) {
+        Skipcache::Framework::Instance().BumpImgDirtyGen();
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -386,9 +392,17 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
+        const bool pow2_padding_only =
+            image_info.props.is_pow2 != cache_image.info.props.is_pow2 &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.size == cache_image.info.size &&
+            image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
+            cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
+            cache_image.info.resources.layers == 1;
+
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size) {
+            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
@@ -1219,22 +1233,25 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     // If there is a stencil attachment, link depth and stencil.
     if (dsc_info.stencil_addr != 0) {
         ImageId stencil_id{};
-        ForEachImageInRegion(dsc_info.stencil_addr, dsc_info.stencil_size,
-                             [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == dsc_info.stencil_addr) {
-                                     stencil_id = image_id;
-                                 }
-                             });
-        if (!stencil_id) {
-            // The insert and the registration write structures other threads
-            // read under the mutex.
+        {
+            // The walk reads the page table and the picked bits that guest-thread
+            // registration, unmap and fault paths write under the mutex; the
+            // insert and the registration write them too.
             std::scoped_lock lock{mutex};
-            ImageInfo info{};
-            info.guest_address = dsc_info.stencil_addr;
-            info.guest_size = dsc_info.stencil_size;
-            info.size = dsc_info.size;
-            stencil_id = slot_images.insert(instance, runtime, slot_image_views, info);
-            RegisterImage(stencil_id);
+            ForEachImageInRegion(dsc_info.stencil_addr, dsc_info.stencil_size,
+                                 [&](ImageId image_id, Image& image) {
+                                     if (image.info.guest_address == dsc_info.stencil_addr) {
+                                         stencil_id = image_id;
+                                     }
+                                 });
+            if (!stencil_id) {
+                ImageInfo info{};
+                info.guest_address = dsc_info.stencil_addr;
+                info.guest_size = dsc_info.stencil_size;
+                info.size = dsc_info.size;
+                stencil_id = slot_images.insert(instance, runtime, slot_image_views, info);
+                RegisterImage(stencil_id);
+            }
         }
         Image& stencil_image = slot_images[stencil_id];
         TouchImageUnlocked(stencil_image, stencil_id);
@@ -1453,10 +1470,11 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     static_assert(sizeof(AmdGpu::Sampler) == 16);
     ++sampler_calls_;
     // Compare and plain uses of one S# need separate samplers, so the key carries
-    // is_depth in the S#'s reserved word-3 bits (unused1), which are masked out.
-    constexpr u64 kReservedBits = u64{0x3FFFF} << 42;
+    // is_depth in the S#'s reserved word-3 bits 12..29 (raw1 bits 44..61, between
+    // border_color_ptr and border_color_type), which are masked out.
+    constexpr u64 kReservedBits = u64{0x3FFFF} << 44;
     auto raw = std::bit_cast<std::array<u64, 2>>(sampler);
-    raw[1] = (raw[1] & ~kReservedBits) | (u64{is_depth} << 42);
+    raw[1] = (raw[1] & ~kReservedBits) | (u64{is_depth} << 44);
     // Every S# field reaches the set index: the filters, max_lod, border color
     // and clamp modes all sit above the low bits of either word.
     const u64 mix = (raw[0] ^ (raw[1] * 0x9E3779B97F4A7C15ULL)) * 0xC2B2AE3D27D4EB4FULL;
@@ -1778,7 +1796,7 @@ void TextureCache::TrackImage(ImageId image_id) {
         // Re-track the whole image
         image.track_addr = image_begin;
         image.track_addr_end = image_end;
-        tracker.UpdatePageWatchers<1>(image_begin, image.info.guest_size);
+        tracker.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track);
     } else {
         if (image_begin < image.track_addr) {
             TrackImageHead(image_id);
@@ -1801,7 +1819,7 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     ASSERT(image.track_addr != 0 && image_begin < image.track_addr);
     const auto size = image.track_addr - image_begin;
     image.track_addr = image_begin;
-    tracker.UpdatePageWatchers<1>(image_begin, size);
+    tracker.UpdatePageWatchers(image_begin, size, PageOp::Track);
 }
 
 void TextureCache::TrackImageTail(ImageId image_id) {
@@ -1817,7 +1835,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     const auto addr = image.track_addr_end;
     const auto size = image_end - image.track_addr_end;
     image.track_addr_end = image_end;
-    tracker.UpdatePageWatchers<1>(addr, size);
+    tracker.UpdatePageWatchers(addr, size, PageOp::Track);
 }
 
 void TextureCache::UntrackImage(ImageId image_id) {
@@ -1831,7 +1849,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     image.track_addr = 0;
     image.track_addr_end = 0;
     if (size != 0) {
-        tracker.UpdatePageWatchers<false>(addr, size);
+        tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
     }
 }
 
@@ -1851,7 +1869,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers<false>(image_begin, size);
+    tracker.UpdatePageWatchers(image_begin, size, PageOp::Untrack);
 }
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
@@ -1871,7 +1889,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers<false>(addr, size);
+    tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
 void TextureCache::GarbageCollectImages() {

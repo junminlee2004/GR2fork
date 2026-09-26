@@ -19,12 +19,6 @@ using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 
-// Access bits that make a subresource's current state a write that must be
-// ordered even when layout and access already match.
-constexpr vk::AccessFlags2 kWriteFlags = vk::AccessFlagBits2::eTransferWrite |
-                                         vk::AccessFlagBits2::eShaderWrite |
-                                         vk::AccessFlagBits2::eMemoryWrite;
-
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {
     vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
@@ -40,8 +34,10 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
             }
             // Always create images with storage flag to avoid needing re-creation in case of e.g
             // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
-            // flag is also used.
-            usage |= vk::ImageUsageFlagBits::eStorage;
+            // flag is also used. The exception here is for multisample images when storage is not
+            // supported, where even with ExtendedUsage we may get only one supported sample back.
+            if (info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
+                usage |= vk::ImageUsageFlagBits::eStorage;
         }
     } else {
         // Similarly to above, we specify storage usage. This is typically not supported by
@@ -286,7 +282,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
     // A partial transition into the state the whole image is already in would
     // materialize the vector only to fill it with identical values.
     if (needs_partial_transition && !partially_transited && last_state.layout == dst_layout &&
-        last_state.access_mask == dst_mask && !(last_state.access_mask & kWriteFlags)) {
+        last_state.access_mask == dst_mask) {
         RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
         return;
     }
@@ -302,9 +298,8 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
             backing->subres_stage_union = last_state.pl_stage;
         }
         const State base_state = last_state;
-        const bool dst_divergent = dst_layout != base_state.layout ||
-                                   dst_mask != base_state.access_mask ||
-                                   static_cast<bool>(dst_mask & kWriteFlags);
+        const bool dst_divergent =
+            dst_layout != base_state.layout || dst_mask != base_state.access_mask;
 
         // In case of partial transition, we need to change the specified subresources only.
         // Otherwise all subresources need to be set to the same state so we can use a full
@@ -328,8 +323,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 
-                const bool is_write = static_cast<bool>(state.access_mask & kWriteFlags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                if (state.layout != dst_layout || state.access_mask != dst_mask) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
@@ -349,8 +343,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                         },
                     });
                     const bool was_divergent = state.layout != base_state.layout ||
-                                               state.access_mask != base_state.access_mask ||
-                                               static_cast<bool>(state.access_mask & kWriteFlags);
+                                               state.access_mask != base_state.access_mask;
                     backing->subres_divergent +=
                         static_cast<u32>(dst_divergent) - static_cast<u32>(was_divergent);
                     state.layout = dst_layout;
@@ -374,12 +367,10 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
             BumpStateEpoch();
         }
     } else { // Full resource transition
-        const bool is_write = static_cast<bool>(last_state.access_mask & kWriteFlags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask) {
             RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
             return;
         }
-
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
@@ -409,6 +400,16 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
     if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
         last_state.pl_stage != dst_stage) {
         BumpStateEpoch();
+    }
+    // subres_divergent is counted against last_state; a partial transition
+    // moves it while the vector stays alive, so recount against the new base.
+    if (!subresource_states.empty() &&
+        (last_state.layout != dst_layout || last_state.access_mask != dst_mask)) {
+        u32 divergent = 0;
+        for (const State& s : subresource_states) {
+            divergent += static_cast<u32>(s.layout != dst_layout || s.access_mask != dst_mask);
+        }
+        backing->subres_divergent = divergent;
     }
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;

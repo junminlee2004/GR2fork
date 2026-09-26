@@ -184,6 +184,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         LOG_WARNING(Render_Vulkan, "stream_copy_workers needs the old buffer cache; it is off");
     }
 
+    scheduler.SetSessionCallback([this] {
+        buffer_cache.FlushSyncBatch(true);
+        // FlushSyncBatch starts a new command buffer without a submit, so the tick does not
+        // move; the bind state the skip caches recorded dies with the old command buffer.
+        last_bound_pipeline_ = {};
+        Skipcache::Framework::Instance().InvalidateAll();
+    });
+
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
@@ -522,17 +530,16 @@ bool Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     return glue_mode_ != 0 && probing && rt_memo_.valid && skipcache.MayConsume(CacheId::PrepareRt);
 }
 
-static std::pair<u32, u32> GetDrawOffsets(
-    const AmdGpu::Regs& regs, const Shader::Info& info,
-    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
+static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
+                                          const Shader::Gcn::FetchShaderData& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
-    if (fetch_shader) {
-        if (vertex_offset == 0 && fetch_shader->vertex_offset_sgpr != -1) {
-            vertex_offset = info.user_data[fetch_shader->vertex_offset_sgpr];
+    if (!fetch_shader.Empty()) {
+        if (vertex_offset == 0 && fetch_shader.vertex_offset_sgpr != -1) {
+            vertex_offset = info.user_data[fetch_shader.vertex_offset_sgpr];
         }
-        if (fetch_shader->instance_offset_sgpr != -1) {
-            instance_offset = info.user_data[fetch_shader->instance_offset_sgpr];
+        if (fetch_shader.instance_offset_sgpr != -1) {
+            instance_offset = info.user_data[fetch_shader.instance_offset_sgpr];
         }
     }
     return {vertex_offset, instance_offset};
@@ -1015,13 +1022,19 @@ void Rasterizer::OnSubmit() {
         }
     }
     skipcache.OnSubmit(DebugState.GetFrameNum(), DebugState.IsGuestThreadsPaused());
-    if (fault_process_pending) {
-        fault_process_pending = false;
-        buffer_cache.ProcessFaultBuffer();
-    }
+    buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
+}
+
+void Rasterizer::OnFence() {
+    // The downloads wait on the GPU, so the guest-copy hold goes first.
+    if (texture_cache.HasPendingDownloads()) {
+        DropCopyHold(hold_drops_wait_);
+    }
+    texture_cache.ProcessDownloadImages();
+    buffer_cache.FlushSyncBatch();
 }
 
 void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
@@ -1314,12 +1327,6 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
                  pushvp_probes_, pushvp_hits_, pushvp_udw_, pushvp_bow_);
         pushvp_probes_ = pushvp_hits_ = pushvp_udw_ = pushvp_bow_ = 0;
     }
-    // merged = cross-region pairs collapsed into one mprotect; flushed = carries
-    // no run absorbed.
-    if (const auto pc = page_manager.DrainProtectCarryStats(); pc.scopes != 0) {
-        LOG_INFO(Render_Skipcache, "[SkipCache] PCARRY scopes={} merged={} flushed={} per300f",
-                 pc.scopes, pc.merged, pc.flushed);
-    }
 }
 
 // ---- BindingSkip LEARNING probe (observe-only) ---------------------------
@@ -1514,7 +1521,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
-        fault_process_pending = true;
     }
 
     return true;
@@ -1914,7 +1920,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{gds_buf->Handle(), 0, gds_buf->SizeBytes()};
-                needs_barrier |= runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes());
+                bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.srt_info.flattened_bufsize_dw * sizeof(u32);
@@ -1956,6 +1962,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
+                lds_buffer.Commit();
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{lds_buffer.Handle(), offset, lds_size};
             } else {
@@ -1980,7 +1987,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{buffer->Handle(), offset_aligned, size + adjust};
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
-                if (desc.is_written && desc.is_formatted) {
+                if (desc.is_written) {
+                    // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
@@ -2182,7 +2190,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 } else {
                     needs_barrier |= runtime.Transit(
                         &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                        desc.view_info.range);
                 }
                 bound_layout = image.backing->state.layout;
             } else if (is_storage) {
@@ -2736,6 +2745,7 @@ const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) 
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image.backing->state.layout;
         attachment.clear_value = {};
+        attachment.is_clear = 0;
 
         if (regs.depth_buffer.DepthValid()) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
@@ -2837,7 +2847,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
+        !buffer_cache.IsRegionInSyncBatch(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
@@ -2874,12 +2885,12 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size);
+    buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     Skipcache::Framework::Instance().BumpMemGen();
     return true;
@@ -2891,21 +2902,14 @@ bool Rasterizer::TryCpWriteBacking(VAddr, const void*, u64) {
     return false;
 }
 
-bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
+bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.ReadMemory(addr, size);
+    buffer_cache.ReadMemory(addr, size, false, assume_locks);
     Skipcache::Framework::Instance().BumpMemGen();
     return true;
-}
-
-void Rasterizer::ProcessDownloadImages() {
-    if (texture_cache.HasPendingDownloads()) {
-        DropCopyHold(hold_drops_wait_);
-    }
-    texture_cache.ProcessDownloadImages();
 }
 
 // Async-signal-safe per-thread cache of positive IsMapped intervals; no lock on the
@@ -2974,13 +2978,15 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
     // acquire load so a thread observing the new generation observes the
     // new interval.
     mapped_ranges_gen_.fetch_add(1, std::memory_order_release);
+}
+
+void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
     page_manager.OnGpuMap(addr, size);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
-    page_manager.OnGpuUnmap(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -3403,5 +3409,15 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
             {(f32)((color >> 16) & 0xff) / 255.0f, (f32)((color >> 8) & 0xff) / 255.0f,
              (f32)(color & 0xff) / 255.0f, (f32)((color >> 24) & 0xff) / 255.0f})});
 }
+
+std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
+    return liverpool->GetGpuCommandProcessorThread();
+}
+
+#ifdef __linux__
+u32 Rasterizer::GetGpuCommandProcessorThreadId() {
+    return liverpool->GetGpuCommandProcessorThreadId();
+}
+#endif
 
 } // namespace Vulkan

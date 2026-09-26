@@ -180,7 +180,7 @@ public:
     void V_MAC_F32(const GcnInst& inst);
     void V_MADMK_F32(const GcnInst& inst);
     void V_BCNT_U32_B32(const GcnInst& inst);
-    void V_MBCNT_U32_B32(bool is_low, const GcnInst& inst);
+    void V_MBCNT_U32_B32(bool hi, const GcnInst& inst);
     void V_ADD_I32(const GcnInst& inst);
     void V_SUB_I32(const GcnInst& inst);
     void V_SUBREV_I32(const GcnInst& inst);
@@ -393,7 +393,7 @@ private:
     u32 next_vgpr_num;
     std::unordered_map<u32, IR::VectorReg> vgpr_map;
     std::array<IR::Attribute, MaxInterpVgpr> vgpr_to_interp{};
-    std::optional<FetchShaderData> fetch_data{};
+    FetchShaderData fetch_data{};
     bool opcode_missing = false;
     u32 pc{};
 };

@@ -7,7 +7,7 @@
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
-#include "video_core/buffer_cache//region_definitions.h"
+#include "video_core/buffer_cache/region_definitions.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -18,15 +18,15 @@ namespace VideoCore {
 struct UffdImpl;
 struct SignalImpl;
 
-class PageManager {
-    // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!
-    // Use the same page size as the tracker.
-    static constexpr size_t PM_PAGE_BITS = TRACKER_PAGE_BITS;
-    static constexpr size_t PM_PAGE_SIZE = TRACKER_BYTES_PER_PAGE;
+enum class PageOp : s8 {
+    None = 0,
+    Track = 1,
+    Untrack = -1,
+};
 
-    // Keep the lock granularity the same as region granularity. (since each regions has
-    // itself a lock)
-    static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
+class PageManager {
+    static constexpr size_t PM_PAGE_BITS = 12;
+    static constexpr size_t PM_PAGE_SIZE = 1ULL << PM_PAGE_BITS;
 
 public:
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
@@ -39,42 +39,12 @@ public:
     void OnGpuUnmap(VAddr address, size_t size);
 
     /// Updates watches in the pages touching the specified region.
-    template <bool track>
-    void UpdatePageWatchers(VAddr addr, u64 size) const;
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
 
-    /// Updates watches in the pages touching the specified region using a
-    /// mask; returns the number of protection calls issued.
-    template <bool track, bool is_read = false>
-    u32 UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
-
-    /// Opens a protect-carry scope on the calling thread (protect_carry_merge).
-    /// Inside one, a per-region watcher update whose last run ends exactly at
-    /// the region boundary keeps its region lock and defers its mprotect, so
-    /// the next region's leading run can be issued as one cross-region call.
-    /// ONLY legal on the GPU command thread, and only around loops that call
-    /// nothing but UpdatePageWatchersForRegion: see the lock-order note at the
-    /// carry site in page_manager.cpp. Callers certify that with an explicit
-    /// flag, and the named sites are Rasterizer::DrainPendingReadArms for every
-    /// ReadArmSite but Submit, plus BufferCache::FinishFaultDownload's
-    /// PendingUnmark and DrainPendingReadReleases; everything else, the
-    /// guest-thread DropPendingReadArms unmap route included, passes false.
-    /// BeginProtectCarry asserts that only one thread ever opens a scope.
-    /// Always paired through ProtectCarryScope.
-    void BeginProtectCarry() const;
-    void EndProtectCarry() const;
-
-    struct ProtectCarryStats {
-        u64 scopes;
-        u64 merged;
-        u64 flushed;
-    };
-    ProtectCarryStats DrainProtectCarryStats() const;
-
-    /// Returns true if any page touched by [addr, addr + size) currently holds a
-    /// write watcher (i.e. it is mapped PROT_READ and a guest store to it would
-    /// fault). An address outside the tracked low 40 bits answers false.
-    /// Diagnostic only: raced against concurrent arms/releases, never branched on.
-    bool IsWriteWatched(VAddr addr, u64 size) const;
+    /// Updates watches in the pages touching the inclusive bounds using a mask.
+    void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                     const RegionBits& write_mask, const RegionBits& read_mask,
+                                     PageOp write_op, PageOp read_op) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
@@ -91,29 +61,6 @@ private:
     friend struct SignalImpl;
     struct Impl;
     std::unique_ptr<Impl> impl;
-};
-
-/// RAII protect-carry scope. Never open one with two bare calls: the carry
-/// holds a page-manager lock, so any path that skipped the close would hang
-/// the next guest fault in that region.
-class ProtectCarryScope {
-public:
-    explicit ProtectCarryScope(const PageManager& pm_, bool enable_) : pm{pm_}, enable{enable_} {
-        if (enable) {
-            pm.BeginProtectCarry();
-        }
-    }
-    ~ProtectCarryScope() {
-        if (enable) {
-            pm.EndProtectCarry();
-        }
-    }
-    ProtectCarryScope(const ProtectCarryScope&) = delete;
-    ProtectCarryScope& operator=(const ProtectCarryScope&) = delete;
-
-private:
-    const PageManager& pm;
-    bool enable;
 };
 
 } // namespace VideoCore

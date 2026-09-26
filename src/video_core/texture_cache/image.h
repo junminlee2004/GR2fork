@@ -261,10 +261,10 @@ public:
         u64 noop_range{};
         std::vector<State> subresource_states;
         // Count of subresource_states entries whose layout or access differ from
-        // `state` or that carry write access; `state` is frozen while the vector is
-        // alive, so the count is stable. Zero means the vector is equivalent to
-        // empty. Stages are excluded (they do not affect the scan's skip
-        // condition); subres_stage_union carries them instead.
+        // `state`; GetBarriersSlow recounts it whenever `state` moves while the
+        // vector is alive. Zero means the vector is equivalent to empty. Stages
+        // are excluded (they do not affect the scan's skip condition);
+        // subres_stage_union carries them instead.
         u32 subres_divergent{};
         vk::PipelineStageFlags2 subres_stage_union{};
         // The handle rides beside its key so a view hit ends here instead of

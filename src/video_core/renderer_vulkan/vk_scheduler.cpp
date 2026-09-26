@@ -22,7 +22,7 @@ Scheduler::Scheduler(const Instance& instance)
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
     pop_poll_throttle_ = std::max<u32>(EmulatorSettings.GetPendingPopThrottle(), 1u);
-    AllocateWorkerCommandBuffers();
+    BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
@@ -94,7 +94,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    current_cmdbuf.beginRendering(rendering_info);
+    CommandBuffer().beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -102,7 +102,20 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    current_cmdbuf.endRendering();
+    CommandBuffer().endRendering();
+}
+
+vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    auto& upload_cmdbuf = sessions.back().upload;
+    if (upload_cmdbuf) {
+        return upload_cmdbuf;
+    }
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    upload_cmdbuf = command_pool.Commit();
+    Check(upload_cmdbuf.begin(begin_info));
+    return upload_cmdbuf;
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -171,13 +184,16 @@ void Scheduler::PopPendingOperations() {
     }
 }
 
-void Scheduler::AllocateWorkerCommandBuffers() {
+void Scheduler::BeginSession() {
+    EndSession();
+
+    auto& session = sessions.emplace_back();
+
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
-
-    current_cmdbuf = command_pool.Commit();
-    Check(current_cmdbuf.begin(begin_info));
+    session.primary = command_pool.Commit();
+    Check(session.primary.begin(begin_info));
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -190,6 +206,24 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         new (profiler_scope) tracy::VkCtxScope{profiler_ctx, &scope_loc, current_cmdbuf, true};
     }
 #endif
+}
+
+void Scheduler::EndSession() {
+    if (sessions.empty()) {
+        return;
+    }
+
+    if (on_session) {
+        on_session();
+    }
+
+    const auto& session = sessions.back();
+    if (session.upload) {
+        Check(session.upload.end());
+    }
+
+    EndRendering();
+    Check(session.primary.end());
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
@@ -220,8 +254,18 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         on_submit(info);
     }
 
-    EndRendering();
-    Check(current_cmdbuf.end());
+    EndSession();
+
+    std::vector<vk::CommandBuffer> cmd_buffers;
+    cmd_buffers.reserve(sessions.size() * 2);
+
+    for (const auto& session : sessions) {
+        if (session.upload) {
+            cmd_buffers.push_back(session.upload);
+        }
+        cmd_buffers.push_back(session.primary);
+    }
+    sessions.clear();
 
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
@@ -243,8 +287,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = 1U,
-        .pCommandBuffers = &current_cmdbuf,
+        .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
+        .pCommandBuffers = cmd_buffers.data(),
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
@@ -254,7 +298,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
-    AllocateWorkerCommandBuffers();
+    BeginSession();
 
     // Apply pending operations
     PopPendingOperations();

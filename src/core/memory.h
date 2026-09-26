@@ -154,6 +154,20 @@ struct VirtualMemoryArea {
 
         return true;
     }
+
+    void ForEachPhysArea(u64 offset, u64 size, auto&& func) {
+        if (size == 0) {
+            return;
+        }
+        const u64 end = offset + size;
+        auto it = std::prev(phys_areas.upper_bound(offset));
+        for (; it != phys_areas.end() && it->first < end; ++it) {
+            const auto& pma = it->second;
+            const u64 clip_start = std::max<u64>(it->first, offset);
+            const u64 clip_end = std::min<u64>(it->first + pma.size, end);
+            func(pma.base + (clip_start - it->first), clip_end - clip_start);
+        }
+    }
 };
 
 class MemoryManager {
@@ -245,8 +259,8 @@ public:
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
     /// Holds the memory map's shared lock open for a batch of guest copies: while
-    /// tls_in_guest_copy_scope is set, CopySparseMemory, ResolveBackingSpans and TryWriteBacking
-    /// skip their own acquisition. The mutex is recursive-shared, so nesting is safe and only the
+    /// tls_in_guest_copy_scope is set, ResolveBackingSpans and TryWriteBacking skip their own
+    /// acquisition. The mutex is recursive-shared, so nesting is safe and only the
     /// outermost scope takes ownership.
     class GuestCopyScope {
     public:
@@ -404,7 +418,7 @@ private:
     VAddr vma_span_begin{};
     VAddr vma_span_end{};
     /// Incremented on every structural change to vma_map. Readers holding the
-    /// shared lock may cache lookups against it; see CopySparseMemory.
+    /// shared lock may cache lookups against it; see TryWriteBacking.
     u64 vma_generation{1};
     bool backing_write_memo_{};
     Common::SharedFirstMutex mutex{};

@@ -101,12 +101,12 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
 }
 
 // Every queued lane copy still reads guest memory that the fence tells the guest it may reuse,
-// so the lanes drain before anything guest-visible is written. Then the downloads, so a fence
-// sees them.
+// so the lanes drain before anything guest-visible is written. Then the downloads and the sync
+// batch, so a fence sees them.
 static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer) {
-        rasterizer->ProcessDownloadImages();
+        rasterizer->OnFence();
     }
 }
 
@@ -318,6 +318,9 @@ void Liverpool::DrainCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+#ifdef __linux__
+    gpu_tid = gettid();
+#endif
     // gpu_thread_core_reserve: own a physical core, strip it from every other thread, and keep
     // stripping, since Windows threads do not inherit their creator's affinity.
     if (const u64 mask = Common::GetReservedCoreMask()) {
@@ -417,8 +420,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+            const u32 size = dump_const->Size();
+            if (rasterizer) {
+                auto& buffer_cache = rasterizer->GetBufferCache();
+                if (buffer_cache.IsRegionInSyncBatch(dump_const->Address<VAddr>(), size)) {
+                    buffer_cache.FlushSyncBatch();
+                }
+            }
             const void* const dump_src = cblock.constants_heap.data() + dump_const->Offset();
-            CpWriteOrCopy(rasterizer, dump_const->Address<void*>(), dump_src, dump_const->Size());
+            CpWriteOrCopy(rasterizer, dump_const->Address<void*>(), dump_src, size);
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -1011,9 +1021,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             FenceDrainAndDownload(rasterizer);
             event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                 auto* memory = Core::Memory::Instance();
-                if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                    memcpy(address, &data, num_bytes);
-                }
+                ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
             });
             if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                 ASSERT(event_eos->size == 1);
@@ -1031,9 +1039,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             event_eop->SignalFence(
                 [](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
-                    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        memcpy(address, &data, num_bytes);
-                    }
+                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                 },
                 [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
             break;
@@ -1079,6 +1085,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                FenceDrainAndDownload(rasterizer);
                 CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data,
                               data_size);
             } else {
@@ -1460,6 +1467,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                FenceDrainAndDownload(rasterizer);
                 CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data,
                               data_size);
             } else {
