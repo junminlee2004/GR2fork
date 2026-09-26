@@ -524,6 +524,10 @@ struct GPUSettings {
     // threads can then share a core. Windows otherwise packs busy threads onto both hyperthreads
     // of a few cores while others idle. Works together with gpu_thread_core_reserve.
     Setting<bool> one_thread_per_core{false};
+    // Allocate the 512 MB direct memory access page table only when a shader binds it. With
+    // direct_memory_access off no shader does, so the table and the page updates that end the
+    // render pass on every buffer creation and deletion are skipped.
+    Setting<bool> lazy_dma_page_table{false};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -901,6 +905,7 @@ struct GPUSettings {
             GPU_OVERRIDE(tracker_lock_spin_rounds),
             GPU_OVERRIDE(gpu_thread_core_reserve),
             GPU_OVERRIDE(one_thread_per_core),
+            GPU_OVERRIDE(lazy_dma_page_table),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(protect_carry_merge),
             GPU_OVERRIDE(stream_buffer_prefer_host),
@@ -1027,7 +1032,7 @@ struct GPUSettings {
     findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, \
     readback_wait_notify, readback_window_kb, deferred_read_release, image_fast_state, \
     guest_copy_lock_batch, spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, \
-    userfaultfd, gpu_thread_core_reserve, one_thread_per_core
+    userfaultfd, gpu_thread_core_reserve, one_thread_per_core, lazy_dma_page_table
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1317,6 +1322,7 @@ public:
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
     SETTING_FORWARD_BOOL(m_gpu, GpuThreadCoreReserve, gpu_thread_core_reserve)
     SETTING_FORWARD_BOOL(m_gpu, OneThreadPerCore, one_thread_per_core)
+    SETTING_FORWARD_BOOL(m_gpu, LazyDmaPageTable, lazy_dma_page_table)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD_BOOL(m_gpu, ProtectCarryMerge, protect_carry_merge)
     SETTING_FORWARD_BOOL(m_gpu, StreamBufferPreferHost, stream_buffer_prefer_host)

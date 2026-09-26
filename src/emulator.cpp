@@ -597,6 +597,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     if (EmulatorSettings.IsOneThreadPerCore()) {
         Common::RestrictProcessToOneThreadPerCore();
     }
+    LOG_INFO(Config, "GPU lazyDmaPageTable: {}", EmulatorSettings.IsLazyDmaPageTable());
     LOG_INFO(Config, "GPU ringDrainFlushDraws: {}", EmulatorSettings.GetRingDrainFlushDraws());
     LOG_INFO(Config, "GPU protectCarryMerge: {}", EmulatorSettings.IsProtectCarryMerge());
     LOG_INFO(Config, "GPU readbackBatching: {}", EmulatorSettings.IsReadbackBatchingEnabled());

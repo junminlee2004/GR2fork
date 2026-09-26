@@ -89,9 +89,12 @@ public:
         return &gds_buffer;
     }
 
-    /// Retrieves the device local DBA page table buffer.
-    [[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept {
-        return &bda_pagetable_buffer;
+    /// Retrieves the device local DBA page table buffer, building it on first use.
+    [[nodiscard]] Buffer* GetBdaPageTableBuffer() {
+        if (!bda_pagetable_buffer) [[unlikely]] {
+            BuildBdaPageTable();
+        }
+        return &*bda_pagetable_buffer;
     }
 
     /// Retrieves the fault buffer.
@@ -486,6 +489,12 @@ private:
 
     void WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 
+    void CreateBdaPageTable();
+
+    void BuildBdaPageTable();
+
+    void WriteBdaEntries(const Buffer& buffer);
+
     void TouchBuffer(const Buffer& buffer);
 
     void DeleteBuffer(BufferId buffer_id);
@@ -541,7 +550,7 @@ private:
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;
     Buffer gds_buffer;
-    Buffer bda_pagetable_buffer;
+    std::optional<Buffer> bda_pagetable_buffer;
     Common::SlotVector<Buffer> slot_buffers;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
