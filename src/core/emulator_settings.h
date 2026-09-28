@@ -466,6 +466,12 @@ struct GPUSettings {
     // which first copies the image into its buffer. Nothing is copied for images the CPU never
     // reads. Needs readbacks_mode Precise (the read faults); otherwise the eager path stays.
     Setting<bool> readback_linear_images_lazy{false};
+    // readback_linear_images_async: with readback_linear_images, a fence no longer waits for the
+    // GPU. Each queued image is copied into its own staging buffer, and a background thread writes
+    // it to guest memory once the GPU finishes, so the guest sees the pixels up to a frame late.
+    // Nothing is protected or tracked and any readbacks_mode works. Suits values a game reads
+    // every frame, like exposure and lighting, not one-off reads. Takes precedence over lazy.
+    Setting<bool> readback_linear_images_async{false};
     Setting<u32> adaptive_skipcaches_mode{AdaptiveSkipCachesMode::SkipCachesDisabled};
     // Size of the uniform stream ring in MiB. The ring blocks the GPU command
     // thread whenever it wraps, until the GPU drains the previous lap, so a
@@ -893,6 +899,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_linear_images_enabled),
             make_override<GPUSettings>("readback_linear_images_lazy",
                                        &GPUSettings::readback_linear_images_lazy),
+            make_override<GPUSettings>("readback_linear_images_async",
+                                       &GPUSettings::readback_linear_images_async),
             GPU_OVERRIDE(adaptive_skipcaches_mode),
             GPU_OVERRIDE(stream_buffer_size_mb),
             GPU_OVERRIDE(readback_batching_enabled),
@@ -1032,7 +1040,8 @@ struct GPUSettings {
     findimg_slot_hint, bind_image_lean, desc_delta_flat, draw_glue_memo, \
     readback_wait_notify, readback_window_kb, deferred_read_release, image_fast_state, \
     guest_copy_lock_batch, spec_fp_cache, cp_write_backing, runtime_info_stamp_gate, \
-    userfaultfd, gpu_thread_core_reserve, one_thread_per_core, lazy_dma_page_table
+    userfaultfd, gpu_thread_core_reserve, one_thread_per_core, lazy_dma_page_table, \
+    readback_linear_images_async
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1423,6 +1432,7 @@ public:
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesLazy, readback_linear_images_lazy)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesAsync, readback_linear_images_async)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)

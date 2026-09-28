@@ -605,6 +605,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              EmulatorSettings.IsReadbackLinearImagesEnabled());
     LOG_INFO(Config, "GPU readbackLinearImagesLazy: {}",
              EmulatorSettings.IsReadbackLinearImagesLazy());
+    LOG_INFO(Config, "GPU readbackLinearImagesAsync: {}",
+             EmulatorSettings.IsReadbackLinearImagesAsync());
     LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
     LOG_INFO(Config, "GPU shouldDumpShaders: {}", EmulatorSettings.IsDumpShaders());
     LOG_INFO(Config, "GPU vblankFrequency: {}", EmulatorSettings.GetVblankFrequency());
