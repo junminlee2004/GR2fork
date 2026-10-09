@@ -432,13 +432,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // GPU settings
 // -------------------------------
 struct GPUSettings {
-    Setting<u32> window_width{1280};
-    Setting<u32> window_height{720};
+    Setting<u32> window_width{1280};  // 720p for 4GB VRAM
+    Setting<u32> window_height{720};   // 720p for 4GB VRAM
     Setting<u32> internal_screen_width{1280};
     Setting<u32> internal_screen_height{720};
     Setting<bool> null_gpu{false};
     Setting<bool> copy_gpu_buffers{false};
-    Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
+    Setting<u32> readbacks_mode{GpuReadbacksMode::Relaxed};  // Optimized for 4GB VRAM (Shadlix)
     Setting<bool> readback_linear_images_enabled{false};
     // readback_linear_images_async: with readback_linear_images, a fence no longer waits for the
     // GPU. Each queued image is copied into its own staging buffer, and a background thread writes
@@ -713,7 +713,7 @@ struct GPUSettings {
     Setting<std::string> full_screen_mode{"Windowed"};
     Setting<std::string> present_mode{"Mailbox"};
     Setting<bool> hdr_allowed{false};
-    Setting<bool> fsr_enabled{false};
+    Setting<bool> fsr_enabled{true};  // Optimized for 4GB VRAM (FSR upscaling)
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
@@ -867,7 +867,7 @@ struct VulkanSettings {
     Setting<s32> gpu_id{-1};
     Setting<bool> renderdoc_enabled{false};
     Setting<bool> vkvalidation_enabled{false};
-    Setting<bool> vkvalidation_core_enabled{true};
+    Setting<bool> vkvalidation_core_enabled{false};  // Disabled for performance (4GB VRAM)
     Setting<bool> vkvalidation_sync_enabled{false};
     Setting<bool> vkvalidation_gpu_enabled{false};
     Setting<bool> vkcrash_diagnostic_enabled{false};

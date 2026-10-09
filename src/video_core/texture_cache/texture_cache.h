@@ -40,7 +40,7 @@ class PageManager;
 
 class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
-    static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
+    static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 2_GB;  // Optimized for 4GB VRAM systems
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
 
     struct BucketEntry {

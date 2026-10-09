@@ -104,6 +104,17 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         return;
     }
 
+    // Optimized GC profile for 4GB VRAM systems: more aggressive thresholds
+    // to prevent OutOfDeviceMemory crashes on GPUs with <= 4GB VRAM.
+    const s64 device_local_memory_early = static_cast<s64>(instance.GetTotalMemoryBudget());
+    if (device_local_memory_early <= 4_GB) {
+        // Trigger GC earlier when approaching the VRAM ceiling
+        pressure_gc_memory = static_cast<u64>(device_local_memory_early / 2);
+        critical_gc_memory = static_cast<u64>(device_local_memory_early * 3 / 4);
+        trigger_gc_memory = static_cast<u64>(device_local_memory_early / 4);
+        return;
+    }
+
     const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
     const s64 min_spacing_expected = device_local_memory - 1_GB;
     const s64 min_spacing_critical = device_local_memory - 512_MB;
