@@ -139,6 +139,22 @@ public:
         m_ranges_map.add({interval, value});
     }
 
+    /// Maps the range to the value, replacing the values it held; ranges that end up with equal
+    /// values join. A range already mapped to the value is left alone.
+    void Set(VAddr base_address, size_t size, const T& value) {
+        if (size == 0) {
+            return;
+        }
+        const VAddr end_address = base_address + size;
+        IntervalType interval{base_address, end_address};
+        const auto it = m_ranges_map.find(base_address);
+        if (it != m_ranges_map.end() && it->second == value &&
+            boost::icl::contains(it->first, interval)) {
+            return;
+        }
+        m_ranges_map.set({interval, value});
+    }
+
     void Subtract(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};

@@ -55,6 +55,26 @@ public:
         });
     }
 
+    /// Calls func(manager, region base address, range start, range size) for the part of the
+    /// range inside each existing region, with that region's lock held.
+    void ForEachRegionLocked(VAddr cpu_addr, u64 size, auto&& func) {
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 page_offset = cpu_addr & HIGHER_PAGE_MASK;
+        while (size > 0) {
+            const u64 amount = std::min(HIGHER_PAGE_SIZE - page_offset, size);
+            if (auto* manager = top_tier[page_index]; manager) {
+                const VAddr region_base = page_index << HIGHER_PAGE_BITS;
+                const auto bounds = manager->GetBounds(page_offset, amount);
+                manager->Lock(bounds);
+                func(manager, region_base, region_base + page_offset, amount);
+                manager->Unlock(bounds);
+            }
+            page_index++;
+            page_offset = 0;
+            size -= amount;
+        }
+    }
+
     /// Mark region as modified from the CPU
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
