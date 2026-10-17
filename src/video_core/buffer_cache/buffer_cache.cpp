@@ -26,6 +26,8 @@ namespace VideoCore {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+// Every readback window lies inside one tracker region.
+static_assert(HIGHER_PAGE_SIZE % BufferCache::READBACK_WINDOW_SIZE == 0);
 constexpr std::optional<u32> CmaskColorExpandedValue(u32 num_samples) {
     switch (num_samples) {
     case 1:
@@ -128,7 +130,8 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
-    gpu_modified_ranges.Subtract(device_addr, size);
+    std::scoped_lock lk{gpu_writes_mutex};
+    gpu_writes.Subtract(device_addr, size);
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
@@ -137,16 +140,21 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
-
-        // GPU-modified ranges come as many small scattered islands,
-        // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
-        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
-        const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
-        DownloadMemory(arena, window_start, window_end - window_start, is_write, async);
+        VAddr start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+        VAddr end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
+        if (!async) {
+            // GPU-modified ranges come as many small scattered islands, so a fault's download is
+            // widened to a window around the request and ends on the page boundary the consume
+            // clears up to; an asynchronous download covers exactly the pages of its range.
+            const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+            start = std::max<VAddr>(Common::AlignDown(device_addr, READBACK_WINDOW_SIZE),
+                                    arena->cpu_addr);
+            end = std::min<VAddr>(std::max<VAddr>(start + READBACK_WINDOW_SIZE, end), arena_end);
+        }
+        DownloadMemory(arena, start, end - start, async);
+        if (is_write) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
     };
     if (assume_locks) {
         flush_request();
@@ -155,29 +163,44 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool is_write,
-                                 bool async) {
-    boost::container::small_vector<vk::BufferCopy, 1> copies;
-    u64 total_size_bytes = 0;
-    const VAddr arena_base = arena->cpu_addr;
-    memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
-        const auto add_download = [&](VAddr start, VAddr end) {
-            const u64 new_offset = start - arena_base;
-            const u64 new_size = end - start;
-            copies.push_back(vk::BufferCopy{
-                .srcOffset = new_offset,
-                .dstOffset = total_size_bytes,
-                .size = new_size,
-            });
-            // Align up to avoid cache conflicts
-            constexpr u64 align = 64ULL;
-            constexpr u64 mask = ~(align - 1ULL);
-            total_size_bytes += (new_size + align - 1) & mask;
-        };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
+u64 BufferCache::CollectWrites(const Buffer* arena, VAddr device_addr, u64 size, u64 tick,
+                               ReadbackCopies& copies) {
+    u64 total_size = copies.empty() ? 0 : copies.back().dstOffset + copies.back().size;
+    std::scoped_lock lk{gpu_writes_mutex};
+    gpu_writes.ForEachInRange(device_addr, size, [&](VAddr begin, VAddr end, u64 write_tick) {
+        if (write_tick > tick) {
+            return;
+        }
+        copies.push_back(vk::BufferCopy{
+            .srcOffset = arena->Offset(begin),
+            .dstOffset = total_size,
+            .size = end - begin,
+        });
+        total_size += end - begin;
     });
+    return total_size;
+}
+
+void BufferCache::WriteBack(VAddr arena_base, const ReadbackCopies& copies, const u8* mapped,
+                            u64 staging_offset) const {
+    for (const auto& copy : copies) {
+        memory->TryWriteBacking(std::bit_cast<u8*>(arena_base + copy.srcOffset),
+                                mapped + (copy.dstOffset - staging_offset), copy.size);
+    }
+}
+
+void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
+    ReadbackCopies copies;
+    const VAddr arena_base = arena->cpu_addr;
+    const u64 total_size_bytes =
+        CollectWrites(arena, device_addr, size, scheduler.CurrentTick(), copies);
     if (total_size_bytes == 0) {
+        // A page GPU modified without a GPU write to copy would fault forever.
+        if (memory_tracker->IsRegionGpuModified(device_addr, size)) {
+            LOG_WARNING(Render_Vulkan, "GPU modified pages without a GPU write at {:#x}",
+                        device_addr);
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        }
         return;
     }
     const auto download =
@@ -186,20 +209,15 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
+    const u64 record_tick = scheduler.CurrentTick();
 
-    const auto write_data = [this, arena_base, device_addr, size, download, is_write, async,
+    const auto write_data = [this, arena_base, device_addr, size, download, async, record_tick,
                              copies = std::move(copies)] {
         download.Invalidate();
-        for (const auto& copy : copies) {
-            auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-            memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                    copy.size);
-        }
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
-        if (is_write) {
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-        }
-
+        WriteBack(arena_base, copies, download.mapped, download.offset);
+        // After the synchronous wait every write the copy found has executed, including the
+        // writes of a packet still being bound, which the commit after its record marks again.
+        ConsumeGpuWrites(device_addr, size, async ? record_tick : scheduler.CurrentTick());
         if (async) {
             staging_pool.FreeDeferred(download);
         }
@@ -211,6 +229,44 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         scheduler.Finish();
         write_data();
     }
+}
+
+void BufferCache::ConsumeGpuWrites(VAddr device_addr, u64 size, u64 known_tick) {
+    // The pages are cleared whole, so the writes are erased whole as well.
+    const VAddr page_start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+    const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
+    memory_tracker->ForEachRegionLocked(
+        page_start, page_end - page_start,
+        [&](RegionManager* manager, VAddr region_base, VAddr start, u64 len) {
+            std::array<u64, NUM_REGION_WORDS> consumed{};
+            std::array<u64, NUM_REGION_WORDS> kept{};
+            const auto mark_pages = [&](std::array<u64, NUM_REGION_WORDS>& pages, VAddr begin,
+                                        VAddr end) {
+                RegionManager::IterateWords(
+                    RegionManager::GetBounds(begin - region_base, end - begin),
+                    [&](u64 index, u64 mask) { pages[index] |= mask; });
+            };
+            boost::container::small_vector<Range, 32> erased;
+            // The map lock stays held through the clear: a write marked meanwhile either shows
+            // up here with a newer tick and keeps its pages, or finds the pages clear afterwards
+            // and sets them again.
+            std::scoped_lock lk{gpu_writes_mutex};
+            gpu_writes.ForEachInRange(start, len, [&](VAddr begin, VAddr end, u64 tick) {
+                if (tick <= known_tick) {
+                    mark_pages(consumed, begin, end);
+                    erased.push_back({begin, end - begin});
+                } else {
+                    mark_pages(kept, begin, end);
+                }
+            });
+            for (const auto& [addr, erased_size] : erased) {
+                gpu_writes.Subtract(addr, erased_size);
+            }
+            for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+                consumed[index] &= ~kept[index];
+            }
+            manager->ChangeRegionStateMasked<StateOp::None, StateOp::Clear>(consumed);
+        });
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
@@ -232,11 +288,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     EnsureResident(arena, first_block, last_block);
     if (is_written) {
         texture_cache.MarkAsMaybeGpuDirty(device_addr, size);
+        MarkGpuWrite(device_addr, size);
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
-    }
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -260,9 +314,46 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
+    // The copy is recorded already, so its write belongs to the open batch.
     texture_cache.MarkAsMaybeGpuDirty(addr, size);
+    StampGpuWrite(addr, size);
     memory_tracker->MarkRegionAsGpuModified(addr, size);
-    gpu_modified_ranges.Add(addr, size);
+}
+
+void BufferCache::StampGpuWrite(VAddr device_addr, u64 size) {
+    const u64 tick = scheduler.CurrentTick();
+    std::scoped_lock lk{gpu_writes_mutex};
+    gpu_writes.Set(device_addr, size, tick);
+}
+
+void BufferCache::MarkGpuWrite(VAddr device_addr, u64 size) {
+    StampGpuWrite(device_addr, size);
+    in_flight.push_back({device_addr, size});
+}
+
+void BufferCache::CommitGpuWrites() {
+    // A flush between the binds and the record moved the packet into the current batch, and a
+    // synchronous download on this thread meanwhile consumed the writes it found: they are
+    // stamped and marked again.
+    if (in_flight_moved) {
+        for (const auto& [addr, size] : in_flight) {
+            StampGpuWrite(addr, size);
+            memory_tracker->MarkRegionAsGpuModified(addr, size);
+        }
+        in_flight_moved = false;
+    }
+    in_flight.clear();
+}
+
+void BufferCache::MoveInFlightWrites() {
+    if (in_flight.empty()) {
+        return;
+    }
+    // The submit took the batch the stamps name; the packet records into the one being opened.
+    for (const auto& [addr, size] : in_flight) {
+        StampGpuWrite(addr, size);
+    }
+    in_flight_moved = true;
 }
 
 void BufferCache::ReadEdgeImagePages(const Image& image) {
@@ -274,25 +365,16 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
     const VAddr image_end = image_addr + image_size;
     const VAddr page_start = PageManager::GetPageAddr(image_addr);
     const VAddr page_end = PageManager::GetNextPageAddr(image_end - 1);
-    boost::container::small_vector<vk::BufferCopy, 2> copies;
-    u64 total_size_bytes = 0;
     const auto [buffer, offset] = ObtainBuffer(page_start, page_end - page_start);
-    const auto add_download = [&](VAddr start, VAddr end) {
-        const u64 new_offset = start - buffer->CpuAddr();
-        const u64 new_size = end - start;
-        copies.push_back(vk::BufferCopy{
-            .srcOffset = new_offset,
-            .dstOffset = total_size_bytes,
-            .size = new_size,
-        });
-        // Align up to avoid cache conflicts
-        constexpr u64 align = 64ULL;
-        constexpr u64 mask = ~(align - 1ULL);
-        total_size_bytes += (new_size + align - 1) & mask;
-    };
-    gpu_modified_ranges.ForEachInRange(page_start, image_addr - page_start, add_download);
-    gpu_modified_ranges.ForEachInRange(image_end, page_end - image_end, add_download);
-    gpu_modified_ranges.Subtract(page_start, page_end - page_start);
+    ReadbackCopies copies;
+    const u64 tick = scheduler.CurrentTick();
+    CollectWrites(buffer, page_start, image_addr - page_start, tick, copies);
+    const u64 total_size_bytes =
+        CollectWrites(buffer, image_end, page_end - image_end, tick, copies);
+    {
+        std::scoped_lock lk{gpu_writes_mutex};
+        gpu_writes.Subtract(page_start, page_end - page_start);
+    }
     if (total_size_bytes == 0) {
         return;
     }
@@ -307,13 +389,7 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
     scheduler.DeferOperation(
         [this, base = buffer->CpuAddr(), download, copies = std::move(copies)]() {
             download.Invalidate();
-            auto* memory = Core::Memory::Instance();
-            for (const auto& copy : copies) {
-                const VAddr copy_device_addr = base + copy.srcOffset;
-                const u64 dst_offset = copy.dstOffset - download.offset;
-                memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
-                                        download.mapped + dst_offset, copy.size);
-            }
+            WriteBack(base, copies, download.mapped, download.offset);
             staging_pool.FreeDeferred(download);
         });
 }

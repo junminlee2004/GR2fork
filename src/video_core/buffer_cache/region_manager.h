@@ -111,6 +111,35 @@ public:
         }
     }
 
+    /// ChangeRegionState over the pages a word mask selects, under the lock the caller holds.
+    template <StateOp cpu_op, StateOp gpu_op>
+    void ChangeRegionStateMasked(const std::array<u64, NUM_REGION_WORDS>& pages) {
+        bool update_watchers{};
+        // The watcher update reads every word between the first and the last changed one, and
+        // only the words the mask selects are computed below.
+        RegionBits write_prot{};
+        RegionBits read_prot{};
+        Bounds watcher_bounds = MIN_BOUNDS;
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            if (pages[index] != 0) {
+                update_watchers |= UpdateProtection<cpu_op, gpu_op>(
+                    write_prot, read_prot, watcher_bounds, index, pages[index]);
+            }
+        }
+        const auto write_op = GetPageOp<Type::CPU>(cpu_op);
+        const auto read_op = GetPageOp<Type::GPU>(gpu_op);
+        update_watchers &= write_op != PageOp::None || read_op != PageOp::None;
+        if (update_watchers) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                 write_op, read_op);
+        }
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            if (pages[index] != 0) {
+                UpdateState<cpu_op, gpu_op>(index, pages[index]);
+            }
+        }
+    }
+
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
     void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
         auto bounds = GetBounds(offset, size);

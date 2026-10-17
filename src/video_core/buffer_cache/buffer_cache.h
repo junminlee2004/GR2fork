@@ -4,6 +4,8 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/enum.h"
@@ -55,6 +57,9 @@ class BufferCache {
     static constexpr u64 STREAM_THRESHOLD = 16_KB;
 
 public:
+    /// A readback serves the GPU writes of one window at a time.
+    static constexpr u64 READBACK_WINDOW_SIZE = 512_KB;
+
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
@@ -104,6 +109,18 @@ public:
     /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image.
     void ReadEdgeImagePages(const Image& image);
 
+    using ReadbackCopies = boost::container::small_vector<vk::BufferCopy, 2>;
+
+    /// Appends the GPU writes of a range stamped up to tick as copies from the arena into a staging
+    /// buffer, packed behind the copies already listed. Returns the packed size of the list.
+    u64 CollectWrites(const Buffer* arena, VAddr device_addr, u64 size, u64 tick,
+                      ReadbackCopies& copies);
+
+    /// Writes the copies of a staging buffer, whose host mapping starts at staging_offset, back to
+    /// guest memory.
+    void WriteBack(VAddr arena_base, const ReadbackCopies& copies, const u8* mapped,
+                   u64 staging_offset) const;
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
         VAddr device_addr, u32 size, ObtainBufferFlags flags = ObtainBufferFlags::None);
@@ -119,6 +136,18 @@ public:
 
     /// Mark region as modified from the GPU
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
+
+    /// Records a GPU write the packet being bound will perform.
+    void MarkGpuWrite(VAddr device_addr, u64 size);
+
+    /// Stamps and marks the writes of the packet again when a flush moved it into the current
+    /// batch. Called right after each draw, dispatch, fill or copy is recorded, and on every exit
+    /// of a packet whose record did not happen.
+    void CommitGpuWrites();
+
+    /// Moves the writes of a packet still being bound into the batch this flush opens. Called from
+    /// the submit callback.
+    void MoveInFlightWrites();
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -144,8 +173,14 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool is_write,
-                        bool async);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
+
+    /// Erases the GPU writes of the range that the GPU had completed at known_tick and clears the
+    /// pages left without one; a write marked since keeps its pages GPU modified.
+    void ConsumeGpuWrites(VAddr device_addr, u64 size, u64 known_tick);
+
+    /// Stamps a GPU write with the tick of the open batch.
+    void StampGpuWrite(VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -164,7 +199,17 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
-    RangeSet gpu_modified_ranges;
+    /// GPU written ranges with the scheduler tick of the batch holding the write; the newest
+    /// write of a byte sets its tick. Guarded by gpu_writes_mutex.
+    RangeMap<u64> gpu_writes;
+    std::mutex gpu_writes_mutex;
+    struct Range {
+        VAddr addr;
+        u64 size;
+    };
+    /// Writes marked for the packet being bound, and whether a flush moved them since.
+    boost::container::small_vector<Range, 8> in_flight;
+    bool in_flight_moved{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
