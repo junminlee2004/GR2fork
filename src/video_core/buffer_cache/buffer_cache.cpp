@@ -6,7 +6,9 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
+#include "core/libraries/kernel/threads/exception.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -136,6 +138,11 @@ void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
+    // A guest thread's fault is served on that thread; the GPU thread's own faults and the
+    // texture cache's downloads take the download below.
+    if (!async && !assume_locks && FaultReadback(device_addr, size, is_write)) {
+        return;
+    }
     const auto flush_request = [this, device_addr, size, is_write, async] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -190,6 +197,11 @@ void BufferCache::WriteBack(VAddr arena_base, const ReadbackCopies& copies, cons
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
+    // An asynchronous download's caller owns the range until the deferred write-back has run; a
+    // synchronous one owns it here.
+    if (!async) {
+        AcquireWindows(device_addr, size);
+    }
     ReadbackCopies copies;
     const VAddr arena_base = arena->cpu_addr;
     const u64 total_size_bytes =
@@ -200,6 +212,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             LOG_WARNING(Render_Vulkan, "GPU modified pages without a GPU write at {:#x}",
                         device_addr);
             memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        }
+        if (!async) {
+            ReleaseWindows(device_addr, size);
         }
         return;
     }
@@ -220,6 +235,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         ConsumeGpuWrites(device_addr, size, async ? record_tick : scheduler.CurrentTick());
         if (async) {
             staging_pool.FreeDeferred(download);
+        } else {
+            ReleaseWindows(device_addr, size);
         }
     };
 
@@ -267,6 +284,131 @@ void BufferCache::ConsumeGpuWrites(VAddr device_addr, u64 size, u64 known_tick) 
             }
             manager->ChangeRegionStateMasked<StateOp::None, StateOp::Clear>(consumed);
         });
+}
+
+bool BufferCache::WindowsOwned(VAddr device_addr, u64 size) const {
+    return std::ranges::any_of(window_owners, [&](const Range& owner) {
+        return owner.addr < device_addr + size && device_addr < owner.addr + owner.size;
+    });
+}
+
+void BufferCache::AcquireWindows(VAddr device_addr, u64 size) {
+    std::unique_lock lk{window_mutex};
+    window_cv.wait(lk, [&] { return !WindowsOwned(device_addr, size); });
+    window_owners.push_back({device_addr, size});
+}
+
+bool BufferCache::TryAcquireWindows(VAddr device_addr, u64 size) {
+    std::scoped_lock lk{window_mutex};
+    if (WindowsOwned(device_addr, size)) {
+        return false;
+    }
+    window_owners.push_back({device_addr, size});
+    return true;
+}
+
+void BufferCache::ReleaseWindows(VAddr device_addr, u64 size) {
+    {
+        std::scoped_lock lk{window_mutex};
+        const auto it = std::ranges::find_if(window_owners, [&](const Range& owner) {
+            return owner.addr == device_addr && owner.size == size;
+        });
+        ASSERT(it != window_owners.end());
+        window_owners.erase(it);
+    }
+    window_cv.notify_all();
+}
+
+void BufferCache::WaitWindowsFree(VAddr device_addr, u64 size) {
+    std::unique_lock lk{window_mutex};
+    window_cv.wait(lk, [&] { return !WindowsOwned(device_addr, size); });
+}
+
+struct BufferCache::Readback {
+    VAddr window{};
+    ReadbackCopies copies{};
+    Vulkan::StagingBufferRef staging{};
+    VAddr arena_base{};
+    u64 tick{};
+    bool busy{};
+};
+
+bool BufferCache::FaultReadback(VAddr device_addr, u64 size, bool is_write) {
+    const VAddr window = Common::AlignDown(device_addr, READBACK_WINDOW_SIZE);
+    if (device_addr + size > window + READBACK_WINDOW_SIZE) {
+        return false;
+    }
+    // Guest signals stay pending until the readback is done: other threads that fault on the
+    // window wait for this one, and a guest handler could wait for them.
+    Libraries::Kernel::Sigset all_signals;
+    Libraries::Kernel::Sigset old_sigmask{};
+    Libraries::Kernel::posix_sigfillset(&all_signals);
+    Libraries::Kernel::posix_pthread_sigmask(POSIX_SIG_SETMASK, &all_signals, &old_sigmask);
+    SCOPE_EXIT {
+        Libraries::Kernel::posix_pthread_sigmask(POSIX_SIG_SETMASK, &old_sigmask, nullptr);
+    };
+    // A request still GPU modified after two readbacks of its own takes the synchronous download,
+    // which copies and unmarks in one GPU thread command.
+    u32 attempts = 0;
+    while (attempts < 2) {
+        Readback job{.window = window};
+        liverpool->SendCommand<true>([this, &job] { RecordReadback(job); });
+        if (job.busy) {
+            WaitWindowsFree(window, READBACK_WINDOW_SIZE);
+        } else {
+            ++attempts;
+            if (!job.copies.empty()) {
+                scheduler.GetWorkSemaphore()->Wait(job.tick);
+                FinishReadback(job);
+            }
+        }
+        bool resolved = true;
+        if (is_write) {
+            // Marks the range CPU modified if it is GPU clean.
+            memory_tracker->InvalidateRegion(device_addr, size, [&resolved] { resolved = false; });
+        } else {
+            resolved = !memory_tracker->IsRegionGpuModified(device_addr, size);
+        }
+        if (resolved) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BufferCache::RecordReadback(Readback& job) {
+    if (!TryAcquireWindows(job.window, READBACK_WINDOW_SIZE)) {
+        job.busy = true;
+        return;
+    }
+    const u64 block = job.window >> block_shift;
+    const auto* arena = GetArena(block, block);
+    const u64 total_size_bytes =
+        CollectWrites(arena, job.window, READBACK_WINDOW_SIZE, scheduler.CurrentTick(), job.copies);
+    if (total_size_bytes == 0) {
+        ReleaseWindows(job.window, READBACK_WINDOW_SIZE);
+        return;
+    }
+    // Held until FinishReadback releases it; the pool reuses it once the GPU passes that release.
+    job.staging = staging_pool.Request(total_size_bytes, MemoryType::HostCached, 0, true);
+    for (auto& copy : job.copies) {
+        copy.dstOffset += job.staging.offset;
+    }
+    job.arena_base = arena->cpu_addr;
+    runtime.CopyBuffer(arena, job.staging.buffer, job.copies);
+    job.tick = scheduler.CurrentTick();
+    scheduler.Flush();
+}
+
+void BufferCache::FinishReadback(const Readback& job) {
+    job.staging.Invalidate();
+    // The write-back runs ahead of the consume: the window is owned, so a write marked meanwhile
+    // keeps its pages GPU modified and the guest never reads them.
+    WriteBack(job.arena_base, job.copies, job.staging.mapped, job.staging.offset);
+    ConsumeGpuWrites(job.window, READBACK_WINDOW_SIZE, job.tick);
+    ReleaseWindows(job.window, READBACK_WINDOW_SIZE);
+    // The staging pool belongs to the GPU thread.
+    liverpool->SendCommand([this, staging = job.staging] { staging_pool.FreeDeferred(staging); });
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,

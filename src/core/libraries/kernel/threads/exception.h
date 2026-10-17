@@ -161,6 +161,7 @@ s32 PS4_SYSV_ABI posix_sigaddset(Sigset* s, s32 sig);
 s32 PS4_SYSV_ABI posix_sigdelset(Sigset* s, s32 sig);
 s32 PS4_SYSV_ABI posix_sigismember(Sigset const* s, s32 sig);
 bool PS4_SYSV_ABI posix_sigisemptyset(Sigset* s);
+s32 PS4_SYSV_ABI posix_pthread_sigmask(s32 how, const Sigset* set, Sigset* oset);
 
 void RegisterException(Core::Loader::SymbolsResolver* sym);
 
