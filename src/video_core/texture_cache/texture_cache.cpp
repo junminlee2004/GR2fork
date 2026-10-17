@@ -1053,8 +1053,6 @@ void TextureCache::GarbageCollectImages() {
             UntrackImage(image_id);
             UnregisterImage(image_id);
             if (True(image.flags & ImageFlagBits::MaybeGpuDirty)) {
-                buffer_cache.ReadMemory(image.info.guest_address, image.info.guest_size, false,
-                                        true, true);
                 maybe_download.push_back(image_id);
             } else {
                 download_queue.push_back(image_id);
@@ -1086,10 +1084,52 @@ void TextureCache::GarbageCollectImages() {
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
 
+    // The images' readback pages are owned from the record of a download to its write-back, so
+    // no faulting thread reads them back meanwhile; images that overlap in memory own one range.
+    using ImageRanges = boost::container::small_vector<std::pair<VAddr, VAddr>, 8>;
+    const auto page_ranges = [&](const auto& image_ids) {
+        ImageRanges ranges;
+        for (const auto& image_id : image_ids) {
+            const auto& info = slot_images[image_id].info;
+            ranges.emplace_back(
+                PageManager::GetPageAddr(info.guest_address),
+                PageManager::GetNextPageAddr(info.guest_address + info.guest_size - 1));
+        }
+        std::ranges::sort(ranges);
+        size_t num_merged = 0;
+        for (const auto [start, end] : ranges) {
+            if (num_merged != 0 && start <= ranges[num_merged - 1].second) {
+                ranges[num_merged - 1].second = std::max(ranges[num_merged - 1].second, end);
+            } else {
+                ranges[num_merged++] = {start, end};
+            }
+        }
+        ranges.resize(num_merged);
+        return ranges;
+    };
+    const auto own = [&](const ImageRanges& ranges) {
+        for (const auto& [start, end] : ranges) {
+            buffer_cache.AcquireWindows(start, end - start);
+        }
+    };
+    const auto release = [&](const ImageRanges& ranges) {
+        for (const auto& [start, end] : ranges) {
+            buffer_cache.ReleaseWindows(start, end - start);
+        }
+    };
+
     if (!maybe_download.empty()) {
+        const auto owned = page_ranges(maybe_download);
+        own(owned);
+        for (const auto& image_id : maybe_download) {
+            const auto& image = slot_images[image_id];
+            buffer_cache.ReadMemory(image.info.guest_address, image.info.guest_size, false, true,
+                                    true);
+        }
         // wait for memory reads to finish
         scheduler.Finish();
         scheduler.PopPendingOperations();
+        release(owned);
 
         for (const auto& image_id : maybe_download) {
             const auto& image = slot_images[image_id];
@@ -1103,6 +1143,8 @@ void TextureCache::GarbageCollectImages() {
         }
     }
 
+    const auto owned = page_ranges(download_queue);
+    own(owned);
     for (const auto& image_id : download_queue) {
         buffer_cache.ReadEdgeImagePages(slot_images[image_id]);
     }
@@ -1118,6 +1160,7 @@ void TextureCache::GarbageCollectImages() {
         scheduler.PopPendingOperations();
     }
 
+    release(owned);
     for (const auto& image_id : download_queue) {
         DeleteImage(image_id);
     }

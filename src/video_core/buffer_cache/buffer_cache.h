@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -106,8 +107,15 @@ public:
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
                     bool assume_locks = false);
 
-    /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image.
+    /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image. The caller
+    /// owns the image's readback windows.
     void ReadEdgeImagePages(const Image& image);
+
+    /// One downloader owns a range at a time: a GPU thread download from its record to its
+    /// write-back, a faulting thread from its copy to the consume, the texture cache across an
+    /// image download. Acquiring waits for the current owners.
+    void AcquireWindows(VAddr device_addr, u64 size);
+    void ReleaseWindows(VAddr device_addr, u64 size);
 
     using ReadbackCopies = boost::container::small_vector<vk::BufferCopy, 2>;
 
@@ -175,6 +183,24 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
 
+    struct Readback;
+
+    /// Serves a fault from the thread that took it, inside one readback window, while the GPU
+    /// thread keeps running. Returns false when the request has to take the synchronous download.
+    bool FaultReadback(VAddr device_addr, u64 size, bool is_write);
+
+    /// Records and submits the copy of the GPU written ranges of a readback window, which the
+    /// faulting thread then owns. Runs on the GPU thread.
+    void RecordReadback(Readback& job);
+
+    /// Writes a signaled readback to guest memory and consumes the writes it copied.
+    void FinishReadback(const Readback& job);
+
+    bool TryAcquireWindows(VAddr device_addr, u64 size);
+    void WaitWindowsFree(VAddr device_addr, u64 size);
+    /// Requires window_mutex.
+    bool WindowsOwned(VAddr device_addr, u64 size) const;
+
     /// Erases the GPU writes of the range that the GPU had completed at known_tick and clears the
     /// pages left without one; a write marked since keeps its pages GPU modified.
     void ConsumeGpuWrites(VAddr device_addr, u64 size, u64 known_tick);
@@ -237,6 +263,10 @@ private:
     u32 block_shift{};
     u32 blocks_per_arena_page{};
     u32 blocks_per_arena_page_shift{};
+
+    std::mutex window_mutex;
+    std::condition_variable window_cv;
+    boost::container::small_vector<Range, 8> window_owners;
 };
 
 } // namespace VideoCore
