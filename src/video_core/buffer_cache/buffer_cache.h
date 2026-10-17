@@ -40,6 +40,7 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+class ReadbackLanes;
 
 enum class ObtainBufferFlags {
     None = 0,
@@ -213,6 +214,10 @@ private:
     /// when a block has no host mapping or the guest range has no backing.
     bool DirectRead(VAddr device_addr, u64 size);
 
+    /// The arena holding an address and the bind semaphore value its binds signal, for the copy
+    /// lanes; nullptr while binds of the arena are still queued for the next submit.
+    const Buffer* ArenaOf(VAddr device_addr, u64& bind_tick);
+
     bool TryAcquireWindows(VAddr device_addr, u64 size);
     void WaitWindowsFree(VAddr device_addr, u64 size);
     /// Requires window_mutex.
@@ -279,6 +284,8 @@ private:
     /// grows them, and the faulting threads, which look arenas and blocks up.
     std::mutex arena_mutex;
     IntervalList<Backing> resident_ranges;
+    /// memory_semaphore value of the last sparse bind submission. Guarded by arena_mutex.
+    u64 last_bind_tick{};
 
     /// Host visible device memory for the arenas; nullopt without readbacks or without a type
     /// whose heap is the video memory.
@@ -296,6 +303,8 @@ private:
     std::mutex window_mutex;
     std::condition_variable window_cv;
     boost::container::small_vector<Range, 8> window_owners;
+    /// Last member: the lane threads stop before anything they use goes away.
+    std::unique_ptr<ReadbackLanes> copy_lanes;
 };
 
 } // namespace VideoCore

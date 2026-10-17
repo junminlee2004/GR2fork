@@ -132,10 +132,16 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    // The readback copy lanes read the sparse arenas from their own queue family.
+    const u32 queue_families[] = {instance.GetGraphicsQueueFamilyIndex(),
+                                  instance.GetCopyQueueFamilyIndex()};
+    const bool shared = mem_type == MemoryType::Sparse && !instance.GetCopyQueues().empty();
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = AllFlags,
-        .sharingMode = vk::SharingMode::eExclusive,
+        .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = shared ? 2u : 0u,
+        .pQueueFamilyIndices = queue_families,
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);

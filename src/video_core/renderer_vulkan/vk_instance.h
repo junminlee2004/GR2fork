@@ -75,6 +75,15 @@ public:
         return present_queue;
     }
 
+    /// Queues of a transfer-only family for the readback copy lanes; empty without such a family.
+    std::span<const vk::Queue> GetCopyQueues() const {
+        return copy_queues;
+    }
+
+    u32 GetCopyQueueFamilyIndex() const {
+        return copy_queue_family_index;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -516,6 +525,8 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    u32 copy_queue_family_index{0};
+    std::vector<vk::Queue> copy_queues;
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};

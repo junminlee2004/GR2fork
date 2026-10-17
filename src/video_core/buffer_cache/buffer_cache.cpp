@@ -16,6 +16,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/readback_lane.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -130,6 +131,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             .value();
     if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
         arena_host_type_index = FindHostVisibleArenaType(instance, reqs.memoryTypeBits);
+        // Lanes serve the windows a direct read cannot; an integrated GPU with host visible
+        // arenas has none.
+        if (!(arena_host_type_index && instance.IsIntegrated())) {
+            copy_lanes = std::make_unique<ReadbackLanes>(instance, scheduler, *this,
+                                                         memory_semaphore.Handle());
+        }
     }
     scheduler.SetHostReadBarrier(arena_host_type_index.has_value());
     LOG_INFO(Render_Vulkan, "Readback arena memory type {}, host visible: {}",
@@ -450,6 +457,18 @@ void BufferCache::FinishReadback(const Readback& job) {
     liverpool->SendCommand([this, staging = job.staging] { staging_pool.FreeDeferred(staging); });
 }
 
+const Buffer* BufferCache::ArenaOf(VAddr device_addr, u64& bind_tick) {
+    std::scoped_lock lk{arena_mutex};
+    const Buffer* arena = address_space[device_addr >> ARENA_PAGE_BITS];
+    // A migrated arena has its blocks bound again by the next submit; until then a copy from it
+    // would read unbound ranges.
+    if (std::ranges::find(pending_binds, arena, &ArenaBinds::arena) != pending_binds.end()) {
+        return nullptr;
+    }
+    bind_tick = last_bind_tick;
+    return arena;
+}
+
 bool BufferCache::GpuThreadReadback(VAddr device_addr, u64 size, bool is_write) {
     if (!DirectReadback(device_addr)) {
         return false;
@@ -522,6 +541,14 @@ bool BufferCache::DirectReadback(VAddr device_addr) {
                 copied = DirectRead(it->addr, it->size);
             }
             cursor = next;
+        }
+    }
+    if (!copied && copy_lanes) {
+        // The lane copies the whole window; what a direct read wrote before giving up is the same
+        // data.
+        u64 bind_tick = 0;
+        if (const Buffer* arena = ArenaOf(window, bind_tick)) {
+            copied = copy_lanes->Copy({arena, window, known, copy_tick, bind_tick}).has_value();
         }
     }
     if (copied) {
@@ -955,6 +982,7 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 
     std::scoped_lock lk{arena_mutex};
     pending_binds.clear();
+    last_bind_tick = signal_tick;
 }
 
 } // namespace VideoCore
