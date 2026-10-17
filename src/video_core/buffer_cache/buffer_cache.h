@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -170,6 +171,7 @@ private:
     };
 
     ArenaBinds* BindsForArena(const Buffer* arena) {
+        std::scoped_lock lk{arena_mutex};
         auto it = std::ranges::find(pending_binds, arena, &ArenaBinds::arena);
         if (it != pending_binds.end()) {
             return std::addressof(*it);
@@ -195,6 +197,21 @@ private:
 
     /// Writes a signaled readback to guest memory and consumes the writes it copied.
     void FinishReadback(const Readback& job);
+
+    /// Serves a fault out of the arena's host mapping: waits for the newest GPU write of the
+    /// faulting page, submitting the open batch when it holds that write (the GPU thread flushes
+    /// in place, a guest thread asks it to), then copies every retired write of the window into
+    /// guest memory and consumes it. Returns false when the window has to take the GPU thread's
+    /// copy.
+    bool DirectReadback(VAddr device_addr);
+
+    /// A fault taken on the GPU thread, served by DirectReadback. Returns false when the
+    /// synchronous download has to serve it.
+    bool GpuThreadReadback(VAddr device_addr, u64 size, bool is_write);
+
+    /// Streams a GPU written range from the arena's host mapping into guest memory. Returns false
+    /// when a block has no host mapping or the guest range has no backing.
+    bool DirectRead(VAddr device_addr, u64 size);
 
     bool TryAcquireWindows(VAddr device_addr, u64 size);
     void WaitWindowsFree(VAddr device_addr, u64 size);
@@ -249,16 +266,28 @@ private:
     struct Backing : public Interval {
         vk::DeviceMemory memory;
         u64 offset;
+        /// Host mapping of the allocation; nullptr when its memory type has no host access.
+        u8* host;
         constexpr bool CanMergeWith(const Backing& other) const noexcept {
             return memory == other.memory && offset + (end - start) == other.offset;
         }
         constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
+            return {{a, b}, memory, offset + (a - start), host};
         }
     };
+    /// Guards resident_ranges, address_space and pending_binds between the GPU thread, which
+    /// grows them, and the faulting threads, which look arenas and blocks up.
+    std::mutex arena_mutex;
     IntervalList<Backing> resident_ranges;
 
-    u32 arena_memory_type_index{};
+    /// Host visible device memory for the arenas; nullopt without readbacks or without a type
+    /// whose heap is the video memory.
+    std::optional<u32> arena_host_type_index;
+    /// Plain device memory, the arena type without a host visible one and the fallback once the
+    /// host visible heap is spent.
+    u32 arena_device_type_index{};
+    /// Set once a host visible allocation failed; later allocations take device memory.
+    bool arena_host_spent{};
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};

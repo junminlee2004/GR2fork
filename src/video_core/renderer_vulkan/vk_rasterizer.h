@@ -81,6 +81,12 @@ public:
 
     u64 Flush();
     void Finish();
+    /// Submits the open batch for a readback thread waiting on its tick. Runs on the GPU command
+    /// thread.
+    void RequestFlush(u64 tick);
+    /// Flushes for a pending RequestFlush; a depth or stencil clear in the open render scope
+    /// defers it to the next draw boundary unless forced.
+    void FlushRequested(bool force = false);
     void OnSubmit();
     void OnFence();
 
@@ -148,6 +154,8 @@ private:
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    /// The tick a readback thread asked RequestFlush to submit; 0 = none pending.
+    u64 flush_request_tick{};
 
     struct ImageBinding {
         VideoCore::ImageId image_id;

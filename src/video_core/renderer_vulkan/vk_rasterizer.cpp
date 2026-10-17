@@ -182,7 +182,9 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-// Commits the GPU writes a packet marked while binding on every exit of the packet.
+// Commits the GPU writes a packet marked while binding on every exit of the packet. The record
+// commits itself before the flush poll that follows it, which would otherwise move the writes
+// just recorded into the next batch; the guard covers the exits before the record.
 struct GpuWriteCommit {
     VideoCore::BufferCache& buffer_cache;
     ~GpuWriteCommit() {
@@ -243,6 +245,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     buffer_cache.CommitGpuWrites();
 
     ResetBindings(false);
+    FlushRequested();
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -363,6 +366,7 @@ void Rasterizer::DispatchDirect() {
     buffer_cache.CommitGpuWrites();
 
     ResetBindings(true);
+    FlushRequested();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -409,6 +413,29 @@ u64 Rasterizer::Flush() {
 
 void Rasterizer::Finish() {
     scheduler.Finish();
+}
+
+void Rasterizer::RequestFlush(u64 tick) {
+    if (tick >= scheduler.CurrentTick()) {
+        flush_request_tick = tick;
+    }
+    FlushRequested();
+}
+
+void Rasterizer::FlushRequested(bool force) {
+    // No request pending, or a flush since the request submitted the batch the waiter needs.
+    if (flush_request_tick < scheduler.CurrentTick()) {
+        flush_request_tick = 0;
+        return;
+    }
+    // BeginRendering re-derives the clear load op, so a scope re-begun after a flush would clear
+    // the attachment a second time.
+    const auto& ds = scheduler.GetRenderState().depth_stencil_attachment;
+    if (!force && scheduler.IsRendering() && (ds.depth_clear || ds.stencil_clear)) {
+        return;
+    }
+    scheduler.Flush();
+    flush_request_tick = 0;
 }
 
 void Rasterizer::OnSubmit() {

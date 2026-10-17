@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/stream_copy.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -161,7 +162,8 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
-bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+template <typename Copy>
+bool MemoryManager::WriteBacking(void* address, u64 size, Copy&& copy) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
@@ -192,13 +194,26 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
-            memcpy(backing, data, copy_size);
-            data = static_cast<const u8*>(data) + copy_size;
+            copy(backing, copy_size);
             size -= copy_size;
         }
     }
 
     return true;
+}
+
+bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    return WriteBacking(address, size, [&data](u8* backing, u64 copy_size) {
+        memcpy(backing, data, copy_size);
+        data = static_cast<const u8*>(data) + copy_size;
+    });
+}
+
+bool MemoryManager::TryStreamBacking(void* address, const void* data, u64 size) {
+    return WriteBacking(address, size, [&data](u8* backing, u64 copy_size) {
+        Common::StreamCopy(backing, data, copy_size);
+        data = static_cast<const u8*>(data) + copy_size;
+    });
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {

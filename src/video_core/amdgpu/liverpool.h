@@ -96,6 +96,10 @@ public:
         rasterizer = rasterizer_;
     }
 
+    Vulkan::Rasterizer* GetRasterizer() const noexcept {
+        return rasterizer;
+    }
+
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if constexpr (wait_done) {
