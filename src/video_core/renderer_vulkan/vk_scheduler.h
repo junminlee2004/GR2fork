@@ -399,6 +399,17 @@ public:
         return render_state;
     }
 
+    /// Returns true while a rendering scope is open.
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
+    /// Ends every command buffer with a device-to-host memory barrier when enabled, so the host may
+    /// read the GPU writes of a batch out of a host visible arena once its tick passes.
+    void SetHostReadBarrier(bool enabled) noexcept {
+        host_read_barrier = enabled;
+    }
+
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
         return dynamic_state;
@@ -479,6 +490,7 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    bool host_read_barrier = false;
     tracy::VkCtxScope* profiler_scope{};
 };
 

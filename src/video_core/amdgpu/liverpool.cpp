@@ -127,6 +127,11 @@ void Liverpool::Process(std::stop_token stoken) {
             }
             task.resume();
 
+            if (!task.done() && rasterizer) {
+                // The parser yielded inside a wait whose label may depend on a guest thread that
+                // waits for a deferred readback request.
+                rasterizer->FlushRequested(true);
+            }
             if (task.done()) {
                 task.destroy();
 
@@ -146,6 +151,10 @@ void Liverpool::Process(std::stop_token stoken) {
                 rasterizer->Flush();
             }
             submit_done = false;
+        } else if (rasterizer) {
+            // Out of packets: a readback request the clear guard deferred would otherwise wait
+            // for the next draw.
+            rasterizer->FlushRequested(true);
         }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);

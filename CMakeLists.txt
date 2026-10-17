@@ -835,6 +835,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/spin_lock.h
            src/common/stb.cpp
            src/common/stb.h
+           src/common/stream_copy.h
            src/common/string_literal.h
            src/common/string_util.cpp
            src/common/string_util.h

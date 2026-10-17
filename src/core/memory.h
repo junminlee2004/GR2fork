@@ -256,6 +256,9 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
+    /// TryWriteBacking with streaming loads from data, for a source in write combined memory.
+    bool TryStreamBacking(void* address, const void* data, u64 size);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -344,6 +347,11 @@ private:
     s32 UnmapMemoryImpl(VAddr virtual_addr, u64 size);
 
 private:
+    /// Writes size bytes to the backing of a virtual range through copy(backing, bytes), which
+    /// advances its own source. Returns false when the range has no physical backing.
+    template <typename Copy>
+    bool WriteBacking(void* address, u64 size, Copy&& copy);
+
     AddressSpace impl;
     PhysMap dmem_map;
     PhysMap fmem_map;

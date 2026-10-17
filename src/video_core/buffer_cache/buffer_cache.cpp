@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
 #include "common/alignment.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -17,6 +19,7 @@
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -69,6 +72,30 @@ std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& prop
     return std::nullopt;
 }
 
+// Host visible device memory serves direct readbacks when its heap is the device's video memory
+// (integrated GPUs, resizable BAR); a BAR carveout of a few hundred MiB is left alone.
+static std::optional<u32> FindHostVisibleArenaType(const Vulkan::Instance& instance,
+                                                   u32 memory_type_bits) {
+    using Flags = vk::MemoryPropertyFlagBits;
+    const auto& props = instance.GetMemoryProperties();
+    const auto type = FindMemoryType(
+        props, Flags::eDeviceLocal | Flags::eHostVisible | Flags::eHostCoherent, memory_type_bits);
+    if (!type || instance.IsIntegrated()) {
+        return type;
+    }
+    u64 largest_local_heap = 0;
+    for (u32 i = 0; i < props.memoryHeapCount; ++i) {
+        if ((props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
+            vk::MemoryHeapFlags{}) {
+            largest_local_heap = std::max<u64>(largest_local_heap, props.memoryHeaps[i].size);
+        }
+    }
+    if (props.memoryHeaps[props.memoryTypes[*type].heapIndex].size == largest_local_heap) {
+        return type;
+    }
+    return std::nullopt;
+}
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -97,10 +124,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
     blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
-    arena_memory_type_index =
+    arena_device_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+        arena_host_type_index = FindHostVisibleArenaType(instance, reqs.memoryTypeBits);
+    }
+    scheduler.SetHostReadBarrier(arena_host_type_index.has_value());
+    LOG_INFO(Render_Vulkan, "Readback arena memory type {}, host visible: {}",
+             arena_host_type_index.value_or(arena_device_type_index),
+             arena_host_type_index.has_value());
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
@@ -138,9 +172,10 @@ void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
-    // A guest thread's fault is served on that thread; the GPU thread's own faults and the
-    // texture cache's downloads take the download below.
-    if (!async && !assume_locks && FaultReadback(device_addr, size, is_write)) {
+    // A fault is served on the thread that took it; the texture cache's downloads and the requests
+    // the fault paths hand back take the download below.
+    if (!async && (assume_locks ? GpuThreadReadback(device_addr, size, is_write)
+                                : FaultReadback(device_addr, size, is_write))) {
         return;
     }
     const auto flush_request = [this, device_addr, size, is_write, async] {
@@ -351,15 +386,19 @@ bool BufferCache::FaultReadback(VAddr device_addr, u64 size, bool is_write) {
     // which copies and unmarks in one GPU thread command.
     u32 attempts = 0;
     while (attempts < 2) {
-        Readback job{.window = window};
-        liverpool->SendCommand<true>([this, &job] { RecordReadback(job); });
-        if (job.busy) {
-            WaitWindowsFree(window, READBACK_WINDOW_SIZE);
-        } else {
+        if (DirectReadback(device_addr)) {
             ++attempts;
-            if (!job.copies.empty()) {
-                scheduler.GetWorkSemaphore()->Wait(job.tick);
-                FinishReadback(job);
+        } else {
+            Readback job{.window = window};
+            liverpool->SendCommand<true>([this, &job] { RecordReadback(job); });
+            if (job.busy) {
+                WaitWindowsFree(window, READBACK_WINDOW_SIZE);
+            } else {
+                ++attempts;
+                if (!job.copies.empty()) {
+                    scheduler.GetWorkSemaphore()->Wait(job.tick);
+                    FinishReadback(job);
+                }
             }
         }
         bool resolved = true;
@@ -409,6 +448,110 @@ void BufferCache::FinishReadback(const Readback& job) {
     ReleaseWindows(job.window, READBACK_WINDOW_SIZE);
     // The staging pool belongs to the GPU thread.
     liverpool->SendCommand([this, staging = job.staging] { staging_pool.FreeDeferred(staging); });
+}
+
+bool BufferCache::GpuThreadReadback(VAddr device_addr, u64 size, bool is_write) {
+    if (!DirectReadback(device_addr)) {
+        return false;
+    }
+    if (is_write) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+    }
+    return true;
+}
+
+bool BufferCache::DirectReadback(VAddr device_addr) {
+    const VAddr window = Common::AlignDown(device_addr, READBACK_WINDOW_SIZE);
+    const VAddr page = Common::AlignDown(device_addr, BYTES_PER_PAGE);
+    const bool on_gpu_thread =
+        std::this_thread::get_id() == liverpool->GetGpuCommandProcessorThread();
+    u64 page_tick = 0;
+    {
+        std::scoped_lock lk{gpu_writes_mutex};
+        gpu_writes.ForEachInRange(page, BYTES_PER_PAGE, [&](VAddr, VAddr, u64 tick) {
+            page_tick = std::max(page_tick, tick);
+        });
+    }
+    if (page_tick == 0) {
+        return false;
+    }
+    bool flushed = false;
+    if (page_tick >= scheduler.CurrentTick()) {
+        if (on_gpu_thread) {
+            scheduler.Flush();
+            flushed = true;
+        } else {
+            liverpool->SendCommand(
+                [this, page_tick] { liverpool->GetRasterizer()->RequestFlush(page_tick); });
+        }
+    }
+    scheduler.GetWorkSemaphore()->Wait(page_tick);
+    // Owned only now, so the GPU thread never waits for a thread that waits for it.
+    AcquireWindows(window, READBACK_WINDOW_SIZE);
+    const u64 known = scheduler.GetWorkSemaphore()->KnownGpuTick();
+    // After the GPU thread's own flush and wait every recorded write has executed, and the writes
+    // of a packet still being bound were moved into the new batch, which marks them again at its
+    // commit; their bytes are the arena's as the GPU left them, so the copy and the consume take
+    // the current tick, like the synchronous download does.
+    const u64 copy_tick = flushed ? scheduler.CurrentTick() : known;
+    const VAddr window_end = window + READBACK_WINDOW_SIZE;
+    bool copied = false;
+    if (arena_host_type_index) {
+        // The islands are collected and copied in batches, the list living on the signal stack.
+        static constexpr size_t BatchIslands = 32;
+        boost::container::small_vector<Range, BatchIslands> islands;
+        copied = true;
+        for (VAddr cursor = window; copied && cursor < window_end;) {
+            islands.clear();
+            VAddr next = window_end;
+            {
+                std::scoped_lock lk{gpu_writes_mutex};
+                gpu_writes.ForEachInRange(cursor, window_end - cursor,
+                                          [&](VAddr begin, VAddr end, u64 tick) {
+                                              if (islands.size() == BatchIslands) {
+                                                  next = std::min(next, begin);
+                                                  return;
+                                              }
+                                              if (tick > copy_tick) {
+                                                  return;
+                                              }
+                                              islands.push_back({begin, end - begin});
+                                          });
+            }
+            for (auto it = islands.begin(); copied && it != islands.end(); ++it) {
+                copied = DirectRead(it->addr, it->size);
+            }
+            cursor = next;
+        }
+    }
+    if (copied) {
+        ConsumeGpuWrites(window, READBACK_WINDOW_SIZE, copy_tick);
+    }
+    ReleaseWindows(window, READBACK_WINDOW_SIZE);
+    return copied;
+}
+
+bool BufferCache::DirectRead(VAddr device_addr, u64 size) {
+    while (size != 0) {
+        const u8* src;
+        u64 chunk;
+        {
+            std::scoped_lock lk{arena_mutex};
+            const auto it = resident_ranges.Find(device_addr >> block_shift);
+            if (it == resident_ranges.end() || !it->host) {
+                return false;
+            }
+            src =
+                it->host + (it->offset << block_shift) + (device_addr - (it->start << block_shift));
+            chunk = std::min(size, (it->end << block_shift) - device_addr);
+        }
+        if (!memory->TryStreamBacking(std::bit_cast<u8*>(device_addr), src, chunk)) {
+            return false;
+        }
+        device_addr += chunk;
+        size -= chunk;
+    }
+    return true;
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
@@ -561,6 +704,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             const auto* new_arena =
                 &arenas.emplace_back(instance, base_block << block_shift,
                                      num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
+            std::scoped_lock lk{arena_mutex};
             address_space[first_page] = new_arena;
             address_space[last_page] = new_arena;
         }
@@ -589,6 +733,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         });
     });
 
+    std::scoped_lock lk{arena_mutex};
     u64 base_page = first_addr >> ARENA_PAGE_BITS;
     for (u32 page = 0; page < (first_size >> ARENA_PAGE_BITS); ++page) {
         address_space[base_page + page] = new_arena;
@@ -615,12 +760,33 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     const vk::MemoryAllocateFlagsInfo alloc_flags = {
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
     };
-    const vk::MemoryAllocateInfo alloc_info = {
+    const bool host_type = arena_host_type_index && !arena_host_spent;
+    vk::MemoryAllocateInfo alloc_info = {
         .pNext = &alloc_flags,
         .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
+        .memoryTypeIndex = host_type ? *arena_host_type_index : arena_device_type_index,
     };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    const auto device = instance.GetDevice();
+    auto allocation = device.allocateMemory(alloc_info);
+    if (allocation.result != vk::Result::eSuccess && host_type &&
+        *arena_host_type_index != arena_device_type_index) {
+        LOG_WARNING(Render_Vulkan,
+                    "Host visible arena memory spent, arenas continue in device memory");
+        arena_host_spent = true;
+        alloc_info.memoryTypeIndex = arena_device_type_index;
+        allocation = device.allocateMemory(alloc_info);
+    }
+    const auto device_memory = Vulkan::Check(allocation);
+    u8* host = nullptr;
+    if (host_type && !arena_host_spent) {
+        const auto [map_result, mapping] = device.mapMemory(device_memory, 0, vk::WholeSize);
+        if (map_result == vk::Result::eSuccess) {
+            host = static_cast<u8*>(mapping);
+        } else {
+            LOG_WARNING(Render_Vulkan, "Mapping arena memory failed: {}",
+                        vk::to_string(map_result));
+        }
+    }
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -636,7 +802,11 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.end = range.end;
         backing.memory = device_memory;
         backing.offset = memory_offset >> block_shift;
-        resident_ranges.Add(backing);
+        backing.host = host;
+        {
+            std::scoped_lock lk{arena_mutex};
+            resident_ranges.Add(backing);
+        }
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
@@ -783,6 +953,7 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
+    std::scoped_lock lk{arena_mutex};
     pending_binds.clear();
 }
 
