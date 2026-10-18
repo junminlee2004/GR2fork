@@ -64,10 +64,9 @@ public:
             const u64 amount = std::min(HIGHER_PAGE_SIZE - page_offset, size);
             if (auto* manager = top_tier[page_index]; manager) {
                 const VAddr region_base = page_index << HIGHER_PAGE_BITS;
-                const auto bounds = manager->GetBounds(page_offset, amount);
-                manager->Lock(bounds);
+                manager->Lock();
                 func(manager, region_base, region_base + page_offset, amount);
-                manager->Unlock(bounds);
+                manager->Unlock();
             }
             page_index++;
             page_offset = 0;
@@ -89,15 +88,14 @@ public:
         }
         bool should_flush = false;
         IteratePages(cpu_addr, size, [&should_flush](RegionManager* manager, u64 offset, u64 size) {
-            const auto bounds = manager->GetBounds(offset, size);
-            manager->Lock(bounds);
+            manager->Lock();
             const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
                                                                                         size);
             }
             should_flush |= modified;
-            manager->Unlock(bounds);
+            manager->Unlock();
         });
         if (should_flush) {
             on_flush();

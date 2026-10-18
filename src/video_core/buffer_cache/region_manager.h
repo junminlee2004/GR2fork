@@ -211,11 +211,11 @@ public:
         }
     }
 
-    void Lock(const Bounds& bounds) noexcept {
+    void Lock() noexcept {
         mutex.lock();
     }
 
-    void Unlock(const Bounds& bounds) noexcept {
+    void Unlock() noexcept {
         mutex.unlock();
     }
 
