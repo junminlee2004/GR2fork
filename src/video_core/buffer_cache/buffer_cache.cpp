@@ -270,8 +270,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                              copies = std::move(copies)] {
         download.Invalidate();
         WriteBack(arena_base, copies, download.mapped, download.offset);
-        // After the synchronous wait every write the copy found has executed, including the
-        // writes of a packet still being bound, which the commit after its record marks again.
+        // After the synchronous wait the copy holds the arena as the GPU left it, including the
+        // ranges of a packet still being bound, which ResetBindings stamps and marks again.
         ConsumeGpuWrites(device_addr, size, async ? record_tick : scheduler.CurrentTick());
         if (async) {
             staging_pool.FreeDeferred(download);
@@ -433,9 +433,9 @@ bool BufferCache::DirectReadback(VAddr device_addr) {
     AcquireWindows(window, READBACK_WINDOW_SIZE);
     const u64 known = scheduler.GetWorkSemaphore()->KnownGpuTick();
     // After the GPU thread's own flush and wait every recorded write has executed, and the writes
-    // of a packet still being bound were moved into the new batch, which marks them again at its
-    // commit; their bytes are the arena's as the GPU left them, so the copy and the consume take
-    // the current tick, like the synchronous download does.
+    // of a packet still being bound were moved into the new batch; ResetBindings stamps and marks
+    // them again after the record. Their bytes are the arena's as the GPU left them, so the copy
+    // and the consume take the current tick, like the synchronous download does.
     const u64 copy_tick = flushed ? scheduler.CurrentTick() : known;
     const VAddr window_end = window + READBACK_WINDOW_SIZE;
     bool copied = false;
@@ -524,7 +524,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     EnsureResident(arena, first_block, last_block);
     if (is_written) {
         texture_cache.MarkAsMaybeGpuDirty(device_addr, size);
-        MarkGpuWrite(device_addr, size);
+        // The caller records the write or adds it to bound_buffers before anything submits; the
+        // submit callback moves only those stamps into the new batch.
+        StampGpuWrite(device_addr, size);
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     return {arena, arena->Offset(device_addr)};
@@ -562,34 +564,9 @@ void BufferCache::StampGpuWrite(VAddr device_addr, u64 size) {
     gpu_writes.Set(device_addr, size, tick);
 }
 
-void BufferCache::MarkGpuWrite(VAddr device_addr, u64 size) {
+void BufferCache::RestampGpuWrite(VAddr device_addr, u64 size) {
     StampGpuWrite(device_addr, size);
-    in_flight.push_back({device_addr, size});
-}
-
-void BufferCache::CommitGpuWrites() {
-    // A flush between the binds and the record moved the packet into the current batch, and a
-    // synchronous download on this thread meanwhile consumed the writes it found: they are
-    // stamped and marked again.
-    if (in_flight_moved) {
-        for (const auto& [addr, size] : in_flight) {
-            StampGpuWrite(addr, size);
-            memory_tracker->MarkRegionAsGpuModified(addr, size);
-        }
-        in_flight_moved = false;
-    }
-    in_flight.clear();
-}
-
-void BufferCache::MoveInFlightWrites() {
-    if (in_flight.empty()) {
-        return;
-    }
-    // The submit took the batch the stamps name; the packet records into the one being opened.
-    for (const auto& [addr, size] : in_flight) {
-        StampGpuWrite(addr, size);
-    }
-    in_flight_moved = true;
+    memory_tracker->MarkRegionAsGpuModified(device_addr, size);
 }
 
 void BufferCache::ReadEdgeImagePages(const Image& image) {

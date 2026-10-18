@@ -147,17 +147,12 @@ public:
     /// Mark region as modified from the GPU
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
 
-    /// Records a GPU write the packet being bound will perform.
-    void MarkGpuWrite(VAddr device_addr, u64 size);
+    /// Stamps a GPU write with the tick of the open batch.
+    void StampGpuWrite(VAddr device_addr, u64 size);
 
-    /// Stamps and marks the writes of the packet again when a flush moved it into the current
-    /// batch. Called right after each draw, dispatch, fill or copy is recorded, and on every exit
-    /// of a packet whose record did not happen.
-    void CommitGpuWrites();
-
-    /// Moves the writes of a packet still being bound into the batch this flush opens. Called from
-    /// the submit callback.
-    void MoveInFlightWrites();
+    /// Stamps a GPU write again and marks its pages GPU modified, for a packet whose writes a
+    /// readback consumed between its binds and its record.
+    void RestampGpuWrite(VAddr device_addr, u64 size);
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -216,9 +211,6 @@ private:
     /// pages left without one; a write marked since keeps its pages GPU modified.
     void ConsumeGpuWrites(VAddr device_addr, u64 size, u64 known_tick);
 
-    /// Stamps a GPU write with the tick of the open batch.
-    void StampGpuWrite(VAddr device_addr, u64 size);
-
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
@@ -244,9 +236,6 @@ private:
         VAddr addr;
         u64 size;
     };
-    /// Writes marked for the packet being bound, and whether a flush moved them since.
-    boost::container::small_vector<Range, 8> in_flight;
-    bool in_flight_moved{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
