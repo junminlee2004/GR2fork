@@ -53,13 +53,22 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     bool handled = false;
     bool static_protection_exception = false; // Windows static guest red-zone protection
     switch (code) {
-    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ACCESS_VIOLATION: {
         guest_info._si_signo = POSIX_SIGSEGV;
         guest_info._si_code = POSIX_SEGV_MAPERR;
         static_protection_exception = true; // Windows static guest red-zone protection
+        // Guest signals arrive as user APCs, which the guest mask holds back while the fault is
+        // handled, so a guest handler never runs on top of a fault path that holds a tracker
+        // lock or a readback window.
+        Sigset all_signals;
+        Sigset old_mask{};
+        posix_sigfillset(&all_signals);
+        posix_pthread_sigmask(POSIX_SIG_SETMASK, &all_signals, &old_mask);
         handled = signals->DispatchAccessViolation(
             pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
+        posix_pthread_sigmask(POSIX_SIG_SETMASK, &old_mask, nullptr);
         break;
+    }
     case EXCEPTION_ILLEGAL_INSTRUCTION:
         guest_info._si_signo = POSIX_SIGILL;
         guest_info._si_code = POSIX_ILL_ILLOPC;
@@ -272,6 +281,11 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
         const bool is_write = Common::IsWriteError(raw_context);
         const bool is_exec = Common::IsExecuteError(raw_context);
         if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
+            // The guest's own handler runs with guest signals deliverable again.
+            sigset_t guest_signal;
+            sigemptyset(&guest_signal);
+            sigaddset(&guest_signal, SIGUSR1);
+            pthread_sigmask(SIG_UNBLOCK, &guest_signal, nullptr);
             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
                 return;
             }
@@ -334,9 +348,15 @@ SignalDispatch::SignalDispatch() {
     action.sa_sigaction = SignalHandler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
+    // Guest signals arrive as SIGUSR1. The kernel blocks it from the moment a fault is taken until
+    // its handler returns, so a guest handler never runs on top of a fault path that holds a
+    // tracker lock or a readback window.
+    struct sigaction fault_action = action;
+    sigaddset(&fault_action.sa_mask, SIGUSR1);
 
     ASSERT_MSG(
-        sigaction(SIGSEGV, &action, nullptr) == 0 && sigaction(SIGBUS, &action, nullptr) == 0 &&
+        sigaction(SIGSEGV, &fault_action, nullptr) == 0 &&
+            sigaction(SIGBUS, &fault_action, nullptr) == 0 &&
             sigaction(SIGILL, &action, nullptr) == 0 && sigaction(SIGABRT, &action, nullptr) == 0 &&
             sigaction(SIGTRAP, &action, nullptr) == 0 && sigaction(SIGSYS, &action, nullptr) == 0 &&
             sigaction(SIGUSR1, &action, nullptr) == 0 && sigaction(SIGFPE, &action, nullptr) == 0 &&

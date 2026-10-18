@@ -356,7 +356,9 @@ bool BufferCache::FaultReadback(VAddr device_addr, u64 size, bool is_write) {
         return false;
     }
     // Guest signals stay pending until the readback is done: other threads that fault on the
-    // window wait for this one, and a guest handler could wait for them.
+    // window wait for this one, and a guest handler could wait for them. The fault handler holds
+    // them already; a readback a guest system call starts, such as a file read into GPU written
+    // memory, gets here without it.
     Libraries::Kernel::Sigset all_signals;
     Libraries::Kernel::Sigset old_sigmask{};
     Libraries::Kernel::posix_sigfillset(&all_signals);
