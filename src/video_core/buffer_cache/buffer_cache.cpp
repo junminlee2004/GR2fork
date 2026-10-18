@@ -34,6 +34,8 @@ static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 // Every readback window lies inside one tracker region.
 static_assert(HIGHER_PAGE_SIZE % BufferCache::READBACK_WINDOW_SIZE == 0);
+static_assert(BufferCache::READBACK_LOCK_SIZE == BYTES_PER_WORD);
+static_assert(BufferCache::READBACK_WINDOW_SIZE % BufferCache::READBACK_LOCK_SIZE == 0);
 constexpr std::optional<u32> CmaskColorExpandedValue(u32 num_samples) {
     switch (num_samples) {
     case 1:
@@ -171,8 +173,6 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
-    std::scoped_lock lk{gpu_writes_mutex};
-    gpu_writes.Subtract(device_addr, size);
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
@@ -213,8 +213,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 u64 BufferCache::CollectWrites(const Buffer* arena, VAddr device_addr, u64 size, u64 tick,
                                ReadbackCopies& copies) {
     u64 total_size = copies.empty() ? 0 : copies.back().dstOffset + copies.back().size;
-    std::scoped_lock lk{gpu_writes_mutex};
-    gpu_writes.ForEachInRange(device_addr, size, [&](VAddr begin, VAddr end, u64 write_tick) {
+    memory_tracker->ForEachGpuWrite(device_addr, size, [&](VAddr begin, VAddr end, u64 write_tick) {
         if (write_tick > tick) {
             return;
         }
@@ -272,7 +271,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         WriteBack(arena_base, copies, download.mapped, download.offset);
         // After the synchronous wait the copy holds the arena as the GPU left it, including the
         // ranges of a packet still being bound, which ResetBindings stamps and marks again.
-        ConsumeGpuWrites(device_addr, size, async ? record_tick : scheduler.CurrentTick());
+        memory_tracker->ConsumeGpuWrites(device_addr, size,
+                                         async ? record_tick : scheduler.CurrentTick());
         if (async) {
             staging_pool.FreeDeferred(download);
         } else {
@@ -288,66 +288,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
 }
 
-void BufferCache::ConsumeGpuWrites(VAddr device_addr, u64 size, u64 known_tick) {
-    // The pages are cleared whole, so the writes are erased whole as well.
-    const VAddr page_start = Common::AlignDown(device_addr, BYTES_PER_PAGE);
-    const VAddr page_end = Common::AlignUp(device_addr + size, BYTES_PER_PAGE);
-    memory_tracker->ForEachRegionLocked(
-        page_start, page_end - page_start,
-        [&](RegionManager* manager, VAddr region_base, VAddr start, u64 len) {
-            std::array<u64, NUM_REGION_WORDS> consumed{};
-            std::array<u64, NUM_REGION_WORDS> kept{};
-            const auto mark_pages = [&](std::array<u64, NUM_REGION_WORDS>& pages, VAddr begin,
-                                        VAddr end) {
-                RegionManager::IterateWords(
-                    RegionManager::GetBounds(begin - region_base, end - begin),
-                    [&](u64 index, u64 mask) { pages[index] |= mask; });
-            };
-            boost::container::small_vector<Range, 32> erased;
-            // The map lock stays held through the clear: a write marked meanwhile either shows
-            // up here with a newer tick and keeps its pages, or finds the pages clear afterwards
-            // and sets them again.
-            std::scoped_lock lk{gpu_writes_mutex};
-            gpu_writes.ForEachInRange(start, len, [&](VAddr begin, VAddr end, u64 tick) {
-                if (tick <= known_tick) {
-                    mark_pages(consumed, begin, end);
-                    erased.push_back({begin, end - begin});
-                } else {
-                    mark_pages(kept, begin, end);
-                }
-            });
-            for (const auto& [addr, erased_size] : erased) {
-                gpu_writes.Subtract(addr, erased_size);
-            }
-            for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
-                consumed[index] &= ~kept[index];
-            }
-            manager->ChangeRegionStateMasked<StateOp::None, StateOp::Clear>(consumed);
-        });
-}
-
-bool BufferCache::WindowsOwned(VAddr device_addr, u64 size) const {
-    return std::ranges::any_of(window_owners, [&](const Range& owner) {
-        return owner.addr < device_addr + size && device_addr < owner.addr + owner.size;
-    });
-}
-
 void BufferCache::AcquireWindows(VAddr device_addr, u64 size) {
-    std::unique_lock lk{window_mutex};
-    window_cv.wait(lk, [&] { return !WindowsOwned(device_addr, size); });
-    window_owners.push_back({device_addr, size});
+    memory_tracker->AcquireReadback<true>(device_addr, size);
 }
 
 void BufferCache::ReleaseWindows(VAddr device_addr, u64 size) {
-    {
-        std::scoped_lock lk{window_mutex};
-        const auto it = std::ranges::find_if(window_owners, [&](const Range& owner) {
-            return owner.addr == device_addr && owner.size == size;
-        });
-        ASSERT(it != window_owners.end());
-        window_owners.erase(it);
-    }
-    window_cv.notify_all();
+    memory_tracker->ReleaseReadback(device_addr, size);
 }
 
 bool BufferCache::FaultReadback(VAddr device_addr, u64 size, bool is_write) {
@@ -411,12 +357,9 @@ bool BufferCache::DirectReadback(VAddr device_addr) {
     const bool on_gpu_thread =
         std::this_thread::get_id() == liverpool->GetGpuCommandProcessorThread();
     u64 page_tick = 0;
-    {
-        std::scoped_lock lk{gpu_writes_mutex};
-        gpu_writes.ForEachInRange(page, BYTES_PER_PAGE, [&](VAddr, VAddr, u64 tick) {
-            page_tick = std::max(page_tick, tick);
-        });
-    }
+    memory_tracker->ForEachGpuWrite(page, BYTES_PER_PAGE, [&](VAddr, VAddr, u64 tick) {
+        page_tick = std::max(page_tick, tick);
+    });
     if (page_tick == 0) {
         return false;
     }
@@ -431,8 +374,9 @@ bool BufferCache::DirectReadback(VAddr device_addr) {
         }
     }
     scheduler.GetWorkSemaphore()->Wait(page_tick);
-    // Owned only now, so the GPU thread never waits for a thread that waits for it.
-    AcquireWindows(window, READBACK_WINDOW_SIZE);
+    // Owned only now, so the GPU thread never waits for a thread that waits for it. The page has
+    // a stamp, so its region exists.
+    memory_tracker->AcquireReadback<false>(window, READBACK_WINDOW_SIZE);
     const u64 known = scheduler.GetWorkSemaphore()->KnownGpuTick();
     // After the GPU thread's own flush and wait every recorded write has executed, and the writes
     // of a packet still being bound were moved into the new batch; ResetBindings stamps and marks
@@ -449,20 +393,17 @@ bool BufferCache::DirectReadback(VAddr device_addr) {
         for (VAddr cursor = window; copied && cursor < window_end;) {
             islands.clear();
             VAddr next = window_end;
-            {
-                std::scoped_lock lk{gpu_writes_mutex};
-                gpu_writes.ForEachInRange(cursor, window_end - cursor,
-                                          [&](VAddr begin, VAddr end, u64 tick) {
-                                              if (islands.size() == BatchIslands) {
-                                                  next = std::min(next, begin);
-                                                  return;
-                                              }
-                                              if (tick > copy_tick) {
-                                                  return;
-                                              }
-                                              islands.push_back({begin, end - begin});
-                                          });
-            }
+            memory_tracker->ForEachGpuWrite(cursor, window_end - cursor,
+                                            [&](VAddr begin, VAddr end, u64 tick) {
+                                                if (islands.size() == BatchIslands) {
+                                                    next = std::min(next, begin);
+                                                    return;
+                                                }
+                                                if (tick > copy_tick) {
+                                                    return;
+                                                }
+                                                islands.push_back({begin, end - begin});
+                                            });
             for (auto it = islands.begin(); copied && it != islands.end(); ++it) {
                 copied = DirectRead(it->addr, it->size);
             }
@@ -478,9 +419,9 @@ bool BufferCache::DirectReadback(VAddr device_addr) {
         }
     }
     if (copied) {
-        ConsumeGpuWrites(window, READBACK_WINDOW_SIZE, copy_tick);
+        memory_tracker->ConsumeGpuWrites(window, READBACK_WINDOW_SIZE, copy_tick);
     }
-    ReleaseWindows(window, READBACK_WINDOW_SIZE);
+    memory_tracker->ReleaseReadback(window, READBACK_WINDOW_SIZE);
     return copied;
 }
 
@@ -561,9 +502,7 @@ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::StampGpuWrite(VAddr device_addr, u64 size) {
-    const u64 tick = scheduler.CurrentTick();
-    std::scoped_lock lk{gpu_writes_mutex};
-    gpu_writes.Set(device_addr, size, tick);
+    memory_tracker->StampGpuWrite(device_addr, size, scheduler.CurrentTick());
 }
 
 void BufferCache::RestampGpuWrite(VAddr device_addr, u64 size) {
@@ -586,10 +525,7 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
     CollectWrites(buffer, page_start, image_addr - page_start, tick, copies);
     const u64 total_size_bytes =
         CollectWrites(buffer, image_end, page_end - image_end, tick, copies);
-    {
-        std::scoped_lock lk{gpu_writes_mutex};
-        gpu_writes.Subtract(page_start, page_end - page_start);
-    }
+    memory_tracker->SubtractGpuWrites(page_start, page_end - page_start);
     if (total_size_bytes == 0) {
         return;
     }

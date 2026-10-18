@@ -1084,16 +1084,18 @@ void TextureCache::GarbageCollectImages() {
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
 
-    // The images' readback pages are owned from the record of a download to its write-back, so
-    // no faulting thread reads them back meanwhile; images that overlap in memory own one range.
+    // The images' readback memory is owned from the record of a download to its write-back, so
+    // no faulting thread reads it back meanwhile. Ownership comes in whole lock units, so images
+    // that share a unit own one range.
     using ImageRanges = boost::container::small_vector<std::pair<VAddr, VAddr>, 8>;
     const auto page_ranges = [&](const auto& image_ids) {
         ImageRanges ranges;
         for (const auto& image_id : image_ids) {
             const auto& info = slot_images[image_id].info;
             ranges.emplace_back(
-                PageManager::GetPageAddr(info.guest_address),
-                PageManager::GetNextPageAddr(info.guest_address + info.guest_size - 1));
+                Common::AlignDown(info.guest_address, BufferCache::READBACK_LOCK_SIZE),
+                Common::AlignUp(info.guest_address + info.guest_size,
+                                BufferCache::READBACK_LOCK_SIZE));
         }
         std::ranges::sort(ranges);
         size_t num_merged = 0;
