@@ -186,24 +186,15 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
 
-    struct Readback;
-
     /// Serves a fault from the thread that took it, inside one readback window, while the GPU
     /// thread keeps running. Returns false when the request has to take the synchronous download.
     bool FaultReadback(VAddr device_addr, u64 size, bool is_write);
 
-    /// Records and submits the copy of the GPU written ranges of a readback window, which the
-    /// faulting thread then owns. Runs on the GPU thread.
-    void RecordReadback(Readback& job);
-
-    /// Writes a signaled readback to guest memory and consumes the writes it copied.
-    void FinishReadback(const Readback& job);
-
     /// Serves a fault out of the arena's host mapping: waits for the newest GPU write of the
     /// faulting page, submitting the open batch when it holds that write (the GPU thread flushes
     /// in place, a guest thread asks it to), then copies every retired write of the window into
-    /// guest memory and consumes it. Returns false when the window has to take the GPU thread's
-    /// copy.
+    /// guest memory and consumes it. Returns false when the synchronous download has to serve
+    /// it.
     bool DirectReadback(VAddr device_addr);
 
     /// A fault taken on the GPU thread, served by DirectReadback. Returns false when the
@@ -218,8 +209,6 @@ private:
     /// lanes; nullptr while binds of the arena are still queued for the next submit.
     const Buffer* ArenaOf(VAddr device_addr, u64& bind_tick);
 
-    bool TryAcquireWindows(VAddr device_addr, u64 size);
-    void WaitWindowsFree(VAddr device_addr, u64 size);
     /// Requires window_mutex.
     bool WindowsOwned(VAddr device_addr, u64 size) const;
 
