@@ -1212,7 +1212,6 @@ void TextureCache::TouchImage(Image& image) {
 
     // Image is still valid
     image.flags &= ~ImageFlagBits::MaybeGpuDirty;
-    image.gpu_hash = 0;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
