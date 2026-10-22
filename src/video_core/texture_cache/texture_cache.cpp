@@ -231,10 +231,6 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::MarkAsMaybeGpuDirty(VAddr addr, size_t size) {
     ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
-        if (image.gpu_hash == 0) {
-            // Read backing pages directly, without faulting through the guest readback path.
-            image.gpu_hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
-        }
         image.flags |= ImageFlagBits::MaybeGpuDirty;
     });
 }
