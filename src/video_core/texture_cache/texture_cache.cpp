@@ -919,6 +919,8 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    // The uploaded contents match memory, so the next written bind takes a new GC baseline.
+    image.gpu_hash = 0;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
