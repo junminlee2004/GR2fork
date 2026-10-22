@@ -707,7 +707,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                event_eos->SignalFence([this](void* address, u64 data, u32 num_bytes) {
+                    if (rasterizer) {
+                        rasterizer->GetTextureCache().MarkAsGuestMemoryChanged(
+                            std::bit_cast<VAddr>(address), &data, num_bytes);
+                    }
                     auto* memory = Core::Memory::Instance();
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                 });
@@ -727,7 +731,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                     rasterizer->OnFence();
                 }
                 event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
+                    [this](void* address, u64 data, u32 num_bytes) {
+                        if (rasterizer) {
+                            rasterizer->GetTextureCache().MarkAsGuestMemoryChanged(
+                                std::bit_cast<VAddr>(address), &data, num_bytes);
+                        }
                         auto* memory = Core::Memory::Instance();
                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                     },

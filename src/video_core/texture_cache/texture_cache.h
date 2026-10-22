@@ -126,6 +126,9 @@ public:
     /// Marks all images as maybe GPU dirty within the provided range.
     void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
 
+    /// Marks maybe GPU dirty images in the range whose memory differs from the data to be written.
+    void MarkAsGuestMemoryChanged(VAddr addr, const void* data, u64 size);
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -412,6 +415,7 @@ private:
     TileManager tile_manager;
     absl::flat_hash_map<u64, SamplerId> samplers;
     absl::flat_hash_set<ImageId> download_images;
+    boost::container::small_vector<ImageId, 8> gc_compare_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

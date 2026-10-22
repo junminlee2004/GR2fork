@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <xxhash.h>
 
@@ -47,6 +48,24 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     const u64 hash = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     return hash;
+}
+
+static bool BackingMemoryDiffers(VAddr virtual_addr, const u8* data, u64 size) {
+    const auto& backing_pages = Core::Memory::Instance()->GetAddressSpace().BackingPages();
+    while (size) {
+        const u64 page = virtual_addr >> Core::GUEST_PAGE_BITS;
+        const u64 offset_in_page = virtual_addr & (Core::GUEST_PAGE_SIZE - 1);
+        const u64 compare_size = std::min<u64>(Core::GUEST_PAGE_SIZE - offset_in_page, size);
+        if (auto* entry = backing_pages.find(page); entry && *entry) {
+            if (std::memcmp(*entry + offset_in_page, data, compare_size) != 0) {
+                return true;
+            }
+        }
+        size -= compare_size;
+        virtual_addr += compare_size;
+        data += compare_size;
+    }
+    return false;
 }
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -150,6 +169,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
         download.Invalidate();
+        MarkAsGuestMemoryChanged(image_addr, download.mapped, copy_size);
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
                                                   copy_size);
         if (discard_buffer_cache) {
@@ -232,11 +252,36 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 
 void TextureCache::MarkAsMaybeGpuDirty(VAddr addr, size_t size) {
     ForEachImageInRegion(addr, size, [&](ImageId image_id, Image& image) {
-        if (image.gpu_hash == 0) {
-            // Read backing pages directly, without faulting through the guest readback path.
-            image.gpu_hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
+        // The garbage collector relies on page protection to observe guest writes to the image.
+        if (image.HasGpuValidData()) {
+            TrackImage(image_id);
         }
+        image.flags |= ImageFlagBits::MaybeGpuDirty;
     });
+}
+
+void TextureCache::MarkAsGuestMemoryChanged(VAddr addr, const void* data, u64 size) {
+    const auto compare = [&](ImageId, Image& image) {
+        if (False(image.flags & ImageFlagBits::MaybeGpuDirty) ||
+            True(image.flags & ImageFlagBits::GuestMemoryChanged)) {
+            return;
+        }
+        const VAddr begin = std::max(addr, image.info.guest_address);
+        const VAddr end =
+            std::min<VAddr>(addr + size, image.info.guest_address + image.info.guest_size);
+        if (BackingMemoryDiffers(begin, static_cast<const u8*>(data) + (begin - addr),
+                                 end - begin)) {
+            image.flags |= ImageFlagBits::GuestMemoryChanged;
+        }
+    };
+    ForEachImageInRegion(addr, size, compare);
+    // The garbage collector unregisters the images it compares before reading their memory.
+    for (const ImageId image_id : gc_compare_images) {
+        Image& image = slot_images[image_id];
+        if (image.Overlaps(addr, size)) {
+            compare(image_id, image);
+        }
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -1084,7 +1129,6 @@ void TextureCache::GarbageCollectImages() {
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
     boost::container::small_vector<ImageId, 8> download_queue;
-    boost::container::small_vector<ImageId, 8> maybe_download;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
@@ -1108,10 +1152,10 @@ void TextureCache::GarbageCollectImages() {
         if (download) {
             UntrackImage(image_id);
             UnregisterImage(image_id);
-            if (image.gpu_hash != 0) {
+            if (True(image.flags & ImageFlagBits::MaybeGpuDirty)) {
+                gc_compare_images.push_back(image_id);
                 buffer_cache.ReadMemory(image.info.guest_address, image.info.guest_size, false,
                                         true, true);
-                maybe_download.push_back(image_id);
             } else {
                 download_queue.push_back(image_id);
             }
@@ -1142,20 +1186,19 @@ void TextureCache::GarbageCollectImages() {
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
 
-    if (!maybe_download.empty()) {
+    if (!gc_compare_images.empty()) {
         // wait for memory reads to finish
         scheduler.Finish();
         scheduler.PopPendingOperations();
 
-        for (const auto& image_id : maybe_download) {
-            const auto& image = slot_images[image_id];
-            const u64 hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
-            if (image.gpu_hash == hash) {
-                download_queue.push_back(image_id);
-            } else {
+        for (const auto& image_id : gc_compare_images) {
+            if (True(slot_images[image_id].flags & ImageFlagBits::GuestMemoryChanged)) {
                 DeleteImage(image_id);
+            } else {
+                download_queue.push_back(image_id);
             }
         }
+        gc_compare_images.clear();
     }
 
     for (const auto& image_id : download_queue) {
@@ -1228,7 +1271,7 @@ void TextureCache::TouchImage(Image& image) {
     image_lru_cache.Touch(image, gc_tick);
 
     // Image is still valid
-    image.gpu_hash = 0;
+    image.flags &= ~(ImageFlagBits::MaybeGpuDirty | ImageFlagBits::GuestMemoryChanged);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

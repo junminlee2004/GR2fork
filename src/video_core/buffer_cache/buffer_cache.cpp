@@ -193,9 +193,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                              copies = std::move(copies)] {
         download.Invalidate();
         for (const auto& copy : copies) {
-            auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-            memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                    copy.size);
+            const VAddr dst_addr = arena_base + copy.srcOffset;
+            const u8* data = download.mapped + (copy.dstOffset - download.offset);
+            texture_cache.MarkAsGuestMemoryChanged(dst_addr, data, copy.size);
+            memory->TryWriteBacking(std::bit_cast<u8*>(dst_addr), data, copy.size);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 
@@ -310,6 +311,8 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
             for (const auto& copy : copies) {
                 const VAddr copy_device_addr = base + copy.srcOffset;
                 const u64 dst_offset = copy.dstOffset - download.offset;
+                texture_cache.MarkAsGuestMemoryChanged(copy_device_addr,
+                                                       download.mapped + dst_offset, copy.size);
                 memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
                                         download.mapped + dst_offset, copy.size);
             }

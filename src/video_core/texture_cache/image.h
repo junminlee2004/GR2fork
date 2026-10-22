@@ -33,8 +33,10 @@ enum ImageFlagBits : u32 {
     GpuDirty = 1 << 2, ///< Image contents have been modified from the GPU (valid data in buffer
                        ///< cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
-    GpuModified = 1 << 3, ///< Contents have been modified from the GPU
-    Registered = 1 << 6,  ///< True when the image is registered
+    GpuModified = 1 << 3,        ///< Contents have been modified from the GPU
+    MaybeGpuDirty = 1 << 4,      ///< Image contents may have been modified in the buffer cache
+    GuestMemoryChanged = 1 << 5, ///< Image memory has been modified while maybe GPU dirty
+    Registered = 1 << 6,         ///< True when the image is registered
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -172,7 +174,6 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 cpu_hash{};
-    u64 gpu_hash{};
     u64 head_hash{};
     u64 tail_hash{};
 
