@@ -151,6 +151,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
         download.Invalidate();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
                                                   copy_size);
+        MarkGpuHashStale(image_addr, copy_size);
         if (discard_buffer_cache) {
             buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
         }
@@ -235,12 +236,20 @@ void TextureCache::MarkAsMaybeGpuDirty(VAddr addr, size_t size) {
         if (!image.CanBeDownloaded()) {
             return;
         }
-        if (image.gpu_hash == 0) {
+        // A baseline kept from an earlier use is reused while its memory is unchanged.
+        if (image.gpu_hash == 0 ||
+            (image.gpu_hash_stale && False(image.flags & ImageFlagBits::MaybeGpuDirty))) {
             // Read backing pages directly, without faulting through the guest readback path.
             image.gpu_hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
+            image.gpu_hash_stale = false;
         }
         image.flags |= ImageFlagBits::MaybeGpuDirty;
     });
+}
+
+void TextureCache::MarkGpuHashStale(VAddr addr, size_t size) {
+    ForEachImageInRegion(addr, size,
+                         [](ImageId image_id, Image& image) { image.gpu_hash_stale = true; });
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -919,6 +928,8 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    // The image was reloaded because its memory changed, so the kept GC baseline is outdated.
+    image.gpu_hash_stale = true;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
@@ -1212,7 +1223,6 @@ void TextureCache::TouchImage(Image& image) {
 
     // Image is still valid
     image.flags &= ~ImageFlagBits::MaybeGpuDirty;
-    image.gpu_hash = 0;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

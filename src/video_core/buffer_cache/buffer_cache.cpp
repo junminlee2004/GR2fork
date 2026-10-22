@@ -196,6 +196,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
             memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                     copy.size);
+            texture_cache.MarkGpuHashStale(arena_base + copy.srcOffset, copy.size);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 
@@ -312,6 +313,7 @@ void BufferCache::ReadEdgeImagePages(const Image& image) {
                 const u64 dst_offset = copy.dstOffset - download.offset;
                 memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr),
                                         download.mapped + dst_offset, copy.size);
+                texture_cache.MarkGpuHashStale(copy_device_addr, copy.size);
             }
             staging_pool.FreeDeferred(download);
         });

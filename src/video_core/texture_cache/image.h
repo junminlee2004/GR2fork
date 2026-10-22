@@ -174,6 +174,7 @@ public:
     u64 tick_accessed_last{};
     u64 cpu_hash{};
     u64 gpu_hash{};
+    bool gpu_hash_stale{};
 
     struct {
         u32 texture : 1;

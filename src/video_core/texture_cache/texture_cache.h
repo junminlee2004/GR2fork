@@ -126,6 +126,9 @@ public:
     /// Marks all images as maybe GPU dirty within the provided range.
     void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
 
+    /// Marks the GC baselines of all images within the provided range as outdated.
+    void MarkGpuHashStale(VAddr addr, size_t size);
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
