@@ -1497,33 +1497,36 @@ void Rasterizer::UpdateDepthStencilState() const {
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so a face whose stencil ops
-        // include ReplaceOp takes its Vulkan reference from op_val.
+        // GCN compares against STENCILTESTVAL and REPLACE_OP writes STENCILOPVAL, but Vulkan has
+        // one reference per face. With ReplaceOp the compared bits come from test_val and the rest
+        // from op_val, which matches GCN unless a bit is both compared and written.
+        const auto reference = [](const AmdGpu::StencilRefMask& ref, AmdGpu::CompareFunc func,
+                                  AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
+                                  AmdGpu::StencilFunc zfail) -> u32 {
+            constexpr auto replace_op = AmdGpu::StencilFunc::ReplaceOp;
+            if (fail != replace_op && zpass != replace_op && zfail != replace_op) {
+                return ref.stencil_test_val;
+            }
+            const u32 compared =
+                func == AmdGpu::CompareFunc::Always || func == AmdGpu::CompareFunc::Never
+                    ? 0
+                    : ref.stencil_mask;
+            if ((ref.stencil_test_val ^ ref.stencil_op_val) & compared & ref.stencil_write_mask) {
+                LOG_WARNING(Render_Vulkan, "Stencil test and ReplaceOp require different values in "
+                                           "the same bits; ReplaceOp will write test_val to them");
+            }
+            return (ref.stencil_test_val & compared) | (ref.stencil_op_val & ~compared);
+        };
         const auto& sc = regs.stencil_control;
-        const auto uses_op_val = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
-                                    AmdGpu::StencilFunc zfail) {
-            return fail == AmdGpu::StencilFunc::ReplaceOp ||
-                   zpass == AmdGpu::StencilFunc::ReplaceOp ||
-                   zfail == AmdGpu::StencilFunc::ReplaceOp;
-        };
-        const bool front_op =
-            uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
+        const u32 front_ref =
+            reference(front, regs.depth_control.stencil_ref_func, sc.stencil_fail_front,
+                      sc.stencil_zpass_front, sc.stencil_zfail_front);
+        const u32 back_ref =
             regs.depth_control.backface_enable
-                ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
-        const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref) {
-            return func != AmdGpu::CompareFunc::Always && func != AmdGpu::CompareFunc::Never &&
-                   ref.stencil_test_val != ref.stencil_op_val;
-        };
-        if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
-            (back_op && regs.depth_control.backface_enable &&
-             ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
-        }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
+                ? reference(back, regs.depth_control.stencil_bf_func, sc.stencil_fail_back,
+                            sc.stencil_zpass_back, sc.stencil_zfail_back)
+                : front_ref;
+        dynamic_state.SetStencilReferences(front_ref, back_ref);
         dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
                                            !stencil_clear ? back.stencil_write_mask : 0U);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
