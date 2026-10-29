@@ -11,6 +11,7 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/cpu_patches.h"
+#include "core/gr2_gfx_trace/gr2_gfx_trace.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
@@ -438,6 +439,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         }
     }
 #endif
+    Gr2GfxTrace::Install(base_virtual_addr);
 }
 
 void Module::LoadDynamicInfo() {
