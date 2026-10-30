@@ -175,6 +175,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
     while (true) {
         timer.Start();
 
+        Gr2AvTrace::OnTickBegin(port->impl.get());
         {
             std::unique_lock lock{port->mutex};
             if (!port->impl || stop.stop_requested()) {
@@ -189,6 +190,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                 port->last_output_time =
                     Kernel::sceKernelGetProcessTime(); // moved from sceAudioOutOutput TOOD recheck
             }
+            Gr2AvTrace::OnTickEnd(port->impl.get());
         }
 
         port->output_cv.notify_all();
@@ -574,8 +576,11 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
 
     s32 samples_sent = 0;
     {
+        Gr2AvTrace::OnGuestBegin();
         std::unique_lock lock{port->mutex};
+        Gr2AvTrace::OnGuestLocked();
         port->output_cv.wait(lock, [&] { return !port->output_ready || port->closing; });
+        Gr2AvTrace::OnGuestWaited();
 
         if (port->closing) {
             LOG_DEBUG(Lib_AudioOut, "Port {} closed while waiting for drain", port_id);
@@ -624,6 +629,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
 
     u32 buffer_frames = 0;
 
+    Gr2AvTrace::OnGuestBegin();
     {
         std::shared_lock read_lock{port_table_mutex};
 
@@ -676,6 +682,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
     }
 
     // Wait for all ports to be ready
+    Gr2AvTrace::OnGuestLocked();
     for (u32 i = 0; i < num; i++) {
         ports[i]->output_cv.wait(locks[i],
                                  [&] { return !ports[i]->output_ready || ports[i]->closing; });
@@ -685,6 +692,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
             return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
         }
     }
+    Gr2AvTrace::OnGuestWaited();
 
     // Copy data to all ports
     for (u32 i = 0; i < num; i++) {

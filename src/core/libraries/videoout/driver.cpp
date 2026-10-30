@@ -6,6 +6,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -234,6 +235,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    Gr2AvTrace::OnFlip(Gr2AvTrace::FlipStage::Present);
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
@@ -291,6 +293,7 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    Gr2AvTrace::OnFlip(Gr2AvTrace::FlipStage::Submit);
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {

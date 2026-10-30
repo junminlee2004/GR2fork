@@ -423,6 +423,7 @@ private:
 
             if (time_to_wait > MIN_SLEEP_THRESHOLD_US) {
                 const u64 sleep_duration = time_to_wait - MIN_SLEEP_THRESHOLD_US;
+                const Gr2AvTrace::BackendSleep sleep_trace{this, sleep_duration};
                 std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
             }
         } else {
