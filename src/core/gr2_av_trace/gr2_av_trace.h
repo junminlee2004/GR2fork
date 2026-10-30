@@ -10,8 +10,7 @@ struct SDL_AudioStream;
 // A once-a-second trace of audio output and movie timing: per audio port, the blocks its output
 // thread took from the guest, the ticks that found none, the longest gap between ticks and how
 // much audio waited in the host queue; per movie, how late the game took its video frames; per AJM
-// instance, the samples it decoded. Written to gr2_av_trace.tsv in the log folder. On with the
-// environment variable GR2_AV_TRACE=1.
+// instance, the samples it decoded. Written to gr2_av_trace.tsv in the log folder.
 namespace Gr2AvTrace {
 
 void OnAudioTick(const void* backend, s32 port_type, u32 sample_rate, u32 block_frames,

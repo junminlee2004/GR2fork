@@ -3,12 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
-#include <string_view>
 #include <thread>
 
 #include <SDL3/SDL_audio.h>
@@ -71,11 +69,6 @@ struct State {
     Clock::time_point start{};
     bool started{};
 };
-
-const bool g_enabled = [] {
-    const char* enabled = std::getenv("GR2_AV_TRACE");
-    return enabled != nullptr && std::string_view{enabled} == "1";
-}();
 
 // Never destroyed, so hooks that run while the emulator exits still find it.
 State& GetState() {
@@ -199,7 +192,7 @@ void AddQueue(const void* backend, const char* host, u64 queued_frames) {
 
 void OnAudioTick(const void* backend, s32 port_type, u32 sample_rate, u32 block_frames,
                  bool block_ready) {
-    if (!g_enabled || sample_rate == 0) {
+    if (sample_rate == 0) {
         return;
     }
     const auto now = Clock::now();
@@ -233,7 +226,7 @@ void OnAudioTick(const void* backend, s32 port_type, u32 sample_rate, u32 block_
 }
 
 void OnSdlQueue(const void* backend, SDL_AudioStream* stream, u32 bytes_per_frame) {
-    if (!g_enabled || bytes_per_frame == 0) {
+    if (bytes_per_frame == 0) {
         return;
     }
     const int queued = SDL_GetAudioStreamQueued(stream);
@@ -243,15 +236,10 @@ void OnSdlQueue(const void* backend, SDL_AudioStream* stream, u32 bytes_per_fram
 }
 
 void OnOpenALQueue(const void* backend, u64 queued_frames) {
-    if (g_enabled) {
-        AddQueue(backend, "openal", queued_frames);
-    }
+    AddQueue(backend, "openal", queued_frames);
 }
 
 void OnVideoFrame(const void* source, u64 timestamp_ms, u64 clock_ms, u64 frames_left) {
-    if (!g_enabled) {
-        return;
-    }
     auto& state = GetState();
     std::scoped_lock lock{state.mutex};
     StartReporter(state);
@@ -272,9 +260,6 @@ void OnVideoFrame(const void* source, u64 timestamp_ms, u64 clock_ms, u64 frames
 }
 
 void OnAjmJob(u32 instance_id, u64 total_samples) {
-    if (!g_enabled) {
-        return;
-    }
     auto& state = GetState();
     std::scoped_lock lock{state.mutex};
     auto& decoder = state.decoders[instance_id];
