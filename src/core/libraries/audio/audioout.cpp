@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_audio_catchup/gr2_audio_catchup.h"
 #include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
@@ -345,7 +346,8 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
         }
 
         // Start output thread - pass shared_ptr by value to keep port alive
-        port->output_thread.Run([port](std::stop_token stop) { AudioOutputThread(port, stop); });
+        port->output_thread.Run(
+            [port](std::stop_token stop) { Gr2AudioCatchup::RunOutputThread(port, stop); });
 
         // Set initial volume
         port->impl->SetVolume(port->volume);
@@ -590,6 +592,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         if (ptr != nullptr) {
             std::memcpy(port->output_buffer, ptr, port->BufferSize());
             port->output_ready = true;
+            port->output_cv.notify_all();
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
     }
@@ -699,6 +702,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
+            ports[i]->output_cv.notify_all();
         }
     }
 

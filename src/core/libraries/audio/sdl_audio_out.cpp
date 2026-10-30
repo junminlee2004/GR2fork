@@ -11,6 +11,7 @@
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_audio_catchup/gr2_audio_catchup.h"
 #include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
@@ -219,6 +220,9 @@ private:
     }
 
     void HandleTiming(u64 current_time) {
+        if (Gr2AudioCatchup::OutputThreadPaces()) {
+            return;
+        }
         if (next_output_time == 0) [[unlikely]] {
             // First output - set initial timing
             next_output_time = current_time + period_us;
