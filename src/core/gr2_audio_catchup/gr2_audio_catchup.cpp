@@ -7,6 +7,7 @@
 
 #include "common/thread.h"
 #include "core/gr2_audio_catchup/gr2_audio_catchup.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/time.h"
@@ -44,6 +45,7 @@ void RunOutputThread(const std::shared_ptr<Libraries::AudioOut::PortOut>& port,
             next_tick = now;
         }
 
+        Gr2AvTrace::OnTickBegin(port->impl.get());
         {
             std::unique_lock lock{port->mutex};
             if (!port->impl || stop.stop_requested()) {
@@ -56,12 +58,15 @@ void RunOutputThread(const std::shared_ptr<Libraries::AudioOut::PortOut>& port,
                     return port->output_ready || port->closing || stop.stop_requested();
                 });
             }
+            Gr2AvTrace::OnAudioTick(port->impl.get(), static_cast<s32>(port->type),
+                                    port->sample_rate, port->buffer_frames, port->output_ready);
             took_block = port->output_ready;
             if (port->output_ready) {
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;
                 port->last_output_time = Kernel::sceKernelGetProcessTime();
             }
+            Gr2AvTrace::OnTickEnd(port->impl.get());
         }
 
         port->output_cv.notify_all();
