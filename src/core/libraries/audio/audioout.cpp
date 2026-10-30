@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/audioout_error.h"
@@ -180,6 +181,8 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
                 break;
             }
 
+            Gr2AvTrace::OnAudioTick(port->impl.get(), static_cast<s32>(port->type),
+                                    port->sample_rate, port->buffer_frames, port->output_ready);
             if (port->output_ready) {
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;

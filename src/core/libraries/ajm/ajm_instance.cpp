@@ -6,6 +6,7 @@
 #include "ajm_instance.h"
 #include "ajm_mp3.h"
 #include "ajm_result.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 
 #include <magic_enum/magic_enum.hpp>
 
@@ -145,6 +146,7 @@ void AjmInstance::ExecuteJob(AjmJob& job) {
         }
     }
 
+    Gr2AvTrace::OnAjmJob(job.instance_id, m_total_samples);
     if (job.output.p_mframe) {
         job.output.p_mframe->num_frames = frames_decoded;
     }

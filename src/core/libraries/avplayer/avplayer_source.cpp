@@ -5,6 +5,7 @@
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/file_sys/fs.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_file_streamer.h"
 #include "core/libraries/avplayer/avplayer_handle_streamer.h"
@@ -408,6 +409,7 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
 
     auto frame = m_video_frames.Pop();
     video_info = frame->info;
+    Gr2AvTrace::OnVideoFrame(this, video_info.timestamp, current_time, m_video_frames.Size());
 
     m_current_video_frame = std::move(frame);
     return true;

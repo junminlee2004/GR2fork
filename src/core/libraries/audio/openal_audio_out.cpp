@@ -29,6 +29,7 @@
 #include <queue>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/openal_manager.h"
@@ -153,6 +154,7 @@ public:
         ALint queued = 0;
         alGetSourcei(source, AL_SOURCE_STATE, &state);
         alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+        Gr2AvTrace::OnOpenALQueue(this, static_cast<u64>(queued) * buffer_frames);
 
         if (state != AL_PLAYING && queued > 0) {
             LOG_DEBUG(Lib_AudioOut, "Audio underrun detected (queued: {}), restarting source",

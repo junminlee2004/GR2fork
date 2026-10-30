@@ -11,6 +11,7 @@
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_av_trace/gr2_av_trace.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/threads.h"
@@ -85,6 +86,7 @@ public:
         const u64 current_time = Kernel::sceKernelGetProcessTime();
         convert(ptr, internal_buffer, buffer_frames, nullptr);
         HandleTiming(current_time);
+        Gr2AvTrace::OnSdlQueue(this, stream, internal_buffer_size / buffer_frames);
 
         if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
             ManageAudioQueue();
