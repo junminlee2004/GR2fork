@@ -6,6 +6,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/gr2_clock_trace/gr2_clock_trace.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -234,6 +235,8 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    Gr2ClockTrace::OnPresent(req.port->vblank_status.count);
+
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
