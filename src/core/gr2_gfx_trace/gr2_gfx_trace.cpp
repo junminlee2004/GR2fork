@@ -91,6 +91,9 @@ constexpr auto TimelineFlushInterval = std::chrono::milliseconds{250};
 // The main loop's frame counter, and the DrawThread's three frame labels: {u64* label, u64 value
 // the label holds once the GPU front end has reached the end of that frame}.
 constexpr u64 FrameCounterAddress = 0x1efb08c;
+// The DrawThread's frame number, the value its next frame label gets. It moves on once the frame
+// is submitted and the frame two before it has reached its label.
+constexpr u64 DrawFrameAddress = 0x1f585f8;
 constexpr u64 FrameLabelsAddress = 0x1f7b680;
 constexpr u32 FrameLabels = 3;
 
@@ -804,6 +807,8 @@ void TimelineThread() {
             "# call\tstart\tduration\tthread\tfunction\tfirst_argument: timed calls of DrawThread "
             "and Game:Main\n"
             "# mark\ttime\tframe\tcount: the main loop's frame counter moved\n"
+            "# mark\ttime\tdraw\tnumber: DrawThread started the frame whose label gets this "
+            "value\n"
             "# mark\ttime\tpresent\tcount: a frame was presented\n"
             "# mark\ttime\tlabel\tindex\tvalue: a frame label got its value, so the GPU front end "
             "has processed that frame's commands\n";
@@ -812,6 +817,7 @@ void TimelineThread() {
         return;
     }
     u32 last_frame = ReadGuest<u32>(FrameCounterAddress);
+    u32 last_draw = ReadGuest<u32>(DrawFrameAddress);
     u32 last_present = DebugState.GetFrameNum();
     std::array<u64, FrameLabels> last_label{};
     std::vector<std::string> names(MaxThreads);
@@ -825,6 +831,10 @@ void TimelineThread() {
         if (const u32 frame = ReadGuest<u32>(FrameCounterAddress); frame != last_frame) {
             last_frame = frame;
             out += fmt::format("mark\t{:.1f}\tframe\t{}\n", now_us, frame);
+        }
+        if (const u32 draw = ReadGuest<u32>(DrawFrameAddress); draw != last_draw) {
+            last_draw = draw;
+            out += fmt::format("mark\t{:.1f}\tdraw\t{}\n", now_us, draw);
         }
         if (const u32 present = DebugState.GetFrameNum(); present != last_present) {
             last_present = present;
