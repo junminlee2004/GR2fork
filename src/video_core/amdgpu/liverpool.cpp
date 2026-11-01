@@ -19,6 +19,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
+#include "video_core/gr2_native/gr2_native.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -808,6 +809,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                 break;
             }
             default:
+                Gr2Native::OnNop(nop->data_block, count, rasterizer);
                 break;
             }
             break;

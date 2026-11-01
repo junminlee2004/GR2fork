@@ -18,6 +18,7 @@
 #include "core/module.h"
 #include "core/prompt_packs/prompt_packs.h"
 #include "core/tls.h"
+#include "video_core/gr2_native/gr2_native.h"
 
 namespace Core {
 
@@ -440,6 +441,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     }
 #endif
     Gr2GfxTrace::Install(base_virtual_addr);
+    Gr2Native::Install(base_virtual_addr);
 }
 
 void Module::LoadDynamicInfo() {
