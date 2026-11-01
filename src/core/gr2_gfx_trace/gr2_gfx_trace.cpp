@@ -24,6 +24,7 @@
 #include <realtimeapiset.h>
 #include <tlhelp32.h>
 #elif defined(__linux__)
+#include <dlfcn.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -425,8 +426,102 @@ std::vector<CpuTime> ReadCpuTimes(u64) {
 }
 #endif
 
-// Once a second writes the window's game frames, presented frames, library calls and the CPU time
-// of every thread, and every DumpSamples seconds rewrites the call tables.
+// NVIDIA's management library, loaded at run time. Without it, as on other vendors' GPUs, no GPU
+// rows are written.
+class Nvml {
+public:
+    Nvml() {
+#ifdef _WIN32
+        library = LoadLibraryW(L"nvml.dll");
+        if (library == nullptr) {
+            library = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+        }
+#elif defined(__linux__)
+        library = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+#endif
+        if (library == nullptr || !Load(init, "nvmlInit_v2") ||
+            !Load(get_count, "nvmlDeviceGetCount_v2") ||
+            !Load(get_handle, "nvmlDeviceGetHandleByIndex_v2") ||
+            !Load(get_name, "nvmlDeviceGetName") ||
+            !Load(get_utilization, "nvmlDeviceGetUtilizationRates") ||
+            !Load(get_clock, "nvmlDeviceGetClockInfo") || init() != Success) {
+            return;
+        }
+        u32 count = 0;
+        if (get_count(&count) != Success) {
+            return;
+        }
+        for (u32 index = 0; index < count; ++index) {
+            Device device{};
+            std::array<char, 96> name{};
+            if (get_handle(index, &device.handle) == Success &&
+                get_name(device.handle, name.data(), static_cast<u32>(name.size())) == Success) {
+                device.name = name.data();
+                devices.push_back(std::move(device));
+            }
+        }
+    }
+
+    // One row per GPU: utilization (the share of the driver's last sample period in which a
+    // kernel ran), memory controller utilization and the graphics clock in MHz.
+    std::string Sample(u32 window) const {
+        std::string out;
+        for (u32 index = 0; index < devices.size(); ++index) {
+            const Device& device = devices[index];
+            Utilization utilization{};
+            u32 clock = 0;
+            if (get_utilization(device.handle, &utilization) != Success) {
+                continue;
+            }
+            get_clock(device.handle, ClockGraphics, &clock);
+            out += fmt::format("gpu\t{}\t{}\t{}\t{}\t{}\t{}\n", window, index, device.name,
+                               utilization.gpu, utilization.memory, clock);
+        }
+        return out;
+    }
+
+    bool Loaded() const {
+        return !devices.empty();
+    }
+
+private:
+    struct Utilization {
+        u32 gpu;
+        u32 memory;
+    };
+    struct Device {
+        void* handle;
+        std::string name;
+    };
+    static constexpr int Success = 0;
+    static constexpr int ClockGraphics = 0;
+
+    template <typename Function>
+    bool Load(Function*& function, const char* name) {
+#ifdef _WIN32
+        function = reinterpret_cast<Function*>(GetProcAddress(library, name));
+#elif defined(__linux__)
+        function = reinterpret_cast<Function*>(dlsym(library, name));
+#endif
+        return function != nullptr;
+    }
+
+#ifdef _WIN32
+    HMODULE library = nullptr;
+#else
+    void* library = nullptr;
+#endif
+    int (*init)() = nullptr;
+    int (*get_count)(u32*) = nullptr;
+    int (*get_handle)(u32, void**) = nullptr;
+    int (*get_name)(void*, char*, u32) = nullptr;
+    int (*get_utilization)(void*, Utilization*) = nullptr;
+    int (*get_clock)(void*, int, u32*) = nullptr;
+    std::vector<Device> devices;
+};
+
+// Once a second writes the window's game frames, presented frames, library calls, the CPU time of
+// every thread and the GPU utilization, and every DumpSamples seconds rewrites the call tables.
 void SamplerThread() {
     Common::SetCurrentThreadName("shadPS4:Gr2GfxTrace");
     const u64 tsc_hz = Common::EstimateRDTSCFrequency();
@@ -436,7 +531,13 @@ void SamplerThread() {
          << "# window\tindex\tend_ms\tlength_ms\tgame_frames\tpresented_frames\t"
             "draws_per_presented_frame\tdispatches_per_presented_frame\n"
             "# calls\tindex\tfunction\tcalls\n"
-            "# cpu\tindex\tos_thread_id\tname\tcpu_ms\tprobe_ms\n";
+            "# cpu\tindex\tos_thread_id\tname\tcpu_ms\tprobe_ms\n"
+            "# gpu\tindex\tdevice\tname\tutilization_percent\tmemory_utilization_percent\t"
+            "graphics_clock_mhz\n";
+    const Nvml nvml;
+    if (!nvml.Loaded()) {
+        file << "# no NVIDIA management library, so no gpu rows\n";
+    }
     file.flush();
 
     std::unordered_map<u64, u64> last_cpu;
@@ -494,6 +595,7 @@ void SamplerThread() {
                                    thread.name, ran / 1e6, probed / 1e6);
             }
         }
+        out += nvml.Sample(window);
         file << out;
         file.flush();
 
