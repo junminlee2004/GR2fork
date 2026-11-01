@@ -7,8 +7,10 @@
 
 // A trace of the Sony graphics library that Gravity Rush 2 links into its executable. Every library
 // function the game calls is hooked at its entry and counted, with its callers, the threads it runs
-// on and the arguments of a few of its calls, and the counts are written to gr2_gfx_trace.tsv in
-// the log folder. On with the environment variable GR2_GFX_TRACE=1.
+// on and the arguments of a few of its calls. The log folder gets two files:
+// - gr2_gfx_cpu.tsv: every second, the game and presented frames, the emulator's draws per frame,
+//   the library calls, and the CPU time of every thread with the part of it spent in the hooks.
+// - gr2_gfx_trace.tsv: the call counts, call sites and argument samples of the whole run.
 namespace Gr2GfxTrace {
 
 /// Hooks the library functions when module_base is the Gravity Rush 2 01.11 executable. Runs once
