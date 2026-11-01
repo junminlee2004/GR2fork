@@ -4,4 +4,5 @@
 target_sources(shadps4 PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/gr2_gfx_trace.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gr2_gfx_trace.h
-    ${CMAKE_CURRENT_LIST_DIR}/hook_table.inc)
+    ${CMAKE_CURRENT_LIST_DIR}/hook_table.inc
+    ${CMAKE_CURRENT_LIST_DIR}/timed_hook_table.inc)

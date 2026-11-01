@@ -70,7 +70,9 @@ constexpr auto SampleInterval = std::chrono::seconds{1};
 constexpr u32 DumpSamples = 10;
 // Arguments are kept from a function's calls number 1, 16, 256 and 4096.
 constexpr u32 SamplesPerFunction = 4;
-constexpr u32 MaxThreads = 64;
+constexpr u32 MaxThreads = 256;
+// Library callers past the mask's last bit share it.
+constexpr u32 ThreadMaskBits = 64;
 constexpr u32 NoThreadSlot = std::numeric_limits<u32>::max();
 constexpr u32 SiteBits = 14;
 constexpr u32 SiteSlots = 1u << SiteBits;
@@ -78,6 +80,19 @@ constexpr u32 XmmArguments = 8;
 // A probe that seems to take longer than this moved between cores whose time stamp counters
 // disagree, and its time is dropped.
 constexpr u64 MaxProbeCycles = 100'000'000;
+// Words a timed hook copies from its caller's stack: a callee with up to 10 arguments finds them
+// where the caller put them.
+constexpr u32 TimedStackArgs = 4;
+// A timed call on a timeline thread shorter than this is only counted, unless its hook says so.
+constexpr u64 TimelineMinNs = 50'000;
+constexpr u32 EventBits = 16;
+constexpr auto PollInterval = std::chrono::microseconds{500};
+constexpr auto TimelineFlushInterval = std::chrono::milliseconds{250};
+// The main loop's frame counter, and the DrawThread's three frame labels: {u64* label, u64 value
+// the label holds once the GPU front end has reached the end of that frame}.
+constexpr u64 FrameCounterAddress = 0x1efb08c;
+constexpr u64 FrameLabelsAddress = 0x1f7b680;
+constexpr u32 FrameLabels = 3;
 
 struct Hook {
     u64 address;
@@ -92,6 +107,19 @@ constexpr Hook Hooks[] = {
 constexpr u32 FrameHook =
     static_cast<u32>(std::ranges::find(Hooks, FrameFunction, &Hook::address) - std::begin(Hooks));
 static_assert(FrameHook < std::size(Hooks));
+
+struct TimedHook {
+    u64 address;
+    u8 size;
+    std::array<u8, 15> bytes;
+    const char* name;
+    // The call goes on the timeline whatever its duration.
+    bool always;
+};
+
+constexpr TimedHook TimedHooks[] = {
+#include "core/gr2_gfx_trace/timed_hook_table.inc"
+};
 
 // The registers a stub saves before it calls Probe, from the lowest address up.
 struct Frame {
@@ -130,6 +158,24 @@ struct ProbeThread {
     std::atomic<u64> os_id;
     // Time stamp counter cycles spent in Probe.
     std::atomic<u64> probe_cycles;
+    // DrawThread and the main thread, whose timed calls go on the timeline.
+    std::atomic<bool> timeline;
+};
+
+struct TimedStats {
+    std::atomic<u64> calls;
+    std::atomic<u64> nanoseconds;
+    std::atomic<u64> max_nanoseconds;
+};
+
+// A timed call of a timeline thread. seq is the event's index + 1 once the fields are written.
+struct CallEvent {
+    std::atomic<u64> seq;
+    u64 start_ns;
+    u64 duration_ns;
+    u64 argument;
+    u32 hook;
+    u32 thread_slot;
 };
 
 std::array<Stats, std::size(Hooks)> g_stats;
@@ -143,6 +189,14 @@ std::array<std::string, MaxThreads> g_thread_names;
 std::array<ProbeThread, MaxThreads> g_probe_threads;
 u32 g_thread_count;
 thread_local u32 t_thread_slot = NoThreadSlot;
+
+std::array<std::array<TimedStats, std::size(TimedHooks)>, MaxThreads> g_timed;
+std::array<CallEvent, 1u << EventBits> g_events;
+std::atomic<u64> g_event_head;
+
+u64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - g_start).count();
+}
 
 u64 OsThreadId() {
 #ifdef _WIN32
@@ -162,6 +216,9 @@ u32 ThreadSlot() {
         if (g_thread_count < MaxThreads) {
             g_thread_names[index] = thread != nullptr ? thread->name : "host";
             g_probe_threads[index].os_id.store(OsThreadId(), std::memory_order_relaxed);
+            g_probe_threads[index].timeline.store(g_thread_names[index] == "DrawThread" ||
+                                                      g_thread_names[index] == "Game:Main",
+                                                  std::memory_order_relaxed);
             ++g_thread_count;
         }
         t_thread_slot = index;
@@ -268,7 +325,7 @@ void PS4_SYSV_ABI Probe(u32 id, const Frame* frame) {
     Stats& stats = g_stats[id];
     const u64 call = stats.calls.fetch_add(1, std::memory_order_relaxed) + 1;
     const u32 slot = ThreadSlot();
-    const u64 thread_bit = u64{1} << slot;
+    const u64 thread_bit = u64{1} << std::min(slot, ThreadMaskBits - 1);
     if ((stats.threads.load(std::memory_order_relaxed) & thread_bit) == 0) {
         stats.threads.fetch_or(thread_bit, std::memory_order_relaxed);
     }
@@ -317,6 +374,93 @@ void EmitProbeCall(Xbyak::CodeGenerator& c, u32 id) {
     for (auto reg = saved.rbegin(); reg != saved.rend(); ++reg) {
         c.pop(*reg);
     }
+}
+
+u64 PS4_SYSV_ABI EnterTimed() {
+    return NowNs();
+}
+
+void PS4_SYSV_ABI ExitTimed(u32 hook, u64 start, u64 argument) {
+    const u64 duration = NowNs() - start;
+    const u32 slot = ThreadSlot();
+    TimedStats& stats = g_timed[slot][hook];
+    stats.calls.store(stats.calls.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    stats.nanoseconds.store(stats.nanoseconds.load(std::memory_order_relaxed) + duration,
+                            std::memory_order_relaxed);
+    if (duration > stats.max_nanoseconds.load(std::memory_order_relaxed)) {
+        stats.max_nanoseconds.store(duration, std::memory_order_relaxed);
+    }
+    if (!g_probe_threads[slot].timeline.load(std::memory_order_relaxed) ||
+        (!TimedHooks[hook].always && duration < TimelineMinNs)) {
+        return;
+    }
+    const u64 index = g_event_head.fetch_add(1, std::memory_order_relaxed);
+    CallEvent& event = g_events[index & (g_events.size() - 1)];
+    event.start_ns = start;
+    event.duration_ns = duration;
+    event.argument = argument;
+    event.hook = hook;
+    event.thread_slot = slot;
+    event.seq.store(index + 1, std::memory_order_release);
+}
+
+// Calls the original function through the trampoline between EnterTimed and ExitTimed. The
+// stub's own frame sits between the caller's and the callee's, so the caller's first
+// TimedStackArgs stack words are copied below it, where the callee looks for them. Frame layout
+// from rsp: the copied words, the start time, the first argument, padding to keep rsp 16-byte
+// aligned at both calls.
+void EmitTimedHook(Xbyak::CodeGenerator& c, u32 id, const u8* trampoline) {
+    using namespace Xbyak::util;
+    constexpr u32 StartSlot = TimedStackArgs * 8;
+    constexpr u32 ArgumentSlot = StartSlot + 8;
+    constexpr u32 FrameSize = ArgumentSlot + 16;
+    static_assert(FrameSize % 16 == 8);
+    constexpr u32 SavedSize = 9 * 8 + XmmArguments * 16 + 8;
+    c.sub(rsp, FrameSize);
+    for (u32 i = 0; i < TimedStackArgs; ++i) {
+        c.mov(r11, ptr[rsp + FrameSize + 8 + i * 8]);
+        c.mov(ptr[rsp + i * 8], r11);
+    }
+    c.mov(ptr[rsp + ArgumentSlot], rdi);
+    const std::array<Xbyak::Reg64, 9> saved{rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11};
+    for (const auto& reg : saved) {
+        c.push(reg);
+    }
+    c.sub(rsp, XmmArguments * 16 + 8);
+    for (u32 i = 0; i < XmmArguments; ++i) {
+        c.vmovdqu(ptr[rsp + i * 16], Xbyak::Xmm(i));
+    }
+    c.mov(rax, reinterpret_cast<u64>(&EnterTimed));
+    c.call(rax);
+    c.mov(ptr[rsp + SavedSize + StartSlot], rax);
+    for (u32 i = 0; i < XmmArguments; ++i) {
+        c.vmovdqu(Xbyak::Xmm(i), ptr[rsp + i * 16]);
+    }
+    c.add(rsp, XmmArguments * 16 + 8);
+    for (auto reg = saved.rbegin(); reg != saved.rend(); ++reg) {
+        c.pop(*reg);
+    }
+    c.mov(r11, reinterpret_cast<u64>(trampoline));
+    c.call(r11);
+    // Keep the return values: rax, rdx, xmm0 and xmm1.
+    constexpr u32 ResultSize = 16 + 32;
+    c.push(rax);
+    c.push(rdx);
+    c.sub(rsp, 32);
+    c.vmovdqu(ptr[rsp], xmm0);
+    c.vmovdqu(ptr[rsp + 16], xmm1);
+    c.mov(edi, id);
+    c.mov(rsi, ptr[rsp + ResultSize + StartSlot]);
+    c.mov(rdx, ptr[rsp + ResultSize + ArgumentSlot]);
+    c.mov(rax, reinterpret_cast<u64>(&ExitTimed));
+    c.call(rax);
+    c.vmovdqu(xmm0, ptr[rsp]);
+    c.vmovdqu(xmm1, ptr[rsp + 16]);
+    c.add(rsp, 32);
+    c.pop(rdx);
+    c.pop(rax);
+    c.add(rsp, FrameSize);
+    c.ret();
 }
 
 // Copies the instructions a hook replaces into the stub. The displacement of a RIP-relative operand
@@ -533,7 +677,8 @@ void SamplerThread() {
             "# calls\tindex\tfunction\tcalls\n"
             "# cpu\tindex\tos_thread_id\tname\tcpu_ms\tprobe_ms\n"
             "# gpu\tindex\tdevice\tname\tutilization_percent\tmemory_utilization_percent\t"
-            "graphics_clock_mhz\n";
+            "graphics_clock_mhz\n"
+            "# wait\tindex\tos_thread_id\tname\tfunction\tcalls\ttotal_ms\tlongest_ms\n";
     const Nvml nvml;
     if (!nvml.Loaded()) {
         file << "# no NVIDIA management library, so no gpu rows\n";
@@ -552,6 +697,12 @@ void SamplerThread() {
     for (u32 slot = 0; slot < MaxThreads; ++slot) {
         last_probe[slot] = g_probe_threads[slot].probe_cycles.load(std::memory_order_relaxed);
     }
+    struct TimedTotals {
+        u64 calls;
+        u64 nanoseconds;
+    };
+    std::vector<std::array<TimedTotals, std::size(TimedHooks)>> last_timed(MaxThreads);
+    std::vector<std::string> names(MaxThreads);
     u64 last_frames = g_frames.load(std::memory_order_relaxed);
     u32 last_presents = DebugState.GetFrameNum();
     auto last_time = Clock::now();
@@ -595,6 +746,31 @@ void SamplerThread() {
                                    thread.name, ran / 1e6, probed / 1e6);
             }
         }
+        u32 thread_count;
+        {
+            std::scoped_lock lock{g_thread_mutex};
+            thread_count = g_thread_count;
+            for (u32 slot = 0; slot < thread_count; ++slot) {
+                names[slot] = g_thread_names[slot];
+            }
+        }
+        for (u32 slot = 0; slot < thread_count; ++slot) {
+            const u64 os_id = g_probe_threads[slot].os_id.load(std::memory_order_relaxed);
+            for (u32 hook = 0; hook < std::size(TimedHooks); ++hook) {
+                TimedStats& stats = g_timed[slot][hook];
+                TimedTotals& last = last_timed[slot][hook];
+                const u64 calls = stats.calls.load(std::memory_order_relaxed);
+                if (calls == last.calls) {
+                    continue;
+                }
+                const u64 nanoseconds = stats.nanoseconds.load(std::memory_order_relaxed);
+                const u64 longest = stats.max_nanoseconds.exchange(0, std::memory_order_relaxed);
+                out += fmt::format("wait\t{}\t{}\t{}\t{}\t{}\t{:.3f}\t{:.3f}\n", window, os_id,
+                                   names[slot], TimedHooks[hook].name, calls - last.calls,
+                                   (nanoseconds - last.nanoseconds) / 1e6, longest / 1e6);
+                last = {calls, nanoseconds};
+            }
+        }
         out += nvml.Sample(window);
         file << out;
         file.flush();
@@ -605,6 +781,114 @@ void SamplerThread() {
         last_frames = frames;
         last_presents = presents;
         last_time = now;
+    }
+}
+
+template <typename T>
+T ReadGuest(u64 address) {
+    T value;
+    std::memcpy(&value,
+                reinterpret_cast<const void*>(MemoryPatcher::g_eboot_address + address - CodeBase),
+                sizeof(value));
+    return value;
+}
+
+// Polls the frame counter, the presented frame count and the frame labels every PollInterval
+// and writes them with the timed calls of the timeline threads to gr2_gfx_timeline.tsv.
+void TimelineThread() {
+    Common::SetCurrentThreadName("shadPS4:Gr2GfxTimeline");
+    const auto path =
+        Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "gr2_gfx_timeline.tsv";
+    std::ofstream file{path, std::ios::trunc};
+    file << "# times in microseconds since the trace started\n"
+            "# call\tstart\tduration\tthread\tfunction\tfirst_argument: timed calls of DrawThread "
+            "and Game:Main\n"
+            "# mark\ttime\tframe\tcount: the main loop's frame counter moved\n"
+            "# mark\ttime\tpresent\tcount: a frame was presented\n"
+            "# mark\ttime\tlabel\tindex\tvalue: a frame label got its value, so the GPU front end "
+            "has processed that frame's commands\n";
+    file.flush();
+    if (FrameLabelsAddress + FrameLabels * 16 - CodeBase > MemoryPatcher::g_eboot_image_size) {
+        return;
+    }
+    u32 last_frame = ReadGuest<u32>(FrameCounterAddress);
+    u32 last_present = DebugState.GetFrameNum();
+    std::array<u64, FrameLabels> last_label{};
+    std::vector<std::string> names(MaxThreads);
+    u64 tail = 0;
+    u64 lost = 0;
+    auto next_flush = Clock::now() + TimelineFlushInterval;
+    std::string out;
+    for (;;) {
+        Common::AccurateSleep(PollInterval, nullptr, false);
+        const double now_us = NowNs() / 1e3;
+        if (const u32 frame = ReadGuest<u32>(FrameCounterAddress); frame != last_frame) {
+            last_frame = frame;
+            out += fmt::format("mark\t{:.1f}\tframe\t{}\n", now_us, frame);
+        }
+        if (const u32 present = DebugState.GetFrameNum(); present != last_present) {
+            last_present = present;
+            out += fmt::format("mark\t{:.1f}\tpresent\t{}\n", now_us, present);
+        }
+        // The labels are read once DrawThread has waited on them, so they are mapped.
+        if (g_frames.load(std::memory_order_relaxed) >= 2) {
+            for (u32 i = 0; i < FrameLabels; ++i) {
+                const u64 label = ReadGuest<u64>(FrameLabelsAddress + i * 16);
+                if (label == 0 || label % 8 != 0) {
+                    continue;
+                }
+                u64 value;
+                std::memcpy(&value, reinterpret_cast<const void*>(label), sizeof(value));
+                if (value != last_label[i]) {
+                    last_label[i] = value;
+                    out += fmt::format("mark\t{:.1f}\tlabel\t{}\t{}\n", now_us, i, value);
+                }
+            }
+        }
+        if (Clock::now() < next_flush) {
+            continue;
+        }
+        next_flush = Clock::now() + TimelineFlushInterval;
+        {
+            std::scoped_lock lock{g_thread_mutex};
+            for (u32 slot = 0; slot < g_thread_count; ++slot) {
+                names[slot] = g_thread_names[slot];
+            }
+        }
+        const u64 head = g_event_head.load(std::memory_order_acquire);
+        if (head - tail > g_events.size()) {
+            lost += head - tail - g_events.size();
+            tail = head - g_events.size();
+        }
+        for (; tail < head; ++tail) {
+            const CallEvent& event = g_events[tail & (g_events.size() - 1)];
+            const u64 seq = event.seq.load(std::memory_order_acquire);
+            if (seq < tail + 1) {
+                break;
+            }
+            // A writer a whole ring ahead can overwrite the event while it is copied, which seq
+            // shows once it is read again.
+            const u64 start = event.start_ns;
+            const u64 duration = event.duration_ns;
+            const u64 argument = event.argument;
+            const u32 hook = event.hook;
+            const u32 slot = event.thread_slot;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq != tail + 1 || event.seq.load(std::memory_order_relaxed) != seq ||
+                hook >= std::size(TimedHooks) || slot >= MaxThreads) {
+                ++lost;
+                continue;
+            }
+            out += fmt::format("call\t{:.1f}\t{:.1f}\t{}\t{}\t{:#x}\n", start / 1e3, duration / 1e3,
+                               names[slot], TimedHooks[hook].name, argument);
+        }
+        if (lost != 0) {
+            out += fmt::format("# lost {} timed calls\n", lost);
+            lost = 0;
+        }
+        file << out;
+        file.flush();
+        out.clear();
     }
 }
 
@@ -625,6 +909,7 @@ void Install(VAddr module_base) {
         LOG_ERROR(Loader, "Graphics trace: no memory for the hooks within reach of the executable");
         return;
     }
+    g_start = Clock::now();
     Xbyak::CodeGenerator c(StubAreaSize, area);
     u32 hooked = 0;
     bool frame_hooked = false;
@@ -653,20 +938,54 @@ void Install(VAddr module_base) {
         ++hooked;
         frame_hooked |= id == FrameHook;
     }
-    LOG_INFO(Loader, "Graphics trace: hooked {} of {} library functions, {} bytes of stubs", hooked,
-             std::size(Hooks), c.getSize());
-    if (hooked == 0) {
+    // A timed hook's trampoline runs the covered instructions and jumps back into the function;
+    // its stub calls the trampoline between the two timing calls.
+    u32 timed = 0;
+    for (u32 id = 0; id < std::size(TimedHooks); ++id) {
+        const TimedHook& hook = TimedHooks[id];
+        u8* entry = reinterpret_cast<u8*>(module_base + hook.address - CodeBase);
+        if (hook.address - CodeBase + hook.size > MemoryPatcher::g_eboot_image_size ||
+            std::memcmp(entry, hook.bytes.data(), hook.size) != 0) {
+            LOG_WARNING(Loader,
+                        "Graphics trace: the code of {} at {:#x} is not the 01.11 "
+                        "executable's",
+                        hook.name, hook.address);
+            continue;
+        }
+        const auto start = c.getSize();
+        const u8* trampoline = c.getCurr();
+        if (!Relocate(entry, hook.size, c)) {
+            c.setSize(start);
+            LOG_WARNING(Loader, "Graphics trace: the code of {} at {:#x} cannot be moved",
+                        hook.name, hook.address);
+            continue;
+        }
+        c.jmp(entry + hook.size);
+        const u8* stub = c.getCurr();
+        EmitTimedHook(c, id, trampoline);
+        const s32 jump = static_cast<s32>(stub - (entry + JmpSize));
+        entry[0] = 0xe9;
+        std::memcpy(entry + 1, &jump, sizeof(jump));
+        std::memset(entry + JmpSize, 0xcc, hook.size - JmpSize);
+        ++timed;
+    }
+    LOG_INFO(Loader,
+             "Graphics trace: hooked {} of {} library functions and timed {} of {} calls, {} "
+             "bytes of stubs",
+             hooked, std::size(Hooks), timed, std::size(TimedHooks), c.getSize());
+    if (hooked == 0 && timed == 0) {
         return;
     }
     if (!frame_hooked) {
         LOG_WARNING(Loader, "Graphics trace: submitAndFlip is not hooked, so no game frames are "
                             "counted");
     }
-    g_start = Clock::now();
     std::thread{SamplerThread}.detach();
+    std::thread{TimelineThread}.detach();
     LOG_INFO(Loader,
              "Graphics trace: gr2_gfx_cpu.tsv in the log folder gets a row group every second, "
-             "gr2_gfx_trace.tsv is rewritten every {} seconds",
+             "gr2_gfx_timeline.tsv gets every frame's timed calls and marks, gr2_gfx_trace.tsv is "
+             "rewritten every {} seconds",
              DumpSamples);
 }
 
