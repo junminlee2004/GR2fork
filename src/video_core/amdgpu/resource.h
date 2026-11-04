@@ -400,6 +400,10 @@ constexpr bool IsAnisoFilter(const Filter filter) {
     return filter == Filter::AnisoPoint || filter == Filter::AnisoLinear;
 }
 
+constexpr bool IsLinearFilter(const Filter filter) {
+    return filter == Filter::Bilinear || filter == Filter::AnisoLinear;
+}
+
 enum class MipFilter : u64 {
     None = 0,
     Point = 1,

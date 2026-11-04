@@ -128,7 +128,7 @@ public:
         const u32 index{Add(sampler_resources, desc, [this, &desc](const auto& existing) {
             return desc.sharp_fetch == existing.sharp_fetch && desc.post_op == existing.post_op &&
                    desc.post_op_tsharp_dw3_off == existing.post_op_tsharp_dw3_off &&
-                   desc.is_depth == existing.is_depth;
+                   desc.is_depth == existing.is_depth && desc.cube == existing.cube;
         })};
         return index;
     }
@@ -324,13 +324,28 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
         auto& lod_prod = resource.sharps[1].post_op_data.lod_prod;
-        const u32 sampler_binding = descriptors.Add(SamplerResource{
+        SamplerResource sampler_res = {
             .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]),
             .post_op = resource.sharps[1].post_op,
             .post_op_tsharp_dw3_off =
                 lod_prod.IsEmpty() ? UNKNOWN_LOCATION : SharpLocationFromSource(lod_prod.Inst()),
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
-        });
+        };
+        // A filtered cube lookup uses two variants of the guest sampler, kept as a pair.
+        // Gathers and texel offsets address texels directly, and integers are never filtered.
+        const bool is_cube_lookup =
+            image.GetViewType(image_res.is_array) == AmdGpu::ImageType::Cube &&
+            !AmdGpu::IsInteger(image.GetNumberFmt()) && !inst_info.is_gather &&
+            !inst_info.has_offset && info.samplers.size() + 2 <= info.samplers.capacity();
+        if (is_cube_lookup) {
+            sampler_res.cube = CubeSampling::Face;
+        }
+        const u32 sampler_binding = descriptors.Add(sampler_res);
+        if (is_cube_lookup) {
+            sampler_res.cube = CubeSampling::Edge;
+            const u32 edge_binding = descriptors.Add(sampler_res);
+            ASSERT(edge_binding == sampler_binding + 1);
+        }
         inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
     } else {
         inst.SetArg(0, ir.Imm32(image_binding));

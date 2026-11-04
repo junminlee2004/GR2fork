@@ -66,6 +66,7 @@ struct FMaskSpecialization {
 struct SamplerSpecialization {
     u8 force_unnormalized : 1;
     u8 force_degamma : 1;
+    CubeFilter cube_filter{};
 
     bool operator==(const SamplerSpecialization&) const = default;
 };
@@ -133,9 +134,11 @@ struct StageSpecialization {
                          spec.type = sharp.GetViewType(desc.is_array);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
-                         if (spec.is_storage) {
+                         // A cube lookup forces the components that swizzle to one.
+                         if (spec.is_storage || spec.type == AmdGpu::ImageType::Cube) {
                              spec.dst_select = sharp.DstSelect();
-                         } else {
+                         }
+                         if (!spec.is_storage) {
                              spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
                          }
                          spec.num_conversion = sharp.GetNumberConversion();
@@ -150,6 +153,7 @@ struct StageSpecialization {
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
                          spec.force_unnormalized = sharp.force_unnormalized;
                          spec.force_degamma = sharp.force_degamma;
+                         spec.cube_filter = desc.GetCubeFilter(sharp);
                      });
 
         // Initialize runtime_info fields that rely on analysis in tessellation passes

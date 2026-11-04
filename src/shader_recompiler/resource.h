@@ -179,11 +179,30 @@ struct ImageResource {
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
 
+/// Cube images are bound as 2D arrays, so a lookup that filters across a face edge is put
+/// together from several taps. It needs two variants of the guest sampler.
+enum class CubeSampling : u8 {
+    None,
+    Face, ///< Clamps to the face. Used where the filter stays on one face.
+    Edge, ///< Reads nothing beyond the face. Used for the taps of a lookup near an edge.
+};
+
+/// What a shader has to know about a sampler to filter a cube across its face edges.
+struct CubeFilter {
+    bool seamless{};
+    bool anisotropic{};
+    s8 lod_bias{}; ///< Sampler LOD bias, rounded up to a whole level.
+    u8 min_lod{};  ///< Sampler minimum LOD, rounded up to a whole level.
+
+    bool operator==(const CubeFilter&) const = default;
+};
+
 struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
     bool is_depth{};
+    CubeSampling cube{};
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
@@ -205,7 +224,48 @@ struct SamplerResource {
             sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             sampler.aniso_threshold.Assign(0);
         }
+        if (cube != CubeSampling::None) {
+            // GCN ignores the clamp modes on a cube. The border of the edge variant must add
+            // nothing to a lookup, so a depth comparison has to fail against it.
+            const auto clamp = cube == CubeSampling::Edge ? AmdGpu::ClampMode::ClampBorder
+                                                          : AmdGpu::ClampMode::ClampLastTexel;
+            sampler.clamp_x.Assign(clamp);
+            sampler.clamp_y.Assign(clamp);
+            const auto func = sampler.depth_compare_func.Value();
+            const bool passes_zero = is_depth && (func == AmdGpu::DepthCompare::Greater ||
+                                                  func == AmdGpu::DepthCompare::GreaterEqual);
+            sampler.border_color_type.Assign(passes_zero ? AmdGpu::BorderColor::White
+                                                         : AmdGpu::BorderColor::TransparentBlack);
+            if (cube == CubeSampling::Edge) {
+                // The taps of one lookup only add up if they all filter alike.
+                sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
+            }
+        }
         return sampler;
+    }
+
+    CubeFilter GetCubeFilter(const AmdGpu::Sampler& sampler) const noexcept {
+        if (cube == CubeSampling::None || !sampler.Valid()) {
+            return {};
+        }
+        const auto func = sampler.depth_compare_func.Value();
+        // Only a filter that is linear both ways reads the texels beyond a face.
+        const bool is_linear = AmdGpu::IsLinearFilter(sampler.xy_mag_filter) &&
+                               AmdGpu::IsLinearFilter(sampler.xy_min_filter);
+        const bool border_fails = !is_depth || func == AmdGpu::DepthCompare::Less ||
+                                  func == AmdGpu::DepthCompare::LessEqual ||
+                                  func == AmdGpu::DepthCompare::Greater ||
+                                  func == AmdGpu::DepthCompare::GreaterEqual;
+        const bool is_aniso = AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
+                              AmdGpu::IsAnisoFilter(sampler.xy_min_filter);
+        // Sign-extend the 14-bit fixed point bias, then round up: (x + 255) >> 8.
+        const s32 lod_bias = static_cast<s16>((sampler.lod_bias.Value() ^ 0x2000u) - 0x2000u);
+        return {
+            .seamless = !sampler.disable_cube_wrap && is_linear && border_fails,
+            .anisotropic = is_aniso && sampler.max_aniso != AmdGpu::AnisoRatio::One,
+            .lod_bias = static_cast<s8>((lod_bias + 255) >> 8),
+            .min_lod = static_cast<u8>((sampler.min_lod.Value() + 255) >> 8),
+        };
     }
 };
 using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
