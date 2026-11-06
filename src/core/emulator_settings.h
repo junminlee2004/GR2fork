@@ -730,6 +730,7 @@ struct GPUSettings {
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
     Setting<bool> fast_shader_math{false};
+    Setting<u32> submit_draw_interval{0};
 
 #define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -825,6 +826,7 @@ struct GPUSettings {
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
             make_override<GPUSettings>("fast_shader_math", &GPUSettings::fast_shader_math),
+            make_override<GPUSettings>("submit_draw_interval", &GPUSettings::submit_draw_interval),
         };
     }
 #undef GPU_OVERRIDE
@@ -859,7 +861,7 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, fast_shader_math, one_core_gpu_thread_pin, \
-    vk_record_thread, async_shader_recompiling, pipeline_sync_budget_ms
+    vk_record_thread, async_shader_recompiling, pipeline_sync_budget_ms, submit_draw_interval
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1290,6 +1292,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, FastShaderMath, fast_shader_math)
+    SETTING_FORWARD(m_gpu, SubmitDrawInterval, submit_draw_interval)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

@@ -68,7 +68,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, bool is_storage_, bool 
         format = Vulkan::LiverpoolToVK::PromoteFormatToDepth(format);
     }
 
-    range.base.level = image.base_level;
+    range.base.level = std::min<u32>(image.base_level, image.NumLevels() - 1);
     range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
     range.extent.levels = image.NumViewLevels(is_array);
     range.extent.layers = image.NumViewLayers(is_array);
