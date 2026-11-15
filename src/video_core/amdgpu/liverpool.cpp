@@ -241,6 +241,7 @@ constexpr std::array kRtRegBlocks = {
     DYN_REG_BLOCK(depth_buffer),          DYN_REG_BLOCK(depth_view),
     DYN_REG_BLOCK(depth_htile_data_base), DYN_REG_BLOCK(depth_render_control),
     DYN_REG_BLOCK(depth_clear),           DYN_REG_BLOCK(stencil_clear),
+    DYN_REG_BLOCK(color_shader_mask),
 };
 #undef DYN_REG_BLOCK
 consteval bool RegBlocksInRange(const auto& blocks) {
